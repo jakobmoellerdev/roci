@@ -12,6 +12,5 @@ paths-ignore:
   - spec
   - "**/tests"
 
-# Default query suite is the fastest; security-and-quality/extended are slower.
-queries:
-  - uses: default
+# No `queries:` block — omitting it runs CodeQL's default query suite, which is
+# the fastest (security-and-quality / security-extended are slower).
