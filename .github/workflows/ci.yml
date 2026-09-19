@@ -61,7 +61,7 @@ jobs:
             echo "No Cargo workspace yet — skipping rustfmt."
           fi
       - if: steps.guard.outputs.have_workspace == 'true'
-        uses: dtolnay/rust-toolchain@1.98.1
+        uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: rustfmt
       - if: steps.guard.outputs.have_workspace == 'true'
