@@ -44,3 +44,12 @@ repos:
         types: [rust]
         pass_filenames: false
         # Regenerates COVERAGE.md + README badge; stage them if the hook changes them.
+
+      - id: conformance
+        name: OCI distribution conformance
+        entry: bash scripts/conformance.sh
+        language: system
+        types: [rust]
+        pass_filenames: false
+        # Builds roci and runs the full OCI conformance suite (all four
+        # categories). Requires Go 1.17+ and the pinned spec submodule.

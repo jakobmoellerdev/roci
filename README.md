@@ -80,8 +80,9 @@ Fetch the pinned OCI spec submodules:
 git submodule update --init --depth 1   # or: just init
 ```
 
-Install the git pre-commit hook (runs fmt, clippy, workflow lint, and the 100%
-coverage gate, and refreshes [`COVERAGE.md`](COVERAGE.md) + the badge on every commit):
+Install the git pre-commit hook (when Rust sources are staged, runs fmt,
+clippy, the 100% coverage gate, and the full OCI conformance suite; refreshes
+[`COVERAGE.md`](COVERAGE.md) + the badge on every commit):
 
 ```sh
 just hooks   # or, with the pre-commit framework: pre-commit install
@@ -105,7 +106,7 @@ Every recipe mirrors a CI gate, so passing locally means passing the required CI
 | `just audit` | `cargo deny` supply-chain check |
 | `just coverage` | Enforce 100% line coverage (cargo-llvm-cov) |
 | `just coverage-report` | Show uncovered lines (developer aid) |
-| `just ci` | Run the full local gate before pushing (actionlint + fmt + clippy + test + build + deps-guard + coverage) |
+| `just ci` | Run the full local gate before pushing (actionlint + fmt + clippy + test + build + deps-guard + coverage + conformance) |
 | `just conformance` | Run the OCI dist-spec conformance suite against a local roci |
 | `just container` | Build the hardened scratch image and smoke-test it |
 | `just container-multiarch` | Build the multi-arch image (linux/amd64, linux/arm64) |
