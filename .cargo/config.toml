@@ -1,0 +1,21 @@
+# roci cargo configuration.
+#
+# The `ci` profile is used by lint/test/build CI jobs and the `justfile`.
+# It trims debuginfo for a smaller, faster cache and disables incremental
+# compilation (a pessimization in CI, which starts from a cold incremental
+# state every run and would only bloat the cache).
+
+[registries.crates-io]
+protocol = "sparse"
+
+[profile.ci]
+inherits = "dev"
+debug = 0
+incremental = false
+strip = "debuginfo"
+
+[net]
+retry = 3
+
+[term]
+color = "always"

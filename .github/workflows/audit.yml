@@ -1,0 +1,46 @@
+name: audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "deny.toml"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "deny.toml"
+  # Catch new advisories filed against unchanged dependencies.
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: guard
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ] || ls ./*/Cargo.toml >/dev/null 2>&1; then
+            echo "have_workspace=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_workspace=false" >> "$GITHUB_OUTPUT"
+            echo "No Cargo workspace yet — skipping supply-chain audit."
+          fi
+      # Runs advisories + licenses + bans + sources per deny.toml.
+      - if: steps.guard.outputs.have_workspace == 'true'
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check

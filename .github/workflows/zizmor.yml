@@ -1,0 +1,42 @@
+name: zizmor
+
+# Static security analysis of the GitHub Actions workflows themselves
+# (zizmorcore/zizmor). Finds template injection, over-broad token permissions,
+# unpinned actions, and similar CI/CD supply-chain risks. Results upload to the
+# repository's code-scanning dashboard as SARIF.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - ".github/dependabot.yml"
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - ".github/dependabot.yml"
+  workflow_dispatch: {}
+
+# Default deny; the job grants only what it needs.
+permissions: {}
+
+concurrency:
+  group: zizmor-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Upload the SARIF results to the code-scanning dashboard.
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4

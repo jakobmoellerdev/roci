@@ -1,0 +1,8 @@
+[toolchain]
+# Pinned stable channel. A fixed version keeps CI cache keys deterministic
+# (Swatinem/rust-cache keys on the toolchain) and makes every contributor and
+# agent reproducible. Bump this single line in a dependency PR; do not hardcode
+# a different toolchain in any workflow.
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

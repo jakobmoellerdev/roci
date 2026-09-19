@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Rust dependencies (workspace root).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  # Pinned GitHub Actions SHAs — keeps third-party action pins current.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+# NOTE: Dependabot PRs are NOT auto-labeled `automerge`; they still require a
+# code-owner review before merge (SECURITY.md supply-chain policy).

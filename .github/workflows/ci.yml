@@ -1,0 +1,182 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  merge_group: {}
+  workflow_dispatch: {}
+
+# Least privilege: read-only token by default. Fork PRs (including
+# autonomous-agent PRs) run the full gate without a write token or secrets.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs; never cancel main or merge-queue runs.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    env:
+      # Pinned actionlint release + sha256 of the linux_amd64 tarball.
+      # Bump both together (checksums.txt on the release page).
+      ACTIONLINT_VERSION: 1.7.7
+      ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          curl -sSfL "$url" -o "$tarball"
+          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
+          tar xzf "$tarball" actionlint
+      # Lints every workflow and the composite action; shellcheck runs on run: blocks.
+      - name: Run actionlint
+        run: ./actionlint -color
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: guard
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ] || ls ./*/Cargo.toml >/dev/null 2>&1; then
+            echo "have_workspace=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_workspace=false" >> "$GITHUB_OUTPUT"
+            echo "No Cargo workspace yet — skipping rustfmt."
+          fi
+      - if: steps.guard.outputs.have_workspace == 'true'
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt
+      - if: steps.guard.outputs.have_workspace == 'true'
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: guard
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ] || ls ./*/Cargo.toml >/dev/null 2>&1; then
+            echo "have_workspace=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_workspace=false" >> "$GITHUB_OUTPUT"
+            echo "No Cargo workspace yet — skipping clippy."
+          fi
+      - if: steps.guard.outputs.have_workspace == 'true'
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: clippy
+          components: clippy
+      # Full flavor: lint everything, extensions included.
+      - if: steps.guard.outputs.have_workspace == 'true'
+        run: cargo clippy --workspace --all-targets --all-features --profile ci -- -D warnings
+      # Minimal flavor must also compile clean (ARCHITECTURE.md invariant 1).
+      - if: steps.guard.outputs.have_workspace == 'true'
+        run: cargo clippy --workspace --no-default-features -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: guard
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ] || ls ./*/Cargo.toml >/dev/null 2>&1; then
+            echo "have_workspace=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_workspace=false" >> "$GITHUB_OUTPUT"
+            echo "No Cargo workspace yet — skipping tests."
+          fi
+      - if: steps.guard.outputs.have_workspace == 'true'
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: test
+      - if: steps.guard.outputs.have_workspace == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      # nextest is faster and gives better flaky isolation than `cargo test`.
+      - if: steps.guard.outputs.have_workspace == 'true'
+        run: cargo nextest run --workspace --all-features --profile ci
+      # nextest does not run doctests; run them separately (no-op on an empty workspace).
+      - if: steps.guard.outputs.have_workspace == 'true'
+        run: cargo test --workspace --all-features --doc
+
+  build-flavors:
+    name: build (${{ matrix.flavor }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [minimal, full]
+    steps:
+      - uses: actions/checkout@v4
+      - id: guard
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ] || ls ./*/Cargo.toml >/dev/null 2>&1; then
+            echo "have_workspace=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_workspace=false" >> "$GITHUB_OUTPUT"
+            echo "No Cargo workspace yet — skipping build."
+          fi
+      - if: steps.guard.outputs.have_workspace == 'true'
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: flavor-${{ matrix.flavor }}
+      # Minimal: core builds with every extension disabled (invariant 1).
+      - if: steps.guard.outputs.have_workspace == 'true' && matrix.flavor == 'minimal'
+        run: cargo build --workspace --no-default-features
+      - if: steps.guard.outputs.have_workspace == 'true' && matrix.flavor == 'full'
+        run: cargo build --workspace --all-features
+
+  minimal-deps-guard:
+    name: minimal-deps-guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: guard
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ] || ls ./*/Cargo.toml >/dev/null 2>&1; then
+            echo "have_workspace=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_workspace=false" >> "$GITHUB_OUTPUT"
+            echo "No Cargo workspace yet — skipping minimal-deps guard."
+          fi
+      - if: steps.guard.outputs.have_workspace == 'true'
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: deps-guard
+      # ARCHITECTURE.md invariant 2: no extension crate in the minimal dep graph.
+      # `roci-cli` is the assembled binary; fail if any ext/cluster crate leaks
+      # into its --no-default-features tree.
+      - if: steps.guard.outputs.have_workspace == 'true'
+        shell: bash
+        run: |
+          if cargo tree -p roci-cli --no-default-features --edges normal --prefix none \
+             | grep -E 'roci-ext-|roci-cluster'; then
+            echo "extension crate leaked into the minimal build (ARCHITECTURE.md invariant 2)"
+            exit 1
+          fi
+          echo "minimal dep graph clean"

@@ -1,0 +1,36 @@
+# cargo-deny configuration — supply-chain gate (SECURITY.md §"Supply chain & CI/CD").
+# Run by `just audit` and the `audit.yml` workflow (`cargo deny check`).
+
+[advisories]
+version = 2
+# Fail on dependencies pulling in yanked crates.
+yanked = "deny"
+# Advisory exceptions live here (RUSTSEC IDs). Keep empty; justify additions in the PR.
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses common in the Rust ecosystem. Expand via PR when a
+# legitimate dependency needs a license not listed here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Warn (not deny) initially — a greenfield dependency tree churns and duplicate
+# versions are common early. Tighten to "deny" once the tree stabilizes.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

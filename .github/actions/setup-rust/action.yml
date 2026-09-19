@@ -1,0 +1,36 @@
+# Composite action: install the pinned Rust toolchain and wire up build caching.
+#
+# The toolchain version is pinned here to match `rust-toolchain.toml`; when you
+# bump the toolchain, bump both. dtolnay/rust-toolchain is invoked with an
+# explicit channel (not @master file-reading) so the resolved toolchain is
+# unambiguous and the cache key is deterministic.
+name: Setup Rust
+description: Install the pinned Rust toolchain and restore the build cache.
+
+inputs:
+  cache-key:
+    description: >-
+      Suffix distinguishing this job's cache from other jobs' (e.g. test,
+      clippy, flavor-full). Distinct feature sets must not clobber each other.
+    required: true
+  components:
+    description: Space/comma-separated extra rustup components (e.g. "clippy, rustfmt").
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      # Pinned to the same channel as rust-toolchain.toml. Bump both together.
+      uses: dtolnay/rust-toolchain@1.98.1
+      with:
+        components: ${{ inputs.components }}
+    - name: Cache cargo registry and build artifacts
+      uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      with:
+        key: ${{ inputs.cache-key }}
+        cache-on-failure: true
+        # Only main writes cache entries; PR jobs restore from main's cache but
+        # never save, so a PR can't poison the shared cache.
+        save-if: ${{ github.ref == 'refs/heads/main' }}

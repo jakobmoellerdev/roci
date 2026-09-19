@@ -1,0 +1,10 @@
+# Code owners for roci.
+#
+# Branch protection on `main` should require code-owner review (SECURITY.md:
+# "All PRs reviewed by code owners; CI blocks unreviewed commits to protected
+# branches"). Auto-merge (.github/workflows/auto-merge.yml) never bypasses this.
+
+* @jakobmoellerdev
+
+# Infrastructure and CI configuration.
+/.github/ @jakobmoellerdev
