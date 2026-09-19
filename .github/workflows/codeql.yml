@@ -8,17 +8,14 @@ name: codeql
 # run is skipped on docs-only changes, leaving the required check waiting
 # forever. Always running keeps the gate satisfiable.
 #
-# Speed: overlay analysis (CodeQL >= 2.23.8). On main we build an *overlay-base*
-# database (a full analysis) and cache it; on a PR we restore that base and run
-# in *overlay* mode, which re-extracts and re-analyzes only the files the PR
-# changed instead of the whole workspace. We drive overlay manually via
-# CODEQL_OVERLAY_DATABASE_MODE (rather than waiting on the server-side
-# OverlayAnalysis feature flag) and manage the base-database cache ourselves
-# with actions/cache. Manual mode does NOT auto-fall-back on a cache miss, so a
-# PR only requests `overlay` when the restore actually hit; otherwise it runs a
-# normal full analysis. dependency-caching + trap-caching further cut the cold
-# path. The overlay-base database records the git OIDs it was built from, so the
-# overlay diff stays correct regardless of the cache key.
+# Speed: dependency-caching + trap-caching let the codeql-action reuse the
+# Cargo dependency resolution it models and the per-source TRAP extractor output
+# across runs, so unchanged files skip re-extraction. Overlay/incremental
+# analysis is left to the codeql-action itself, which enables it automatically
+# when the CLI and server support it — we do NOT hand-drive
+# CODEQL_OVERLAY_DATABASE_MODE with a self-managed actions/cache base database:
+# that plumbing is unsupported alongside the action and produced overlay-base
+# databases missing base-database-oids.json, failing init on every cache hit.
 
 on:
   push:
@@ -44,54 +41,20 @@ jobs:
       contents: read
       # Upload analysis results to the code-scanning dashboard.
       security-events: write
-    env:
-      # Stable database directory so the cache save/restore path is predictable.
-      CODEQL_DB: ${{ github.workspace }}/codeql-db
-      # overlay-base on main (build + cache the base), overlay on a PR IFF the
-      # base was restored (set later), else empty -> full analysis. Overlay with
-      # submodules needs git >= 2.36 (ubuntu-latest ships >= 2.43).
-      OVERLAY_CACHE_KEY_PREFIX: codeql-overlay-base-rust-
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # Overlay diffs the PR against the base database's commit, so the
-          # merge-base must be reachable in local history.
-          fetch-depth: 0
-
-      # On main: prime the mode to build a fresh overlay-base database.
-      - name: Select overlay mode (main -> overlay-base)
-        if: github.event_name == 'push' || github.event_name == 'schedule'
-        run: echo "CODEQL_OVERLAY_DATABASE_MODE=overlay-base" >> "$GITHUB_ENV"
-
-      # On PRs: try to restore a cached overlay-base database.
-      - name: Restore overlay-base database
-        id: overlay-restore
-        if: github.event_name == 'pull_request'
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ${{ env.CODEQL_DB }}
-          key: ${{ env.OVERLAY_CACHE_KEY_PREFIX }}${{ github.sha }}
-          restore-keys: ${{ env.OVERLAY_CACHE_KEY_PREFIX }}
-
-      # Only request overlay mode when a base database was actually restored;
-      # manual mode does not self-heal a missing base, so a miss must run full.
-      - name: Select overlay mode (PR -> overlay on cache hit)
-        if: github.event_name == 'pull_request' && steps.overlay-restore.outputs.cache-matched-key != ''
-        run: echo "CODEQL_OVERLAY_DATABASE_MODE=overlay" >> "$GITHUB_ENV"
-
       - name: Initialize CodeQL
         uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           languages: rust
           build-mode: none
           config-file: ./.github/codeql/config.yml
-          db-location: ${{ env.CODEQL_DB }}
-          # Cache cargo dependency resolution and TRAP output across runs; these
-          # accelerate the cold (full) path that overlay falls back to.
+          # Cache cargo dependency resolution and per-source TRAP output across
+          # runs; the action reuses them to skip re-extraction of unchanged files.
           dependency-caching: true
           trap-caching: true
-
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
@@ -100,13 +63,3 @@ jobs:
           threads: 0
           # Never upload the raw database as a debug artifact.
           upload-database: false
-
-      # On main only: publish the freshly built overlay-base database to the
-      # cache so subsequent PRs can run in overlay mode. actions/cache/save is a
-      # no-op when the key already exists, so re-running the same commit is safe.
-      - name: Save overlay-base database
-        if: github.event_name == 'push' || github.event_name == 'schedule'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ${{ env.CODEQL_DB }}
-          key: ${{ env.OVERLAY_CACHE_KEY_PREFIX }}${{ github.sha }}
