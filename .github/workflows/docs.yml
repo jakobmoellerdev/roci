@@ -31,6 +31,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # configure-pages with enablement: true self-provisions Pages (build
+      # type = GitHub Actions), so a first deploy never depends on flipping
+      # Settings → Pages by hand.
+      pages: write
+      id-token: write
     defaults:
       run:
         working-directory: docs
@@ -44,12 +49,14 @@ jobs:
           cache: npm
           cache-dependency-path: docs/package-lock.json
       # Configure Pages so VitePress emits the correct base path for the
-      # project site (https://<owner>.github.io/<repo>/). No-op on PRs where
-      # Pages is not enabled, so guard it to the deploying event.
+      # project site (https://<owner>.github.io/<repo>/), self-enabling Pages
+      # on first run. Skipped on PRs (no deploy, and no write token on forks).
       - name: Configure Pages
         id: pages
         if: github.event_name != 'pull_request'
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+        with:
+          enablement: true
       - run: npm ci
       - name: Build site
         # base_path is empty on PRs (Configure Pages skipped); fall back to /roci/.
