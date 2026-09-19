@@ -1,0 +1,14 @@
+# zizmor configuration (https://docs.zizmor.sh/configuration/).
+#
+# All real findings are fixed in-tree (actions pinned by commit SHA,
+# persist-credentials disabled, dependabot cooldown set). The one rule disabled
+# below is a stylistic note, not a vulnerability:
+#
+# self-repository — recommends GitHub's `$/...` local-action syntax over
+# `./...`. That syntax is not yet supported on current runners, so the
+# composite action at `./.github/actions/setup-rust` intentionally uses `./`.
+rules:
+  self-repository:
+    ignore:
+      - ci.yml
+      - conformance.yml

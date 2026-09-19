@@ -23,7 +23,7 @@ runs:
   steps:
     - name: Install Rust toolchain
       # Pinned to the same channel as rust-toolchain.toml. Bump both together.
-      uses: dtolnay/rust-toolchain@1.98.1
+      uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
       with:
         components: ${{ inputs.components }}
     - name: Cache cargo registry and build artifacts

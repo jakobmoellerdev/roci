@@ -32,7 +32,9 @@ jobs:
       ACTIONLINT_VERSION: 1.7.7
       ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install pinned actionlint
         shell: bash
         run: |
@@ -50,7 +52,9 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - id: guard
         shell: bash
         run: |
@@ -61,7 +65,7 @@ jobs:
             echo "No Cargo workspace yet — skipping rustfmt."
           fi
       - if: steps.guard.outputs.have_workspace == 'true'
-        uses: dtolnay/rust-toolchain@1.98.1
+        uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
         with:
           components: rustfmt
       - if: steps.guard.outputs.have_workspace == 'true'
@@ -71,7 +75,9 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - id: guard
         shell: bash
         run: |
@@ -97,7 +103,9 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - id: guard
         shell: bash
         run: |
@@ -112,7 +120,7 @@ jobs:
         with:
           cache-key: test
       - if: steps.guard.outputs.have_workspace == 'true'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@678b06b887cdbf44fa0601e5915f865e17c2241d # v2.44.60
         with:
           tool: nextest
       # nextest is faster and gives better flaky isolation than `cargo test`.
@@ -130,7 +138,9 @@ jobs:
       matrix:
         flavor: [minimal, full]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - id: guard
         shell: bash
         run: |
@@ -154,7 +164,9 @@ jobs:
     name: minimal-deps-guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - id: guard
         shell: bash
         run: |
