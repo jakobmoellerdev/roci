@@ -2,13 +2,25 @@ name: codeql
 
 # CodeQL static analysis (SAST) for Rust. Uses build-mode: none — CodeQL
 # extracts from source without compiling.
+#
+# Runs on every push to main and every PR (no path filter): the repo's
+# code_scanning ruleset requires a CodeQL result to merge, and a path-filtered
+# run is skipped on docs-only changes, leaving the required check waiting
+# forever. Always running keeps the gate satisfiable.
+#
+# Speed: dependency-caching + trap-caching let the codeql-action reuse the
+# Cargo dependency resolution it models and the per-source TRAP extractor output
+# across runs, so unchanged files skip re-extraction. Overlay/incremental
+# analysis is left to the codeql-action itself, which enables it automatically
+# when the CLI and server support it — we do NOT hand-drive
+# CODEQL_OVERLAY_DATABASE_MODE with a self-managed actions/cache base database:
+# that plumbing is unsupported alongside the action and produced overlay-base
+# databases missing base-database-oids.json, failing init on every cache hit.
 
 on:
   push:
     branches: [main]
-    paths: ["crates/**", "Cargo.*", ".github/workflows/codeql.yml", ".github/codeql/**"]
-  pull_request:
-    paths: ["crates/**", "Cargo.*", ".github/workflows/codeql.yml", ".github/codeql/**"]
+  pull_request: {}
   schedule:
     # Weekly full scan to catch newly published CodeQL queries against unchanged code.
     - cron: "23 4 * * 1"
@@ -45,9 +57,15 @@ jobs:
           languages: rust
           build-mode: none
           config-file: ./.github/codeql/config.yml
+          # Cache cargo dependency resolution and per-source TRAP output across
+          # runs; the action reuses them to skip re-extraction of unchanged files.
+          dependency-caching: true
+          trap-caching: true
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           category: "/language:rust"
           # Use all runner cores to speed up analysis.
           threads: 0
+          # Never upload the raw database as a debug artifact.
+          upload-database: false
