@@ -1,0 +1,17 @@
+# CodeQL configuration for roci — tuned for speed.
+#
+# Scope analysis to the Rust workspace crates only: the OCI spec submodules and
+# docs are not our code and analyzing them wastes time. Use the default query
+# suite (fast) rather than security-extended.
+name: roci-codeql
+
+paths:
+  - crates
+
+paths-ignore:
+  - spec
+  - "**/tests"
+
+# Default query suite is the fastest; security-and-quality/extended are slower.
+queries:
+  - uses: default

@@ -6,7 +6,9 @@ name: codeql
 on:
   push:
     branches: [main]
-  pull_request: {}
+    paths: ["crates/**", "Cargo.*", ".github/workflows/codeql.yml", ".github/codeql/**"]
+  pull_request:
+    paths: ["crates/**", "Cargo.*", ".github/workflows/codeql.yml", ".github/codeql/**"]
   schedule:
     # Weekly full scan to catch newly published CodeQL queries against unchanged code.
     - cron: "23 4 * * 1"
@@ -36,7 +38,10 @@ jobs:
         with:
           languages: rust
           build-mode: none
+          config-file: ./.github/codeql/config.yml
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           category: "/language:rust"
+          # Use all runner cores to speed up analysis.
+          threads: 0

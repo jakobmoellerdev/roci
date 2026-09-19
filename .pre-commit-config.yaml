@@ -25,7 +25,7 @@ repos:
 
       - id: actionlint
         name: actionlint
-        entry: actionlint
+        entry: actionlint -ignore 'unknown permission scope "code-quality"'
         language: system
         files: ^\.github/(workflows|actions)/
         pass_filenames: false

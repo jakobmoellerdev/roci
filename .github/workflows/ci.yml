@@ -45,8 +45,10 @@ jobs:
           echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
           tar xzf "$tarball" actionlint
       # Lints every workflow and the composite action; shellcheck runs on run: blocks.
+      # `-ignore` the not-yet-recognized `code-quality` permission scope (a
+      # recent GitHub addition actionlint 1.7.12 doesn't know yet but is valid).
       - name: Run actionlint
-        run: ./actionlint -color
+        run: ./actionlint -color -ignore 'unknown permission scope "code-quality"'
 
   fmt:
     name: rustfmt
@@ -83,6 +85,12 @@ jobs:
   test-and-coverage:
     name: test + coverage (100% lines)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Report coverage to GitHub's code-coverage API for PR gating
+      # ("Restrict code coverage"). Fork PRs lack this and are skipped gracefully.
+      code-quality: write
+      pull-requests: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -96,7 +104,7 @@ jobs:
           tool: nextest,cargo-llvm-cov
       - name: Tests + coverage (single instrumented build, 100% gate)
         # scripts/coverage.sh instruments once, runs the suite via nextest, and
-        # asserts 100% line coverage (lcov), excluding the binary entrypoint shim.
+        # asserts 100% line coverage (lcov); also emits cobertura.xml.
         run: bash scripts/coverage.sh
       - name: HTML coverage report
         if: always()
@@ -104,6 +112,16 @@ jobs:
       # Doctests are not instrumented (none exist yet); run them for correctness.
       - name: Doctests
         run: cargo test --workspace --all-features --doc --profile ci
+      # Report coverage to GitHub so PRs can be gated on it. Skipped on fork PRs
+      # (no write access) — the action exits gracefully there anyway.
+      - name: Report coverage to GitHub
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/upload-code-coverage@d8e329117199404bba6fc81efe8093dc7c015e34 # v1.4.2
+        with:
+          file: cobertura.xml
+          language: Rust
+          label: code-coverage/llvm-cov
+          fail-on-error: false
       - name: Upload coverage reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -111,6 +129,7 @@ jobs:
           name: coverage
           path: |
             lcov.info
+            cobertura.xml
             coverage-html
             COVERAGE.md
           if-no-files-found: ignore

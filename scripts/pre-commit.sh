@@ -33,7 +33,7 @@ fi
 # Workflow lint/security only when workflow files are staged.
 if echo "$staged" | grep -qE '^\.github/(workflows|actions)/'; then
   if command -v actionlint >/dev/null 2>&1; then
-    echo "[pre-commit] actionlint"; actionlint
+    echo "[pre-commit] actionlint"; actionlint -ignore 'unknown permission scope "code-quality"'
   fi
   if command -v zizmor >/dev/null 2>&1; then
     echo "[pre-commit] zizmor"; zizmor --config .github/zizmor.yml .github/workflows .github/actions
