@@ -30,6 +30,10 @@ confidence-threshold = 0.9
 # versions are common early. Tighten to "deny" once the tree stabilizes.
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal workspace crates are `{ path = … }` deps without a version, which
+# cargo-deny would otherwise flag as wildcards. This is the standard workspace
+# pattern, so permit it while still denying wildcard versions on third-party crates.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
