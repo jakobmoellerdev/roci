@@ -2,13 +2,17 @@ name: codeql
 
 # CodeQL static analysis (SAST) for Rust. Uses build-mode: none — CodeQL
 # extracts from source without compiling.
+#
+# Runs on every push to main and every PR (no path filter): the repo's
+# code_scanning ruleset requires a CodeQL result to merge, and a path-filtered
+# run is skipped on docs-only changes, leaving the required check waiting
+# forever. Always running keeps the gate satisfiable; build-mode: none plus the
+# crates/-scoped config keep docs-only runs fast.
 
 on:
   push:
     branches: [main]
-    paths: ["crates/**", "Cargo.*", ".github/workflows/codeql.yml", ".github/codeql/**"]
-  pull_request:
-    paths: ["crates/**", "Cargo.*", ".github/workflows/codeql.yml", ".github/codeql/**"]
+  pull_request: {}
   schedule:
     # Weekly full scan to catch newly published CodeQL queries against unchanged code.
     - cron: "23 4 * * 1"

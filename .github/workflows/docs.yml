@@ -3,7 +3,8 @@ name: docs
 # Build the VitePress documentation site (docs/) and deploy it to GitHub Pages.
 # Pull requests build only (validating the site + dead links); pushes to main
 # build and deploy. Least privilege: the build job is read-only; only the
-# deploy job gets the Pages write + id-token permissions.
+# deploy job holds the Pages write + id-token permissions (it also self-enables
+# Pages on first run via configure-pages, so no manual Settings toggle).
 
 on:
   push:
@@ -31,11 +32,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # configure-pages with enablement: true self-provisions Pages (build
-      # type = GitHub Actions), so a first deploy never depends on flipping
-      # Settings → Pages by hand.
-      pages: write
-      id-token: write
     defaults:
       run:
         working-directory: docs
@@ -48,20 +44,11 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: docs/package-lock.json
-      # Configure Pages so VitePress emits the correct base path for the
-      # project site (https://<owner>.github.io/<repo>/), self-enabling Pages
-      # on first run. Skipped on PRs (no deploy, and no write token on forks).
-      - name: Configure Pages
-        id: pages
-        if: github.event_name != 'pull_request'
-        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
-        with:
-          enablement: true
       - run: npm ci
       - name: Build site
-        # base_path is empty on PRs (Configure Pages skipped); fall back to /roci/.
-        env:
-          DOCS_BASE: ${{ steps.pages.outputs.base_path || '/roci/' }}
+        # GitHub Pages serves this project site under /roci/; VitePress'
+        # config defaults DOCS_BASE to /roci/, matching the repo name, so the
+        # build needs no Pages configuration (and stays token-free).
         run: npm run docs:build
       - name: Upload Pages artifact
         if: github.event_name != 'pull_request'
@@ -82,6 +69,13 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Configure Pages
+        # enablement: true self-provisions Pages (build type = GitHub Actions)
+        # on first run, so the deploy never depends on a manual Settings toggle.
+        # Lives here (not build) so only this privileged job holds pages: write.
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+        with:
+          enablement: true
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
