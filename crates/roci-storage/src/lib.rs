@@ -420,9 +420,10 @@ impl Storage for FsStorage {
         match tokio::fs::read_dir(&dir).await {
             Ok(mut rd) => {
                 while let Some(entry) = rd.next_entry().await? {
-                    if let Some(name) = entry.file_name().to_str() {
-                        tags.push(name.to_string());
-                    }
+                    // Tag names are UTF-8 in practice; a non-UTF-8 name (only
+                    // creatable via out-of-band corruption) is included lossily
+                    // rather than silently dropped.
+                    tags.push(entry.file_name().to_string_lossy().into_owned());
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -794,10 +795,9 @@ mod tests {
         // The real descriptor is returned; the subdirectory entry is skipped.
         assert_eq!(listed.len(), 1);
 
-        // A non-UTF-8 tag filename is skipped by list_tags (covers the
-        // file_name().to_str() == None edge). Unix-only, and only on filesystems
-        // that permit non-UTF-8 names (ext4/Linux does; APFS/darwin rejects the
-        // write, so we skip the assertion there rather than fail).
+        // A non-UTF-8 tag filename is listed lossily by list_tags. Unix-only,
+        // and only on filesystems that permit non-UTF-8 names (ext4/Linux does;
+        // APFS/darwin rejects the write, so we skip the assertion there).
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
@@ -807,7 +807,8 @@ mod tests {
             let bad = std::ffi::OsStr::from_bytes(b"bad-\xff-name");
             if std::fs::write(tags_dir.join(bad), b"x").is_ok() {
                 let tags = s.list_tags("r2").await.unwrap();
-                assert_eq!(tags, vec!["valid".to_string()]);
+                assert!(tags.contains(&"valid".to_string()));
+                assert_eq!(tags.len(), 2);
             }
         }
     }

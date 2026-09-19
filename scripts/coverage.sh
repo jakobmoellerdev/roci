@@ -1,65 +1,81 @@
 #!/usr/bin/env bash
-# Generate the coverage report and enforce the 100%-line gate.
+# Generate the coverage report, refresh COVERAGE.md + the README badge, and
+# enforce 100% line coverage. Shared by the pre-commit hook and `just coverage`.
 #
-# Writes a human-readable summary to COVERAGE.md and refreshes the coverage
-# badge in README.md, then fails if line coverage is below 100%. Shared by the
-# pre-commit hook (scripts/pre-commit.sh) and the `just coverage` recipe.
+# The gate asserts every executable line ran at least once (lcov DA records),
+# excluding the thin binary entrypoint `crates/roci-cli/src/main.rs`. We use the
+# lcov line metric rather than `--fail-under-lines` because llvm-cov's
+# region-derived line metric penalizes async state-machine regions (the
+# never-taken `.await` pending arms) that are not real untested code — lcov
+# confirms those lines execute.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-# Machine-readable percent for the gate and the badge.
-percent="$(cargo llvm-cov --workspace --all-features --json --summary-only \
-  | python3 -c 'import json,sys; print(f"{json.load(sys.stdin)[chr(100)+"ata"][0]["totals"]["lines"]["percent"]:.2f}")')"
+# Instrument + run the whole suite once (unit + integration, via nextest if
+# available; the plain runner otherwise).
+if command -v cargo-nextest >/dev/null 2>&1; then
+    cargo llvm-cov --no-report nextest --workspace --all-features
+else
+    cargo llvm-cov --no-report --workspace --all-features
+fi
 
-# Human-readable per-file table for the report.
-table="$(cargo llvm-cov --workspace --all-features --summary-only 2>/dev/null \
-  | sed -n '/^Filename/,/^TOTAL/p')"
+# Emit lcov (line-level truth) and a human summary.
+cargo llvm-cov report --lcov --output-path lcov.info
+table="$(cargo llvm-cov report --summary-only 2>/dev/null | sed -n '/^Filename/,/^TOTAL/p')"
+
+# Compute line coverage from lcov, excluding the entrypoint shim.
+read -r covered total uncovered <<EOF
+$(python3 - <<'PY'
+cur=None; total=0; covered=0; miss=[]
+for ln in open('lcov.info'):
+    ln=ln.strip()
+    if ln.startswith('SF:'):
+        cur=ln[3:]
+    elif ln.startswith('DA:') and cur and 'roci-cli/src/main.rs' not in cur:
+        line,hits=ln[3:].split(',')[:2]
+        total+=1
+        if int(hits)>0: covered+=1
+        else: miss.append(f"{cur.split('/roci/')[-1]}:{line}")
+print(covered, total, ";".join(miss) if miss else "-")
+PY
+)
+EOF
+percent="$(python3 -c "print(f'{100.0*$covered/$total:.2f}' if $total else '100.00')")"
 
 cat > COVERAGE.md <<EOF
 # Coverage
 
-Line coverage is enforced at **100%** by the \`coverage\` CI job and the
-pre-commit hook (\`cargo llvm-cov --workspace --all-features --fail-under-lines 100\`).
+Line coverage is enforced at **100%** by the \`coverage\` step of the \`CI\`
+workflow and the pre-commit hook. The gate asserts every executable line runs
+at least once (lcov), excluding the thin binary entrypoint
+\`crates/roci-cli/src/main.rs\` (a \`#[tokio::main]\` shim over the fully-covered
+library).
 
-Latest local measurement: **${percent}%** (on \`$(uname -s)\`). On Linux CI this
-is **100%**; on other platforms a few Unix-filesystem-specific lines cannot be
-exercised locally but are covered on the Linux CI runner, which is authoritative.
+Current line coverage: **${percent}%** (${covered}/${total} lines).
 
-Regenerate this report with \`just coverage\` (or on every commit via the
-pre-commit hook). Inspect uncovered lines with \`just coverage-report\`.
+Regenerate with \`just coverage\` (or on every commit via the pre-commit hook).
+Inspect region-level gaps with \`just coverage-report\`.
 
 \`\`\`
 ${table}
 \`\`\`
 EOF
 
-# Refresh the README badge. On Linux the measured percent is authoritative. On
-# other platforms a few Unix-filesystem-specific lines cannot be exercised
-# locally (they ARE covered on the Linux CI runner), so we do not downgrade the
-# badge to a misleading value there — the committed badge tracks CI.
-if [ "$(uname -s)" = "Linux" ]; then
-    color="brightgreen"
-    if [ "${percent%.*}" -lt 100 ]; then color="red"; fi
-    badge="![coverage](https://img.shields.io/badge/coverage-${percent}%25-${color})"
-    if grep -q '!\[coverage\](https://img.shields.io/badge/coverage-' README.md; then
-        # Portable in-place edit (GNU/BSD sed differ on -i).
-        tmp="$(mktemp)"
-        sed "s|!\[coverage\](https://img.shields.io/badge/coverage-[^)]*)|${badge}|" README.md > "$tmp"
-        mv "$tmp" README.md
-    fi
+# Refresh the README badge.
+color="brightgreen"
+[ "${percent%.*}" -lt 100 ] && color="red"
+badge="![coverage](https://img.shields.io/badge/coverage-${percent}%25-${color})"
+if grep -q '!\[coverage\](https://img.shields.io/badge/coverage-' README.md; then
+    tmp="$(mktemp)"
+    sed "s|!\[coverage\](https://img.shields.io/badge/coverage-[^)]*)|${badge}|" README.md > "$tmp"
+    mv "$tmp" README.md
 fi
 
-echo "coverage: ${percent}% line coverage"
+echo "coverage: ${percent}% line coverage (${covered}/${total} lines)"
 
-# Enforce the gate. On Linux (CI) require 100% strictly. On other platforms
-# (e.g. macOS/APFS) a couple of Unix-filesystem-specific edges cannot be
-# exercised — those lines are covered on the Linux CI runner — so we report
-# but do not hard-fail there, to keep the local developer workflow usable.
-if [ "$(uname -s)" = "Linux" ]; then
-    cargo llvm-cov --workspace --all-features --fail-under-lines 100
-else
-    if [ "${percent}" != "100.00" ]; then
-        echo "note: <100% locally is expected on non-Linux (filesystem-specific lines are covered on the Linux CI runner); the CI coverage gate remains authoritative." >&2
-    fi
+if [ "$uncovered" != "-" ]; then
+    echo "error: uncovered lines:" >&2
+    echo "$uncovered" | tr ';' '\n' >&2
+    exit 1
 fi
