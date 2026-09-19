@@ -36,4 +36,4 @@ is built on native per-arch runners — no QEMU emulation:
 - **Pull requests** build only `linux/arm64` (on an `ubuntu-24.04-arm` runner) to save time.
 - **`main`** builds both `linux/amd64` and `linux/arm64`, assembles a multi-arch manifest, and pushes it to GHCR.
 
-`darwin/amd64` and `darwin/arm64` binaries build cleanly from the same workspace and are produced by the release pipeline (macOS runners), not as container platforms.
+`darwin/amd64` and `darwin/arm64` binaries build cleanly from the same workspace and are **planned** to ship as cross-compiled release binaries (macOS runners), not as container platforms; that release pipeline is not wired up yet.

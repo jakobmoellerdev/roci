@@ -1,6 +1,6 @@
 # Documentation site
 
-This site is built with [VitePress](https://vitepress.dev/) and lives in the `docs/` directory. It is deployed to GitHub Pages by the `docs` workflow (`.github/workflows/docs.yml`) on every push to `main`.
+This site is built with [VitePress](https://vitepress.dev/) and lives in the `docs/` directory. It is deployed to GitHub Pages by the `docs` workflow (`.github/workflows/docs.yml`) when a push to `main` touches `docs/**` or the workflow itself (the trigger is path-filtered); pull requests that touch those paths build only, validating the site and its links.
 
 ## Local development
 

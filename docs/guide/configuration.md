@@ -11,7 +11,7 @@ Configuration is being built out across the phased [build plan](/design/plan). T
 With no configuration, roci:
 
 - Listens on `127.0.0.1:5000`.
-- Stores content as an [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md) under a local storage root.
+- Stores content in a filesystem-backed content-addressable store (per-repo `blobs/`, `manifests/`, `tags/`) under a local storage root.
 - Enables only the core distribution API — no extensions.
 
 ## Command-line flags
@@ -19,7 +19,7 @@ With no configuration, roci:
 | Flag | Purpose |
 | --- | --- |
 | `--listen` | Address to bind (default `127.0.0.1:5000`). |
-| `--storage-root` | Directory for the on-disk OCI image layout. |
+| `--storage-root` | Directory for the on-disk content-addressable store. |
 
 ## Build flavors
 

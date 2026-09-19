@@ -27,7 +27,7 @@ Each doc has one owner; when your change touches its concern, update it **in the
 
 ## Documentation site (`docs/`)
 
-The public documentation site is a [VitePress](https://vitepress.dev/) app in [`docs/`](docs/), deployed to GitHub Pages by [`.github/workflows/docs.yml`](.github/workflows/docs.yml) on every push to `main` (pull requests build-only, validating the site and its internal links).
+The public documentation site is a [VitePress](https://vitepress.dev/) app in [`docs/`](docs/), deployed to GitHub Pages by [`.github/workflows/docs.yml`](.github/workflows/docs.yml) when a push to `main` touches `docs/**` or the workflow file (the trigger is path-filtered; the deploy job also gates on `github.ref == 'refs/heads/main'`). Pull requests touching those paths build-only, validating the site and its internal links.
 
 - **Work in `docs/`.** `npm install` once, then `npm run docs:dev` for a hot-reloading preview and `npm run docs:build` to reproduce the CI build (VitePress fails the build on dead internal links, so a green build means links resolve). Commit the `docs/package-lock.json` when dependencies change — the workflow uses `npm ci`.
 - **Design pages don't duplicate.** The overviews under `docs/design/` (`architecture`, `security`, `storage`, `plan`, `research`) are summaries that **link** the canonical root docs ([`ARCHITECTURE.md`](ARCHITECTURE.md), [`SECURITY.md`](SECURITY.md), [`PLAN.md`](PLAN.md), [`RESEARCH.md`](RESEARCH.md)), which remain the source of truth. When you change a canonical doc, update the matching overview in the **same change** so the site does not drift; never fork design rationale into the site.

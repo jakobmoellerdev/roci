@@ -21,7 +21,7 @@ roci targets full conformance with the OCI Distribution Spec v1.1.1 and feature 
 
 ## Design principles
 
-- **OCI image layout on disk.** Storage is a plain [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), so any OCI layout can be served directly as a registry and inspected with standard tooling.
+- **Content-addressable storage.** Blobs and manifests live in a filesystem-backed content-addressable store (per-repo `blobs/`, `manifests/`, `tags/`) with streamed hash-on-write. Serving a standard [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md) directly is a roadmap goal (see below), not yet the on-disk format.
 - **Core vs. extensions.** The dist-spec surface is a stable core; signatures, search, sync, scanning, and metrics are cleanly separated extensions that can be compiled and configured independently.
 - **Config-driven behavior.** All behavior is controlled from configuration, not code paths baked at build time.
 - **Rootless by default.** No root privileges required to run.
@@ -143,8 +143,9 @@ gh attestation verify oci://ghcr.io/jakobmoellerdev/roci:latest --owner jakobmoe
 Alongside the image, the workflow builds a standalone static `roci` binary for
 each Linux arch on its native runner and attests it. Container images are
 Linux-only (OCI/Docker has no darwin runtime); `darwin/amd64` and
-`darwin/arm64` binaries build cleanly from the same workspace and are produced
-by the release pipeline (macOS runners), not as container platforms.
+`darwin/arm64` binaries build cleanly from the same workspace and are
+**planned** to ship as cross-compiled release binaries (macOS runners), not as
+container platforms — that release pipeline is not wired up yet.
 
 ### Security scanning
 

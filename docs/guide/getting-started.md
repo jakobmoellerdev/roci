@@ -19,7 +19,7 @@ Common flags:
 | Flag | Purpose |
 | --- | --- |
 | `--listen` | Address to bind (default `127.0.0.1:5000`). |
-| `--storage-root` | Directory for the on-disk OCI image layout. |
+| `--storage-root` | Directory for the on-disk content-addressable store. |
 
 ## Prerequisites
 
@@ -37,4 +37,4 @@ skopeo copy --dest-tls-verify=false \
   docker://127.0.0.1:5000/alpine:latest
 ```
 
-Because storage is a plain [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), you can also inspect the `--storage-root` directory directly with standard OCI tooling.
+Storage is a filesystem-backed content-addressable store: under `--storage-root`, each repository gets `<repo>/blobs/<algo>/<hex>`, `<repo>/manifests/<algo>/<hex>`, and `<repo>/tags/<tag>`. This is roci's own CAS layout, not an [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), so inspect it with those paths rather than expecting `oci-layout`/`index.json` at the root.

@@ -58,8 +58,10 @@ jobs:
 
   deploy:
     name: deploy
-    # Only deploy from main; PRs stop after a successful build.
-    if: github.event_name != 'pull_request'
+    # Deploy only from a push/dispatch on main itself — never a PR, and never a
+    # manual dispatch on some other branch (which would publish that branch to
+    # the live site). PRs stop after a successful build.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     permissions:

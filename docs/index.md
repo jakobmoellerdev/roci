@@ -27,8 +27,8 @@ features:
     details: An index designed for low-latency tag, manifest, referrer, and search lookups, with zero-copy blob serving where the OS allows it.
   - title: Config-driven
     details: Start with zero config and sane defaults; grow into a single declarative config file. All behavior is controlled from configuration, not build-time code paths.
-  - title: OCI image layout on disk
-    details: Storage is a plain OCI image layout, so any layout can be served directly as a registry and inspected with standard tooling.
+  - title: Content-addressable storage
+    details: Blobs and manifests are stored in a filesystem-backed content-addressable store with streamed hash-on-write — no whole-blob buffering, deduplicated by digest.
   - title: Core vs. extensions
     details: The dist-spec surface is a stable core; signatures, search, sync, scanning, and metrics are cleanly separated extensions compiled and configured independently.
   - title: Rootless & hardened
