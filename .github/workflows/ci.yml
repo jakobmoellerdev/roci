@@ -96,8 +96,9 @@ jobs:
           tool: nextest,cargo-llvm-cov
       - name: Tests + coverage (single instrumented build)
         run: |
-          # Instrument once; nextest runs the unit/integration suite under coverage.
-          cargo llvm-cov --no-report --cargo-profile ci nextest --workspace --all-features
+          # Use llvm-cov's default instrumentation profile (the `ci` profile
+          # strips debuginfo, which coverage needs); nextest runs the suite.
+          cargo llvm-cov --no-report nextest --workspace --all-features
           # Emit every report from the one collected profile.
           cargo llvm-cov report --lcov --output-path lcov.info
           cargo llvm-cov report --html --output-dir coverage-html
