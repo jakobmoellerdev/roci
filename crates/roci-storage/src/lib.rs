@@ -216,10 +216,12 @@ impl FsStorage {
         })
     }
 
-    /// Validate a single untrusted path component: reject empty, `.`/`..`, and
-    /// any embedded separator (`/`, `\`) or NUL. Defense-in-depth backstop so
-    /// the CAS is safe regardless of the caller (SECURITY.md inv. 8).
-    fn safe_component(s: &str) -> Result<(), StorageError> {
+    /// Validate a single untrusted path component and **return it** so callers
+    /// build paths from the validated value (a barrier the taint analysis and
+    /// a human both see). Rejects empty, `.`/`..`, and any embedded separator
+    /// (`/`, `\`) or NUL. Defense-in-depth backstop so the CAS is safe
+    /// regardless of the caller (SECURITY.md inv. 8).
+    fn safe_component(s: &str) -> Result<&str, StorageError> {
         if s.is_empty()
             || s == "."
             || s == ".."
@@ -227,15 +229,17 @@ impl FsStorage {
         {
             return Err(StorageError::BadPath(s.to_string()));
         }
-        Ok(())
+        Ok(s)
     }
 
     fn repo_dir(&self, repo: &str) -> Result<PathBuf, StorageError> {
-        // A repo name may contain `/`; each component is validated.
+        // A repo name may contain `/`; build the path from each *validated*
+        // component so no unchecked input reaches the filesystem join.
+        let mut path = PathBuf::clone(&self.root);
         for component in repo.split('/') {
-            Self::safe_component(component)?;
+            path.push(Self::safe_component(component)?);
         }
-        Ok(self.root.join(repo))
+        Ok(path)
     }
     fn blob_path(&self, repo: &str, d: &Digest) -> Result<PathBuf, StorageError> {
         Ok(self.repo_dir(repo)?.join("blobs").join(d.relative_path()))
@@ -254,12 +258,16 @@ impl FsStorage {
             .with_extension("mediatype"))
     }
     fn tag_path(&self, repo: &str, tag: &str) -> Result<PathBuf, StorageError> {
-        Self::safe_component(tag)?;
-        Ok(self.repo_dir(repo)?.join("tags").join(tag))
+        Ok(self
+            .repo_dir(repo)?
+            .join("tags")
+            .join(Self::safe_component(tag)?))
     }
     fn upload_path(&self, repo: &str, id: &str) -> Result<PathBuf, StorageError> {
-        Self::safe_component(id)?;
-        Ok(self.repo_dir(repo)?.join("uploads").join(id))
+        Ok(self
+            .repo_dir(repo)?
+            .join("uploads")
+            .join(Self::safe_component(id)?))
     }
     fn referrers_dir(&self, repo: &str, subject: &Digest) -> Result<PathBuf, StorageError> {
         Ok(self
@@ -395,6 +403,12 @@ impl Storage for FsStorage {
         media_type: &str,
         data: &[u8],
     ) -> Result<(), StorageError> {
+        // Validate the tag (if any) *before* writing any content so a bad tag
+        // cannot leave a partially-committed manifest + media-type file.
+        let tag_dest = match tag {
+            Some(tag) => Some(self.tag_path(repo, tag)?),
+            None => None,
+        };
         let dest = self.manifest_path(repo, digest)?;
         tokio::fs::create_dir_all(
             self.repo_dir(repo)?
@@ -408,8 +422,7 @@ impl Storage for FsStorage {
             media_type.as_bytes(),
         )
         .await?;
-        if let Some(tag) = tag {
-            let tp = self.tag_path(repo, tag)?;
+        if let Some(tp) = tag_dest {
             tokio::fs::create_dir_all(self.repo_dir(repo)?.join("tags")).await?;
             tokio::fs::write(tp, digest.as_string().as_bytes()).await?;
         }

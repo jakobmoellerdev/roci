@@ -432,12 +432,17 @@ async fn put_manifest<S: Storage>(
     }
     let digest = sha256_of(&body);
     // A digest reference must match the content; a tag is associated as-is.
+    // Parse the reference so an uppercase-hex digest compares equal (Digest
+    // canonicalizes to lowercase) and compare constant-time.
     let tag = if reference.contains(':') {
-        if reference != digest.as_string() {
-            return ApiError::digest_invalid("manifest digest does not match reference")
-                .into_response();
+        match Digest::parse(reference) {
+            Ok(ref_digest) if ref_digest.ct_eq(&digest) => None,
+            Ok(_) => {
+                return ApiError::digest_invalid("manifest digest does not match reference")
+                    .into_response()
+            }
+            Err(e) => return map_storage_err(e),
         }
-        None
     } else {
         Some(reference)
     };
@@ -535,6 +540,7 @@ async fn delete_manifest<S: Storage>(st: &AppState<S>, repo: &str, reference: &s
     };
     match st.storage.delete_manifest(repo, &d).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(StorageError::NotFound) => ApiError::manifest_unknown().into_response(),
         Err(e) => map_storage_err(e),
     }
 }
@@ -772,8 +778,12 @@ async fn referrers<S: Storage>(
         .list_referrers(repo, subject)
         .await
         .unwrap_or_default();
+    // Bound work *before* parsing: take at most MAX_PAGE raw descriptors so a
+    // large referrer index cannot exhaust memory/CPU in the parse below
+    // (GHSA-259w-8hf6-59bj amplification class).
     let mut manifests: Vec<serde_json::Value> = raw
         .into_iter()
+        .take(MAX_PAGE)
         .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .collect();
 
@@ -792,9 +802,7 @@ async fn referrers<S: Storage>(
         );
     }
 
-    // Cap the referrers-list size to bound response amplification
-    // (GHSA-259w-8hf6-59bj class).
-    manifests.truncate(MAX_PAGE);
+    // (list already bounded to MAX_PAGE before parsing above)
     let body = serde_json::json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.index.v1+json",
@@ -1542,6 +1550,17 @@ mod tests {
             .await,
             StatusCode::BAD_REQUEST
         );
+        // Delete a nonexistent manifest *by digest* → 404 MANIFEST_UNKNOWN
+        // (not NAME_UNKNOWN).
+        let ghost = sha256_of(b"ghost-manifest");
+        let v = body_json_of(
+            &app,
+            HttpRequest::delete(format!("/v2/r/manifests/{}", ghost.as_string()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_UNKNOWN");
         // Delete an absent tag → 404.
         assert_eq!(
             status_of(
@@ -1572,6 +1591,19 @@ mod tests {
             .await,
             StatusCode::CREATED
         );
+        // Uppercase-hex digest reference still matches (Digest canonicalizes to
+        // lowercase; the compare parses both) → 201.
+        assert_eq!(
+            status_of(
+                &app,
+                HttpRequest::put(format!("/v2/r/manifests/sha256:{}", md_hex_upper(&md)))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(m.to_vec()))
+                    .unwrap()
+            )
+            .await,
+            StatusCode::CREATED
+        );
         // Mismatched digest reference → 400.
         let wrong = sha256_of(b"other");
         assert_eq!(
@@ -1585,6 +1617,48 @@ mod tests {
             .await,
             StatusCode::BAD_REQUEST
         );
+        // A `:`-form reference that is a *malformed* digest → 400 DIGEST_INVALID.
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/sha256:short")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(m.to_vec()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "DIGEST_INVALID");
+    }
+
+    #[tokio::test]
+    async fn delete_manifest_io_error_maps_to_500() {
+        // `<repo>/manifests/sha256` as a file makes remove_file of
+        // `.../sha256/<hex>` fail with ENOTDIR (non-NotFound Io), exercising
+        // delete_manifest's Io arm on the delete-by-digest path.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path()).unwrap();
+        let m_dir = dir.path().join("r").join("manifests");
+        std::fs::create_dir_all(&m_dir).unwrap();
+        std::fs::write(m_dir.join("sha256"), b"not a dir").unwrap();
+        let app = build_router(AppState::new(storage));
+        let d = sha256_of(b"x");
+        let resp = app
+            .oneshot(
+                HttpRequest::delete(format!("/v2/r/manifests/{}", d.as_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Uppercase the hex of a digest for the case-insensitive match test.
+    fn md_hex_upper(d: &Digest) -> String {
+        d.as_string()
+            .split_once(':')
+            .unwrap()
+            .1
+            .to_ascii_uppercase()
     }
 
     #[tokio::test]
