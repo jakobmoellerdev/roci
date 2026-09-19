@@ -10,3 +10,11 @@ authors.workspace = true
 [dependencies]
 tracing.workspace = true
 tracing-subscriber.workspace = true
+opentelemetry = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[features]
+default = []
+# OpenTelemetry span spine. Off in the minimal build so the OTel dependency
+# tree compiles out entirely (ARCHITECTURE.md build-flavor invariants).
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]

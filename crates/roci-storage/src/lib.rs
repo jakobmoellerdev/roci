@@ -46,6 +46,20 @@ impl Digest {
         format!("{}:{}", self.algorithm, self.hex)
     }
 
+    /// Constant-time equality: compares the algorithm, then the hex bytes with
+    /// a branch-free accumulator so digest verification leaks no timing signal
+    /// (SECURITY.md §Storage boundary).
+    pub fn ct_eq(&self, other: &Digest) -> bool {
+        if self.algorithm != other.algorithm || self.hex.len() != other.hex.len() {
+            return false;
+        }
+        let mut diff: u8 = 0;
+        for (a, b) in self.hex.bytes().zip(other.hex.bytes()) {
+            diff |= a ^ b;
+        }
+        diff == 0
+    }
+
     fn relative_path(&self) -> PathBuf {
         PathBuf::from(&self.algorithm).join(&self.hex)
     }
@@ -68,6 +82,8 @@ pub enum StorageError {
     DigestMismatch { expected: String, actual: String },
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+    #[error("unsafe path component: {0}")]
+    BadPath(String),
 }
 
 /// A resolved reference target: either a tag pointing at a manifest digest, or
@@ -200,33 +216,56 @@ impl FsStorage {
         })
     }
 
-    fn repo_dir(&self, repo: &str) -> PathBuf {
-        self.root.join(repo)
+    /// Validate a single untrusted path component: reject empty, `.`/`..`, and
+    /// any embedded separator (`/`, `\`) or NUL. Defense-in-depth backstop so
+    /// the CAS is safe regardless of the caller (SECURITY.md inv. 8).
+    fn safe_component(s: &str) -> Result<(), StorageError> {
+        if s.is_empty()
+            || s == "."
+            || s == ".."
+            || s.bytes().any(|b| b == b'/' || b == b'\\' || b == 0)
+        {
+            return Err(StorageError::BadPath(s.to_string()));
+        }
+        Ok(())
     }
-    fn blob_path(&self, repo: &str, d: &Digest) -> PathBuf {
-        self.repo_dir(repo).join("blobs").join(d.relative_path())
+
+    fn repo_dir(&self, repo: &str) -> Result<PathBuf, StorageError> {
+        // A repo name may contain `/`; each component is validated.
+        for component in repo.split('/') {
+            Self::safe_component(component)?;
+        }
+        Ok(self.root.join(repo))
     }
-    fn manifest_path(&self, repo: &str, d: &Digest) -> PathBuf {
-        self.repo_dir(repo)
+    fn blob_path(&self, repo: &str, d: &Digest) -> Result<PathBuf, StorageError> {
+        Ok(self.repo_dir(repo)?.join("blobs").join(d.relative_path()))
+    }
+    fn manifest_path(&self, repo: &str, d: &Digest) -> Result<PathBuf, StorageError> {
+        Ok(self
+            .repo_dir(repo)?
+            .join("manifests")
+            .join(d.relative_path()))
+    }
+    fn manifest_meta_path(&self, repo: &str, d: &Digest) -> Result<PathBuf, StorageError> {
+        Ok(self
+            .repo_dir(repo)?
             .join("manifests")
             .join(d.relative_path())
+            .with_extension("mediatype"))
     }
-    fn manifest_meta_path(&self, repo: &str, d: &Digest) -> PathBuf {
-        self.repo_dir(repo)
-            .join("manifests")
-            .join(d.relative_path())
-            .with_extension("mediatype")
+    fn tag_path(&self, repo: &str, tag: &str) -> Result<PathBuf, StorageError> {
+        Self::safe_component(tag)?;
+        Ok(self.repo_dir(repo)?.join("tags").join(tag))
     }
-    fn tag_path(&self, repo: &str, tag: &str) -> PathBuf {
-        self.repo_dir(repo).join("tags").join(tag)
+    fn upload_path(&self, repo: &str, id: &str) -> Result<PathBuf, StorageError> {
+        Self::safe_component(id)?;
+        Ok(self.repo_dir(repo)?.join("uploads").join(id))
     }
-    fn upload_path(&self, repo: &str, id: &str) -> PathBuf {
-        self.repo_dir(repo).join("uploads").join(id)
-    }
-    fn referrers_dir(&self, repo: &str, subject: &Digest) -> PathBuf {
-        self.repo_dir(repo)
+    fn referrers_dir(&self, repo: &str, subject: &Digest) -> Result<PathBuf, StorageError> {
+        Ok(self
+            .repo_dir(repo)?
             .join("referrers")
-            .join(subject.relative_path())
+            .join(subject.relative_path()))
     }
 }
 
@@ -250,14 +289,14 @@ pub fn sha256_of(data: &[u8]) -> Digest {
 
 impl Storage for FsStorage {
     async fn blob_size(&self, repo: &str, digest: &Digest) -> Result<u64, StorageError> {
-        let meta = tokio::fs::metadata(self.blob_path(repo, digest))
+        let meta = tokio::fs::metadata(self.blob_path(repo, digest)?)
             .await
             .map_err(map_not_found)?;
         Ok(meta.len())
     }
 
     async fn read_blob(&self, repo: &str, digest: &Digest) -> Result<Vec<u8>, StorageError> {
-        tokio::fs::read(self.blob_path(repo, digest))
+        tokio::fs::read(self.blob_path(repo, digest)?)
             .await
             .map_err(map_not_found)
     }
@@ -267,7 +306,7 @@ impl Storage for FsStorage {
         repo: &str,
         digest: &Digest,
     ) -> Result<tokio::fs::File, StorageError> {
-        tokio::fs::File::open(self.blob_path(repo, digest))
+        tokio::fs::File::open(self.blob_path(repo, digest)?)
             .await
             .map_err(map_not_found)
     }
@@ -278,15 +317,15 @@ impl Storage for FsStorage {
             *seq += 1;
             format!("{}-{}", std::process::id(), *seq)
         };
-        let path = self.upload_path(repo, &id);
-        let uploads_dir = self.repo_dir(repo).join("uploads");
+        let path = self.upload_path(repo, &id)?;
+        let uploads_dir = self.repo_dir(repo)?.join("uploads");
         tokio::fs::create_dir_all(&uploads_dir).await?;
         tokio::fs::File::create(&path).await?;
         Ok(id)
     }
 
     async fn append_upload(&self, repo: &str, id: &str, chunk: &[u8]) -> Result<u64, StorageError> {
-        let path = self.upload_path(repo, id);
+        let path = self.upload_path(repo, id)?;
         let mut f = tokio::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -298,7 +337,7 @@ impl Storage for FsStorage {
     }
 
     async fn upload_size(&self, repo: &str, id: &str) -> Result<u64, StorageError> {
-        let meta = tokio::fs::metadata(self.upload_path(repo, id))
+        let meta = tokio::fs::metadata(self.upload_path(repo, id)?)
             .await
             .map_err(map_not_found)?;
         Ok(meta.len())
@@ -310,10 +349,10 @@ impl Storage for FsStorage {
         id: &str,
         expected: &Digest,
     ) -> Result<(), StorageError> {
-        let path = self.upload_path(repo, id);
+        let path = self.upload_path(repo, id)?;
         let data = tokio::fs::read(&path).await.map_err(map_not_found)?;
         let actual = sha256_of(&data);
-        if &actual != expected {
+        if !actual.ct_eq(expected) {
             return Err(StorageError::DigestMismatch {
                 expected: expected.as_string(),
                 actual: actual.as_string(),
@@ -326,14 +365,14 @@ impl Storage for FsStorage {
 
     async fn put_blob(&self, repo: &str, digest: &Digest, data: &[u8]) -> Result<(), StorageError> {
         let actual = sha256_of(data);
-        if &actual != digest {
+        if !actual.ct_eq(digest) {
             return Err(StorageError::DigestMismatch {
                 expected: digest.as_string(),
                 actual: actual.as_string(),
             });
         }
-        let dest = self.blob_path(repo, digest);
-        tokio::fs::create_dir_all(self.repo_dir(repo).join("blobs").join(&digest.algorithm))
+        let dest = self.blob_path(repo, digest)?;
+        tokio::fs::create_dir_all(self.repo_dir(repo)?.join("blobs").join(&digest.algorithm))
             .await?;
         // Write to a temp file then atomically rename into the CAS.
         let tmp = dest.with_extension("tmp");
@@ -343,7 +382,7 @@ impl Storage for FsStorage {
     }
 
     async fn delete_blob(&self, repo: &str, digest: &Digest) -> Result<(), StorageError> {
-        tokio::fs::remove_file(self.blob_path(repo, digest))
+        tokio::fs::remove_file(self.blob_path(repo, digest)?)
             .await
             .map_err(map_not_found)
     }
@@ -356,18 +395,22 @@ impl Storage for FsStorage {
         media_type: &str,
         data: &[u8],
     ) -> Result<(), StorageError> {
-        let dest = self.manifest_path(repo, digest);
+        let dest = self.manifest_path(repo, digest)?;
         tokio::fs::create_dir_all(
-            self.repo_dir(repo)
+            self.repo_dir(repo)?
                 .join("manifests")
                 .join(&digest.algorithm),
         )
         .await?;
         tokio::fs::write(&dest, data).await?;
-        tokio::fs::write(self.manifest_meta_path(repo, digest), media_type.as_bytes()).await?;
+        tokio::fs::write(
+            self.manifest_meta_path(repo, digest)?,
+            media_type.as_bytes(),
+        )
+        .await?;
         if let Some(tag) = tag {
-            let tp = self.tag_path(repo, tag);
-            tokio::fs::create_dir_all(self.repo_dir(repo).join("tags")).await?;
+            let tp = self.tag_path(repo, tag)?;
+            tokio::fs::create_dir_all(self.repo_dir(repo)?.join("tags")).await?;
             tokio::fs::write(tp, digest.as_string().as_bytes()).await?;
         }
         Ok(())
@@ -377,15 +420,15 @@ impl Storage for FsStorage {
         let digest = if reference.contains(':') {
             Digest::parse(reference)?
         } else {
-            let raw = tokio::fs::read(self.tag_path(repo, reference))
+            let raw = tokio::fs::read(self.tag_path(repo, reference)?)
                 .await
                 .map_err(map_not_found)?;
             Digest::parse(std::str::from_utf8(&raw).map_err(|_| StorageError::NotFound)?)?
         };
-        let bytes = tokio::fs::read(self.manifest_path(repo, &digest))
+        let bytes = tokio::fs::read(self.manifest_path(repo, &digest)?)
             .await
             .map_err(map_not_found)?;
-        let media_type = tokio::fs::read_to_string(self.manifest_meta_path(repo, &digest))
+        let media_type = tokio::fs::read_to_string(self.manifest_meta_path(repo, &digest)?)
             .await
             .unwrap_or_else(|_| "application/vnd.oci.image.manifest.v1+json".to_string());
         Ok(ManifestRef {
@@ -396,11 +439,11 @@ impl Storage for FsStorage {
     }
 
     async fn delete_manifest(&self, repo: &str, digest: &Digest) -> Result<(), StorageError> {
-        let path = self.manifest_path(repo, digest);
+        let path = self.manifest_path(repo, digest)?;
         tokio::fs::remove_file(&path).await.map_err(map_not_found)?;
-        let _ = tokio::fs::remove_file(self.manifest_meta_path(repo, digest)).await;
+        let _ = tokio::fs::remove_file(self.manifest_meta_path(repo, digest)?).await;
         // Remove any tags pointing at this digest.
-        let tags_dir = self.repo_dir(repo).join("tags");
+        let tags_dir = self.repo_dir(repo)?.join("tags");
         if let Ok(mut rd) = tokio::fs::read_dir(&tags_dir).await {
             let target = digest.as_string();
             while let Ok(Some(entry)) = rd.next_entry().await {
@@ -415,7 +458,7 @@ impl Storage for FsStorage {
     }
 
     async fn list_tags(&self, repo: &str) -> Result<Vec<String>, StorageError> {
-        let dir = self.repo_dir(repo).join("tags");
+        let dir = self.repo_dir(repo)?.join("tags");
         let mut tags = Vec::new();
         match tokio::fs::read_dir(&dir).await {
             Ok(mut rd) => {
@@ -440,7 +483,7 @@ impl Storage for FsStorage {
         referrer: &Digest,
         referrer_descriptor: &[u8],
     ) -> Result<(), StorageError> {
-        let dir = self.referrers_dir(repo, subject);
+        let dir = self.referrers_dir(repo, subject)?;
         tokio::fs::create_dir_all(&dir).await?;
         // File name is the referrer's own digest so re-pushes are idempotent.
         let fname = format!("{}-{}", referrer.algorithm, referrer.hex);
@@ -453,7 +496,7 @@ impl Storage for FsStorage {
         repo: &str,
         subject: &Digest,
     ) -> Result<Vec<Vec<u8>>, StorageError> {
-        let dir = self.referrers_dir(repo, subject);
+        let dir = self.referrers_dir(repo, subject)?;
         let mut out = Vec::new();
         match tokio::fs::read_dir(&dir).await {
             Ok(mut rd) => {
@@ -479,6 +522,45 @@ mod tests {
         assert!(Digest::parse("sha256:zz").is_err());
         assert!(Digest::parse("nope").is_err());
         assert!(Digest::parse(&format!("sha256:{}", "a".repeat(64))).is_ok());
+    }
+
+    #[test]
+    fn ct_eq_matches_equal_and_rejects_differences() {
+        let a = sha256_of(b"payload");
+        let b = sha256_of(b"payload");
+        assert!(a.ct_eq(&b));
+        let c = sha256_of(b"other");
+        assert!(!a.ct_eq(&c));
+        // Differing algorithm never matches.
+        let s512 = Digest::parse(&format!("sha512:{}", "a".repeat(128))).unwrap();
+        let s256 = Digest::parse(&format!("sha256:{}", "a".repeat(64))).unwrap();
+        assert!(!s512.ct_eq(&s256));
+    }
+
+    #[tokio::test]
+    async fn path_backstop_rejects_traversal_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let d = sha256_of(b"x");
+        // A `..` repo component is rejected before any filesystem access.
+        assert!(matches!(
+            s.blob_size("a/../b", &d).await,
+            Err(StorageError::BadPath(_))
+        ));
+        // A `..` tag / upload id is rejected too.
+        assert!(matches!(
+            s.get_manifest("r", "..").await,
+            Err(StorageError::BadPath(_))
+        ));
+        assert!(matches!(
+            s.append_upload("r", "../evil", b"x").await,
+            Err(StorageError::BadPath(_))
+        ));
+        // BadPath renders a message.
+        assert_eq!(
+            StorageError::BadPath("..".into()).to_string(),
+            "unsafe path component: .."
+        );
     }
 
     #[tokio::test]

@@ -40,4 +40,4 @@ Storage is a plain [OCI image layout](https://github.com/opencontainers/image-sp
 
 The canonical doc enumerates invariants that must never regress (build-flavor isolation, extension-crate naming, storage-format stability, and more). Changing an invariant requires updating `ARCHITECTURE.md` and flagging the change.
 
-See also: [Security](/design/security) · [Storage](/design/storage) · [Build plan](/design/plan) · [Research](/design/research).
+See also: [Security](/design/security) · [Storage](/design/storage) · [Research](/design/research).

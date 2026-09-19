@@ -23,3 +23,4 @@ tempfile.workspace = true
 tower = { workspace = true, features = ["util"] }
 serde_json.workspace = true
 http-body-util = "0.1"
+roci-storage.workspace = true

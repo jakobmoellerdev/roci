@@ -40,15 +40,15 @@ Rules:
 
 **Goal:** a binary that boots, serves `/v2/` (end-1 → `200`), and has the architectural seams in place. No storage yet.
 
-- [ ] Workspace layout: `roci-core` (HTTP + protocol), `roci-storage` (`Storage` + `MetadataStore` traits + local backend), `roci-config`, `roci-telemetry`, `roci-cli` (binary). Extension + `roci-cluster` crates added later.
+- [x] Workspace layout: `roci-core` (HTTP + protocol), `roci-storage` (`Storage` + `MetadataStore` traits + local backend), `roci-config`, `roci-telemetry`, `roci-cli` (binary). Extension + `roci-cluster` crates added later.
 - [ ] HTTP stack (axum/hyper or equivalent), **HTTP/2 multiplexing + keep-alive** with HTTP/1.1 fallback; async runtime; graceful shutdown. Pin `hyper` past CVE-2023-44487 (Rapid Reset).
-- [ ] **OpenTelemetry spine from day one** — `tracing` + `tracing-opentelemetry`, OTel SDK wired at startup. Every request handler is a span; logs are structured events on the trace. Console/no-op exporter for now (OTLP export lands in Phase 4). Footprint note: OTel behind a cargo feature so a minimal build can compile it out; sampling configurable and default-cheap.
-- [ ] `Digest` type: parse/validate `algorithm:hex`, constant-time compare, **wire allowlist = sha256/sha512 only** (reject SHA-1/unregistered → `DIGEST_INVALID`; BLAKE3 internal-only). Load-bearing — every subsystem keys off it. (SECURITY §Storage boundary.)
-- [ ] `RepositoryName` + `Reference` types enforcing spec grammars (name ≤255, tag ≤128) **before any filesystem path is constructed**, plus a `Storage`-layer backstop rejecting `..`/`.`/`NUL` components (SECURITY inv. 8; path-traversal CVE class).
+- [x] **OpenTelemetry spine from day one** — `tracing` + `tracing-opentelemetry`, OTel SDK wired at startup. Every request handler is a span; logs are structured events on the trace. Console/no-op exporter for now (OTLP export lands in Phase 4). Footprint note: OTel behind a cargo feature so a minimal build can compile it out; sampling configurable and default-cheap.
+- [x] `Digest` type: parse/validate `algorithm:hex`, constant-time compare, **wire allowlist = sha256/sha512 only** (reject SHA-1/unregistered → `DIGEST_INVALID`; BLAKE3 internal-only). Load-bearing — every subsystem keys off it. (SECURITY §Storage boundary.)
+- [x] `RepositoryName` + `Reference` types enforcing spec grammars (name ≤255, tag ≤128) **before any filesystem path is constructed**, plus a `Storage`-layer backstop rejecting `..`/`.`/`NUL` components (SECURITY inv. 8; path-traversal CVE class).
 - [ ] **Bounded-input guards:** manifest size cap (≤4 MiB) + JSON recursion-depth cap before parse; `n`/pagination caps on list endpoints; wired read/write timeouts + per-method rate limits (SECURITY inv. 14; CVE-2023-2253 class).
-- [ ] Error model → JSON `{ "errors": [{code,message,detail}] }` with all 14 codes as an enum; correct HTTP status mapping.
-- [ ] `GET /v2/` (end-1) returns `200`.
-- [ ] Config skeleton: zero-config defaults, single declarative file (format TBD — likely TOML/YAML), storage root path.
+- [x] Error model → JSON `{ "errors": [{code,message,detail}] }` with all 14 codes as an enum; correct HTTP status mapping.
+- [x] `GET /v2/` (end-1) returns `200`.
+- [x] Config skeleton: zero-config defaults, single declarative file (format TBD — likely TOML/YAML), storage root path.
 
 **Correctness gate:** `GET /v2/` returns `200`; malformed name/reference/digest rejected with correct code before any handler logic; a request emits one root span with structured log events attached.
 

@@ -3,7 +3,7 @@
 roci follows a **config-driven** design: all behavior is controlled from configuration rather than build-time code paths. It starts with zero config and sane defaults, and grows into a single declarative config file — no external database is required to run.
 
 ::: info Status
-Configuration is being built out across the phased [build plan](/design/plan). This page tracks the intended surface; consult `cargo run -p roci-cli -- --help` for the flags available in your build.
+Configuration is being built out across the phased [build plan](https://github.com/jakobmoellerdev/roci/blob/main/PLAN.md). This page tracks the intended surface; consult `cargo run -p roci-cli -- --help` for the flags available in your build.
 :::
 
 ## Zero-config defaults
