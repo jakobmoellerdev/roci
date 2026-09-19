@@ -14,7 +14,7 @@ use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
 
-use roci_storage::{sha256_of, Digest, Storage, StorageError};
+use roci_storage::{digest_of, sha256_of, Digest, Storage, StorageError};
 
 mod error;
 mod names;
@@ -418,9 +418,13 @@ async fn put_manifest<S: Storage>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/vnd.oci.image.manifest.v1+json")
         .to_string();
-    let body = match read_body_limited(req, MAX_MANIFEST).await {
+    // Bound the manifest body by the smaller of the configured request-body
+    // limit and the fixed 4 MiB manifest cap. Exceeding the configured limit is
+    // a 413 (payload too large); exceeding only the fixed cap is MANIFEST_INVALID.
+    let manifest_limit = st.max_body.min(MAX_MANIFEST);
+    let body = match read_body_limited(req, manifest_limit).await {
         Ok(b) => b,
-        // The manifest exceeded the 4 MiB cap; treat as an invalid manifest.
+        Err(resp) if st.max_body <= MAX_MANIFEST => return *resp,
         Err(_) => {
             return ApiError::manifest_invalid("manifest exceeds 4 MiB size cap").into_response()
         }
@@ -430,21 +434,25 @@ async fn put_manifest<S: Storage>(
     if json_depth_exceeds(&body, MAX_JSON_DEPTH) {
         return ApiError::manifest_invalid("manifest JSON nesting too deep").into_response();
     }
-    let digest = sha256_of(&body);
-    // A digest reference must match the content; a tag is associated as-is.
-    // Parse the reference so an uppercase-hex digest compares equal (Digest
-    // canonicalizes to lowercase) and compare constant-time.
-    let tag = if reference.contains(':') {
+    // A digest reference must match the content. Compute the content digest
+    // with the *reference's* algorithm (sha256/sha512) so a sha512 reference is
+    // honored; a tagged push defaults to sha256. Compare constant-time and
+    // parse the reference so uppercase hex still matches.
+    let (digest, tag) = if reference.contains(':') {
         match Digest::parse(reference) {
-            Ok(ref_digest) if ref_digest.ct_eq(&digest) => None,
-            Ok(_) => {
-                return ApiError::digest_invalid("manifest digest does not match reference")
-                    .into_response()
+            Ok(ref_digest) => {
+                let content = digest_of(&body, ref_digest.algorithm());
+                if content.ct_eq(&ref_digest) {
+                    (content, None)
+                } else {
+                    return ApiError::digest_invalid("manifest digest does not match reference")
+                        .into_response();
+                }
             }
             Err(e) => return map_storage_err(e),
         }
     } else {
-        Some(reference)
+        (sha256_of(&body), Some(reference))
     };
     // Parse the manifest to extract subject/artifactType/annotations for the
     // referrers index (best-effort; a non-JSON body simply has no subject).
@@ -1214,6 +1222,58 @@ mod tests {
         )
         .await;
         assert_eq!(v["errors"][0]["code"], "DIGEST_INVALID");
+    }
+
+    #[tokio::test]
+    async fn manifest_over_fixed_cap_is_manifest_invalid() {
+        // Default app (256 MiB body limit); a manifest larger than the fixed
+        // 4 MiB cap → 400 MANIFEST_INVALID (distinct from the configured-limit
+        // 413 path).
+        let (app, _d) = app();
+        let over = Body::from(vec![b'x'; MAX_MANIFEST + 1]);
+        let resp = app
+            .oneshot(
+                HttpRequest::put("/v2/r/manifests/t")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(over)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn sha512_blob_and_manifest_roundtrip() {
+        // The wire allowlist advertises sha512; a sha512 monolithic blob push
+        // and a sha512-referenced manifest push must both succeed (regression
+        // for the sha256-only hashing bug).
+        let (app, _d) = app();
+        let blob = b"sha512-payload";
+        let bd = roci_storage::digest_of(blob, "sha512");
+        assert_eq!(
+            status_of(
+                &app,
+                HttpRequest::post(format!("/v2/r/blobs/uploads/?digest={}", bd.as_string()))
+                    .body(Body::from(blob.to_vec()))
+                    .unwrap()
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        let m = br#"{"schemaVersion":2}"#;
+        let md = roci_storage::digest_of(m, "sha512");
+        assert_eq!(
+            status_of(
+                &app,
+                HttpRequest::put(format!("/v2/r/manifests/{}", md.as_string()))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(m.to_vec()))
+                    .unwrap()
+            )
+            .await,
+            StatusCode::CREATED
+        );
     }
 
     #[tokio::test]
@@ -2173,19 +2233,19 @@ mod tests {
     #[tokio::test]
     async fn oversized_bodies_are_413() {
         let (app, _d) = app_tiny_body(4);
-        // put_manifest over the fixed 4 MiB cap → 400 MANIFEST_INVALID (the
-        // manifest cap is independent of the per-app blob body limit).
-        let over_manifest = Body::from(vec![b'x'; MAX_MANIFEST + 1]);
+        // A manifest over the configured request-body limit (4 bytes here) →
+        // 413 (payload too large), since the effective cap is the smaller of
+        // the configured limit and the fixed 4 MiB manifest cap.
         assert_eq!(
             status_of(
                 &app,
                 HttpRequest::put("/v2/r/manifests/t")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(over_manifest)
+                    .body(Body::from("way too many bytes"))
                     .unwrap()
             )
             .await,
-            StatusCode::BAD_REQUEST
+            StatusCode::PAYLOAD_TOO_LARGE
         );
         // monolithic upload oversized.
         let d = sha256_of(b"way too many bytes");

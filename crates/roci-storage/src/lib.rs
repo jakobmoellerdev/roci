@@ -4,7 +4,7 @@
 //! blob in memory (ARCHITECTURE.md invariant 4).
 #![forbid(unsafe_code)]
 
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha512};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -44,6 +44,11 @@ impl Digest {
     /// The canonical `algorithm:hex` string.
     pub fn as_string(&self) -> String {
         format!("{}:{}", self.algorithm, self.hex)
+    }
+
+    /// The digest's wire algorithm (`sha256` or `sha512`).
+    pub fn algorithm(&self) -> &str {
+        &self.algorithm
     }
 
     /// Constant-time equality: compares the algorithm, then the hex bytes with
@@ -295,6 +300,24 @@ pub fn sha256_of(data: &[u8]) -> Digest {
     }
 }
 
+/// Compute the digest of `data` using the given wire algorithm (sha256 or
+/// sha512 — the values [`Digest::parse`] accepts). Verification hashes with the
+/// *expected* algorithm so a sha512 digest is honored, not silently rejected.
+pub fn digest_of(data: &[u8], algorithm: &str) -> Digest {
+    match algorithm {
+        "sha512" => {
+            let mut h = Sha512::new();
+            h.update(data);
+            Digest {
+                algorithm: "sha512".into(),
+                hex: hex::encode(h.finalize()),
+            }
+        }
+        // Default to sha256 for the only other allowlisted algorithm.
+        _ => sha256_of(data),
+    }
+}
+
 impl Storage for FsStorage {
     async fn blob_size(&self, repo: &str, digest: &Digest) -> Result<u64, StorageError> {
         let meta = tokio::fs::metadata(self.blob_path(repo, digest)?)
@@ -359,20 +382,17 @@ impl Storage for FsStorage {
     ) -> Result<(), StorageError> {
         let path = self.upload_path(repo, id)?;
         let data = tokio::fs::read(&path).await.map_err(map_not_found)?;
-        let actual = sha256_of(&data);
-        if !actual.ct_eq(expected) {
-            return Err(StorageError::DigestMismatch {
-                expected: expected.as_string(),
-                actual: actual.as_string(),
-            });
-        }
+        // put_blob verifies the digest (hashing with the expected algorithm);
+        // only promote into the CAS and drop the staging file on success.
         self.put_blob(repo, expected, &data).await?;
         let _ = tokio::fs::remove_file(&path).await;
         Ok(())
     }
 
     async fn put_blob(&self, repo: &str, digest: &Digest, data: &[u8]) -> Result<(), StorageError> {
-        let actual = sha256_of(data);
+        // Hash with the *expected* algorithm so sha512 digests are honored, not
+        // silently rejected against a sha256 recompute.
+        let actual = digest_of(data, &digest.algorithm);
         if !actual.ct_eq(digest) {
             return Err(StorageError::DigestMismatch {
                 expected: digest.as_string(),
