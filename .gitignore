@@ -10,8 +10,10 @@
 *.profraw
 *.profdata
 
-# Compiled conformance test binary (built on demand from the submodule).
+# Conformance artifacts (built/emitted on demand from the submodule).
 /spec/distribution-spec/conformance/conformance.test
+/spec/distribution-spec/conformance/report.html
+/spec/distribution-spec/conformance/junit.xml
 
 # Local roci data directories.
 /roci-data

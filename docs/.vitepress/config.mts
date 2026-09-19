@@ -81,7 +81,6 @@ export default defineConfig({
             { text: 'Architecture', link: '/design/architecture' },
             { text: 'Security', link: '/design/security' },
             { text: 'Storage', link: '/design/storage' },
-            { text: 'Build plan', link: '/design/plan' },
             { text: 'Research', link: '/design/research' },
           ],
         },

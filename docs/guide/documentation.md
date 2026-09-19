@@ -55,7 +55,7 @@ Never recolor the brand gradients or hand-edit the copies — edit the source SV
 
 ## Keeping content current
 
-The design pages under `docs/design/` are **overviews that link the canonical documents** (`ARCHITECTURE.md`, `SECURITY.md`, `PLAN.md`, `RESEARCH.md`) rather than duplicating them. When a design or user-facing capability changes, update:
+The design pages under `docs/design/` are **overviews that link the canonical documents** (`ARCHITECTURE.md`, `SECURITY.md`, `RESEARCH.md`) rather than duplicating them. The build plan has no overview page — `PLAN.md` is the single source and is linked directly (e.g. from the [Configuration](/guide/configuration) guide). When a design or user-facing capability changes, update:
 
 1. The owning canonical doc at the repo root (per the maintenance contract in `AGENTS.md`).
 2. The matching overview or roadmap entry in `docs/` so the site does not drift.

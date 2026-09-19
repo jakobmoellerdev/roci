@@ -14,7 +14,13 @@ use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
 
-use roci_storage::{sha256_of, Digest, Storage, StorageError};
+use roci_storage::{digest_of, sha256_of, Digest, Storage, StorageError};
+
+mod error;
+mod names;
+
+pub use error::{ApiError, ErrorCode};
+pub use names::RepositoryName;
 
 /// Shared handler state.
 pub struct AppState<S: Storage> {
@@ -64,102 +70,117 @@ pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
                 .patch(route_patch)
                 .delete(route_delete),
         )
+        // One root span per request; every handler's structured events attach
+        // to it (Phase 0 observability spine). OTLP export lands in Phase 4.
+        .layer(axum::middleware::from_fn(request_span))
         .with_state(state)
+}
+
+/// Middleware: wrap each request in a `tracing` span carrying `method`, `path`,
+/// and `otel.kind=server`, then emit one structured completion event with the
+/// response `status` on that span.
+async fn request_span(req: Request, next: axum::middleware::Next) -> Response {
+    use tracing::Instrument as _;
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let span = tracing::info_span!(
+        "http.request",
+        otel.kind = "server",
+        http.method = %method,
+        http.path = %path,
+    );
+    async move {
+        let response = next.run(req).await;
+        let status = response.status().as_u16();
+        tracing::info!(http.status = status, "request completed");
+        response
+    }
+    .instrument(span)
+    .await
 }
 
 // ---- OCI error envelope --------------------------------------------------
 
-fn oci_error(status: StatusCode, code: &str, message: &str) -> Response {
-    let body = serde_json::json!({
-        "errors": [{ "code": code, "message": message }]
-    });
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response()
-}
-
+/// Map a storage-layer error to the spec JSON envelope.
 fn map_storage_err(e: StorageError) -> Response {
-    match e {
-        StorageError::NotFound => {
-            oci_error(StatusCode::NOT_FOUND, "NAME_UNKNOWN", "resource not found")
-        }
-        StorageError::BadDigest(d) => oci_error(
-            StatusCode::BAD_REQUEST,
-            "DIGEST_INVALID",
-            &format!("invalid digest: {d}"),
-        ),
-        StorageError::DigestMismatch { expected, actual } => oci_error(
-            StatusCode::BAD_REQUEST,
-            "DIGEST_INVALID",
-            &format!("digest mismatch: expected {expected}, got {actual}"),
-        ),
-        StorageError::Io(_) => oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "UNKNOWN",
-            "internal error",
-        ),
-    }
+    ApiError::from(e).into_response()
 }
 
 // ---- Path parsing --------------------------------------------------------
 
 /// The parsed grammar of a `/v2/<name>/<verb>...` path.
 enum Parsed {
-    Blob { repo: String, digest: String },
+    Blob { repo: String, digest: Digest },
     ManifestRef { repo: String, reference: String },
     UploadStart { repo: String },
     UploadSession { repo: String, id: String },
     TagsList { repo: String },
-    Referrers { repo: String, digest: String },
+    Referrers { repo: String, digest: Digest },
     Unknown,
 }
 
-/// Split `<name>/<tail...>` where the last one or two segments form the verb.
-fn parse_path(rest: &str) -> Parsed {
+/// Split `<name>/<tail...>` where the last one or two segments form the verb,
+/// **validating** the repository name (and the reference/digest, where the verb
+/// carries one) against the dist-spec grammar before any handler runs. An
+/// unrecognized path shape yields `Ok(Parsed::Unknown)` (→ 404); a recognized
+/// shape with a malformed name/reference/digest yields `Err(ApiError)`.
+fn parse_path(rest: &str) -> Result<Parsed, ApiError> {
     let segments: Vec<&str> = rest.split('/').collect();
     let n = segments.len();
     if n < 2 {
-        return Parsed::Unknown;
+        return Ok(Parsed::Unknown);
     }
+    // Validate a repository name, surfacing NAME_INVALID.
+    let checked_repo = |repo: String| -> Result<String, ApiError> {
+        RepositoryName::parse(&repo)?;
+        Ok(repo)
+    };
     // blobs/uploads/<id?>
     if n >= 3 && segments[n - 3] == "blobs" && segments[n - 2] == "uploads" {
-        let repo = segments[..n - 3].join("/");
+        let repo = checked_repo(segments[..n - 3].join("/"))?;
         let id = segments[n - 1];
-        return if id.is_empty() {
+        return Ok(if id.is_empty() {
             Parsed::UploadStart { repo }
         } else {
             Parsed::UploadSession {
                 repo,
                 id: id.to_string(),
             }
-        };
+        });
     }
     if n >= 2 && segments[n - 2] == "blobs" && segments[n - 1] == "uploads" {
         // trailing slash omitted: `.../blobs/uploads`
-        let repo = segments[..n - 2].join("/");
-        return Parsed::UploadStart { repo };
+        let repo = checked_repo(segments[..n - 2].join("/"))?;
+        return Ok(Parsed::UploadStart { repo });
     }
-    match segments[n - 2] {
-        "blobs" => Parsed::Blob {
-            repo: segments[..n - 2].join("/"),
-            digest: segments[n - 1].to_string(),
-        },
-        "manifests" => Parsed::ManifestRef {
-            repo: segments[..n - 2].join("/"),
-            reference: segments[n - 1].to_string(),
-        },
+    Ok(match segments[n - 2] {
+        "blobs" => {
+            let repo = checked_repo(segments[..n - 2].join("/"))?;
+            let digest = Digest::parse(segments[n - 1]).map_err(ApiError::from)?;
+            Parsed::Blob { repo, digest }
+        }
+        "manifests" => {
+            // The repo name is validated (400 NAME_INVALID); the manifest
+            // reference is NOT grammar-rejected here. Per the dist-spec
+            // conformance suite, a syntactically-invalid or unknown manifest
+            // reference must resolve to 404 MANIFEST_UNKNOWN, not 400 — so the
+            // reference flows through and the storage lookup decides.
+            let repo = checked_repo(segments[..n - 2].join("/"))?;
+            Parsed::ManifestRef {
+                repo,
+                reference: segments[n - 1].to_string(),
+            }
+        }
         "tags" if segments[n - 1] == "list" => Parsed::TagsList {
-            repo: segments[..n - 2].join("/"),
+            repo: checked_repo(segments[..n - 2].join("/"))?,
         },
-        "referrers" => Parsed::Referrers {
-            repo: segments[..n - 2].join("/"),
-            digest: segments[n - 1].to_string(),
-        },
+        "referrers" => {
+            let repo = checked_repo(segments[..n - 2].join("/"))?;
+            let digest = Digest::parse(segments[n - 1]).map_err(ApiError::from)?;
+            Parsed::Referrers { repo, digest }
+        }
         _ => Parsed::Unknown,
-    }
+    })
 }
 
 // ---- Query params --------------------------------------------------------
@@ -201,7 +222,11 @@ async fn route_get<S: Storage>(
     Path(rest): Path<String>,
     req: Request,
 ) -> Response {
-    match parse_path(&rest) {
+    let parsed = match parse_path(&rest) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    match parsed {
         Parsed::Blob { repo, digest } => get_blob(&st, &repo, &digest, false).await,
         Parsed::ManifestRef { repo, reference } => {
             get_manifest(&st, &repo, &reference, false).await
@@ -217,7 +242,7 @@ async fn route_get<S: Storage>(
             referrers(&st, &repo, &digest, q).await
         }
         Parsed::UploadSession { repo, id } => upload_status(&st, &repo, &id).await,
-        _ => oci_error(StatusCode::NOT_FOUND, "UNSUPPORTED", "unsupported path"),
+        _ => ApiError::name_unknown().into_response(),
     }
 }
 
@@ -225,10 +250,14 @@ async fn route_head<S: Storage>(
     State(st): State<AppState<S>>,
     Path(rest): Path<String>,
 ) -> Response {
-    match parse_path(&rest) {
+    let parsed = match parse_path(&rest) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    match parsed {
         Parsed::Blob { repo, digest } => get_blob(&st, &repo, &digest, true).await,
         Parsed::ManifestRef { repo, reference } => get_manifest(&st, &repo, &reference, true).await,
-        _ => oci_error(StatusCode::NOT_FOUND, "UNSUPPORTED", "unsupported path"),
+        _ => ApiError::name_unknown().into_response(),
     }
 }
 
@@ -238,12 +267,16 @@ async fn route_post<S: Storage>(
     req: Request,
 ) -> Response {
     let query = req.uri().query().unwrap_or("").to_string();
-    match parse_path(&rest) {
+    let parsed = match parse_path(&rest) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    match parsed {
         Parsed::UploadStart { repo } => {
             let q: UploadQuery = serde_urlencoded::from_str(&query).unwrap_or_default();
             start_upload(&st, &repo, q, req).await
         }
-        _ => oci_error(StatusCode::NOT_FOUND, "UNSUPPORTED", "unsupported path"),
+        _ => ApiError::name_unknown().into_response(),
     }
 }
 
@@ -253,13 +286,17 @@ async fn route_put<S: Storage>(
     req: Request,
 ) -> Response {
     let query = req.uri().query().unwrap_or("").to_string();
-    match parse_path(&rest) {
+    let parsed = match parse_path(&rest) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    match parsed {
         Parsed::UploadSession { repo, id } => {
             let q: UploadQuery = serde_urlencoded::from_str(&query).unwrap_or_default();
             finish_upload(&st, &repo, &id, q, req).await
         }
         Parsed::ManifestRef { repo, reference } => put_manifest(&st, &repo, &reference, req).await,
-        _ => oci_error(StatusCode::NOT_FOUND, "UNSUPPORTED", "unsupported path"),
+        _ => ApiError::name_unknown().into_response(),
     }
 }
 
@@ -268,9 +305,13 @@ async fn route_patch<S: Storage>(
     Path(rest): Path<String>,
     req: Request,
 ) -> Response {
-    match parse_path(&rest) {
+    let parsed = match parse_path(&rest) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    match parsed {
         Parsed::UploadSession { repo, id } => patch_upload(&st, &repo, &id, req).await,
-        _ => oci_error(StatusCode::NOT_FOUND, "UNSUPPORTED", "unsupported path"),
+        _ => ApiError::name_unknown().into_response(),
     }
 }
 
@@ -278,23 +319,34 @@ async fn route_delete<S: Storage>(
     State(st): State<AppState<S>>,
     Path(rest): Path<String>,
 ) -> Response {
-    match parse_path(&rest) {
+    let parsed = match parse_path(&rest) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    match parsed {
         Parsed::Blob { repo, digest } => delete_blob(&st, &repo, &digest).await,
         Parsed::ManifestRef { repo, reference } => delete_manifest(&st, &repo, &reference).await,
-        _ => oci_error(StatusCode::NOT_FOUND, "UNSUPPORTED", "unsupported path"),
+        _ => ApiError::name_unknown().into_response(),
     }
 }
 
 // ---- end-2 / end-10: blobs ----------------------------------------------
 
-async fn get_blob<S: Storage>(st: &AppState<S>, repo: &str, digest: &str, head: bool) -> Response {
-    let d = match Digest::parse(digest) {
-        Ok(d) => d,
-        Err(e) => return map_storage_err(e),
-    };
-    let size = match st.storage.blob_size(repo, &d).await {
-        Ok(s) => s,
-        Err(e) => return map_storage_err(e),
+async fn get_blob<S: Storage>(st: &AppState<S>, repo: &str, d: &Digest, head: bool) -> Response {
+    // HEAD needs only the length; GET reads the bytes (and derives the length
+    // from them, avoiding a redundant stat + a TOCTOU-only NotFound arm).
+    let (size, body) = if head {
+        match st.storage.blob_size(repo, d).await {
+            Ok(s) => (s, None),
+            Err(StorageError::NotFound) => return ApiError::blob_unknown().into_response(),
+            Err(e) => return map_storage_err(e),
+        }
+    } else {
+        match st.storage.read_blob(repo, d).await {
+            Ok(bytes) => (bytes.len() as u64, Some(bytes)),
+            Err(StorageError::NotFound) => return ApiError::blob_unknown().into_response(),
+            Err(e) => return map_storage_err(e),
+        }
     };
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
@@ -306,22 +358,16 @@ async fn get_blob<S: Storage>(st: &AppState<S>, repo: &str, digest: &str, head: 
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
-    if head {
-        return (StatusCode::OK, headers).into_response();
-    }
-    match st.storage.read_blob(repo, &d).await {
-        Ok(bytes) => (StatusCode::OK, headers, bytes).into_response(),
-        Err(e) => map_storage_err(e),
+    match body {
+        Some(bytes) => (StatusCode::OK, headers, bytes).into_response(),
+        None => (StatusCode::OK, headers).into_response(),
     }
 }
 
-async fn delete_blob<S: Storage>(st: &AppState<S>, repo: &str, digest: &str) -> Response {
-    let d = match Digest::parse(digest) {
-        Ok(d) => d,
-        Err(e) => return map_storage_err(e),
-    };
-    match st.storage.delete_blob(repo, &d).await {
+async fn delete_blob<S: Storage>(st: &AppState<S>, repo: &str, d: &Digest) -> Response {
+    match st.storage.delete_blob(repo, d).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(StorageError::NotFound) => ApiError::blob_unknown().into_response(),
         Err(e) => map_storage_err(e),
     }
 }
@@ -355,6 +401,7 @@ async fn get_manifest<S: Storage>(
                 (StatusCode::OK, headers, m.bytes).into_response()
             }
         }
+        Err(StorageError::NotFound) => ApiError::manifest_unknown().into_response(),
         Err(e) => map_storage_err(e),
     }
 }
@@ -371,23 +418,41 @@ async fn put_manifest<S: Storage>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/vnd.oci.image.manifest.v1+json")
         .to_string();
-    let body = match read_body_limited(req, st.max_body).await {
+    // Bound the manifest body by the smaller of the configured request-body
+    // limit and the fixed 4 MiB manifest cap. Exceeding the configured limit is
+    // a 413 (payload too large); exceeding only the fixed cap is MANIFEST_INVALID.
+    let manifest_limit = st.max_body.min(MAX_MANIFEST);
+    let body = match read_body_limited(req, manifest_limit).await {
         Ok(b) => b,
-        Err(resp) => return *resp,
-    };
-    let digest = sha256_of(&body);
-    // A digest reference must match the content; a tag is associated as-is.
-    let tag = if reference.contains(':') {
-        if reference != digest.as_string() {
-            return oci_error(
-                StatusCode::BAD_REQUEST,
-                "DIGEST_INVALID",
-                "manifest digest does not match reference",
-            );
+        Err(resp) if st.max_body <= MAX_MANIFEST => return *resp,
+        Err(_) => {
+            return ApiError::manifest_invalid("manifest exceeds 4 MiB size cap").into_response()
         }
-        None
+    };
+    // Reject pathologically nested JSON before handing bytes to serde_json
+    // (bounded-input guard; SECURITY.md inv. 14). A non-JSON body has depth 0.
+    if json_depth_exceeds(&body, MAX_JSON_DEPTH) {
+        return ApiError::manifest_invalid("manifest JSON nesting too deep").into_response();
+    }
+    // A digest reference must match the content. Compute the content digest
+    // with the *reference's* algorithm (sha256/sha512) so a sha512 reference is
+    // honored; a tagged push defaults to sha256. Compare constant-time and
+    // parse the reference so uppercase hex still matches.
+    let (digest, tag) = if reference.contains(':') {
+        match Digest::parse(reference) {
+            Ok(ref_digest) => {
+                let content = digest_of(&body, ref_digest.algorithm());
+                if content.ct_eq(&ref_digest) {
+                    (content, None)
+                } else {
+                    return ApiError::digest_invalid("manifest digest does not match reference")
+                        .into_response();
+                }
+            }
+            Err(e) => return map_storage_err(e),
+        }
     } else {
-        Some(reference)
+        (sha256_of(&body), Some(reference))
     };
     // Parse the manifest to extract subject/artifactType/annotations for the
     // referrers index (best-effort; a non-JSON body simply has no subject).
@@ -466,7 +531,9 @@ async fn put_manifest<S: Storage>(
 }
 
 async fn delete_manifest<S: Storage>(st: &AppState<S>, repo: &str, reference: &str) -> Response {
-    // Resolve tag → digest first so tag deletions work too.
+    // Resolve tag → digest first so tag deletions work too. A `:`-form
+    // reference is a digest (grammar checked by Digest::parse → 400 on a
+    // malformed digest); otherwise it is a tag resolved via storage.
     let d = if reference.contains(':') {
         match Digest::parse(reference) {
             Ok(d) => d,
@@ -475,11 +542,13 @@ async fn delete_manifest<S: Storage>(st: &AppState<S>, repo: &str, reference: &s
     } else {
         match st.storage.get_manifest(repo, reference).await {
             Ok(m) => m.digest,
+            Err(StorageError::NotFound) => return ApiError::manifest_unknown().into_response(),
             Err(e) => return map_storage_err(e),
         }
     };
     match st.storage.delete_manifest(repo, &d).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(StorageError::NotFound) => ApiError::manifest_unknown().into_response(),
         Err(e) => map_storage_err(e),
     }
 }
@@ -626,11 +695,7 @@ async fn finish_upload<S: Storage>(
     let digest = match q.digest {
         Some(d) => d,
         None => {
-            return oci_error(
-                StatusCode::BAD_REQUEST,
-                "DIGEST_INVALID",
-                "missing digest on upload completion",
-            )
+            return ApiError::digest_invalid("missing digest on upload completion").into_response()
         }
     };
     let d = match Digest::parse(&digest) {
@@ -694,9 +759,9 @@ async fn list_tags<S: Storage>(st: &AppState<S>, repo: &str, q: TagsQuery) -> Re
             tags = tags.split_off(pos + 1);
         }
     }
-    if let Some(n) = q.n {
-        tags.truncate(n);
-    }
+    // Clamp the requested page size to the server-side cap (SECURITY inv. 14).
+    let limit = q.n.map(|n| n.min(MAX_PAGE)).unwrap_or(MAX_PAGE);
+    tags.truncate(limit);
     let body = serde_json::json!({ "name": repo, "tags": tags });
     (
         StatusCode::OK,
@@ -711,22 +776,22 @@ async fn list_tags<S: Storage>(st: &AppState<S>, repo: &str, q: TagsQuery) -> Re
 async fn referrers<S: Storage>(
     st: &AppState<S>,
     repo: &str,
-    digest: &str,
+    subject: &Digest,
     q: ReferrersQuery,
 ) -> Response {
-    let subject = match Digest::parse(digest) {
-        Ok(d) => d,
-        Err(_) => return oci_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", "invalid digest"),
-    };
     // Referrers for a subject are returned even if the subject manifest itself
     // is absent; a missing index is simply an empty list.
     let raw = st
         .storage
-        .list_referrers(repo, &subject)
+        .list_referrers(repo, subject)
         .await
         .unwrap_or_default();
+    // Bound work *before* parsing: take at most MAX_PAGE raw descriptors so a
+    // large referrer index cannot exhaust memory/CPU in the parse below
+    // (GHSA-259w-8hf6-59bj amplification class).
     let mut manifests: Vec<serde_json::Value> = raw
         .into_iter()
+        .take(MAX_PAGE)
         .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .collect();
 
@@ -745,6 +810,7 @@ async fn referrers<S: Storage>(
         );
     }
 
+    // (list already bounded to MAX_PAGE before parsing above)
     let body = serde_json::json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.index.v1+json",
@@ -761,16 +827,57 @@ async fn read_body_limited(req: Request, limit: usize) -> Result<Vec<u8>, Box<Re
     let body = req.into_body();
     match to_bytes(body, limit).await {
         Ok(b) => Ok(b.to_vec()),
-        Err(_) => Err(Box::new(oci_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "SIZE_INVALID",
-            "request body too large",
-        ))),
+        Err(_) => Err(Box::new(
+            ApiError::payload_too_large("request body too large").into_response(),
+        )),
     }
 }
 
 /// Maximum accepted body size (256 MiB). Chunked uploads split larger blobs.
 const MAX_BODY: usize = 256 * 1024 * 1024;
+
+/// Maximum accepted manifest size (4 MiB) — bounded-input guard (PLAN Phase 0).
+const MAX_MANIFEST: usize = 4 * 1024 * 1024;
+
+/// Maximum JSON nesting depth accepted in a manifest body.
+const MAX_JSON_DEPTH: usize = 32;
+
+/// Maximum page size for list endpoints (tags/referrers); server-side cap.
+const MAX_PAGE: usize = 1000;
+
+/// Returns true if `bytes` contains JSON bracket/brace nesting deeper than
+/// `max`. A cheap, allocation-free pre-scan that treats string literals
+/// (skipping escaped quotes) as opaque so `{`/`[` inside strings don't count.
+/// Non-JSON input never exceeds the limit.
+fn json_depth_exceeds(bytes: &[u8], max: usize) -> bool {
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > max {
+                    return true;
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
 
 #[cfg(test)]
 mod tests {
@@ -1060,6 +1167,260 @@ mod tests {
         app.clone().oneshot(req).await.unwrap().status()
     }
 
+    /// Read a response body as a JSON value (for asserting the error envelope).
+    async fn body_json_of(app: &Router, req: HttpRequest<Body>) -> serde_json::Value {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    #[tokio::test]
+    async fn malformed_name_and_reference_rejected_before_handler() {
+        let (app, _d) = app();
+        // Uppercase repo name → NAME_INVALID (400), before any storage access.
+        let v = body_json_of(
+            &app,
+            HttpRequest::get("/v2/Foo/manifests/tag")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "NAME_INVALID");
+        // Path-traversal repo component → NAME_INVALID.
+        assert_eq!(
+            status_of(
+                &app,
+                HttpRequest::get("/v2/a/../b/manifests/t")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        // A syntactically-invalid manifest reference is NOT a 400 — per the
+        // dist-spec conformance suite it resolves to 404 MANIFEST_UNKNOWN
+        // (matches the suite's `.INVALID_MANIFEST_NAME` nonexistent-manifest
+        // case). Only the repository name is grammar-rejected (above).
+        let v = body_json_of(
+            &app,
+            HttpRequest::get("/v2/ok/manifests/.INVALID_MANIFEST_NAME")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_UNKNOWN");
+    }
+
+    #[tokio::test]
+    async fn non_allowlisted_digest_rejected() {
+        let (app, _d) = app();
+        let v = body_json_of(
+            &app,
+            HttpRequest::get("/v2/ok/blobs/sha1:deadbeef")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "DIGEST_INVALID");
+    }
+
+    #[tokio::test]
+    async fn manifest_over_fixed_cap_is_manifest_invalid() {
+        // Default app (256 MiB body limit); a manifest larger than the fixed
+        // 4 MiB cap → 400 MANIFEST_INVALID (distinct from the configured-limit
+        // 413 path).
+        let (app, _d) = app();
+        let over = Body::from(vec![b'x'; MAX_MANIFEST + 1]);
+        let resp = app
+            .oneshot(
+                HttpRequest::put("/v2/r/manifests/t")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(over)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn sha512_blob_and_manifest_roundtrip() {
+        // The wire allowlist advertises sha512; a sha512 monolithic blob push
+        // and a sha512-referenced manifest push must both succeed (regression
+        // for the sha256-only hashing bug).
+        let (app, _d) = app();
+        let blob = b"sha512-payload";
+        let bd = roci_storage::digest_of(blob, "sha512");
+        assert_eq!(
+            status_of(
+                &app,
+                HttpRequest::post(format!("/v2/r/blobs/uploads/?digest={}", bd.as_string()))
+                    .body(Body::from(blob.to_vec()))
+                    .unwrap()
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        let m = br#"{"schemaVersion":2}"#;
+        let md = roci_storage::digest_of(m, "sha512");
+        assert_eq!(
+            status_of(
+                &app,
+                HttpRequest::put(format!("/v2/r/manifests/{}", md.as_string()))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(m.to_vec()))
+                    .unwrap()
+            )
+            .await,
+            StatusCode::CREATED
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_json_depth_capped() {
+        let (app, _d) = app();
+        // 40 levels of nested arrays exceeds MAX_JSON_DEPTH (32) → MANIFEST_INVALID.
+        let deep = format!("{}{}", "[".repeat(40), "]".repeat(40));
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/ok/manifests/t")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(deep))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
+    }
+
+    #[tokio::test]
+    async fn missing_blob_is_blob_unknown() {
+        let (app, _d) = app();
+        let d = sha256_of(b"absent");
+        let v = body_json_of(
+            &app,
+            HttpRequest::get(format!("/v2/ok/blobs/{}", d.as_string()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "BLOB_UNKNOWN");
+    }
+
+    #[tokio::test]
+    async fn tags_list_page_size_is_capped() {
+        let (app, storage, _d) = app_with_storage();
+        // Push more tags than a small requested `n`; the response honors `n`
+        // up to the server cap.
+        let body = br#"{"schemaVersion":2}"#;
+        let d = sha256_of(body);
+        for t in ["a", "b", "c", "d"] {
+            storage
+                .put_manifest("r", Some(t), &d, "application/json", body)
+                .await
+                .unwrap();
+        }
+        let v = body_json_of(
+            &app,
+            HttpRequest::get("/v2/r/tags/list?n=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["tags"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_manifest_by_tag_io_error_maps_to_500() {
+        // `<repo>/tags/<tag>` as a directory makes tag→digest resolution fail
+        // with a non-NotFound IO error, exercising delete_manifest's Io arm.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path()).unwrap();
+        let tag_path = dir.path().join("r").join("tags").join("t");
+        std::fs::create_dir_all(&tag_path).unwrap();
+        let app = build_router(AppState::new(storage));
+        let resp = app
+            .oneshot(
+                HttpRequest::delete("/v2/r/manifests/t")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn put_and_patch_to_invalid_name_rejected() {
+        // route_put / route_patch validate the name before dispatch.
+        let (app, _d) = app();
+        assert_eq!(
+            status_of(
+                &app,
+                HttpRequest::put("/v2/BAD/manifests/t")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                HttpRequest::patch("/v2/BAD/blobs/uploads/x")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_blob_io_error_maps_to_500() {
+        // Make `<repo>/blobs/<alg>/<hex>` a directory so remove_file yields a
+        // non-NotFound IO error, exercising delete_blob's Io → 500 arm.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path()).unwrap();
+        let d = sha256_of(b"x");
+        let blob_dir = dir
+            .path()
+            .join("r")
+            .join("blobs")
+            .join("sha256")
+            .join(hex_of(&d));
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        let app = build_router(AppState::new(storage));
+        let resp = app
+            .oneshot(
+                HttpRequest::delete(format!("/v2/r/blobs/{}", d.as_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn manifest_with_escaped_quote_accepted() {
+        // A backslash-escaped quote inside a JSON string exercises the escape
+        // branch of json_depth_exceeds; the manifest is well-formed and stored.
+        let (app, _d) = app();
+        let body = br#"{"schemaVersion":2,"annotations":{"k":"a\"b"}}"#;
+        let d = sha256_of(body);
+        let resp = app
+            .oneshot(
+                HttpRequest::put("/v2/ok/manifests/t")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let _ = d;
+    }
+
     #[tokio::test]
     async fn head_blob_and_manifest() {
         let (app, storage, _d) = app_with_storage();
@@ -1249,6 +1610,17 @@ mod tests {
             .await,
             StatusCode::BAD_REQUEST
         );
+        // Delete a nonexistent manifest *by digest* → 404 MANIFEST_UNKNOWN
+        // (not NAME_UNKNOWN).
+        let ghost = sha256_of(b"ghost-manifest");
+        let v = body_json_of(
+            &app,
+            HttpRequest::delete(format!("/v2/r/manifests/{}", ghost.as_string()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_UNKNOWN");
         // Delete an absent tag → 404.
         assert_eq!(
             status_of(
@@ -1279,6 +1651,19 @@ mod tests {
             .await,
             StatusCode::CREATED
         );
+        // Uppercase-hex digest reference still matches (Digest canonicalizes to
+        // lowercase; the compare parses both) → 201.
+        assert_eq!(
+            status_of(
+                &app,
+                HttpRequest::put(format!("/v2/r/manifests/sha256:{}", md_hex_upper(&md)))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(m.to_vec()))
+                    .unwrap()
+            )
+            .await,
+            StatusCode::CREATED
+        );
         // Mismatched digest reference → 400.
         let wrong = sha256_of(b"other");
         assert_eq!(
@@ -1292,6 +1677,48 @@ mod tests {
             .await,
             StatusCode::BAD_REQUEST
         );
+        // A `:`-form reference that is a *malformed* digest → 400 DIGEST_INVALID.
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/sha256:short")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(m.to_vec()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "DIGEST_INVALID");
+    }
+
+    #[tokio::test]
+    async fn delete_manifest_io_error_maps_to_500() {
+        // `<repo>/manifests/sha256` as a file makes remove_file of
+        // `.../sha256/<hex>` fail with ENOTDIR (non-NotFound Io), exercising
+        // delete_manifest's Io arm on the delete-by-digest path.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path()).unwrap();
+        let m_dir = dir.path().join("r").join("manifests");
+        std::fs::create_dir_all(&m_dir).unwrap();
+        std::fs::write(m_dir.join("sha256"), b"not a dir").unwrap();
+        let app = build_router(AppState::new(storage));
+        let d = sha256_of(b"x");
+        let resp = app
+            .oneshot(
+                HttpRequest::delete(format!("/v2/r/manifests/{}", d.as_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Uppercase the hex of a digest for the case-insensitive match test.
+    fn md_hex_upper(d: &Digest) -> String {
+        d.as_string()
+            .split_once(':')
+            .unwrap()
+            .1
+            .to_ascii_uppercase()
     }
 
     #[tokio::test]
@@ -1412,6 +1839,70 @@ mod tests {
             )
             .await,
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn head_and_post_to_invalid_name_rejected() {
+        // route_head / route_post validate the name before dispatch.
+        let (app, _d) = app();
+        assert_eq!(
+            status_of(
+                &app,
+                HttpRequest::head("/v2/BAD/manifests/t")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                HttpRequest::post("/v2/BAD/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_and_manifest_io_errors_map_to_500() {
+        // `<repo>/blobs/sha256` as a *file* makes both metadata (HEAD) and read
+        // (GET) of `.../sha256/<hex>` fail with ENOTDIR (non-NotFound Io),
+        // exercising get_blob's Io arms on both the HEAD and GET paths.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path()).unwrap();
+        let repo_dir = dir.path().join("r").join("blobs");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(repo_dir.join("sha256"), b"not a dir").unwrap();
+        let app = build_router(AppState::new(storage));
+        let d = sha256_of(b"x");
+        for req in [
+            HttpRequest::get(format!("/v2/r/blobs/{}", d.as_string())),
+            HttpRequest::head(format!("/v2/r/blobs/{}", d.as_string())),
+        ] {
+            assert_eq!(
+                status_of(&app, req.body(Body::empty()).unwrap()).await,
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+        // `<repo2>/manifests/sha256` as a file makes get_manifest by digest fail
+        // with ENOTDIR, exercising get_manifest's Io arm.
+        let m_dir = dir.path().join("r2").join("manifests");
+        std::fs::create_dir_all(&m_dir).unwrap();
+        std::fs::write(m_dir.join("sha256"), b"not a dir").unwrap();
+        assert_eq!(
+            status_of(
+                &app,
+                HttpRequest::get(format!("/v2/r2/manifests/{}", d.as_string()))
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await,
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 
@@ -1742,14 +2233,15 @@ mod tests {
     #[tokio::test]
     async fn oversized_bodies_are_413() {
         let (app, _d) = app_tiny_body(4);
-        let big = Body::from("way too many bytes");
-        // put_manifest oversized.
+        // A manifest over the configured request-body limit (4 bytes here) →
+        // 413 (payload too large), since the effective cap is the smaller of
+        // the configured limit and the fixed 4 MiB manifest cap.
         assert_eq!(
             status_of(
                 &app,
                 HttpRequest::put("/v2/r/manifests/t")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(big)
+                    .body(Body::from("way too many bytes"))
                     .unwrap()
             )
             .await,

@@ -80,8 +80,9 @@ Fetch the pinned OCI spec submodules:
 git submodule update --init --depth 1   # or: just init
 ```
 
-Install the git pre-commit hook (runs fmt, clippy, workflow lint, and the 100%
-coverage gate, and refreshes [`COVERAGE.md`](COVERAGE.md) + the badge on every commit):
+Install the git pre-commit hook (when Rust sources are staged, runs fmt,
+clippy, the 100% coverage gate, and the full OCI conformance suite; refreshes
+[`COVERAGE.md`](COVERAGE.md) + the badge on every commit):
 
 ```sh
 just hooks   # or, with the pre-commit framework: pre-commit install
@@ -105,7 +106,7 @@ Every recipe mirrors a CI gate, so passing locally means passing the required CI
 | `just audit` | `cargo deny` supply-chain check |
 | `just coverage` | Enforce 100% line coverage (cargo-llvm-cov) |
 | `just coverage-report` | Show uncovered lines (developer aid) |
-| `just ci` | Run the full local gate before pushing (actionlint + fmt + clippy + test + build + deps-guard + coverage) |
+| `just ci` | Run the full local gate before pushing (actionlint + fmt + clippy + test + build + deps-guard + coverage + conformance) |
 | `just conformance` | Run the OCI dist-spec conformance suite against a local roci |
 | `just container` | Build the hardened scratch image and smoke-test it |
 | `just container-multiarch` | Build the multi-arch image (linux/amd64, linux/arm64) |
@@ -159,16 +160,16 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [ ] Conforms to OCI Distribution Spec APIs (v1.1.1)
 - [ ] Uses OCI image layout for image storage
 - [ ] Can serve any OCI image layout as a registry
-- [ ] Single binary for all features
-- [ ] Runs without root privileges
-- [ ] Clear separation between core dist-spec and roci-specific extensions
+- [~] Single binary for all features
+- [~] Runs without root privileges
+- [~] Clear separation between core dist-spec and roci-specific extensions
 - [ ] Behavior controlled entirely via configuration
 - [ ] Binaries released for multiple operating systems and architectures
 - [ ] Image deletion by tag
 - [ ] Compatible with ecosystem tools (skopeo, cri-o)
 - [ ] Suitable for on-premises deployments (e.g. colocated with Kubernetes)
 - [ ] HTTP/2 multiplexing + keep-alive; TLS 1.3 with optional kTLS zero-copy
-- [ ] SHA-512 default digests (SHA-256 accepted); constant-time verification
+- [~] SHA-512 default digests (SHA-256 accepted); constant-time verification
 - [ ] Immutable-by-digest response caching (`ETag`/`If-None-Match` → `304`), correct tag-vs-digest cache-control
 - [ ] Foreign media types & `tar+zstd` layers stored/served as opaque blobs (Nydus, eStargz, SBOM, signatures)
 
@@ -194,7 +195,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [ ] HTTP Bearer token authentication (per-request scope binding)
 - [ ] Identity-Based Access Control
 - [ ] Live modification of authorization configuration while running
-- [ ] Boundary hardening — path-traversal-safe validation, wire digest allowlist, bounded inputs (size/`n`/depth)
+- [~] Boundary hardening — path-traversal-safe validation, wire digest allowlist, bounded inputs (size/`n`/depth)
 - [ ] Repository isolation — no cross-repo presence/content oracle; cross-repo mount double-authorized
 - [ ] SSRF containment — no client-URL fetch; host-allowlisted, repo-gated redirects
 - [ ] Prior-art CVE-class regression suite in CI

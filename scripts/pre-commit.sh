@@ -28,6 +28,12 @@ if echo "$staged" | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$'; then
   bash scripts/coverage.sh
   # Re-stage the regenerated report and badge so they land in this commit.
   git add COVERAGE.md README.md
+
+  echo "[pre-commit] OCI distribution conformance"
+  # Blocks the commit unless the built binary passes the full conformance
+  # suite (all four categories). Requires Go 1.17+ and the pinned spec
+  # submodule; scripts/conformance.sh fails loudly if either is missing.
+  bash scripts/conformance.sh
 fi
 
 # Workflow lint/security only when workflow files are staged.

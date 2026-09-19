@@ -60,7 +60,7 @@ zizmor:
 coverage:
     bash scripts/coverage.sh
 
-# Install the git pre-commit hook (fmt, clippy, workflow lint, coverage).
+# Install the git pre-commit hook (fmt, clippy, coverage, conformance; workflow lint when workflows staged).
 hooks:
     ln -sf ../../scripts/pre-commit.sh .git/hooks/pre-commit
     @echo "installed .git/hooks/pre-commit"
@@ -71,29 +71,14 @@ coverage-report:
     cargo llvm-cov report --show-missing-lines
 
 # Full local gate — run before pushing (the required CI checks).
-ci: lint-workflows fmt clippy test build deps-guard coverage
+ci: lint-workflows fmt clippy test build deps-guard coverage conformance
 
-# Requires Go 1.17+. Serves on 127.0.0.1:5000 with a temp storage root.
-# NOTE: the roci CLI flags below are the intended shape; align with roci-cli's actual arg parser once Phase 0 lands.
-# Build + run the OCI conformance suite against a locally-started roci (CI `conformance` job).
+# Build + run the OCI conformance suite against a locally-started roci
+# (CI `conformance` job). Requires Go 1.17+ and the pinned spec submodule
+# (run `just init` first if absent). Shares scripts/conformance.sh with the
+# pre-commit hook.
 conformance: init
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo build --profile ci -p roci-cli --all-features
-    storage="$(mktemp -d)"
-    ./target/ci/roci --storage-root "$storage" --listen 127.0.0.1:5000 &
-    srv=$!
-    trap 'kill $srv 2>/dev/null || true' EXIT
-    for _ in $(seq 1 30); do
-      curl -sf http://127.0.0.1:5000/v2/ >/dev/null && break || sleep 1
-    done
-    ( cd spec/distribution-spec/conformance && go test -c -o conformance.test )
-    OCI_ROOT_URL=http://127.0.0.1:5000 \
-    OCI_NAMESPACE=roci-conformance/test \
-    OCI_CROSSMOUNT_NAMESPACE=roci-conformance/other \
-    OCI_TEST_PULL=1 OCI_TEST_PUSH=1 OCI_TEST_CONTENT_DISCOVERY=1 OCI_TEST_CONTENT_MANAGEMENT=1 \
-    OCI_HIDE_SKIPPED_WORKFLOWS=1 \
-    ./spec/distribution-spec/conformance/conformance.test
+    bash scripts/conformance.sh
 
 # Build the hardened scratch image and smoke-test the running container
 # (CI `container` workflow). Requires Docker. Uses a named volume so the

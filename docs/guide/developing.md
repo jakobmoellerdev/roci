@@ -26,8 +26,10 @@ Fetch the pinned OCI spec submodules:
 git submodule update --init --depth 1   # or: just init
 ```
 
-Install the git pre-commit hook (runs fmt, clippy, workflow lint, and the 100%
-coverage gate, and refreshes `COVERAGE.md` + the badge on every commit):
+Install the git pre-commit hook (when Rust sources are staged it runs fmt,
+clippy, the 100% coverage gate, and the full OCI conformance suite; it also
+runs workflow lint/security when workflows are staged, and refreshes
+`COVERAGE.md` + the badge on every commit):
 
 ```sh
 just hooks   # or, with the pre-commit framework: pre-commit install
