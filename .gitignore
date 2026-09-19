@@ -4,6 +4,7 @@
 
 # Coverage artifacts (cargo-llvm-cov). COVERAGE.md is committed; these are not.
 /lcov.info
+/cobertura.xml
 /coverage-html
 /coverage-summary.txt
 *.profraw

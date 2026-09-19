@@ -20,8 +20,10 @@ else
     cargo llvm-cov --no-report --workspace --all-features
 fi
 
-# Emit lcov (line-level truth) and a human summary.
+# Emit lcov (line-level truth) and Cobertura XML (for GitHub's code-coverage
+# API / PR gating), plus a human summary.
 cargo llvm-cov report --lcov --output-path lcov.info
+cargo llvm-cov report --cobertura --output-path cobertura.xml
 table="$(cargo llvm-cov report --summary-only 2>/dev/null | sed -n '/^Filename/,/^TOTAL/p')"
 
 # Compute line coverage from lcov, excluding the entrypoint shim.
