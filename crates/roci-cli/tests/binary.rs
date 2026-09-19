@@ -8,27 +8,17 @@ use std::net::TcpStream;
 use std::process::Command;
 use std::time::Duration;
 
-/// Locate the compiled `roci` binary next to the test executable.
+/// Locate the compiled `roci` binary. Cargo sets `CARGO_BIN_EXE_roci` for
+/// integration tests of the crate that defines the binary, pointing at the
+/// instrumented binary under `cargo llvm-cov`.
 fn roci_bin() -> std::path::PathBuf {
-    // The integration test runs from target/<profile>/deps/…; the binary is two
-    // levels up in the same profile directory.
-    let mut dir = std::env::current_exe().unwrap();
-    dir.pop(); // test binary name
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    dir.join("roci")
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_roci"))
 }
 
 #[test]
 fn binary_serves_v2_then_shuts_down_on_sigint() {
     let bin = roci_bin();
-    if !bin.exists() {
-        // The binary isn't built in this invocation (e.g. `cargo test -p roci-core`);
-        // nothing to exercise here.
-        eprintln!("roci binary not found at {}; skipping", bin.display());
-        return;
-    }
+    assert!(bin.exists(), "roci binary not found at {}", bin.display());
     let storage = tempfile::tempdir().unwrap();
     // Use a fixed loopback port unlikely to collide in CI.
     let port = 5599;

@@ -86,7 +86,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: test
-      - uses: taiki-e/install-action@678b06b887cdbf44fa0601e5915f865e17c2241d # v2.44.60
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           tool: nextest
       # nextest is faster and gives better flaky isolation than `cargo test`.
@@ -146,7 +146,7 @@ jobs:
         with:
           cache-key: coverage
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@678b06b887cdbf44fa0601e5915f865e17c2241d # v2.44.60
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           tool: cargo-llvm-cov
       # Instrument + run tests once, then emit every report from the same data.
@@ -156,11 +156,13 @@ jobs:
           cargo llvm-cov report --lcov --output-path lcov.info
           cargo llvm-cov report --html --output-dir coverage-html
           cargo llvm-cov report --summary-only | tee coverage-summary.txt
+          # Surface exactly which lines are uncovered (aids diagnosis on failure).
+          cargo llvm-cov report --show-missing-lines
           # Enforce the 100%-line gate from the same run.
           cargo llvm-cov report --fail-under-lines 100
       - name: Upload coverage reports
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage
           path: |

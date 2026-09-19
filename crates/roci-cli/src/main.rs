@@ -148,12 +148,8 @@ mod tests {
             listen: taken,
             storage_root: dir.path().to_path_buf(),
         };
-        let result = serve(
-            config,
-            |_| unreachable!("bind should fail before on_bind"),
-            async {},
-        )
-        .await;
+        // Bind fails before on_bind/shutdown are used, so pass trivial ones.
+        let result = serve(config, |_| {}, std::future::pending()).await;
         assert!(result.is_err());
     }
 
