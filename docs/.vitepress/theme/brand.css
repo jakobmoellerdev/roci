@@ -1,0 +1,62 @@
+/**
+ * roci brand tokens → VitePress theme variables.
+ *
+ * Palette source of truth: assets/BRAND.md. Keep these hexes in sync with it.
+ *   Rust (bright)  #F4713B   gradient start / accent hover
+ *   Rust (base)    #CE422B   primary brand orange
+ *   Rust (deep)    #9E2F1E   gradient end
+ *   Slate          #5B6875 / #AEB9C6 / #C4CDD8
+ *   Ink            #12161C
+ *   Canvas (dark)  #0D1117 → #161B22
+ *
+ * Never recolor the brand gradients or swap the orange for another hue.
+ */
+
+:root {
+  --roci-rust-bright: #f4713b;
+  --roci-rust-base: #ce422b;
+  --roci-rust-deep: #9e2f1e;
+  --roci-slate: #5b6875;
+  --roci-ink: #12161c;
+  --roci-canvas-1: #0d1117;
+  --roci-canvas-2: #161b22;
+
+  /* Brand accent — maps the Rust gradient onto VitePress's brand slots. */
+  --vp-c-brand-1: var(--roci-rust-base);
+  --vp-c-brand-2: var(--roci-rust-bright);
+  --vp-c-brand-3: var(--roci-rust-base);
+  --vp-c-brand-soft: rgba(206, 66, 43, 0.14);
+
+  /* Hero name uses the brand gradient (top-left → bottom-right, per BRAND.md). */
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: linear-gradient(
+    120deg,
+    var(--roci-rust-bright),
+    var(--roci-rust-deep)
+  );
+  --vp-home-hero-image-background-image: linear-gradient(
+    120deg,
+    rgba(244, 113, 59, 0.5),
+    rgba(158, 47, 30, 0.5)
+  );
+  --vp-home-hero-image-filter: blur(44px);
+
+  /* Buttons */
+  --vp-button-brand-bg: var(--roci-rust-base);
+  --vp-button-brand-hover-bg: var(--roci-rust-bright);
+  --vp-button-brand-active-bg: var(--roci-rust-deep);
+  --vp-button-brand-border: transparent;
+  --vp-button-brand-hover-border: transparent;
+}
+
+.dark {
+  /* Dark backdrops track the brand canvas gradient (BRAND.md). */
+  --vp-c-bg: var(--roci-canvas-1);
+  --vp-c-bg-alt: var(--roci-canvas-2);
+  --vp-c-bg-elv: var(--roci-canvas-2);
+
+  /* Slightly brighter accent for legibility on the dark canvas. */
+  --vp-c-brand-1: #e8683f;
+  --vp-c-brand-2: var(--roci-rust-bright);
+  --vp-c-brand-3: var(--roci-rust-base);
+}

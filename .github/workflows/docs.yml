@@ -1,0 +1,80 @@
+name: docs
+
+# Build the VitePress documentation site (docs/) and deploy it to GitHub Pages.
+# Pull requests build only (validating the site + dead links); pushes to main
+# build and deploy. Least privilege: the build job is read-only; only the
+# deploy job gets the Pages write + id-token permissions.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch: {}
+
+# Default deny; each job grants only what it needs.
+permissions: {}
+
+concurrency:
+  group: docs-${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs; never cancel an in-flight Pages deployment.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+      # Configure Pages so VitePress emits the correct base path for the
+      # project site (https://<owner>.github.io/<repo>/). No-op on PRs where
+      # Pages is not enabled, so guard it to the deploying event.
+      - name: Configure Pages
+        id: pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - run: npm ci
+      - name: Build site
+        # base_path is empty on PRs (Configure Pages skipped); fall back to /roci/.
+        env:
+          DOCS_BASE: ${{ steps.pages.outputs.base_path || '/roci/' }}
+        run: npm run docs:build
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: docs/.vitepress/dist
+
+  deploy:
+    name: deploy
+    # Only deploy from main; PRs stop after a successful build.
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

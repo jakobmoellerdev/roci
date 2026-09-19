@@ -15,5 +15,10 @@
 # Local roci data directories.
 /roci-data
 
+# VitePress docs site (docs/): dependencies and build output.
+/docs/node_modules
+/docs/.vitepress/dist
+/docs/.vitepress/cache
+
 # Editor/OS noise.
 .DS_Store

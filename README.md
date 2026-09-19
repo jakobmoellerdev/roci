@@ -37,6 +37,8 @@ Design documents:
 
 The design docs are reverse-engineered from [zot](https://zotregistry.dev)'s published architecture, storage, security-posture, and scale-out articles (cited within) and adapted to Rust.
 
+A rendered documentation site (VitePress) is published to GitHub Pages from [`docs/`](docs/): <https://jakobmoellerdev.github.io/roci/>. Build it locally with `cd docs && npm install && npm run docs:dev`.
+
 Specs are vendored under `spec/` — OCI Distribution + Image specs as submodules pinned to `v1.1.1`, plus a snapshot of the Docker Registry V2 API reference:
 
 ```

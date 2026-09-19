@@ -23,6 +23,18 @@ Each doc has one owner; when your change touches its concern, update it **in the
 - **Freshly gathered research** → consolidate into [`RESEARCH.md`](RESEARCH.md) with a Sources row, then cite it by key from the doc that acts on it. Never inline a new source table elsewhere.
 - **[`PLAN.md`](PLAN.md) (build steps) and the [`README.md`](README.md) high-level feature roadmap MUST be kept updated** whenever a decision adds/changes a build step or a user-facing capability — a design/security decision is not "done" until PLAN and the README reflect it.
 - Respect the stated **invariants**; changing one requires updating its owning doc and flagging the change.
+- **[`docs/`](docs/) (the VitePress site) MUST be kept in sync** with any user-facing or design change: the [Roadmap page](docs/roadmap.md) mirrors the README roadmap, and the design overviews under `docs/design/` link the canonical root docs. See § *Documentation site (`docs/`)* below.
+
+## Documentation site (`docs/`)
+
+The public documentation site is a [VitePress](https://vitepress.dev/) app in [`docs/`](docs/), deployed to GitHub Pages by [`.github/workflows/docs.yml`](.github/workflows/docs.yml) on every push to `main` (pull requests build-only, validating the site and its internal links).
+
+- **Work in `docs/`.** `npm install` once, then `npm run docs:dev` for a hot-reloading preview and `npm run docs:build` to reproduce the CI build (VitePress fails the build on dead internal links, so a green build means links resolve). Commit the `docs/package-lock.json` when dependencies change — the workflow uses `npm ci`.
+- **Design pages don't duplicate.** The overviews under `docs/design/` (`architecture`, `security`, `storage`, `plan`, `research`) are summaries that **link** the canonical root docs ([`ARCHITECTURE.md`](ARCHITECTURE.md), [`SECURITY.md`](SECURITY.md), [`PLAN.md`](PLAN.md), [`RESEARCH.md`](RESEARCH.md)), which remain the source of truth. When you change a canonical doc, update the matching overview in the **same change** so the site does not drift; never fork design rationale into the site.
+- **Roadmap mirrors the README.** [`docs/roadmap.md`](docs/roadmap.md) mirrors the README feature roadmap. A capability whose status changes MUST be updated in both `README.md` and `docs/roadmap.md` in one change (this extends the maintenance contract above).
+- **Guide pages track behavior.** When a user-facing capability changes (CLI flags, config surface, container usage, local-dev tasks), update the relevant page under `docs/guide/` alongside the code and the README.
+- **Branding is not re-authored here.** Theming maps the [`assets/BRAND.md`](assets/BRAND.md) palette onto VitePress variables in `docs/.vitepress/theme/brand.css`; the logo/favicon/social-card in `docs/public/` are **copies** of the source-of-truth SVGs in `assets/`. When the brand assets change, re-copy them (`cp assets/{logo.svg,logo-dark.svg,favicon.svg,icon.svg,social-card.svg} docs/public/`) — never recolor gradients or hand-edit the copies.
+- **Workflow hygiene.** Keep `docs.yml` `actionlint`- and `zizmor`-clean like every other workflow: pin actions by commit SHA, `persist-credentials: false` on checkout, default-deny `permissions` with only the deploy job holding `pages: write` + `id-token: write`.
 
 ## OCI specs (local reference)
 
