@@ -17,34 +17,21 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
-  # Decide which platforms to build. PRs build only linux/arm64 (native arm64
-  # runner) to save time; main builds both amd64 and arm64. Each platform is
-  # built on its own native runner — no QEMU emulation.
-  matrix:
-    name: select platforms
-    runs-on: ubuntu-latest
-    outputs:
-      platforms: ${{ steps.pick.outputs.platforms }}
-    steps:
-      - id: pick
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo 'platforms=[{"arch":"arm64","runner":"ubuntu-24.04-arm"}]' >> "$GITHUB_OUTPUT"
-          else
-            echo 'platforms=[{"arch":"amd64","runner":"ubuntu-latest"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]' >> "$GITHUB_OUTPUT"
-          fi
-
   # Build the image on a native runner per arch and smoke-test the running
   # container there (native, no emulation). On main, also push by digest so the
   # publish job can assemble a multi-arch manifest.
+  #
+  # Platform selection is static: PRs build only linux/arm64 (native arm64
+  # runner) to save time; main builds both amd64 and arm64. The list is chosen
+  # inline from the event — no generator job spins up a runner just to emit it.
   build:
     name: build & smoke-test (${{ matrix.plat.arch }})
-    needs: matrix
     strategy:
       fail-fast: false
       matrix:
-        plat: ${{ fromJSON(needs.matrix.outputs.platforms) }}
+        plat: ${{ github.event_name == 'pull_request'
+          && fromJSON('[{"arch":"arm64","runner":"ubuntu-24.04-arm"}]')
+          || fromJSON('[{"arch":"amd64","runner":"ubuntu-latest"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]') }}
     runs-on: ${{ matrix.plat.runner }}
     permissions:
       contents: read
@@ -185,14 +172,16 @@ jobs:
 
   # Cross-compile the standalone binary for each Linux arch on its native
   # runner and attest it. Containers are Linux-only; darwin binaries are
-  # produced from macOS runners in the release pipeline (out of scope here).
+  # planned as cross-compiled release binaries (macOS runners), not wired up
+  # yet and out of scope here. Same static per-event platform list as `build`.
   binaries:
     name: binary (linux-${{ matrix.plat.arch }})
-    needs: matrix
     strategy:
       fail-fast: false
       matrix:
-        plat: ${{ fromJSON(needs.matrix.outputs.platforms) }}
+        plat: ${{ github.event_name == 'pull_request'
+          && fromJSON('[{"arch":"arm64","runner":"ubuntu-24.04-arm"}]')
+          || fromJSON('[{"arch":"amd64","runner":"ubuntu-latest"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]') }}
     runs-on: ${{ matrix.plat.runner }}
     permissions:
       contents: read
