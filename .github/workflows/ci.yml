@@ -29,8 +29,8 @@ jobs:
     env:
       # Pinned actionlint release + sha256 of the linux_amd64 tarball.
       # Bump both together (checksums.txt on the release page).
-      ACTIONLINT_VERSION: 1.7.7
-      ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,6 +58,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
         with:
           components: rustfmt
+      # rustfmt needs no build.
       - run: cargo fmt --all --check
 
   clippy:
@@ -74,10 +75,13 @@ jobs:
       # Full flavor: lint everything, extensions included.
       - run: cargo clippy --workspace --all-targets --all-features --profile ci -- -D warnings
       # Minimal flavor must also compile clean (ARCHITECTURE.md invariant 1).
-      - run: cargo clippy --workspace --no-default-features -- -D warnings
+      - run: cargo clippy --workspace --no-default-features --profile ci -- -D warnings
 
-  test:
-    name: test
+  # One instrumented all-features build serves BOTH the test run and the
+  # coverage gate — nextest runs under llvm-cov, so we compile once instead of
+  # once for tests and again for coverage.
+  test-and-coverage:
+    name: test + coverage (100% lines)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -85,81 +89,24 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: test
-      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
-        with:
-          tool: nextest
-      # nextest is faster and gives better flaky isolation than `cargo test`.
-      - run: cargo nextest run --workspace --all-features --profile ci
-      # nextest does not run doctests; run them separately.
-      - run: cargo test --workspace --all-features --doc
-
-  build-flavors:
-    name: build (${{ matrix.flavor }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        flavor: [minimal, full]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup-rust
-        with:
-          cache-key: flavor-${{ matrix.flavor }}
-      # Minimal: core builds with every extension disabled (invariant 1).
-      - if: matrix.flavor == 'minimal'
-        run: cargo build --workspace --no-default-features
-      - if: matrix.flavor == 'full'
-        run: cargo build --workspace --all-features
-
-  minimal-deps-guard:
-    name: minimal-deps-guard
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup-rust
-        with:
-          cache-key: deps-guard
-      # ARCHITECTURE.md invariant 2: no extension crate in the minimal dep graph.
-      - name: Assert minimal dependency graph is extension-free
-        shell: bash
-        run: |
-          if cargo tree -p roci-cli --no-default-features --edges normal --prefix none \
-             | grep -E 'roci-ext-|roci-cluster'; then
-            echo "extension crate leaked into the minimal build (ARCHITECTURE.md invariant 2)"
-            exit 1
-          fi
-          echo "minimal dep graph clean"
-
-  coverage:
-    name: coverage (100% lines)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup-rust
-        with:
-          cache-key: coverage
+          cache-key: test-cov
           components: llvm-tools-preview
       - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
-          tool: cargo-llvm-cov
-      # Instrument + run tests once, then emit every report from the same data.
-      - name: Coverage gate + reports
+          tool: nextest,cargo-llvm-cov
+      - name: Tests + coverage (single instrumented build)
         run: |
-          cargo llvm-cov --workspace --all-features --no-report
+          # Instrument once; nextest runs the unit/integration suite under coverage.
+          cargo llvm-cov --no-report nextest --workspace --all-features --profile ci
+          # Emit every report from the one collected profile.
           cargo llvm-cov report --lcov --output-path lcov.info
           cargo llvm-cov report --html --output-dir coverage-html
           cargo llvm-cov report --summary-only | tee coverage-summary.txt
-          # Surface exactly which lines are uncovered (aids diagnosis on failure).
           cargo llvm-cov report --show-missing-lines
-          # Enforce the 100%-line gate from the same run.
           cargo llvm-cov report --fail-under-lines 100
+      # Doctests are not instrumented (none exist yet); run them for correctness.
+      - name: Doctests
+        run: cargo test --workspace --all-features --doc --profile ci
       - name: Upload coverage reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -170,3 +117,39 @@ jobs:
             coverage-html
             coverage-summary.txt
           if-no-files-found: ignore
+
+  # Minimal flavor is a distinct feature set (cannot reuse the all-features
+  # artifacts), so it gets its own compile — the only extra build besides the
+  # instrumented one. The `full` flavor is already compiled by test-and-coverage.
+  build-minimal:
+    name: build (minimal flavor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: flavor-minimal
+      # Core builds with every extension disabled (ARCHITECTURE invariant 1).
+      - run: cargo build --workspace --no-default-features --profile ci
+
+  minimal-deps-guard:
+    name: minimal-deps-guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+      # ARCHITECTURE.md invariant 2: no extension crate in the minimal dep graph.
+      # `cargo tree` resolves metadata only — no workspace compile needed.
+      - name: Assert minimal dependency graph is extension-free
+        shell: bash
+        run: |
+          if cargo tree -p roci-cli --no-default-features --edges normal --prefix none \
+             | grep -E 'roci-ext-|roci-cluster'; then
+            echo "extension crate leaked into the minimal build (ARCHITECTURE.md invariant 2)"
+            exit 1
+          fi
+          echo "minimal dep graph clean"

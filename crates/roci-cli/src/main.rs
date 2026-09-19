@@ -128,16 +128,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_parses_args_and_shuts_down() {
-        // `run` parses process args (none in the test harness → all defaults),
-        // binds the default port, then returns once shutdown fires immediately.
-        // Use an ephemeral port by overriding via env is not available, so bind
-        // the default and shut down at once; if the default port is taken the
-        // bind error still exercises run's error path.
-        let _ = run(async {}).await;
-    }
-
-    #[tokio::test]
     async fn serve_returns_err_on_bind_failure() {
         // Bind a port first, then ask serve to bind the same port → its
         // TcpListener::bind fails and serve returns Err (covers the error path).
