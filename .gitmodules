@@ -1,3 +1,6 @@
 [submodule "spec/distribution-spec"]
 	path = spec/distribution-spec
 	url = https://github.com/opencontainers/distribution-spec.git
+[submodule "spec/image-spec"]
+	path = spec/image-spec
+	url = https://github.com/opencontainers/image-spec.git
