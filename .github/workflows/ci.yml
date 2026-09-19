@@ -32,7 +32,7 @@ jobs:
       ACTIONLINT_VERSION: 1.7.7
       ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install pinned actionlint
@@ -52,83 +52,47 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - id: guard
-        shell: bash
-        run: |
-          if [ -f Cargo.toml ] || ls ./*/Cargo.toml >/dev/null 2>&1; then
-            echo "have_workspace=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "have_workspace=false" >> "$GITHUB_OUTPUT"
-            echo "No Cargo workspace yet — skipping rustfmt."
-          fi
-      - if: steps.guard.outputs.have_workspace == 'true'
-        uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
         with:
           components: rustfmt
-      - if: steps.guard.outputs.have_workspace == 'true'
-        run: cargo fmt --all --check
+      - run: cargo fmt --all --check
 
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - id: guard
-        shell: bash
-        run: |
-          if [ -f Cargo.toml ] || ls ./*/Cargo.toml >/dev/null 2>&1; then
-            echo "have_workspace=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "have_workspace=false" >> "$GITHUB_OUTPUT"
-            echo "No Cargo workspace yet — skipping clippy."
-          fi
-      - if: steps.guard.outputs.have_workspace == 'true'
-        uses: ./.github/actions/setup-rust
+      - uses: ./.github/actions/setup-rust
         with:
           cache-key: clippy
           components: clippy
       # Full flavor: lint everything, extensions included.
-      - if: steps.guard.outputs.have_workspace == 'true'
-        run: cargo clippy --workspace --all-targets --all-features --profile ci -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features --profile ci -- -D warnings
       # Minimal flavor must also compile clean (ARCHITECTURE.md invariant 1).
-      - if: steps.guard.outputs.have_workspace == 'true'
-        run: cargo clippy --workspace --no-default-features -- -D warnings
+      - run: cargo clippy --workspace --no-default-features -- -D warnings
 
   test:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - id: guard
-        shell: bash
-        run: |
-          if [ -f Cargo.toml ] || ls ./*/Cargo.toml >/dev/null 2>&1; then
-            echo "have_workspace=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "have_workspace=false" >> "$GITHUB_OUTPUT"
-            echo "No Cargo workspace yet — skipping tests."
-          fi
-      - if: steps.guard.outputs.have_workspace == 'true'
-        uses: ./.github/actions/setup-rust
+      - uses: ./.github/actions/setup-rust
         with:
           cache-key: test
-      - if: steps.guard.outputs.have_workspace == 'true'
-        uses: taiki-e/install-action@678b06b887cdbf44fa0601e5915f865e17c2241d # v2.44.60
+      - uses: taiki-e/install-action@678b06b887cdbf44fa0601e5915f865e17c2241d # v2.44.60
         with:
           tool: nextest
       # nextest is faster and gives better flaky isolation than `cargo test`.
-      - if: steps.guard.outputs.have_workspace == 'true'
-        run: cargo nextest run --workspace --all-features --profile ci
-      # nextest does not run doctests; run them separately (no-op on an empty workspace).
-      - if: steps.guard.outputs.have_workspace == 'true'
-        run: cargo test --workspace --all-features --doc
+      - run: cargo nextest run --workspace --all-features --profile ci
+      # nextest does not run doctests; run them separately.
+      - run: cargo test --workspace --all-features --doc
 
   build-flavors:
     name: build (${{ matrix.flavor }})
@@ -138,52 +102,30 @@ jobs:
       matrix:
         flavor: [minimal, full]
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - id: guard
-        shell: bash
-        run: |
-          if [ -f Cargo.toml ] || ls ./*/Cargo.toml >/dev/null 2>&1; then
-            echo "have_workspace=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "have_workspace=false" >> "$GITHUB_OUTPUT"
-            echo "No Cargo workspace yet — skipping build."
-          fi
-      - if: steps.guard.outputs.have_workspace == 'true'
-        uses: ./.github/actions/setup-rust
+      - uses: ./.github/actions/setup-rust
         with:
           cache-key: flavor-${{ matrix.flavor }}
       # Minimal: core builds with every extension disabled (invariant 1).
-      - if: steps.guard.outputs.have_workspace == 'true' && matrix.flavor == 'minimal'
+      - if: matrix.flavor == 'minimal'
         run: cargo build --workspace --no-default-features
-      - if: steps.guard.outputs.have_workspace == 'true' && matrix.flavor == 'full'
+      - if: matrix.flavor == 'full'
         run: cargo build --workspace --all-features
 
   minimal-deps-guard:
     name: minimal-deps-guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - id: guard
-        shell: bash
-        run: |
-          if [ -f Cargo.toml ] || ls ./*/Cargo.toml >/dev/null 2>&1; then
-            echo "have_workspace=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "have_workspace=false" >> "$GITHUB_OUTPUT"
-            echo "No Cargo workspace yet — skipping minimal-deps guard."
-          fi
-      - if: steps.guard.outputs.have_workspace == 'true'
-        uses: ./.github/actions/setup-rust
+      - uses: ./.github/actions/setup-rust
         with:
           cache-key: deps-guard
       # ARCHITECTURE.md invariant 2: no extension crate in the minimal dep graph.
-      # `roci-cli` is the assembled binary; fail if any ext/cluster crate leaks
-      # into its --no-default-features tree.
-      - if: steps.guard.outputs.have_workspace == 'true'
+      - name: Assert minimal dependency graph is extension-free
         shell: bash
         run: |
           if cargo tree -p roci-cli --no-default-features --edges normal --prefix none \
@@ -192,3 +134,37 @@ jobs:
             exit 1
           fi
           echo "minimal dep graph clean"
+
+  coverage:
+    name: coverage (100% lines)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: coverage
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@678b06b887cdbf44fa0601e5915f865e17c2241d # v2.44.60
+        with:
+          tool: cargo-llvm-cov
+      # Instrument + run tests once, then emit every report from the same data.
+      - name: Coverage gate + reports
+        run: |
+          cargo llvm-cov --workspace --all-features --no-report
+          cargo llvm-cov report --lcov --output-path lcov.info
+          cargo llvm-cov report --html --output-dir coverage-html
+          cargo llvm-cov report --summary-only | tee coverage-summary.txt
+          # Enforce the 100%-line gate from the same run.
+          cargo llvm-cov report --fail-under-lines 100
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage
+          path: |
+            lcov.info
+            coverage-html
+            coverage-summary.txt
+          if-no-files-found: ignore

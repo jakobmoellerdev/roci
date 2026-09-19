@@ -1,8 +1,7 @@
 name: codeql
 
 # CodeQL static analysis (SAST) for Rust. Uses build-mode: none — CodeQL
-# extracts from source without compiling (GA for Rust). Guarded so it is a
-# no-op until a Cargo workspace with Rust code exists.
+# extracts from source without compiling.
 
 on:
   push:
@@ -29,26 +28,15 @@ jobs:
       # Upload analysis results to the code-scanning dashboard.
       security-events: write
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - id: guard
-        shell: bash
-        run: |
-          if [ -f Cargo.toml ] || ls ./*/Cargo.toml >/dev/null 2>&1; then
-            echo "have_workspace=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "have_workspace=false" >> "$GITHUB_OUTPUT"
-            echo "No Cargo workspace yet — no Rust code to analyze; CodeQL skipped."
-          fi
       - name: Initialize CodeQL
-        if: steps.guard.outputs.have_workspace == 'true'
         uses: github/codeql-action/init@3ea06614dafe36dec890db3446326e0d40ce53d4 # v3.38.1
         with:
           languages: rust
           build-mode: none
       - name: Perform CodeQL analysis
-        if: steps.guard.outputs.have_workspace == 'true'
         uses: github/codeql-action/analyze@3ea06614dafe36dec890db3446326e0d40ce53d4 # v3.38.1
         with:
           category: "/language:rust"

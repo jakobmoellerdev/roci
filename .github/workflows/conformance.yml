@@ -13,9 +13,8 @@ concurrency:
   group: conformance-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Which OCI conformance categories to run. During early phases, set a
-# not-yet-implemented category to "0" here. All default to "1"; safe because
-# the whole job is skipped until a buildable server workspace exists.
+# Which OCI conformance categories to run. Set a category to "0" here if a
+# future change temporarily regresses it; all default to "1".
 env:
   OCI_TEST_PULL: "1"
   OCI_TEST_PUSH: "1"
@@ -28,41 +27,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Needs spec/distribution-spec/conformance/ from the pinned submodule.
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
           submodules: recursive
-      - id: guard
-        shell: bash
-        run: |
-          if [ -f Cargo.toml ] || ls ./*/Cargo.toml >/dev/null 2>&1; then
-            echo "have_workspace=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "have_workspace=false" >> "$GITHUB_OUTPUT"
-            echo "No Cargo workspace yet — no server to test; conformance skipped."
-          fi
-
-      - if: steps.guard.outputs.have_workspace == 'true'
-        uses: ./.github/actions/setup-rust
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
         with:
           cache-key: conformance
       # The conformance suite is a Go binary (requires Go 1.17+).
-      - if: steps.guard.outputs.have_workspace == 'true'
-        uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.22"
 
       - name: Build roci
-        if: steps.guard.outputs.have_workspace == 'true'
         run: cargo build --profile ci -p roci-cli --all-features
 
       - name: Start roci and wait for readiness
-        if: steps.guard.outputs.have_workspace == 'true'
         shell: bash
         run: |
           storage="$(mktemp -d)"
-          # NOTE: --storage-root / --listen are the intended CLI flags; align
-          # with roci-cli's actual arg parser once Phase 0 lands.
           ./target/ci/roci --storage-root "$storage" --listen 127.0.0.1:5000 &
           echo "ROCI_PID=$!" >> "$GITHUB_ENV"
           for _ in $(seq 1 30); do
@@ -74,12 +57,10 @@ jobs:
           echo "roci did not become ready within 30s"; exit 1
 
       - name: Build conformance binary
-        if: steps.guard.outputs.have_workspace == 'true'
         working-directory: spec/distribution-spec/conformance
         run: go test -c -o conformance.test
 
       - name: Run conformance suite
-        if: steps.guard.outputs.have_workspace == 'true'
         working-directory: spec/distribution-spec/conformance
         env:
           OCI_ROOT_URL: http://127.0.0.1:5000
@@ -89,8 +70,8 @@ jobs:
         run: ./conformance.test
 
       - name: Upload conformance report
-        if: always() && steps.guard.outputs.have_workspace == 'true'
-        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: conformance-report
           path: |
@@ -99,6 +80,6 @@ jobs:
           if-no-files-found: ignore
 
       - name: Stop roci
-        if: always() && steps.guard.outputs.have_workspace == 'true' && env.ROCI_PID != ''
+        if: always() && env.ROCI_PID != ''
         shell: bash
         run: kill "$ROCI_PID" 2>/dev/null || true

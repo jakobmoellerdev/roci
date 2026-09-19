@@ -1,0 +1,48 @@
+[package]
+name = "roci-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "roci"
+path = "src/main.rs"
+
+[dependencies]
+roci-core.workspace = true
+roci-storage.workspace = true
+roci-config.workspace = true
+roci-telemetry.workspace = true
+tokio.workspace = true
+axum.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+# Extensions are additive and feature-gated. The default build is `minimal`
+# (core + storage + config + telemetry only); no extension crate appears in the
+# minimal dependency graph (ARCHITECTURE.md invariant 2).
+roci-storage-s3 = { workspace = true, optional = true }
+roci-ext-search = { workspace = true, optional = true }
+roci-ext-sig = { workspace = true, optional = true }
+roci-ext-scan = { workspace = true, optional = true }
+roci-ext-sync = { workspace = true, optional = true }
+roci-cluster = { workspace = true, optional = true }
+
+[features]
+default = []
+s3 = ["dep:roci-storage-s3"]
+search = ["dep:roci-ext-search"]
+sig = ["dep:roci-ext-sig"]
+scan = ["dep:roci-ext-scan"]
+sync = ["dep:roci-ext-sync"]
+cluster = ["dep:roci-cluster"]
+# Convenience aggregate enabling every extension.
+full = ["s3", "search", "sig", "scan", "sync", "cluster"]
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] }

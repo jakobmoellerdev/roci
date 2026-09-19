@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="140" viewBox="0 0 400 140" role="img" aria-label="roci">
+  <title>roci (monochrome black)</title>
+  <g fill="#12161C" stroke="#12161C">
+    <g transform="translate(20 20)">
+      <path d="M50 4 L92 28 V76 L50 100 L8 76 V28 Z"
+            fill="none" stroke-width="6" stroke-linejoin="round"/>
+      <g stroke-linejoin="round">
+        <rect x="30" y="34" width="40" height="12" rx="3" stroke="none"/>
+        <rect x="30" y="50" width="40" height="12" rx="3" stroke="none"/>
+        <rect x="30" y="66" width="40" height="12" rx="3" stroke="none"/>
+      </g>
+    </g>
+    <text x="130" y="88" stroke="none"
+          font-family="'SF Mono','JetBrains Mono','DejaVu Sans Mono',ui-monospace,monospace"
+          font-size="72" font-weight="700" letter-spacing="-2">roci</text>
+  </g>
+</svg>

@@ -1,0 +1,19 @@
+# Rust build artifacts.
+/target
+**/*.rs.bk
+
+# Coverage artifacts (cargo-llvm-cov). COVERAGE.md is committed; these are not.
+/lcov.info
+/coverage-html
+/coverage-summary.txt
+*.profraw
+*.profdata
+
+# Compiled conformance test binary (built on demand from the submodule).
+/spec/distribution-spec/conformance/conformance.test
+
+# Local roci data directories.
+/roci-data
+
+# Editor/OS noise.
+.DS_Store

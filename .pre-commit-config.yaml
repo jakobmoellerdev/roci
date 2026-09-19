@@ -1,0 +1,46 @@
+# Pre-commit hooks for roci (https://pre-commit.com).
+#
+# Install once: `pip install pre-commit && pre-commit install`
+# (or run `just hooks` to install the equivalent native git hook without the
+# pre-commit framework).
+#
+# These mirror the most important CI gates so a bad commit is caught locally.
+# Coverage is regenerated and the report/badge re-staged on every commit.
+repos:
+  - repo: local
+    hooks:
+      - id: rustfmt
+        name: rustfmt
+        entry: cargo fmt --all --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: clippy
+        name: clippy (all features + minimal)
+        entry: bash -c 'cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo clippy --workspace --no-default-features -- -D warnings'
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: actionlint
+        name: actionlint
+        entry: actionlint
+        language: system
+        files: ^\.github/(workflows|actions)/
+        pass_filenames: false
+
+      - id: zizmor
+        name: zizmor
+        entry: zizmor --config .github/zizmor.yml .github/workflows .github/actions
+        language: system
+        files: ^\.github/(workflows|actions)/
+        pass_filenames: false
+
+      - id: coverage
+        name: coverage (100% lines) + report refresh
+        entry: bash scripts/coverage.sh
+        language: system
+        types: [rust]
+        pass_filenames: false
+        # Regenerates COVERAGE.md + README badge; stage them if the hook changes them.

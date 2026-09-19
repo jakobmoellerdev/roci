@@ -1,0 +1,25 @@
+[package]
+name = "roci-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+roci-storage.workspace = true
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+serde_urlencoded = "0.7"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile.workspace = true
+tower = { workspace = true, features = ["util"] }
+serde_json.workspace = true
+http-body-util = "0.1"

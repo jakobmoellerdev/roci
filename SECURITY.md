@@ -20,6 +20,8 @@ roci adopts zot's **defense-in-depth** philosophy: layered, industry-standard co
 - **Adversaries:** unauthenticated network clients; authenticated-but-unauthorized users attempting cross-repo access; malicious content pushers; slow/abusive connections (DoS); attackers exploiting memory-safety or dependency vulnerabilities.
 - **Out of scope:** host OS hardening, network perimeter, physical security, compromised admin.
 
+The two untrusted-input trust boundaries — the **HTTP request boundary** and the **storage boundary** — are analyzed concretely in their own sections below (attack class → control), grounded in real registry CVEs/GHSAs (see §Tracked prior-art CVE classes).
+
 ## Build-time hardening
 
 ### Memory safety (roci's strongest divergence)
@@ -99,6 +101,33 @@ After authentication, roci allows or denies a specific **action** by a **user/id
 - **Image signatures (extensions).** cosign and notation signatures stored/served via the referrers API; verification hooks let policy require valid signatures.
 - **Vulnerability scanning (extension).** Trivy integration scans stored images; the vuln DB is refreshed on a configurable interval by the background scheduler. The scanner implementation is abstracted so it can change without user-facing impact.
 
+## HTTP request-boundary controls
+
+The HTTP edge is the primary untrusted-input boundary. Every control below is a **design requirement enforced before any storage or filesystem operation**; verdicts and CVE references come from an adversarial boundary review (`[refined from research]`).
+
+- **Name / reference / digest validation before any path construction.** `RepositoryName`, `Reference`, and upload-session IDs MUST be parsed against their dist-spec grammars *before* a filesystem path is built from them (`RepositoryName` `[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(\/…)*` ≤255 chars; `Reference` tag `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}` or a digest). The spec name grammar excludes `..` by construction, so enforcing it is both spec-correct and traversal-proof; digest hex is charset-locked (`[a-f0-9]{64|128}`) so `blobs/<alg>/<hex>` can never contain a separator or `..`. Reject invalid input with `NAME_INVALID`/`DIGEST_INVALID`. **Defence-in-depth:** a `Storage`-layer backstop rejects any path component that is `..`, `.`, or contains `NUL`, even if the edge validated. (CVE-2021-21334 / GHSA-hmfx-3pcx-653p containerd path traversal; GHSA-qq97-vm5h-rrhg distribution name sanitisation; Harbor CVE-2019-3990.)
+- **Wire digest algorithm allowlist.** Only `sha256` and `sha512` are accepted as wire digests; SHA-1/MD5/any unregistered algorithm → `DIGEST_INVALID` at parse time. **BLAKE3 is internal-only (scrub, Bao tree) and MUST NEVER appear as a wire/descriptor digest** — the referrers-index update path asserts every stored descriptor digest is in the allowlist (else a BLAKE3-unaware client silently skips verification = integrity bypass). (SHAttered 2017; OCI descriptor grammar.)
+- **Cross-repo mount is double-authorized.** `POST …?mount=<digest>&from=<src>` (`end-11`) requires **pull on `<src>` AND push on the destination repo — two independent checks**, the source check *before* the blob is read. Checking only the destination lets a blob be exfiltrated from a private source into a readable destination. (Harbor GHSA-r4cx-r72v-m728; zot documents this class.)
+- **Per-method authorization matrix + scope binding.** GET/HEAD⇒pull, POST/PATCH/PUT⇒push, DELETE⇒delete, checked per endpoint. Bearer-token `repository:<name>:<action>` scope is validated against the actual request path+method (constant-time name compare), never merely "a token is present." Anonymous-pull vs authenticated-push is enforced per endpoint. (CVE-2020-13401 scope confusion; GHSA-phw4-mc57-4hwc JWT signing-key injection; GHSA-3p65-76g6-3w7r pull-through credential exfiltration.)
+- **SSRF / open-redirect containment.** roci never fetches a client- or manifest-supplied URL: `descriptor.urls` is not dereferenced; `subject`/`from` are repo names, not URLs. The 307 signed-URL redirect (remote backend) is emitted only after repo-membership verification, to a host matching a configured allowlist (never `169.254.169.254`/RFC-1918/link-local), with a short (≤60 s) blob-scoped signature. The `sync` extension validates upstream URLs at config load (public `https://` only; reject metadata/loopback/private ranges) and MUST NOT accept invalid TLS certs. (CVE-2022-24878 Flux, CVE-2023-45288 containerd pull-through, Harbor GHSA-jfh8-c2jp-hdph.)
+- **Request-smuggling / desync hygiene.** HTTP/2 (frame-length framed) is the default and immune to CL/TE confusion; HTTP/1.1 keep-alive follows RFC 7230 (TE wins). Operators are warned that HTTP/1.1 behind a TE/CL-ambiguous proxy is a smuggling risk (prefer HTTP/2-only or a correct proxy). `Location`/response headers are built only from validated repo/id (no CRLF injection); header construction never `unwrap()`s attacker input into a panic. `hyper` is pinned past **CVE-2023-44487 / GHSA-rr69-rxr6-8qwv** (HTTP/2 Rapid Reset) and tracked by `cargo audit`.
+- **DoS bounds (see also §DoS in Storage boundary).** Separate **manifest size cap** (default ≤4 MiB, distinct from the blob cap) checked before JSON parse; bounded JSON recursion depth; per-session upload size cap; `n`/pagination parameters on tag-list and referrers capped server-side (never allocate `O(n)` from a client integer); wired read/write timeouts + per-method rate limits. (CVE-2023-2253 / GHSA-hqxw-f8mx-cpmw catalog `n` OOM; GHSA-259w-8hf6-59bj referrers amplification.)
+- **Cache-poisoning split (tag vs digest).** Manifest-by-**tag** responses are mutable → `Cache-Control: no-cache`/`must-revalidate`, no immutable ETag. Manifest/blob-by-**digest** responses are immutable → `ETag: "<digest>"`, `Cache-Control: immutable, max-age=31536000`, `If-None-Match`→`304`. Filtered referrers responses set an appropriate `Vary`. A mutable tag must never be cacheable as immutable. (GHSA-77mh-r6f6-crvq containerd cache poisoning; ARCHITECTURE invariant 14.)
+- **TLS / 0-RTT.** Non-idempotent requests (POST/PATCH/PUT/DELETE) carrying TLS 1.3 `Early-Data` are rejected with `425 Too Early` (RFC 8470) — only idempotent GET/HEAD may use 0-RTT. kTLS fallback to userspace TLS is logged and alertable (`registry.sendfile.zerocopy{result=fallback}`), never silent. Cluster-peer mTLS uses a per-cluster CA / cert pinning; `accept_invalid_certs` is prohibited in sync and cluster configs. (RFC 8470; CVE-2022-26945 go-getter TLS bypass.)
+
+## Storage-boundary controls
+
+Everything operating on files derived from untrusted input. Content addressing is the structural backbone: the CAS path is a pure function of a validated digest, so substituting a blob's content changes its digest and thus its path — **content substitution in place is structurally impossible**.
+
+- **Digest verified before promotion.** Upload streams into an anonymous `O_TMPFILE` inode with hash-on-write; the digest is verified **before** `linkat` promotes it into the CAS namespace. Because the inode is namespace-invisible until `linkat`, there is **no TOCTOU window** and no partially-verified blob is ever readable. At manifest PUT, referenced-blob existence is checked (`MANIFEST_BLOB_UNKNOWN` on miss); `Content-Type` MUST agree with the manifest `mediaType` field to prevent type confusion (CVE-2021-41190 / GHSA-qq97-vm5h-rrhg).
+- **Symlink-escape backstop.** Blob opens use `O_NOFOLLOW`; on Linux ≥5.6, `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` is a kernel-enforced guarantee that no digest-derived path escapes the CAS root or follows a planted symlink — defence-in-depth even though the charset-locked digest already makes the path safe. Blob fds are never opened `O_RDWR` after promotion.
+- **Reflink over hardlink (a security choice).** Dedup uses reflink (`FICLONE`) — independent deletion, no write-through-shared-inode hazard. On filesystems without reflink (ext4/NFS) the automatic hardlink fallback is logged; the shared-inode write-through risk is bounded by never opening blob fds for writing. `copy_file_range` (cross-repo mount) operates only on validated, `O_NOFOLLOW`-opened fds.
+- **Cross-repo isolation is authoritative, not advisory.** The global existence filter and the small-blob content cache are **fast-path optimizations, never the sole authority for a `200`**: a HEAD/GET first confirms repo membership in the metadata index, so a globally-present blob in another repo yields `404`, closing the **presence/content oracle** (directly analogous to **GHSA-f2g3-hh2r-cwgc** cross-repo cache resurrection). The small-blob cache is keyed by `(repo, digest)` (or membership-checked post-lookup). Repo-local-by-default reads (`hydrateBlobOnRead=false`) stand; 307 redirects are repo-membership-gated.
+- **GC as an integrity property.** A blob is collected only when unreferenced **and** past its grace period **and** not pinned by an in-flight upload (defends the Harbor in-flight-deletion class). Manifest commit + blob backref update are one atomic WAL record so a crash never desynchronizes them; a startup consistency check verifies every referenced blob is in the backref map before GC is enabled. **All delete paths** (blob-by-digest, tag, referrer) pass through a single `can_delete()` guard so `delete.enabled=false` cannot be bypassed via an alternate path (CVE-2026-41888 / GHSA-6pjf-3r9x-m592).
+- **Blobs are opaque bytes — never parsed by media type.** roci NEVER decompresses, extracts, or parses layer/artifact blob content (tar, gzip, zstd, Nydus RAFS, eStargz, SBOM, signatures) — no server-side zip/tar-bomb surface. The **only** server-side parsing is manifest/image-config JSON (bounded: size cap, recursion-depth cap, deterministic duplicate-key handling) and roci's own WAL.
+- **Quota / exhaustion.** Per-repo and per-total storage quotas (`max_repo_bytes`, `max_total_bytes`) are checked at blob finalize (`507`/`413` when exceeded); concurrent-upload-session count is capped; list-endpoint `n` is capped. Prevents a single push from filling the disk and denying all clients.
+- **Metadata is a rebuildable cache, never trusted over the CAS.** The WAL, rkyv snapshot, and filters are derived state — a blob GET always opens the content-addressed file, so a tampered index can at worst mis-map a tag to a *different existing* blob (which a digest-verifying client detects), never forge arbitrary content. Under a "compromised storage volume" threat model, the WAL/snapshot get an optional **HMAC** (per-deployment key) since CRC32C authenticates nothing against an adversary; the rkyv snapshot carries an integrity header verified before any zero-copy cast (a crafted snapshot is otherwise UB).
+
 ## Secrets handling
 
 - Sensitive config (backend credentials, LDAP bind password, token signing keys) MAY live in separate referenced files with stricter filesystem permissions, and mount as Kubernetes Secrets (zot config model).
@@ -114,6 +143,32 @@ After authentication, roci allows or denies a specific **action** by a **user/id
 5. No blob is fully buffered in memory; upload/download memory is bounded regardless of client behavior.
 6. `roci-minimal` carries the minimum dependency set required for a conformant registry.
 7. `unsafe` code is confined to audited modules and CI-gated.
+8. `RepositoryName`, `Reference`, and upload-session IDs are validated against their spec grammars before any filesystem path is constructed from them; a `Storage`-layer backstop rejects `..`/`.`/`NUL` path components.
+9. Only `sha256`/`sha512` are wire digests; BLAKE3 is internal-only and never a wire/descriptor digest.
+10. The existence filter and small-blob cache are never the sole authority for a `200`; repo membership is confirmed before serving cross-repo-shared content (no presence/content oracle).
+11. Cross-repo mount authorizes both source (pull) and destination (push); 307 redirects are repo-membership-gated and host-allowlisted.
+12. All delete operations (blob/tag/referrer) pass through one `can_delete()` guard; `delete.enabled=false` cannot be bypassed by an alternate path.
+13. Blob content is never parsed/decompressed by media type; only manifest/config JSON is parsed, under size + depth + duplicate-key bounds.
+14. Every client-supplied count/size (`n`, manifest size, upload total) is bounded before allocation; timeouts and per-method rate limits are wired.
+
+## Tracked prior-art CVE classes (regression targets)
+
+Real registry advisories that the boundary controls above defend; each is a CI/test regression target.
+
+| Class | Advisory | roci control |
+| --- | --- | --- |
+| Path traversal via name/layer | CVE-2021-21334, GHSA-hmfx-3pcx-653p, GHSA-qq97-vm5h-rrhg, Harbor CVE-2019-3990 | grammar validation before path construction (inv. 8) |
+| Manifest type confusion | CVE-2021-41190 / GHSA-qq97-vm5h-rrhg | `Content-Type`↔`mediaType` agreement; digest allowlist (inv. 9) |
+| Cross-repo mount authz bypass | Harbor GHSA-r4cx-r72v-m728 | double-authz mount (inv. 11) |
+| Token scope confusion / JWT key injection | CVE-2020-13401, GHSA-phw4-mc57-4hwc | per-request scope binding |
+| Pull-through credential exfiltration / SSRF | GHSA-3p65-76g6-3w7r, CVE-2022-24878, CVE-2023-45288, Harbor GHSA-jfh8-c2jp-hdph | no client-URL fetch; 307 allowlist; sync URL validation |
+| HTTP/2 Rapid Reset | CVE-2023-44487 / GHSA-rr69-rxr6-8qwv | pinned patched `hyper`; `cargo audit` gate |
+| Unbounded allocation / OOM | CVE-2023-2253 / GHSA-hqxw-f8mx-cpmw, GHSA-259w-8hf6-59bj | manifest size + `n` caps (inv. 14) |
+| Cross-repo cache resurrection oracle | GHSA-f2g3-hh2r-cwgc | membership check before cache/filter `200` (inv. 10) |
+| Delete-control bypass | CVE-2026-41888 / GHSA-6pjf-3r9x-m592 | single `can_delete()` guard (inv. 12) |
+| Cache poisoning (mutable tag cached immutable) | GHSA-77mh-r6f6-crvq | tag/digest cache-control split |
+| Digest downgrade (SHA-1) | SHAttered 2017 | wire digest allowlist (inv. 9) |
+| TLS/0-RTT replay, cert-validation bypass | RFC 8470, CVE-2022-26945 | `425 Too Early` on non-idempotent; no `accept_invalid_certs` |
 
 ## Reporting security issues
 

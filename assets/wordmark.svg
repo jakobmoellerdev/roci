@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="280" height="100" viewBox="0 0 280 100" role="img" aria-label="roci">
+  <title>roci wordmark</title>
+  <defs>
+    <linearGradient id="rust" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F4713B"/>
+      <stop offset="1" stop-color="#CE422B"/>
+    </linearGradient>
+  </defs>
+  <text x="10" y="72"
+        font-family="'SF Mono','JetBrains Mono','DejaVu Sans Mono',ui-monospace,monospace"
+        font-size="72" font-weight="700" letter-spacing="-2">
+    <tspan fill="url(#rust)">r</tspan><tspan fill="#5B6875">oci</tspan>
+  </text>
+</svg>
