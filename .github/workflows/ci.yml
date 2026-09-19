@@ -86,7 +86,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: test
-      - uses: taiki-e/install-action@678b06b887cdbf44fa0601e5915f865e17c2241d # v2.44.60
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: nextest
       # nextest is faster and gives better flaky isolation than `cargo test`.
@@ -146,7 +146,7 @@ jobs:
         with:
           cache-key: coverage
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@678b06b887cdbf44fa0601e5915f865e17c2241d # v2.44.60
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-llvm-cov
       # Instrument + run tests once, then emit every report from the same data.
