@@ -178,6 +178,12 @@ impl From<StorageError> for ApiError {
             StorageError::BadPath(p) => {
                 ApiError::name_invalid(format!("unsafe path component: {p}"))
             }
+            // The upload endpoints translate this to a 416 with a Range header
+            // at the call site; the generic fallback is a 400 BLOB_UPLOAD_INVALID.
+            StorageError::RangeNotSatisfiable { .. } => ApiError::new(
+                ErrorCode::BlobUploadInvalid,
+                "content range does not match offset",
+            ),
             StorageError::Io(_) => ApiError::Internal("internal error".to_string()),
         }
     }
@@ -260,6 +266,14 @@ mod tests {
             })
             .code(),
             "DIGEST_INVALID"
+        );
+        assert_eq!(
+            ApiError::from(StorageError::RangeNotSatisfiable {
+                expected: 3,
+                got: 0
+            })
+            .code(),
+            "BLOB_UPLOAD_INVALID"
         );
         let io = StorageError::Io(std::io::Error::other("x"));
         assert_eq!(ApiError::from(io).code(), "UNKNOWN");

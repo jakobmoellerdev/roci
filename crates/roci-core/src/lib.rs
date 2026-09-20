@@ -952,13 +952,9 @@ async fn patch_upload<S: Storage>(
     id: &str,
     req: Request,
 ) -> Response {
-    // Current committed size of the session.
-    let current = match st.storage.upload_size(repo, id).await {
-        Ok(s) => s,
-        Err(e) => return map_storage_err(e),
-    };
-    // If the client supplied a Content-Range, its start MUST equal the current
-    // offset; out-of-order or retried chunks are rejected with 416.
+    // Parse a Content-Range start offset, if supplied; the storage layer
+    // enforces it against the current size *atomically under the session lock*
+    // (a pre-check here would race two concurrent PATCHes with the same range).
     let range_start = req
         .headers()
         .get(header::CONTENT_RANGE)
@@ -966,8 +962,15 @@ async fn patch_upload<S: Storage>(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split('-').next())
         .and_then(|s| s.trim().parse::<u64>().ok());
-    if let Some(start) = range_start {
-        if start != current {
+    let body = match read_body_limited(req, st.max_body).await {
+        Ok(b) => b,
+        Err(resp) => return *resp,
+    };
+    let total = match st.storage.append_upload(repo, id, &body, range_start).await {
+        Ok(t) => t,
+        // The atomic under-lock offset check rejects a concurrent/duplicate
+        // chunk the pre-check above raced past → 416 with the current range.
+        Err(StorageError::RangeNotSatisfiable { expected, .. }) => {
             let mut headers = HeaderMap::new();
             headers.insert(
                 header::LOCATION,
@@ -975,17 +978,10 @@ async fn patch_upload<S: Storage>(
             );
             headers.insert(
                 "range",
-                HeaderValue::from_str(&format!("0-{}", current.saturating_sub(1))).unwrap(),
+                HeaderValue::from_str(&format!("0-{}", expected.saturating_sub(1))).unwrap(),
             );
             return (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response();
         }
-    }
-    let body = match read_body_limited(req, st.max_body).await {
-        Ok(b) => b,
-        Err(resp) => return *resp,
-    };
-    let total = match st.storage.append_upload(repo, id, &body).await {
-        Ok(t) => t,
         Err(e) => return map_storage_err(e),
     };
     // Reject a session whose cumulative size exceeds the per-upload cap: drop
@@ -1030,7 +1026,7 @@ async fn finish_upload<S: Storage>(
         Err(resp) => return *resp,
     };
     if !body.is_empty() {
-        let total = match st.storage.append_upload(repo, id, &body).await {
+        let total = match st.storage.append_upload(repo, id, &body, None).await {
             Ok(t) => t,
             Err(e) => return map_storage_err(e),
         };
@@ -2517,7 +2513,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(put.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // finish_upload's non-regular-file guard rejects a directory session as
+        // a bad path (400 NAME_INVALID) before hashing, rather than a generic 500.
+        assert_eq!(put.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

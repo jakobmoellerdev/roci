@@ -258,25 +258,24 @@ impl MetadataStore for LogMetadataStore {
     }
 
     fn apply(&self, op: MetaOp) -> io::Result<()> {
-        // Durably record first, then reflect the mutation in RAM: applying only
-        // after the fdatasync succeeds keeps the in-memory maps consistent with
-        // what a restart would replay (a failed barrier must not leave a
-        // mutation visible in-process that then vanishes on restart).
+        // Append the record and reflect it in RAM under one lock (so the
+        // in-memory maps always match log-replay order even under concurrent
+        // appends), then coalesce the durability barrier. The in-RAM maps are a
+        // rebuildable cache and the log is the source of truth: if the barrier
+        // fails, the record is already in the log (replayed on restart) and the
+        // in-RAM state already matches that replay — the caller gets the error.
         let my_seq = self.append_record(&op)?;
-        self.group_commit_through(my_seq)?;
-        let mut state = self.inner.lock().expect("metadata lock poisoned");
-        Self::apply_in_ram(&mut state, &op);
-        Ok(())
+        self.group_commit_through(my_seq)
     }
 }
 
 impl LogMetadataStore {
     /// Phase 1 of a group-committed apply: under the fast `inner` lock, buffer
-    /// the record into the kernel (write + flush, no fsync) and return this
-    /// write's monotonic sequence number. Does NOT touch the in-RAM maps — the
-    /// caller applies those only after durability is confirmed. On the first
-    /// mutation, open the log and hand a `sync_data`-capable clone to the
-    /// durability coordinator.
+    /// the record into the kernel (write + flush, no fsync), apply it to the
+    /// in-RAM maps **in append order** (same lock → no reordering across
+    /// concurrent callers), and return this write's monotonic sequence number.
+    /// On the first mutation, open the log and hand a `sync_data`-capable clone
+    /// to the durability coordinator.
     fn append_record(&self, op: &MetaOp) -> io::Result<u64> {
         let record = encode(op);
         let mut state = self.inner.lock().expect("metadata lock poisoned");
@@ -292,7 +291,9 @@ impl LogMetadataStore {
         let log = state.log.as_mut().expect("log opened above");
         log.write_all(&record)?;
         log.flush()?;
-        Ok(self.appended.fetch_add(1, Ordering::AcqRel) + 1)
+        let seq = self.appended.fetch_add(1, Ordering::AcqRel) + 1;
+        Self::apply_in_ram(&mut state, op);
+        Ok(seq)
     }
 
     /// Phase 2 of a group-committed apply: the coalesced durability barrier.

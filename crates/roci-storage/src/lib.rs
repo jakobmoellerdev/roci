@@ -96,6 +96,8 @@ pub enum StorageError {
     Io(#[from] io::Error),
     #[error("unsafe path component: {0}")]
     BadPath(String),
+    #[error("content range start {got} does not match current offset {expected}")]
+    RangeNotSatisfiable { expected: u64, got: u64 },
 }
 
 /// A resolved reference target: either a tag pointing at a manifest digest, or
@@ -140,12 +142,17 @@ pub trait Storage: Send + Sync + 'static {
     /// Begin a chunked upload session, returning its id.
     fn begin_upload(&self, repo: &str)
         -> impl Future<Output = Result<String, StorageError>> + Send;
-    /// Append bytes to an upload session, returning the new total size.
+    /// Append bytes to an upload session, returning the new total size. When
+    /// `expected_offset` is `Some(n)`, the current committed size MUST equal
+    /// `n` (a `Content-Range` precondition checked *inside* the session lock so
+    /// two concurrent PATCHes cannot both pass an out-of-lock check) — a
+    /// mismatch yields [`StorageError::RangeNotSatisfiable`].
     fn append_upload(
         &self,
         repo: &str,
         id: &str,
         chunk: &[u8],
+        expected_offset: Option<u64>,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send;
     /// Current size of an in-progress upload.
     fn upload_size(
@@ -311,13 +318,21 @@ impl FsStorage {
 
     /// The async lock for one upload session, creating it on first use. Held
     /// across `append`/`finish`/`abort` so those never interleave on one id.
-    fn session_lock(&self, repo: &str, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    /// The id is validated *before* an entry is created, so a stream of
+    /// syntactically-invalid ids cannot leak lock-map entries; a caller that
+    /// then finds no session drops the entry on its error path.
+    fn session_lock(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>, StorageError> {
+        Self::safe_component(id)?;
         let mut locks = self.upload_locks.lock().expect("upload-locks poisoned");
-        Arc::clone(
+        Ok(Arc::clone(
             locks
                 .entry((repo.to_string(), id.to_string()))
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        )
+        ))
     }
 
     /// Drop a finished/aborted session's lock entry so the map does not grow
@@ -755,17 +770,40 @@ impl Storage for FsStorage {
         Ok(id)
     }
 
-    async fn append_upload(&self, repo: &str, id: &str, chunk: &[u8]) -> Result<u64, StorageError> {
-        // Serialize with any concurrent finish/abort on this session so bytes
-        // cannot be appended between a finish's hash-verify and its promote.
-        let lock = self.session_lock(repo, id);
+    async fn append_upload(
+        &self,
+        repo: &str,
+        id: &str,
+        chunk: &[u8],
+        expected_offset: Option<u64>,
+    ) -> Result<u64, StorageError> {
+        // Serialize with any concurrent append/finish/abort on this session so
+        // bytes cannot be appended between a finish's hash-verify and its
+        // promote, and so the Content-Range offset check below is atomic with
+        // the append (two concurrent PATCHes cannot both pass it).
+        let lock = self.session_lock(repo, id)?;
         let _guard = lock.lock().await;
         let path = self.upload_path(repo, id)?;
-        let mut f = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .await
-            .map_err(map_not_found)?;
+        let mut f = match tokio::fs::OpenOptions::new().append(true).open(&path).await {
+            Ok(f) => f,
+            Err(e) => {
+                // No such session: drop the just-created lock entry so a stream
+                // of unknown ids cannot leak lock-map entries.
+                self.drop_session_lock(repo, id);
+                return Err(map_not_found(e));
+            }
+        };
+        // Enforce the Content-Range precondition under the lock: the current
+        // committed size must equal the client-declared start offset.
+        if let Some(offset) = expected_offset {
+            let current = f.metadata().await?.len();
+            if current != offset {
+                return Err(StorageError::RangeNotSatisfiable {
+                    expected: current,
+                    got: offset,
+                });
+            }
+        }
         f.write_all(chunk).await?;
         f.flush().await?;
         Ok(f.metadata().await?.len())
@@ -786,9 +824,23 @@ impl Storage for FsStorage {
     ) -> Result<(), StorageError> {
         // Hold the session lock across the whole verify+promote so a concurrent
         // append cannot inject unverified bytes between the hash and the rename.
-        let lock = self.session_lock(repo, id);
+        let lock = self.session_lock(repo, id)?;
         let _guard = lock.lock().await;
         let staging = self.upload_path(repo, id)?;
+        // Reject a staging entry that is not a regular file (e.g. a symlink
+        // planted into the uploads dir): `symlink_metadata` does not follow, so
+        // a non-regular entry never gets hashed-through and promoted into the
+        // CAS. Interim stand-in for `O_NOFOLLOW`/`openat2 RESOLVE_BENEATH`.
+        let st_meta = tokio::fs::symlink_metadata(&staging)
+            .await
+            .map_err(map_not_found)?;
+        if !st_meta.is_file() {
+            let _ = tokio::fs::remove_file(&staging).await;
+            self.drop_session_lock(repo, id);
+            return Err(StorageError::BadPath(format!(
+                "upload {id} is not a regular file"
+            )));
+        }
         // Stream-hash the staging file (no full-blob buffer), verifying it
         // matches the client-declared digest before promoting it.
         let actual = hash_file(&staging, expected.algorithm())
@@ -845,7 +897,7 @@ impl Storage for FsStorage {
 
     async fn abort_upload(&self, repo: &str, id: &str) -> Result<bool, StorageError> {
         // Serialize with any concurrent append/finish, then drop the session.
-        let lock = self.session_lock(repo, id);
+        let lock = self.session_lock(repo, id)?;
         let guard = lock.lock().await;
         // Idempotent: a missing session is `Ok(false)` (nothing removed).
         let removed = match tokio::fs::remove_file(self.upload_path(repo, id)?).await {
@@ -1161,13 +1213,19 @@ impl Storage for FsStorage {
                 .join(digest.algorithm()),
         )
         .await?;
-        // Promote by a hard link — O(1) and copy-free on one filesystem. On any
-        // failure (a destination that already exists from a concurrent/repeat
-        // mount, a cross-device link, or a filesystem without hard links) fall
-        // back to a byte copy; `copy` streams and overwrites, so a re-mount of
-        // identical content is harmless.
-        if tokio::fs::hard_link(&src, &dest).await.is_err() {
-            tokio::fs::copy(&src, &dest).await?;
+        // Promote by a hard link — O(1), copy-free on one filesystem. A
+        // destination that already exists (a concurrent or repeat mount) is a
+        // success: blobs are content-addressed, so the existing file is already
+        // the correct bytes — never copy over it (that would truncate a
+        // hard-linked source). Any other link failure (cross-device, or a
+        // filesystem without hard links) means the blob cannot be cheaply
+        // mounted here; report it not-mounted so the caller falls back to a
+        // normal upload session (dist-spec end-11 permits a `202`) — we never
+        // write a partial blob directly under its digest.
+        match tokio::fs::hard_link(&src, &dest).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Ok(false),
         }
         let digest_str = digest.as_string();
         self.presence.insert(to_repo, &digest_str);
@@ -1238,7 +1296,7 @@ mod tests {
             Err(StorageError::NotFound)
         ));
         assert!(matches!(
-            s.append_upload("r", "../evil", b"x").await,
+            s.append_upload("r", "../evil", b"x", None).await,
             Err(StorageError::BadPath(_))
         ));
         // BadPath renders a message.
@@ -1271,8 +1329,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = FsStorage::new(dir.path()).unwrap();
         let id = s.begin_upload("r").await.unwrap();
-        s.append_upload("r", &id, b"chunk1").await.unwrap();
-        let total = s.append_upload("r", &id, b"chunk2").await.unwrap();
+        s.append_upload("r", &id, b"chunk1", None).await.unwrap();
+        let total = s.append_upload("r", &id, b"chunk2", None).await.unwrap();
         assert_eq!(total, 12);
         let d = sha256_of(b"chunk1chunk2");
         s.finish_upload("r", &id, &d).await.unwrap();
@@ -1375,7 +1433,7 @@ mod tests {
 
         // finish_upload with a wrong expected digest is rejected.
         let id = s.begin_upload("r").await.unwrap();
-        s.append_upload("r", &id, b"abc").await.unwrap();
+        s.append_upload("r", &id, b"abc", None).await.unwrap();
         let wrong = sha256_of(b"xyz");
         assert!(matches!(
             s.finish_upload("r", &id, &wrong).await,
@@ -1387,7 +1445,7 @@ mod tests {
             Err(StorageError::NotFound)
         ));
         assert!(matches!(
-            s.append_upload("r", "nope", b"x").await,
+            s.append_upload("r", "nope", b"x", None).await,
             Err(StorageError::NotFound)
         ));
     }
@@ -1473,14 +1531,14 @@ mod tests {
     async fn upload_size_errors_when_session_path_is_a_dir() {
         let dir = tempfile::tempdir().unwrap();
         let s = FsStorage::new(dir.path()).unwrap();
-        // Create an "upload" that is actually a directory; metadata succeeds but
-        // finish_upload's read fails. Directly exercise the read error.
+        // Create an "upload" that is actually a directory; finish_upload's
+        // non-regular-file guard rejects it as a bad path before hashing.
         let up = dir.path().join("r").join("uploads").join("dir-session");
         std::fs::create_dir_all(&up).unwrap();
         let d = sha256_of(b"x");
         assert!(matches!(
             s.finish_upload("r", "dir-session", &d).await,
-            Err(StorageError::Io(_))
+            Err(StorageError::BadPath(_))
         ));
     }
 
@@ -1864,10 +1922,10 @@ mod tests {
         let data = vec![0x5au8; 1024 * 1024];
         let d = sha256_of(&data);
         let id = s.begin_upload("r").await.unwrap();
-        s.append_upload("r", &id, &data[..512 * 1024])
+        s.append_upload("r", &id, &data[..512 * 1024], None)
             .await
             .unwrap();
-        s.append_upload("r", &id, &data[512 * 1024..])
+        s.append_upload("r", &id, &data[512 * 1024..], None)
             .await
             .unwrap();
         s.finish_upload("r", &id, &d).await.unwrap();
@@ -1883,7 +1941,7 @@ mod tests {
         // A finish whose bytes do not hash to the declared digest is rejected
         // and drops the staging file.
         let id2 = s.begin_upload("r").await.unwrap();
-        s.append_upload("r", &id2, b"mismatch").await.unwrap();
+        s.append_upload("r", &id2, b"mismatch", None).await.unwrap();
         assert!(matches!(
             s.finish_upload("r", &id2, &d).await,
             Err(StorageError::DigestMismatch { .. })
@@ -1967,15 +2025,112 @@ mod tests {
         let d = digest_of(data, "sha512");
         assert_eq!(d.algorithm(), "sha512");
         let id = s.begin_upload("r").await.unwrap();
-        s.append_upload("r", &id, data).await.unwrap();
+        s.append_upload("r", &id, data, None).await.unwrap();
         s.finish_upload("r", &id, &d).await.unwrap();
         assert_eq!(s.read_blob("r", &d).await.unwrap(), data);
         // A sha512 mismatch is rejected by the streamed verify.
         let id2 = s.begin_upload("r").await.unwrap();
-        s.append_upload("r", &id2, b"different").await.unwrap();
+        s.append_upload("r", &id2, b"different", None)
+            .await
+            .unwrap();
         assert!(matches!(
             s.finish_upload("r", &id2, &d).await,
             Err(StorageError::DigestMismatch { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn append_upload_enforces_content_range_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let id = s.begin_upload("r").await.unwrap();
+        // First chunk at offset 0 is accepted.
+        assert_eq!(s.append_upload("r", &id, b"abc", Some(0)).await.unwrap(), 3);
+        // A chunk whose declared offset does not match the current size (3) is
+        // rejected under the lock.
+        assert!(matches!(
+            s.append_upload("r", &id, b"de", Some(0)).await,
+            Err(StorageError::RangeNotSatisfiable {
+                expected: 3,
+                got: 0
+            })
+        ));
+        // The correct offset (3) is accepted.
+        assert_eq!(s.append_upload("r", &id, b"de", Some(3)).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn upload_ops_reject_invalid_id_and_do_not_leak_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        // A traversal id is rejected by session_lock's validation on every op,
+        // before any lock-map entry is created.
+        assert!(matches!(
+            s.append_upload("r", "../evil", b"x", None).await,
+            Err(StorageError::BadPath(_))
+        ));
+        let d = sha256_of(b"x");
+        assert!(matches!(
+            s.finish_upload("r", "../evil", &d).await,
+            Err(StorageError::BadPath(_))
+        ));
+        assert!(matches!(
+            s.abort_upload("r", "../evil").await,
+            Err(StorageError::BadPath(_))
+        ));
+        // A valid-but-unknown session id: append errors NotFound and drops the
+        // lock entry it created, so the map does not grow per unknown id.
+        assert!(matches!(
+            s.append_upload("r", "deadbeef", b"x", None).await,
+            Err(StorageError::NotFound)
+        ));
+        assert!(s
+            .upload_locks
+            .lock()
+            .unwrap()
+            .get(&("r".to_string(), "deadbeef".to_string()))
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mount_falls_back_to_session_when_hard_link_fails() {
+        // A hard-link failure that is not AlreadyExists (here: a read-only
+        // destination alg dir → EACCES) reports the blob not-mounted so the
+        // caller falls back to a normal upload session — never a partial copy.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let data = b"mountable";
+        let d = sha256_of(data);
+        s.put_blob("src", &d, data).await.unwrap();
+        // Pre-create dst's blobs/sha256 dir read-only so hard_link into it fails.
+        s.ensure_layout("dst").await.unwrap();
+        let alg = dir.path().join("dst").join("blobs").join("sha256");
+        std::fs::create_dir_all(&alg).unwrap();
+        std::fs::set_permissions(&alg, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(!s.mount_blob("src", "dst", &d).await.unwrap());
+        // Restore perms so the tempdir cleans up.
+        std::fs::set_permissions(&alg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finish_rejects_non_regular_staging_file() {
+        // A staging entry that is a symlink (not a regular file) is rejected by
+        // finish_upload's no-follow guard, never hashed-through and promoted.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let uploads = dir.path().join("r").join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        let target = dir.path().join("outside-secret");
+        std::fs::write(&target, b"secret").unwrap();
+        symlink(&target, uploads.join("linksess")).unwrap();
+        let d = sha256_of(b"secret");
+        assert!(matches!(
+            s.finish_upload("r", "linksess", &d).await,
+            Err(StorageError::BadPath(_))
         ));
     }
 }
