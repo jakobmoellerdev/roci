@@ -939,6 +939,9 @@ static FORCE_TMPFILE_UNSUPPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(all(test, target_os = "linux"))]
 static FORCE_STAT_ERROR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(test, target_os = "linux"))]
+static FORCE_SYSCALL_ERROR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// Serializes the fault-injection tests (which flip the process-global
 /// `FORCE_*` switches) against each other and against tests that assert on the
 /// real reflink/hard-link behavior, so a stray forced fallback cannot make a
@@ -1223,7 +1226,15 @@ fn dir_beneath(root: &Path, rel: &Path, create: bool) -> io::Result<std::os::fd:
     )
     .map_err(io::Error::from)?;
     for comp in rel.iter() {
-        match rustix::fs::openat(&dir, comp, dir_flags, Mode::empty()) {
+        #[cfg(all(test, target_os = "linux"))]
+        let opened = if FORCE_SYSCALL_ERROR.load(std::sync::atomic::Ordering::Relaxed) {
+            Err(rustix::io::Errno::IO)
+        } else {
+            rustix::fs::openat(&dir, comp, dir_flags, Mode::empty())
+        };
+        #[cfg(not(all(test, target_os = "linux")))]
+        let opened = rustix::fs::openat(&dir, comp, dir_flags, Mode::empty());
+        match opened {
             Ok(next) => dir = next,
             Err(rustix::io::Errno::NOENT) if create => {
                 // Create the missing directory component (0o755) then open it
@@ -1620,13 +1631,12 @@ impl Storage for FsStorage {
         // Record presence so future reads skip the stat on a definite miss.
         let digest_str = expected.as_string();
         self.presence.insert(repo, &digest_str);
-
         // Warm the small-blob cache for a cacheable blob: read it back through
-        // the same no-follow beneath-root open. The blob was just promoted, so a
-        // resolve failure here is a genuine IO fault that simply skips the warm.
-        if let Ok(rel) = self.blob_rel(repo, expected) {
-            self.warm_small_blob_cache(repo, &rel, &digest_str).await;
-        }
+        // the same no-follow beneath-root open (the blob path is the validated
+        // `alg_rel/hex` just promoted). A genuine IO hiccup skips the warm.
+        let blob_rel = alg_rel.join(&hex);
+        self.warm_small_blob_cache(repo, &blob_rel, &digest_str)
+            .await;
         Ok(())
     }
 
@@ -3188,6 +3198,22 @@ mod tests {
             s.cache.get("r", &d.as_string()).map(|b| b.to_vec()),
             Some(b"warmable".to_vec())
         );
+    }
+
+    // dir_beneath propagates a genuine openat syscall error (not a symlink/
+    // NotFound) from its walk, exercised via the FORCE_SYSCALL_ERROR seam.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dir_beneath_propagates_syscall_error() {
+        use std::sync::atomic::Ordering;
+        let _serialize = FAULT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let d = sha256_of(b"blocked-write");
+        FORCE_SYSCALL_ERROR.store(true, Ordering::Relaxed);
+        let res = s.put_blob("r", &d, b"blocked-write").await;
+        FORCE_SYSCALL_ERROR.store(false, Ordering::Relaxed);
+        assert!(matches!(res, Err(StorageError::Io(_))));
     }
 
     // open_beneath rejects a non-regular final entry: a FIFO planted at a blob
