@@ -718,7 +718,12 @@ async fn copy_file_atomic(src: &Path, dest: &Path) -> io::Result<()> {
     output.sync_all().await?;
     drop(input);
     drop(output);
-    tokio::fs::rename(&tmp, dest).await
+    tokio::fs::rename(&tmp, dest).await?;
+    // Sync the containing directory so the renamed entry survives a crash.
+    if let Some(parent) = dest.parent() {
+        sync_dir(parent).await?;
+    }
+    Ok(())
 }
 
 /// Copy all bytes from `input` to `output`. Linux uses `copy_file_range`
@@ -1301,10 +1306,7 @@ impl Storage for FsStorage {
         match tokio::fs::hard_link(&src, &dest).await {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(_) => {
-                copy_file_atomic(&src, &dest).await?;
-                sync_dir(dest.parent().unwrap_or(&dest)).await?;
-            }
+            Err(_) => copy_file_atomic(&src, &dest).await?,
         }
         let digest_str = digest.as_string();
         self.presence.insert(to_repo, &digest_str);
