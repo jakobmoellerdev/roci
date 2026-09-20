@@ -426,6 +426,21 @@ impl FsStorage {
         rel.push(Self::safe_component(&d.hex)?);
         Ok(rel)
     }
+    /// The blob's *directory* path relative to the store root
+    /// (`<repo…>/blobs/<alg>`) plus its leaf filename (the digest hex). The
+    /// write side opens the directory beneath-root (no-follow) and operates on
+    /// the leaf relative to that dirfd, so a symlinked parent cannot redirect a
+    /// promotion. Components are validated exactly like [`Self::blob_rel`].
+    fn blob_dir_rel(&self, repo: &str, d: &Digest) -> Result<(PathBuf, String), StorageError> {
+        let mut dir = PathBuf::new();
+        for component in repo.split('/') {
+            dir.push(Self::safe_component(component)?);
+        }
+        dir.push("blobs");
+        dir.push(&d.algorithm);
+        Self::safe_component(&d.hex)?;
+        Ok((dir, d.hex.clone()))
+    }
     /// The upload staging path relative to the store root
     /// (`<repo…>/uploads/<id>`), validated component-wise like [`Self::blob_rel`].
     fn upload_rel(&self, repo: &str, id: &str) -> Result<PathBuf, StorageError> {
@@ -436,6 +451,18 @@ impl FsStorage {
         rel.push("uploads");
         rel.push(Self::safe_component(id)?);
         Ok(rel)
+    }
+    /// The upload staging *directory* relative to the store root
+    /// (`<repo…>/uploads`) plus the validated session-id leaf, for dirfd-anchored
+    /// promotion (rename staging → CAS with no parent-symlink traversal).
+    fn upload_dir_rel(&self, repo: &str, id: &str) -> Result<(PathBuf, String), StorageError> {
+        let mut dir = PathBuf::new();
+        for component in repo.split('/') {
+            dir.push(Self::safe_component(component)?);
+        }
+        dir.push("uploads");
+        Self::safe_component(id)?;
+        Ok((dir, id.to_string()))
     }
     fn layout_path(&self, repo: &str) -> Result<PathBuf, StorageError> {
         Ok(self.repo_dir(repo)?.join("oci-layout"))
@@ -698,24 +725,11 @@ pub fn digest_of(data: &[u8], algorithm: &str) -> Digest {
     }
 }
 
-/// A per-operation temporary sibling of `dest`: `<dest>.<16 random hex>.tmp`.
-/// Concurrent writers of the same digest each get a distinct staging path, so
-/// one writer's rename never clobbers another's open handle (the shared
-/// `.tmp` race). The random suffix comes from `getrandom`; on the vanishingly
-/// unlikely RNG failure the caller surfaces it as an IO error.
-fn unique_tmp(dest: &Path) -> io::Result<PathBuf> {
-    let mut buf = [0u8; 8];
-    getrandom::fill(&mut buf).map_err(io::Error::other)?;
-    let mut name = dest.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.tmp", hex::encode(buf)));
-    Ok(dest.with_file_name(name))
-}
-
-/// Stream the file at `path` through the hasher selected by `algorithm`
-/// (sha256/sha512), returning its [`Digest`] without buffering the whole file.
-/// Used to verify a staged upload before promoting it into the CAS.
-async fn hash_file(path: &Path, algorithm: &str) -> io::Result<Digest> {
-    let mut f = tokio::fs::File::open(path).await?;
+/// Stream `f` through the hasher selected by `algorithm` (sha256/sha512),
+/// returning its [`Digest`] without buffering the whole file. `f` is an
+/// already-opened, no-follow-validated regular-file handle (the caller opens it
+/// beneath the store root). Used to verify a staged upload before promoting it.
+async fn hash_reader(mut f: tokio::fs::File, algorithm: &str) -> io::Result<Digest> {
     let mut buf = [0u8; 64 * 1024];
     // One hasher per algorithm keeps the loop monomorphic without dynamic
     // dispatch; sha256 is the default for any non-sha512 (allowlisted) value.
@@ -748,73 +762,137 @@ async fn hash_file(path: &Path, algorithm: &str) -> io::Result<Digest> {
     }
 }
 
-/// Copy `src` into the CAS at `dest` crash-atomically: copy to a per-operation
-/// unique temp sibling, fsync it, then rename into place (so a reader never
-/// sees a partial blob and a crash leaves at most an orphan temp, never a
-/// corrupt-but-named digest). The copy step uses a whole-file reflink
-/// (`FICLONE`) on Linux (btrfs/XFS share extents O(1) — CoW, no userspace byte
-/// transit; RESEARCH §8.8), falling back to a streaming copy on any filesystem
-/// that cannot reflink and on non-Linux platforms. Used as the cross-repo mount
-/// fallback when a hard link is not possible (cross-device / no-hardlink fs).
-async fn copy_file_atomic(src: &Path, dest: &Path) -> io::Result<()> {
-    let tmp = unique_tmp(dest)?;
-    let input = tokio::fs::File::open(src).await?;
-    let output = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .await?;
-    copy_contents(&input, &output).await?;
-    output.sync_all().await?;
-    drop(input);
-    drop(output);
-    tokio::fs::rename(&tmp, dest).await?;
-    // Sync the containing directory so the renamed entry survives a crash. A
-    // CAS blob path always has a parent (`blobs/<alg>/`); fall back to `dest`
-    // only to keep this total.
-    sync_dir(dest.parent().unwrap_or(dest)).await
-}
-
-/// Reflink `src` into the CAS at `dest` crash-atomically (temp + `FICLONE` +
-/// fsync + rename), returning `Unsupported` if the filesystem cannot reflink so
-/// the caller can fall back to a hard link. This is the mount **primary**: a
-/// reflink shares extents CoW like a hard link but with independent deletion and
-/// no write-through-shared-inode hazard (SECURITY.md contract). Linux only;
-/// other platforms report `Unsupported`.
-#[cfg(target_os = "linux")]
-async fn reflink_atomic(src: &Path, dest: &Path) -> io::Result<()> {
-    use std::os::fd::AsFd;
-    let tmp = unique_tmp(dest)?;
-    let input = tokio::fs::File::open(src).await?;
-    let output = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .await?;
-    let inf = input.as_fd().try_clone_to_owned()?;
-    let outf = output.as_fd().try_clone_to_owned()?;
-    let reflinked = tokio::task::spawn_blocking(move || {
-        let (mut i, mut o) = (std::fs::File::from(inf), std::fs::File::from(outf));
-        try_reflink(&mut o, &mut i)
+/// Promote a blob named `leaf` from `from_alg_rel` into `to_alg_rel` (both
+/// directories relative to `root`), for a cross-repo mount. Everything is
+/// anchored to dirfds walked no-follow beneath `root`, so a symlinked `repo`,
+/// `blobs`, or `<alg>` parent on either side cannot redirect the promotion.
+/// Contract order (SECURITY.md:124): **reflink first** (`FICLONE` into a temp
+/// opened in the destination dirfd, then `renameat` — CoW, independent
+/// deletion), then a **hard link** (`linkat` between dirfds, O(1) same-fs), then
+/// a **streaming copy** (cross-device / no-hardlink). A pre-existing destination
+/// is re-validated no-follow as a regular file (idempotent success) or rejected.
+#[cfg(unix)]
+async fn mount_promote_beneath(
+    root: &Path,
+    from_alg_rel: &Path,
+    to_alg_rel: &Path,
+    leaf: &str,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+    let root = root.to_path_buf();
+    let from_alg_rel = from_alg_rel.to_path_buf();
+    let to_alg_rel = to_alg_rel.to_path_buf();
+    let leaf = leaf.to_string();
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
+        let from_dir = dir_beneath(&root, &from_alg_rel, false)?;
+        let to_dir = dir_beneath(&root, &to_alg_rel, true)?;
+        // Open the source no-follow and require a regular file.
+        let src = rustix::fs::openat(
+            &from_dir,
+            leaf.as_str(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let src_st = rustix::fs::fstat(&src).map_err(io::Error::from)?;
+        if !FileType::from_raw_mode(src_st.st_mode).is_file() {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        let mut src_file = std::fs::File::from(src);
+        // Treat a pre-existing regular-file destination as idempotent success; a
+        // symlink/dir/other there is rejected (re-checked here, not only in the
+        // caller's earlier stat, to close the check→promote race).
+        match rustix::fs::statat(&to_dir, leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => return Ok(()),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "mount destination exists and is not a regular file",
+                ))
+            }
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => return Err(io::Error::from(e)),
+        }
+        // Write into a unique temp in the destination dir (no-follow), by
+        // reflink where possible else a streaming copy, then renameat into place.
+        let mut rnd = [0u8; 8];
+        getrandom::fill(&mut rnd).map_err(io::Error::other)?;
+        let tmp = format!(".{}.{}.tmp", leaf, hex::encode(rnd));
+        let promote_via_temp = |flags: OFlags| -> io::Result<std::fs::File> {
+            rustix::fs::openat(
+                &to_dir,
+                tmp.as_str(),
+                OFlags::WRONLY
+                    | OFlags::CREATE
+                    | OFlags::EXCL
+                    | OFlags::NOFOLLOW
+                    | OFlags::CLOEXEC
+                    | flags,
+                Mode::from_raw_mode(0o644),
+            )
+            .map(std::fs::File::from)
+            .map_err(io::Error::from)
+        };
+        // First try a hard link (O(1), no temp) — skipped when a reflink is
+        // preferred and available. Reflink is the contract primary, so attempt it
+        // into the temp; if the filesystem cannot reflink, hard-link directly;
+        // if that also fails (cross-device), stream-copy into the temp.
+        let mut out = promote_via_temp(OFlags::empty())?;
+        if try_reflink(&mut out, &mut src_file) {
+            out.sync_all()?;
+            rustix::fs::renameat(&to_dir, tmp.as_str(), &to_dir, leaf.as_str())
+                .map_err(io::Error::from)?;
+            rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
+            return Ok(());
+        }
+        // Reflink unavailable: drop the temp and try a direct hard link.
+        drop(out);
+        let _ = rustix::fs::unlinkat(&to_dir, tmp.as_str(), AtFlags::empty());
+        match try_hardlink_at(&from_dir, leaf.as_str(), &to_dir, leaf.as_str()) {
+            Ok(()) => {
+                rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
+                Ok(())
+            }
+            // Destination raced in as a valid blob between our stat and link.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            // Cross-device / no-hardlink: stream-copy into a fresh temp + rename.
+            Err(_) => {
+                let mut out = promote_via_temp(OFlags::empty())?;
+                stream_copy(&mut src_file, &mut out)?;
+                out.sync_all()?;
+                rustix::fs::renameat(&to_dir, tmp.as_str(), &to_dir, leaf.as_str())
+                    .map_err(io::Error::from)?;
+                rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
+                Ok(())
+            }
+        }
     })
     .await
-    .map_err(io::Error::other)?;
-    if !reflinked {
-        drop(output);
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(io::Error::from(io::ErrorKind::Unsupported));
-    }
-    output.sync_all().await?;
-    drop(input);
-    drop(output);
-    tokio::fs::rename(&tmp, dest).await?;
-    sync_dir(dest.parent().unwrap_or(dest)).await
+    .map_err(io::Error::other)?
 }
 
-/// Non-Linux: reflink is unavailable.
-#[cfg(not(target_os = "linux"))]
-async fn reflink_atomic(_src: &Path, _dest: &Path) -> io::Result<()> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
+/// `linkat` between two dirfds, with a test-only fault seam: when
+/// `FORCE_COPY_FALLBACK` is set it returns an `EXDEV`-shaped error so the copy
+/// fallback runs deterministically on a single filesystem.
+#[cfg(unix)]
+fn try_hardlink_at(
+    from_dir: &std::os::fd::OwnedFd,
+    from_leaf: &str,
+    to_dir: &std::os::fd::OwnedFd,
+    to_leaf: &str,
+) -> io::Result<()> {
+    #[cfg(all(test, target_os = "linux"))]
+    if FORCE_COPY_FALLBACK.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(io::Error::from_raw_os_error(18)); // EXDEV
+    }
+    rustix::fs::linkat(
+        from_dir,
+        from_leaf,
+        to_dir,
+        to_leaf,
+        rustix::fs::AtFlags::empty(),
+    )
+    .map_err(io::Error::from)
 }
 
 /// Test-only switches: on a single filesystem a real `ioctl_ficlone`/`hard_link`
@@ -857,48 +935,18 @@ fn try_reflink(output: &mut std::fs::File, input: &mut std::fs::File) -> bool {
     rustix::fs::ioctl_ficlone(&*output, &*input).is_ok()
 }
 
-/// `hard_link` with a test-only fault seam: when `FORCE_COPY_FALLBACK` is set
-/// it returns an `EXDEV`-shaped error so the copy fallback runs deterministically
-/// on a single filesystem. Outside `cfg(test)` it is a plain `hard_link`.
-async fn try_hardlink(src: &Path, dest: &Path) -> io::Result<()> {
-    #[cfg(all(test, target_os = "linux"))]
-    if FORCE_COPY_FALLBACK.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(io::Error::from_raw_os_error(18)); // EXDEV
-    }
-    tokio::fs::hard_link(src, dest).await
-}
-
-/// Copy all bytes from `input` to `output`. Linux first attempts a whole-file
-/// reflink (`FICLONE`): on btrfs/XFS/bcachefs this shares the source extents
-/// copy-on-write in O(1) with zero data transit (RESEARCH §8.8). On any
-/// filesystem that cannot reflink (ext4/tmpfs) or a cross-device target it
-/// falls back to a streaming read/write loop. Both run on a blocking thread so
-/// a multi-GiB copy never stalls a Tokio worker. Other platforms stream via
-/// tokio.
-#[cfg(target_os = "linux")]
-async fn copy_contents(input: &tokio::fs::File, output: &tokio::fs::File) -> io::Result<()> {
-    use std::os::fd::AsFd;
-    let inf = input.as_fd().try_clone_to_owned()?;
-    let outf = output.as_fd().try_clone_to_owned()?;
-    tokio::task::spawn_blocking(move || -> io::Result<()> {
-        let mut infile = std::fs::File::from(inf);
-        let mut outfile = std::fs::File::from(outf);
-        // Whole-file reflink first: instant CoW extent share on btrfs/XFS. On
-        // any failure (unsupported fs, cross-device) stream the bytes instead.
-        if !try_reflink(&mut outfile, &mut infile) {
-            stream_copy(&mut infile, &mut outfile)?;
-        }
-        Ok(())
-    })
-    .await
-    .map_err(io::Error::other)?
+/// Non-Linux: no `FICLONE`, so a reflink is never available (the caller falls
+/// back to a hard link, then a streaming copy).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn try_reflink(_output: &mut std::fs::File, _input: &mut std::fs::File) -> bool {
+    false
 }
 
 /// Rewind both files and copy `input` to `output` with a buffered read/write
 /// loop, first truncating the destination so a retry never leaves stale tail
 /// bytes. The streaming fallback used when a reflink is not possible. Runs on
 /// the blocking thread that owns the file handles.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn stream_copy(input: &mut std::fs::File, output: &mut std::fs::File) -> io::Result<()> {
     use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
     input.seek(SeekFrom::Start(0))?;
@@ -915,63 +963,82 @@ fn stream_copy(input: &mut std::fs::File, output: &mut std::fs::File) -> io::Res
     Ok(())
 }
 
-/// Non-Linux copy: stream the whole file through tokio.
-#[cfg(not(target_os = "linux"))]
-async fn copy_contents(input: &tokio::fs::File, output: &tokio::fs::File) -> io::Result<()> {
-    let mut reader = tokio::io::BufReader::new(input.try_clone().await?);
-    let mut writer = output.try_clone().await?;
-    tokio::io::copy(&mut reader, &mut writer).await?;
-    Ok(())
-}
-
-/// Publish `data` as the CAS blob at `dest` (whose parent is `alg_dir`) with a
-/// per-operation unique temp sibling, fsync, and atomic rename. Portable across
-/// every platform and the fallback the Linux `O_TMPFILE` path degrades to when
-/// the filesystem lacks `O_TMPFILE` (NFS, some overlay setups). A rename onto an
+/// Publish `data` as the CAS blob named `leaf` inside the directory `alg_rel`
+/// (relative to `root`, e.g. `<repo…>/blobs/<alg>`) with a per-operation unique
+/// temp sibling, fsync, and atomic rename — all **relative to a dirfd walked
+/// no-follow beneath `root`**, so a symlinked `repo`/`blobs`/`<alg>` parent
+/// cannot redirect the write outside the store. Portable across every platform
+/// and the fallback the Linux `O_TMPFILE` path degrades to. A rename onto an
 /// existing blob is harmless (content-addressed: identical bytes).
-async fn publish_bytes_rename(alg_dir: &Path, dest: &Path, data: &[u8]) -> io::Result<()> {
-    let tmp = unique_tmp(dest)?;
-    {
-        let mut f = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .await?;
-        f.write_all(data).await?;
-        f.sync_all().await?;
-    }
-    tokio::fs::rename(&tmp, dest).await?;
-    let _ = alg_dir;
-    sync_dir(dest.parent().unwrap_or(dest)).await
+#[cfg(unix)]
+async fn publish_bytes_rename(
+    root: &Path,
+    alg_rel: &Path,
+    leaf: &str,
+    data: &[u8],
+) -> io::Result<()> {
+    use rustix::fs::{Mode, OFlags};
+    use std::io::Write as _;
+    let root = root.to_path_buf();
+    let alg_rel = alg_rel.to_path_buf();
+    let leaf = leaf.to_string();
+    let data = data.to_vec();
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
+        let dirfd = dir_beneath(&root, &alg_rel, true)?;
+        let mut tmp = [0u8; 8];
+        getrandom::fill(&mut tmp).map_err(io::Error::other)?;
+        let tmp_name = format!(".{}.{}.tmp", leaf, hex::encode(tmp));
+        let fd = rustix::fs::openat(
+            &dirfd,
+            tmp_name.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )
+        .map_err(io::Error::from)?;
+        let mut f = std::fs::File::from(fd);
+        f.write_all(&data)?;
+        f.sync_all()?;
+        drop(f);
+        rustix::fs::renameat(&dirfd, tmp_name.as_str(), &dirfd, leaf.as_str())
+            .map_err(io::Error::from)?;
+        // Persist the new directory entry (fsync the dirfd).
+        rustix::fs::fsync(&dirfd).map_err(io::Error::from)?;
+        Ok(())
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
-/// Publish `data` as the CAS blob at `dest` crash-atomically. On Linux this
-/// opens an anonymous `O_TMPFILE` inode in `alg_dir`, writes+fsyncs it, then
-/// `linkat`s it into place: a partial blob is never visible under its digest
-/// name, and no orphan temp survives a crash. A filesystem without `O_TMPFILE`
-/// (`EOPNOTSUPP`/`ENOTSUP`/`EISDIR`/`EINVAL`) degrades to the portable
-/// temp+rename path. `linkat` returning `EEXIST` means a blob already exists at
-/// the digest name; it is dedup success only if that entry is a *regular file*
-/// (validated no-follow) — a planted symlink/dir there is rejected. Non-Linux
-/// platforms use the temp+rename path directly.
+/// Publish `data` as the CAS blob `leaf` inside `alg_rel` crash-atomically,
+/// anchored to a dirfd walked no-follow beneath `root`. On Linux this opens an
+/// anonymous `O_TMPFILE` inode in the (beneath-root) directory, writes+fsyncs
+/// it, then `linkat`s it into place: a partial blob is never visible under its
+/// digest name and no orphan temp survives a crash. A filesystem without
+/// `O_TMPFILE` degrades to the portable temp+rename path. `linkat` `EEXIST`
+/// means a blob already exists at the name; it is dedup success only if that
+/// entry is a *regular file* (validated no-follow via the dirfd) — a planted
+/// symlink/dir is rejected. Non-Linux platforms use the temp+rename path.
 #[cfg(target_os = "linux")]
-async fn publish_bytes(alg_dir: &Path, dest: &Path, data: &[u8]) -> io::Result<()> {
+async fn publish_bytes(root: &Path, alg_rel: &Path, leaf: &str, data: &[u8]) -> io::Result<()> {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     use rustix::io::Errno;
     use std::io::Write as _;
     use std::os::fd::AsRawFd;
-    let alg_dir_buf = alg_dir.to_path_buf();
-    let dest_buf = dest.to_path_buf();
+    let root_buf = root.to_path_buf();
+    let alg_rel_buf = alg_rel.to_path_buf();
+    let leaf_buf = leaf.to_string();
     let data_vec = data.to_vec();
     let outcome = tokio::task::spawn_blocking(move || -> io::Result<bool> {
-        // Anonymous inode in the target directory: it has no name until linkat.
-        let opened = rustix::fs::open(
-            &alg_dir_buf,
+        let dirfd = dir_beneath(&root_buf, &alg_rel_buf, true)?;
+        // Anonymous inode in the (beneath-root) target directory.
+        let opened = rustix::fs::openat(
+            &dirfd,
+            ".",
             OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o644),
         );
         // In test, simulate a filesystem without O_TMPFILE so the fallback arm
-        // below runs deterministically (ext4 in CI always supports O_TMPFILE).
+        // runs deterministically (ext4 in CI always supports O_TMPFILE).
         #[cfg(all(test, target_os = "linux"))]
         let opened = if FORCE_TMPFILE_UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed) {
             Err(Errno::OPNOTSUPP)
@@ -980,57 +1047,54 @@ async fn publish_bytes(alg_dir: &Path, dest: &Path, data: &[u8]) -> io::Result<(
         };
         let fd = match opened {
             Ok(fd) => fd,
-            // O_TMPFILE unavailable (unsupported fs like NFS/overlay, or any
-            // other open failure) → take the portable temp+rename fallback,
-            // which re-attempts the write and surfaces a genuine IO error itself.
+            // O_TMPFILE unavailable → signal the portable temp+rename fallback.
             Err(_) => return Ok(false),
         };
         let mut f = std::fs::File::from(fd);
         f.write_all(&data_vec)?;
         f.sync_all()?;
-        // Link the anonymous inode into place via its /proc/self/fd magic link
-        // (AT_EMPTY_PATH would need CAP_DAC_READ_SEARCH).
+        // Link the anonymous inode into place via its /proc/self/fd magic link,
+        // relative to the beneath-root dirfd (AT_EMPTY_PATH would need
+        // CAP_DAC_READ_SEARCH).
         let proc_path = format!("/proc/self/fd/{}", f.as_raw_fd());
         match rustix::fs::linkat(
             rustix::fs::CWD,
             proc_path,
-            rustix::fs::CWD,
-            &dest_buf,
+            &dirfd,
+            leaf_buf.as_str(),
             AtFlags::SYMLINK_FOLLOW,
         ) {
-            Ok(()) => Ok(true),
-            // A blob already exists at the digest name: dedup success only if it
-            // is a regular file (no-follow). A planted symlink/dir is rejected —
-            // it must never be reported present nor later followed on read.
+            Ok(()) => {}
+            // A blob already exists at the name: dedup success only if it is a
+            // regular file (no-follow, via the dirfd). A planted symlink/dir is
+            // rejected — never reported present nor later followed on read.
             Err(Errno::EXIST) => {
-                let st = rustix::fs::statat(rustix::fs::CWD, &dest_buf, AtFlags::SYMLINK_NOFOLLOW)
+                let st = rustix::fs::statat(&dirfd, leaf_buf.as_str(), AtFlags::SYMLINK_NOFOLLOW)
                     .map_err(io::Error::from)?;
-                if FileType::from_raw_mode(st.st_mode).is_file() {
-                    Ok(true)
-                } else {
-                    Err(io::Error::new(
+                if !FileType::from_raw_mode(st.st_mode).is_file() {
+                    return Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
                         "CAS destination exists and is not a regular file",
-                    ))
+                    ));
                 }
             }
-            Err(e) => Err(io::Error::from(e)),
+            Err(e) => return Err(io::Error::from(e)),
         }
+        rustix::fs::fsync(&dirfd).map_err(io::Error::from)?;
+        Ok(true)
     })
     .await
     .map_err(io::Error::other)??;
     if !outcome {
-        // O_TMPFILE unsupported here: portable temp+rename.
-        return publish_bytes_rename(alg_dir, dest, data).await;
+        return publish_bytes_rename(root, alg_rel, leaf, data).await;
     }
-    // Persist the new directory entry.
-    sync_dir(alg_dir).await
+    Ok(())
 }
 
-/// Non-Linux publish: portable temp+rename.
+/// Non-Linux publish: portable dirfd-anchored temp+rename.
 #[cfg(not(target_os = "linux"))]
-async fn publish_bytes(alg_dir: &Path, dest: &Path, data: &[u8]) -> io::Result<()> {
-    publish_bytes_rename(alg_dir, dest, data).await
+async fn publish_bytes(root: &Path, alg_rel: &Path, leaf: &str, data: &[u8]) -> io::Result<()> {
+    publish_bytes_rename(root, alg_rel, leaf, data).await
 }
 
 /// Fsync a directory so a prior `rename` into it is durable (the rename's
@@ -1066,7 +1130,7 @@ fn resolve_beneath(
     rel: &Path,
     final_flags: rustix::fs::OFlags,
 ) -> io::Result<std::fs::File> {
-    use rustix::fs::{Mode, OFlags};
+    use rustix::fs::{FileType, Mode, OFlags};
     use std::os::fd::OwnedFd;
     // The store root is trusted (roci created it); open it followed.
     let mut dir: OwnedFd = rustix::fs::open(
@@ -1075,11 +1139,14 @@ fn resolve_beneath(
         Mode::empty(),
     )
     .map_err(io::Error::from)?;
+
     let comps: Vec<&std::ffi::OsStr> = rel.iter().collect();
     for (i, comp) in comps.iter().enumerate() {
         let last = i + 1 == comps.len();
         let flags = if last {
-            final_flags | OFlags::NOFOLLOW | OFlags::CLOEXEC
+            // `O_NONBLOCK` so opening a planted FIFO/device does not block; we
+            // fstat and reject any non-regular final entry below.
+            final_flags | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
         } else {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
         };
@@ -1096,7 +1163,108 @@ fn resolve_beneath(
         };
         dir = next;
     }
+    // The final descriptor must be a *regular file*: a FIFO/device/socket at a
+    // digest path is not a valid CAS blob and must never be served or appended
+    // to (a FIFO read would block, a device would return non-CAS bytes).
+    let st = rustix::fs::fstat(&dir).map_err(io::Error::from)?;
+    if !FileType::from_raw_mode(st.st_mode).is_file() {
+        return Err(io::Error::from(io::ErrorKind::NotFound));
+    }
+
     Ok(std::fs::File::from(dir))
+}
+
+/// Walk a *directory* path `rel` (relative to `root`) component by component
+/// with `openat` + `O_DIRECTORY | O_NOFOLLOW`, refusing to traverse a symlink at
+/// any level, and return an owned fd for the leaf directory. When `create`, a
+/// missing component is `mkdirat`-created (then opened no-follow) so the whole
+/// CAS directory tree is materialised beneath the trusted root — never through a
+/// planted symlink. This is the write-side anchor: callers do `openat`/`linkat`/
+/// `renameat`/`unlinkat` *relative to the returned fd*, so a symlinked `repo`,
+/// `blobs`, or `<alg>` parent can never redirect a mutation outside the store.
+#[cfg(unix)]
+fn dir_beneath(root: &Path, rel: &Path, create: bool) -> io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::fd::OwnedFd;
+    let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    // The store root is trusted (roci created it); open it followed.
+    let mut dir: OwnedFd = rustix::fs::open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    for comp in rel.iter() {
+        match rustix::fs::openat(&dir, comp, dir_flags, Mode::empty()) {
+            Ok(next) => dir = next,
+            Err(rustix::io::Errno::NOENT) if create => {
+                // Create the missing directory component (0o755) then open it
+                // no-follow. A concurrent creator racing us yields EEXIST, which
+                // we treat as "already there" and re-open.
+                match rustix::fs::mkdirat(&dir, comp, Mode::from_raw_mode(0o755)) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(e) => return Err(io::Error::from(e)),
+                }
+                dir = rustix::fs::openat(&dir, comp, dir_flags, Mode::empty())
+                    .map_err(io::Error::from)?;
+            }
+            // A symlinked / non-directory / missing component: not a valid CAS
+            // directory. `NotFound` so a read returns 404; a write with
+            // `create=false` likewise cannot proceed through it.
+            Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::NOENT) => {
+                return Err(io::Error::from(io::ErrorKind::NotFound));
+            }
+            Err(e) => return Err(io::Error::from(e)),
+        }
+    }
+    Ok(dir)
+}
+
+/// Rename `from_leaf` in directory `from_dir_rel` to `to_leaf` in directory
+/// `to_dir_rel` (both relative to `root`), via `renameat` on dirfds walked
+/// no-follow beneath `root` (the destination dir is created). A symlinked parent
+/// on either side cannot redirect the rename outside the store. Then fsyncs the
+/// destination directory so the new entry is durable.
+#[cfg(unix)]
+async fn rename_beneath(
+    root: &Path,
+    from_dir_rel: &Path,
+    from_leaf: &str,
+    to_dir_rel: &Path,
+    to_leaf: &str,
+) -> io::Result<()> {
+    let root = root.to_path_buf();
+    let from_dir_rel = from_dir_rel.to_path_buf();
+    let from_leaf = from_leaf.to_string();
+    let to_dir_rel = to_dir_rel.to_path_buf();
+    let to_leaf = to_leaf.to_string();
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
+        let from_fd = dir_beneath(&root, &from_dir_rel, false)?;
+        let to_fd = dir_beneath(&root, &to_dir_rel, true)?;
+        rustix::fs::renameat(&from_fd, from_leaf.as_str(), &to_fd, to_leaf.as_str())
+            .map_err(io::Error::from)?;
+        rustix::fs::fsync(&to_fd).map_err(io::Error::from)?;
+        Ok(())
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+/// Remove `leaf` from directory `dir_rel` (relative to `root`) via `unlinkat`
+/// on a dirfd walked no-follow beneath `root`, so a symlinked parent cannot
+/// redirect the deletion. Maps a missing entry / symlinked parent to `NotFound`.
+#[cfg(unix)]
+async fn unlink_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io::Result<()> {
+    let root = root.to_path_buf();
+    let dir_rel = dir_rel.to_path_buf();
+    let leaf = leaf.to_string();
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
+        let dirfd = dir_beneath(&root, &dir_rel, false)?;
+        rustix::fs::unlinkat(&dirfd, leaf.as_str(), rustix::fs::AtFlags::empty())
+            .map_err(io::Error::from)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// Async wrapper: open `rel` beneath `root` read-only, no-follow at every
@@ -1391,55 +1559,53 @@ impl Storage for FsStorage {
                 actual: staged_size,
             });
         }
-        // Stream-hash the staging file (no full-blob buffer), verifying it
+        // Stream-hash the staging file (no full-blob buffer) through a handle
+        // opened *beneath the store root* (no-follow, regular-file-checked), so
+        // no parent-symlink swap can redirect the hash input, and verify it
         // matches the client-declared digest before promoting it.
-        let actual = hash_file(&staging, expected.algorithm())
+        let staging_fd = open_beneath(&self.root, &staging_rel)
+            .await
+            .map_err(map_not_found)?;
+        let actual = hash_reader(staging_fd, expected.algorithm())
             .await
             .map_err(map_not_found)?;
         if !actual.ct_eq(expected) {
             // Reject and drop the staging file so a bad upload leaves nothing.
-            let _ = tokio::fs::remove_file(&staging).await;
+            let (up_dir, up_leaf) = self.upload_dir_rel(repo, id)?;
+            let _ = unlink_beneath(&self.root, &up_dir, &up_leaf).await;
             self.drop_session_lock(repo, id);
             return Err(StorageError::DigestMismatch {
                 expected: expected.as_string(),
                 actual: actual.as_string(),
             });
         }
-        // Ensure the layout marker + the target `blobs/<alg>` dir exist, then
-        // fsync the staging file's contents durable and rename it *in place*
-        // into the CAS — atomic on the same filesystem, copy-free, so a crash
-        // can never leave a corrupt-but-named blob (a torn write stays under
-        // `uploads/` and is discarded on the next finish).
+        // Ensure the layout marker exists, then rename the staging file into the
+        // CAS via dirfds walked no-follow beneath the store root — atomic on the
+        // same filesystem, copy-free, and safe against a symlinked `uploads`,
+        // `blobs`, or `<alg>` parent. A crash can never leave a corrupt-but-named
+        // blob (a torn write stays under `uploads/` and is discarded).
         self.ensure_layout(repo).await?;
-        let dest = self.blob_path(repo, expected)?;
-        let alg_dir = self
-            .repo_dir(repo)?
-            .join("blobs")
-            .join(expected.algorithm());
-        tokio::fs::create_dir_all(&alg_dir).await?;
-        {
-            let f = tokio::fs::OpenOptions::new()
-                .write(true)
-                .open(&staging)
-                .await
-                .map_err(map_not_found)?;
-            f.sync_all().await?;
-        }
-        tokio::fs::rename(&staging, &dest).await?;
-        // Sync the CAS directory so the renamed entry survives a crash/power
-        // loss (syncing the file alone does not persist the directory entry).
-        sync_dir(&alg_dir).await?;
+        let (up_dir, up_leaf) = self.upload_dir_rel(repo, id)?;
+        let (alg_rel, hex) = self.blob_dir_rel(repo, expected)?;
+        rename_beneath(&self.root, &up_dir, &up_leaf, &alg_rel, &hex).await?;
         self.drop_session_lock(repo, id);
         // Record presence so future reads skip the stat on a definite miss.
         let digest_str = expected.as_string();
         self.presence.insert(repo, &digest_str);
         // Warm the small-blob cache only for a blob small enough to be cacheable
-        // — reading a multi-GiB layer back just to feed a cache that would
-        // reject it is the buffering this rework exists to avoid.
-        let size = tokio::fs::metadata(&dest).await?.len();
-        if size <= self.cache.threshold() as u64 {
-            if let Ok(bytes) = tokio::fs::read(&dest).await {
-                self.cache.put(repo, &digest_str, &bytes);
+        // — read it back through the same no-follow beneath-root open. Reading a
+        // multi-GiB layer back to feed a cache that would reject it is the
+        // buffering this rework exists to avoid, so gate on the stat first.
+        if let Ok(Some((true, size))) =
+            stat_beneath(&self.root, &self.blob_rel(repo, expected)?).await
+        {
+            if size <= self.cache.threshold() as u64 {
+                if let Ok(mut f) = open_beneath(&self.root, &self.blob_rel(repo, expected)?).await {
+                    let mut bytes = Vec::new();
+                    if f.read_to_end(&mut bytes).await.is_ok() {
+                        self.cache.put(repo, &digest_str, &bytes);
+                    }
+                }
             }
         }
         Ok(())
@@ -1473,15 +1639,14 @@ impl Storage for FsStorage {
         // A repo populated only by blob pushes still gets a valid oci-layout
         // marker so the directory is a well-formed OCI image layout.
         self.ensure_layout(repo).await?;
-        let dest = self.blob_path(repo, digest)?;
-        let alg_dir = self.repo_dir(repo)?.join("blobs").join(&digest.algorithm);
-        tokio::fs::create_dir_all(&alg_dir).await?;
-        // Publish the bytes into the CAS crash-atomically. On Linux this uses an
-        // anonymous `O_TMPFILE` inode + `linkat` (a partial blob is never
-        // namespace-visible, and `EEXIST` on link is the dedup signal — an
-        // identical blob already exists, which is success); elsewhere it writes
-        // a per-operation unique temp, fsyncs, and atomically renames.
-        publish_bytes(&alg_dir, &dest, data).await?;
+        // Publish the bytes into the CAS crash-atomically, anchored to a dirfd
+        // walked no-follow beneath the store root (dir_beneath creates the
+        // `blobs/<alg>` tree): a symlinked parent cannot redirect the write, a
+        // partial blob is never namespace-visible (Linux `O_TMPFILE`+`linkat`),
+        // and an `EEXIST` at the digest name is dedup only if it is a regular
+        // file. Non-Linux / no-`O_TMPFILE` uses a temp+`renameat` in that dirfd.
+        let (alg_rel, leaf) = self.blob_dir_rel(repo, digest)?;
+        publish_bytes(&self.root, &alg_rel, &leaf, data).await?;
         // Record presence so future reads skip the stat on a definite miss, and
         // warm the small-blob cache (a no-op for large layers).
         let digest_str = digest.as_string();
@@ -1491,7 +1656,10 @@ impl Storage for FsStorage {
     }
 
     async fn delete_blob(&self, repo: &str, digest: &Digest) -> Result<(), StorageError> {
-        tokio::fs::remove_file(self.blob_path(repo, digest)?)
+        // Remove via a dirfd walked no-follow beneath the store root so a
+        // symlinked `blobs`/`<alg>` parent cannot redirect the deletion.
+        let (alg_rel, leaf) = self.blob_dir_rel(repo, digest)?;
+        unlink_beneath(&self.root, &alg_rel, &leaf)
             .await
             .map_err(map_not_found)?;
         let digest_str = digest.as_string();
@@ -1586,9 +1754,14 @@ impl Storage for FsStorage {
         let bytes = match self.cache.get(repo, &digest_str) {
             Some(cached) => cached.to_vec(),
             None => {
-                let b = tokio::fs::read(self.blob_path(repo, &digest)?)
+                // Read the manifest blob through a no-follow beneath-root open
+                // (regular-file-checked) so a symlinked CAS parent/leaf cannot
+                // redirect the read outside the store, even on a cache miss.
+                let mut f = open_beneath(&self.root, &self.blob_rel(repo, &digest)?)
                     .await
                     .map_err(map_not_found)?;
+                let mut b = Vec::new();
+                f.read_to_end(&mut b).await.map_err(map_not_found)?;
                 self.cache.put(repo, &digest_str, &b);
                 b
             }
@@ -1601,8 +1774,11 @@ impl Storage for FsStorage {
     }
 
     async fn delete_manifest(&self, repo: &str, digest: &Digest) -> Result<(), StorageError> {
-        // Remove the manifest blob from the CAS (NotFound if absent).
-        tokio::fs::remove_file(self.blob_path(repo, digest)?)
+        // Remove the manifest blob from the CAS via a dirfd walked no-follow
+        // beneath the store root (NotFound if absent); a symlinked parent cannot
+        // redirect the deletion outside the store.
+        let (alg_rel, leaf) = self.blob_dir_rel(repo, digest)?;
+        unlink_beneath(&self.root, &alg_rel, &leaf)
             .await
             .map_err(map_not_found)?;
         // Drop the manifest from the presence filter + small-blob cache.
@@ -1741,60 +1917,34 @@ impl Storage for FsStorage {
         to_repo: &str,
         digest: &Digest,
     ) -> Result<bool, StorageError> {
-        let src = self.blob_path(from_repo, digest)?;
         // Source absent → the caller falls back to a normal upload session.
         if !self.blob_exists(from_repo, digest).await? {
             return Ok(false);
         }
-        // Ensure the destination layout + `blobs/<alg>` dir exist.
-        self.ensure_layout(to_repo).await?;
-        let dest = self.blob_path(to_repo, digest)?;
-        let alg_dir = self
-            .repo_dir(to_repo)?
-            .join("blobs")
-            .join(digest.algorithm());
-        tokio::fs::create_dir_all(&alg_dir).await?;
         // Same-repo mount: source and destination are the same path — already
         // present, nothing to promote (a copy-onto-self would truncate it).
-        if src == dest {
+        let (from_alg_rel, leaf) = self.blob_dir_rel(from_repo, digest)?;
+        let (to_alg_rel, _) = self.blob_dir_rel(to_repo, digest)?;
+        if from_alg_rel == to_alg_rel {
             self.presence.insert(to_repo, &digest.as_string());
             return Ok(true);
         }
-        // A pre-existing destination is idempotent success only if it is a
-        // *regular file* reached with no symlink traversal (a content-addressed
-        // blob is the correct bytes by construction); a planted symlink/dir is
-        // rejected rather than reported as a false 201.
-        let dest_rel = self.blob_rel(to_repo, digest)?;
-        match stat_beneath(&self.root, &dest_rel).await? {
-            Some((true, _)) => {
-                self.presence.insert(to_repo, &digest.as_string());
-                return Ok(true);
-            }
-            Some((false, _)) => {
+        self.ensure_layout(to_repo).await?;
+        // Promote via dirfds walked no-follow beneath the store root, contract
+        // order reflink → hard link → streaming copy (SECURITY.md:124). A
+        // pre-existing regular-file destination is idempotent success; a planted
+        // symlink/dir parent or destination is rejected (re-validated inside the
+        // promotion, closing the check→promote race).
+        match mount_promote_beneath(&self.root, &from_alg_rel, &to_alg_rel, &leaf).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(StorageError::BadPath(format!(
                     "mount destination for {} is not a regular file",
                     digest.as_string()
                 )));
             }
-            None => {}
+            Err(e) => return Err(StorageError::Io(e)),
         }
-        // Promote, contract order (SECURITY.md:124): **reflink first** (CoW,
-        // independent deletion, no shared-inode write-through hazard), then a
-        // **hard link** (O(1) same-fs), then a **crash-atomic streaming copy**
-        // (cross-device / no-hardlink). Each writes via temp+rename or is O(1),
-        // so a reader never sees a partial blob.
-        match reflink_atomic(&src, &dest).await {
-            Ok(()) => {}
-            Err(_) => match try_hardlink(&src, &dest).await {
-                Ok(()) => {}
-                // Destination raced in as a valid blob between our stat and link.
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(_) => copy_file_atomic(&src, &dest).await?,
-            },
-        }
-        // Persist the new directory entry so a successful 201 mount survives a
-        // crash — every promotion path needs this, not only the copy fallback.
-        sync_dir(&alg_dir).await?;
         self.presence.insert(to_repo, &digest.as_string());
         Ok(true)
     }
@@ -2564,6 +2714,29 @@ mod tests {
         assert!(s.open_blob("r", &d).await.is_err());
     }
 
+    // The *write* side is beneath-root too: a symlinked `blobs` parent must not
+    // let put_blob create the blob outside the store, and delete_blob must not
+    // follow it. The dirfd walk refuses to descend a symlinked component, so the
+    // write fails rather than escaping.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn put_blob_refuses_symlinked_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let data = b"write-escape-attempt";
+        let d = sha256_of(data);
+        // Point the repo's `blobs` at an outside directory via a symlink.
+        let outside = dir.path().join("outside-blobs");
+        std::fs::create_dir_all(&outside).unwrap();
+        let repo_dir = s.repo_dir("r").unwrap();
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::os::unix::fs::symlink(&outside, repo_dir.join("blobs")).unwrap();
+        // put_blob must refuse to write through the symlinked `blobs` parent.
+        assert!(s.put_blob("r", &d, data).await.is_err());
+        // Nothing was created under the outside target.
+        assert!(!outside.join(&d.algorithm).join(&d.hex).exists());
+    }
+
     // A PATCH append opens the staging file O_NOFOLLOW: a symlink planted at
     // `uploads/<id>` cannot redirect the append to an arbitrary target.
     #[cfg(unix)]
@@ -2808,79 +2981,40 @@ mod tests {
         std::fs::set_permissions(&alg, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    #[tokio::test]
-    async fn copy_file_atomic_transfers_contents() {
-        // The copy fallback (reflink on Linux, tokio copy elsewhere) transfers a
-        // non-empty and an empty file into distinct destinations via a unique
-        // temp + rename.
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src");
-        let payload = vec![0x5au8; 70000];
-        tokio::fs::write(&src, &payload).await.unwrap();
-        let dst = dir.path().join("dst");
-        copy_file_atomic(&src, &dst).await.unwrap();
-        assert_eq!(tokio::fs::read(&dst).await.unwrap(), payload);
-        let empty_src = dir.path().join("empty");
-        tokio::fs::write(&empty_src, b"").await.unwrap();
-        let empty_dst = dir.path().join("empty-dst");
-        copy_file_atomic(&empty_src, &empty_dst).await.unwrap();
-        assert_eq!(tokio::fs::read(&empty_dst).await.unwrap(), b"");
-    }
-
-    // Force the reflink + hard-link fast paths to "fail" so the cross-device
-    // copy fallback (streaming copy in copy_file_atomic, and mount_blob's copy
-    // branch) runs deterministically on a single filesystem. Guards the paths a
-    // single-fs CI cannot otherwise reach.
+    // Drive the reflink / hard-link / copy fallbacks of mount_promote_beneath and
+    // publish_bytes deterministically on a single filesystem via the FORCE_*
+    // seams — the branches CI's one filesystem cannot otherwise reach. Serialized
+    // so a forced fallback cannot flake a parallel mount test.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn copy_fallback_paths_when_reflink_and_hardlink_unavailable() {
+    async fn mount_and_put_fallback_paths() {
         use std::sync::atomic::Ordering;
         let _serialize = FAULT_TEST_LOCK.lock().await;
-        FORCE_COPY_FALLBACK.store(true, Ordering::Relaxed);
-        // copy_file_atomic streams (reflink forced off) — bytes still land.
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("plain-src");
-        let payload = vec![0x5au8; 70000];
-        tokio::fs::write(&src, &payload).await.unwrap();
-        let dst = dir.path().join("plain-dst");
-        copy_file_atomic(&src, &dst).await.unwrap();
-        assert_eq!(tokio::fs::read(&dst).await.unwrap(), payload);
-        // mount_blob's hard link is forced to fail → copy fallback promotes.
-        let store = tempfile::tempdir().unwrap();
-        let s = FsStorage::new(store.path()).unwrap();
-        let data = b"mount-via-copy";
+        let data = b"fallback-blob";
         let d = sha256_of(data);
-        s.put_blob("srcrepo", &d, data).await.unwrap();
-        assert!(s.mount_blob("srcrepo", "dstrepo", &d).await.unwrap());
-        assert_eq!(s.read_blob("dstrepo", &d).await.unwrap(), data);
+
+        // (1) Reflink + hard link forced off → mount takes the streaming copy.
+        FORCE_COPY_FALLBACK.store(true, Ordering::Relaxed);
+        let s1 = FsStorage::new(tempfile::tempdir().unwrap().path()).unwrap();
+        s1.put_blob("srcrepo", &d, data).await.unwrap();
+        assert!(s1.mount_blob("srcrepo", "dstrepo", &d).await.unwrap());
+        assert_eq!(s1.read_blob("dstrepo", &d).await.unwrap(), data);
         FORCE_COPY_FALLBACK.store(false, Ordering::Relaxed);
-        // Now the reflink-succeeds branch: try_reflink reports success (moving
-        // the bytes via the streaming copy) so copy_contents skips its own copy.
+
+        // (2) Reflink forced to succeed → mount takes the reflink primary.
         FORCE_REFLINK_OK.store(true, Ordering::Relaxed);
-        let rsrc = dir.path().join("reflink-src");
-        tokio::fs::write(&rsrc, &payload).await.unwrap();
-        let rdst = dir.path().join("reflink-dst");
-        copy_file_atomic(&rsrc, &rdst).await.unwrap();
-        assert_eq!(tokio::fs::read(&rdst).await.unwrap(), payload);
-        // Reflink succeeds in mount_blob's primary path (FORCE_REFLINK_OK moves
-        // the bytes), exercising the `reflink_atomic Ok` arm.
-        let rstore = tempfile::tempdir().unwrap();
-        let rs = FsStorage::new(rstore.path()).unwrap();
-        let rd = sha256_of(b"reflink-mount");
-        rs.put_blob("srcrepo", &rd, b"reflink-mount").await.unwrap();
-        assert!(rs.mount_blob("srcrepo", "dstrepo", &rd).await.unwrap());
-        assert_eq!(
-            rs.read_blob("dstrepo", &rd).await.unwrap(),
-            b"reflink-mount"
-        );
+        let s2 = FsStorage::new(tempfile::tempdir().unwrap().path()).unwrap();
+        s2.put_blob("srcrepo", &d, data).await.unwrap();
+        assert!(s2.mount_blob("srcrepo", "dstrepo", &d).await.unwrap());
+        assert_eq!(s2.read_blob("dstrepo", &d).await.unwrap(), data);
         FORCE_REFLINK_OK.store(false, Ordering::Relaxed);
-        // O_TMPFILE unsupported → put_blob takes the temp+rename fallback.
+
+        // (3) O_TMPFILE unsupported → put_blob takes the temp+rename fallback.
         FORCE_TMPFILE_UNSUPPORTED.store(true, Ordering::Relaxed);
-        let tstore = tempfile::tempdir().unwrap();
-        let ts = FsStorage::new(tstore.path()).unwrap();
+        let s3 = FsStorage::new(tempfile::tempdir().unwrap().path()).unwrap();
         let td = sha256_of(b"no-tmpfile-here");
-        ts.put_blob("r", &td, b"no-tmpfile-here").await.unwrap();
-        assert_eq!(ts.read_blob("r", &td).await.unwrap(), b"no-tmpfile-here");
+        s3.put_blob("r", &td, b"no-tmpfile-here").await.unwrap();
+        assert_eq!(s3.read_blob("r", &td).await.unwrap(), b"no-tmpfile-here");
         FORCE_TMPFILE_UNSUPPORTED.store(false, Ordering::Relaxed);
     }
 

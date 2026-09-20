@@ -2035,11 +2035,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_manifest_io_error_maps_to_500() {
-        // `<repo>/blobs/sha256` as a file makes remove_file of
-        // `.../sha256/<hex>` fail with ENOTDIR (non-NotFound Io), exercising
-        // delete_manifest's Io arm on the delete-by-digest path (a manifest is
-        // a blob in the CAS).
+    async fn delete_manifest_non_directory_cas_parent_is_404() {
+        // `<repo>/blobs/sha256` as a regular file makes the beneath-root dirfd
+        // walk refuse to descend into it (ENOTDIR → treated as absent), so a
+        // delete of `.../sha256/<hex>` reports the manifest simply not found
+        // (404 MANIFEST_UNKNOWN) rather than a 500 — a symlinked/broken CAS
+        // parent can never redirect the deletion outside the store. A genuine IO
+        // error (e.g. EACCES) still surfaces as 500 via unlink_beneath.
         let dir = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(dir.path()).unwrap();
         let b_dir = dir.path().join("r").join("blobs");
@@ -2055,7 +2057,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // Uppercase the hex of a digest for the case-insensitive match test.
