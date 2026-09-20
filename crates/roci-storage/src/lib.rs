@@ -964,16 +964,20 @@ async fn publish_bytes(alg_dir: &Path, dest: &Path, data: &[u8]) -> io::Result<(
     let data_vec = data.to_vec();
     let outcome = tokio::task::spawn_blocking(move || -> io::Result<bool> {
         // Anonymous inode in the target directory: it has no name until linkat.
-        #[cfg(test)]
-        if FORCE_TMPFILE_UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed) {
-            // Simulate a filesystem without O_TMPFILE → take the rename fallback.
-            return Ok(false);
-        }
-        let fd = match rustix::fs::open(
+        let opened = rustix::fs::open(
             &alg_dir_buf,
             OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o644),
-        ) {
+        );
+        // In test, simulate a filesystem without O_TMPFILE so the fallback arm
+        // below runs deterministically (ext4 in CI always supports O_TMPFILE).
+        #[cfg(all(test, target_os = "linux"))]
+        let opened = if FORCE_TMPFILE_UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed) {
+            Err(Errno::OPNOTSUPP)
+        } else {
+            opened
+        };
+        let fd = match opened {
             Ok(fd) => fd,
             // O_TMPFILE unavailable (unsupported fs like NFS/overlay, or any
             // other open failure) → take the portable temp+rename fallback,
