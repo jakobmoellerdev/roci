@@ -1123,15 +1123,18 @@ impl Storage for FsStorage {
                 .join(digest.algorithm()),
         )
         .await?;
-        // Promote by a hard link — O(1) and copy-free on one filesystem. On any
-        // failure (a destination that already exists from a concurrent/repeat
-        // mount, a cross-device link, or a filesystem without hard links) fall
-        // back to an in-kernel copy: `copy_file_range` on Linux (btrfs/XFS
-        // reflink O(1), ext4 in-kernel, NFS server-side — no userspace transit;
-        // RESEARCH §8.8), `tokio::fs::copy` elsewhere. Both overwrite, so a
-        // re-mount of identical content is harmless.
-        if tokio::fs::hard_link(&src, &dest).await.is_err() {
-            copy_file(&src, &dest).await?;
+        // Promote by a hard link — O(1), copy-free on one filesystem. A
+        // destination that already exists (a concurrent or repeat mount) is a
+        // success: blobs are content-addressed, so the existing file is already
+        // correct — never re-copy it (that would truncate the shared inode).
+        // Any other failure (cross-device, or a filesystem without hard links)
+        // falls back to an in-kernel byte copy — `copy_file_range` on Linux
+        // (btrfs/XFS reflink O(1), ext4 in-kernel, NFS server-side; no userspace
+        // transit; RESEARCH §8.8), `tokio::fs::copy` elsewhere.
+        match tokio::fs::hard_link(&src, &dest).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => copy_file(&src, &dest).await?,
         }
         let digest_str = digest.as_string();
         self.presence.insert(to_repo, &digest_str);
@@ -1789,13 +1792,32 @@ mod tests {
         // Absent source → Ok(false) (caller falls back to a session).
         let absent = sha256_of(b"never-stored");
         assert!(!s.mount_blob("src", "dst", &absent).await.unwrap());
-        // An empty blob mounted then re-mounted exercises the copy path with a
-        // zero-length source (the `n == 0` arm of the in-kernel copy loop).
-        let empty = sha256_of(b"");
-        s.put_blob("src", &empty, b"").await.unwrap();
-        assert!(s.mount_blob("src", "dst", &empty).await.unwrap());
-        assert!(s.mount_blob("src", "dst", &empty).await.unwrap());
-        assert_eq!(s.read_blob("dst", &empty).await.unwrap(), b"");
+        // Re-mounting an existing destination is an idempotent success (the
+        // hard link reports AlreadyExists and the content-addressed blob is
+        // already correct — no re-copy).
+        assert!(s.mount_blob("src", "dst", &d).await.unwrap());
+        assert_eq!(s.read_blob("dst", &d).await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn copy_file_transfers_contents() {
+        // Directly exercise the in-kernel copy fallback (copy_file_range on
+        // Linux, tokio copy elsewhere) with distinct source/destination files:
+        // a non-empty file drives the byte-transfer loop, an empty file its
+        // zero-length arm.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        let payload = vec![0xa5u8; 4096];
+        tokio::fs::write(&src, &payload).await.unwrap();
+        copy_file(&src, &dst).await.unwrap();
+        assert_eq!(tokio::fs::read(&dst).await.unwrap(), payload);
+        // A zero-length source copies to an empty destination.
+        let empty_src = dir.path().join("empty");
+        let empty_dst = dir.path().join("empty-dst");
+        tokio::fs::write(&empty_src, b"").await.unwrap();
+        copy_file(&empty_src, &empty_dst).await.unwrap();
+        assert_eq!(tokio::fs::read(&empty_dst).await.unwrap(), b"");
     }
 
     #[tokio::test]
