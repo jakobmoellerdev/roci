@@ -692,7 +692,13 @@ async fn put_manifest<S: Storage>(
     // Content-Type (compared on the bare type, `;`-params stripped). A body with
     // no `mediaType` (image index / some artifacts) skips the check — never
     // inferred. A mismatch is a malformed manifest.
-    if let Some(body_mt) = parsed.get("mediaType").and_then(|v| v.as_str()) {
+    if let Some(mt) = parsed.get("mediaType") {
+        // A present `mediaType` must be a string; a non-string is malformed and
+        // must not silently bypass the agreement check (CVE-2021-41190).
+        let Some(body_mt) = mt.as_str() else {
+            return ApiError::manifest_invalid("manifest mediaType is not a string")
+                .into_response();
+        };
         let bare = |s: &str| s.split(';').next().unwrap_or(s).trim().to_string();
         if bare(&media_type) != bare(body_mt) {
             return ApiError::manifest_invalid("Content-Type does not match manifest mediaType")
@@ -719,8 +725,12 @@ async fn put_manifest<S: Storage>(
             }
         }
     }
-    // Each `layers` entry must be a descriptor with a valid string digest.
-    if let Some(layers) = parsed.get("layers").and_then(|v| v.as_array()) {
+    // A present `layers` must be an array; a non-array is a malformed manifest
+    // (not silently skipped). Each entry must be a descriptor with a digest.
+    if let Some(layers) = parsed.get("layers") {
+        let Some(layers) = layers.as_array() else {
+            return ApiError::manifest_invalid("manifest layers is not an array").into_response();
+        };
         for layer in layers {
             match descriptor_digest_str(layer) {
                 Some(s) => match Digest::parse(s) {
@@ -3456,6 +3466,39 @@ mod tests {
                     "application/vnd.oci.image.manifest.v1+json",
                 )
                 .body(Body::from(serde_json::to_vec(&bad_config_shape).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
+        // A present but non-string `mediaType` must not bypass the CVE-2021-41190
+        // agreement check → MANIFEST_INVALID.
+        let non_string_mt = serde_json::json!({ "schemaVersion": 2, "mediaType": 123 });
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v5")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .body(Body::from(serde_json::to_vec(&non_string_mt).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
+        // A present but non-array `layers` is malformed → MANIFEST_INVALID.
+        let non_array_layers = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "layers": "not-an-array"
+        });
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v6")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .body(Body::from(serde_json::to_vec(&non_array_layers).unwrap()))
                 .unwrap(),
         )
         .await;

@@ -648,6 +648,19 @@ pub fn digest_of(data: &[u8], algorithm: &str) -> Digest {
     }
 }
 
+/// A per-operation temporary sibling of `dest`: `<dest>.<16 random hex>.tmp`.
+/// Concurrent writers of the same digest each get a distinct staging path, so
+/// one writer's rename never clobbers another's open handle (the shared
+/// `.tmp` race). The random suffix comes from `getrandom`; on the vanishingly
+/// unlikely RNG failure the caller surfaces it as an IO error.
+fn unique_tmp(dest: &Path) -> io::Result<PathBuf> {
+    let mut buf = [0u8; 8];
+    getrandom::fill(&mut buf).map_err(io::Error::other)?;
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.tmp", hex::encode(buf)));
+    Ok(dest.with_file_name(name))
+}
+
 /// Stream the file at `path` through the hasher selected by `algorithm`
 /// (sha256/sha512), returning its [`Digest`] without buffering the whole file.
 /// Used to verify a staged upload before promoting it into the CAS.
@@ -683,6 +696,63 @@ async fn hash_file(path: &Path, algorithm: &str) -> io::Result<Digest> {
             hex: hex::encode(h.finalize()),
         })
     }
+}
+
+/// Copy `src` into the CAS at `dest` crash-atomically: copy to a per-operation
+/// unique temp sibling, fsync it, then rename into place (so a reader never
+/// sees a partial blob and a crash leaves at most an orphan temp, never a
+/// corrupt-but-named digest). The copy step uses `copy_file_range` on Linux
+/// (btrfs/XFS share extents O(1) — reflink; ext4 in-kernel copy; NFS
+/// server-side copy — no userspace byte transit; RESEARCH §8.8) and a plain
+/// streaming copy elsewhere. Used as the cross-repo mount fallback when a hard
+/// link is not possible (cross-device / no-hardlink filesystem).
+async fn copy_file_atomic(src: &Path, dest: &Path) -> io::Result<()> {
+    let tmp = unique_tmp(dest)?;
+    let input = tokio::fs::File::open(src).await?;
+    let output = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .await?;
+    copy_contents(&input, &output).await?;
+    output.sync_all().await?;
+    drop(input);
+    drop(output);
+    tokio::fs::rename(&tmp, dest).await
+}
+
+/// Copy all bytes from `input` to `output`. Linux uses `copy_file_range`
+/// (in-kernel, reflink-capable); other platforms stream via tokio.
+#[cfg(target_os = "linux")]
+async fn copy_contents(input: &tokio::fs::File, output: &tokio::fs::File) -> io::Result<()> {
+    use std::os::fd::AsFd;
+    let mut remaining = input.metadata().await?.len() as usize;
+    let inf = input.as_fd().try_clone_to_owned()?;
+    let outf = output.as_fd().try_clone_to_owned()?;
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
+        loop {
+            // A zero return means EOF (also the case for an empty source on the
+            // first call); otherwise advance by the bytes the kernel copied.
+            let n = rustix::fs::copy_file_range(&inf, None, &outf, None, remaining)
+                .map_err(io::Error::from)?;
+            if n == 0 {
+                break;
+            }
+            remaining -= n;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+/// Non-Linux copy: stream the whole file through tokio.
+#[cfg(not(target_os = "linux"))]
+async fn copy_contents(input: &tokio::fs::File, output: &tokio::fs::File) -> io::Result<()> {
+    let mut reader = tokio::io::BufReader::new(input.try_clone().await?);
+    let mut writer = output.try_clone().await?;
+    tokio::io::copy(&mut reader, &mut writer).await?;
+    Ok(())
 }
 
 /// Fsync a directory so a prior `rename` into it is durable (the rename's
@@ -926,11 +996,18 @@ impl Storage for FsStorage {
         let dest = self.blob_path(repo, digest)?;
         let alg_dir = self.repo_dir(repo)?.join("blobs").join(&digest.algorithm);
         tokio::fs::create_dir_all(&alg_dir).await?;
-        // Write to a temp file, fsync it durable, then atomically rename into
-        // the CAS so a crash cannot leave a corrupt-but-named blob.
-        let tmp = dest.with_extension("tmp");
+        // Write to a per-operation unique temp (so concurrent writers of the
+        // same digest never share a staging path), fsync it durable, then
+        // atomically rename into the CAS — a crash cannot leave a
+        // corrupt-but-named blob, and publishing is idempotent (identical
+        // content, so a rename over an existing blob is harmless).
+        let tmp = unique_tmp(&dest)?;
         {
-            let mut f = tokio::fs::File::create(&tmp).await?;
+            let mut f = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .await?;
             f.write_all(data).await?;
             f.sync_all().await?;
         }
@@ -1218,14 +1295,16 @@ impl Storage for FsStorage {
         // success: blobs are content-addressed, so the existing file is already
         // the correct bytes — never copy over it (that would truncate a
         // hard-linked source). Any other link failure (cross-device, or a
-        // filesystem without hard links) means the blob cannot be cheaply
-        // mounted here; report it not-mounted so the caller falls back to a
-        // normal upload session (dist-spec end-11 permits a `202`) — we never
-        // write a partial blob directly under its digest.
+        // filesystem without hard links) falls back to a crash-atomic in-kernel
+        // copy (`copy_file_range` on Linux → reflink on btrfs/XFS): copy to a
+        // unique temp, fsync, rename — never a partial blob under the digest.
         match tokio::fs::hard_link(&src, &dest).await {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(_) => return Ok(false),
+            Err(_) => {
+                copy_file_atomic(&src, &dest).await?;
+                sync_dir(dest.parent().unwrap_or(&dest)).await?;
+            }
         }
         let digest_str = digest.as_string();
         self.presence.insert(to_repo, &digest_str);
@@ -2094,24 +2173,44 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn mount_falls_back_to_session_when_hard_link_fails() {
+    async fn mount_hard_link_failure_falls_back_to_copy() {
         // A hard-link failure that is not AlreadyExists (here: a read-only
-        // destination alg dir → EACCES) reports the blob not-mounted so the
-        // caller falls back to a normal upload session — never a partial copy.
+        // destination alg dir → EACCES) dispatches to the crash-atomic copy
+        // fallback. In this fixture the copy's temp create also fails (the dir
+        // is read-only), so the error propagates — exercising the fallback
+        // dispatch without needing a second filesystem.
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let s = FsStorage::new(dir.path()).unwrap();
         let data = b"mountable";
         let d = sha256_of(data);
         s.put_blob("src", &d, data).await.unwrap();
-        // Pre-create dst's blobs/sha256 dir read-only so hard_link into it fails.
         s.ensure_layout("dst").await.unwrap();
         let alg = dir.path().join("dst").join("blobs").join("sha256");
         std::fs::create_dir_all(&alg).unwrap();
         std::fs::set_permissions(&alg, std::fs::Permissions::from_mode(0o500)).unwrap();
-        assert!(!s.mount_blob("src", "dst", &d).await.unwrap());
+        assert!(s.mount_blob("src", "dst", &d).await.is_err());
         // Restore perms so the tempdir cleans up.
         std::fs::set_permissions(&alg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_file_atomic_transfers_contents() {
+        // The in-kernel copy fallback (copy_file_range on Linux, tokio copy
+        // elsewhere) transfers a non-empty file and an empty file into distinct
+        // destinations via a unique temp + rename.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let payload = vec![0x5au8; 70000];
+        tokio::fs::write(&src, &payload).await.unwrap();
+        let dst = dir.path().join("dst");
+        copy_file_atomic(&src, &dst).await.unwrap();
+        assert_eq!(tokio::fs::read(&dst).await.unwrap(), payload);
+        let empty_src = dir.path().join("empty");
+        tokio::fs::write(&empty_src, b"").await.unwrap();
+        let empty_dst = dir.path().join("empty-dst");
+        copy_file_atomic(&empty_src, &empty_dst).await.unwrap();
+        assert_eq!(tokio::fs::read(&empty_dst).await.unwrap(), b"");
     }
 
     #[cfg(unix)]

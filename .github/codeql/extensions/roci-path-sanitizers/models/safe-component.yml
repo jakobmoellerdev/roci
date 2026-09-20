@@ -1,0 +1,28 @@
+# roci path-injection sanitizer models.
+#
+# Every filesystem path in roci-storage is built only from `SafeComponent`
+# values, whose sole constructor `SafeComponent::new` validates an untrusted
+# component and rejects `.`/`..`, any separator (`/`, `\`) and NUL before it is
+# ever joined into a path (crates/roci-storage/src/lib.rs; SECURITY.md inv. 8).
+# CodeQL's default Rust taint model does not recognize this validating
+# constructor as a barrier, so it re-reports `rust/path-injection` on every
+# `repo_dir`/`blob_path`/`upload_path` that joins a validated component.
+#
+# These barrier models teach CodeQL that the `Ok` value returned by the
+# validator is sanitized for path injection — the durable fix for the recurring
+# false positives (versus dismissing each generated alert per push).
+#
+# `SafeComponent` is defined at the crate root of `roci-storage`, so its
+# canonical path is `roci_storage::SafeComponent`; both the constructor and the
+# `safe_component` wrapper that delegates to it are modeled.
+extensions:
+  - addsTo:
+      pack: codeql/rust-all
+      extensible: barrierModel
+    data:
+      # SafeComponent::new(&str) -> Result<SafeComponent, StorageError>:
+      # the Ok value is a validated, traversal-free path component.
+      - ["<roci_storage::SafeComponent>::new", "ReturnValue.Field[core::result::Result::Ok(0)]", "path-injection", "manual"]
+      # FsStorage::safe_component(&str) -> Result<SafeComponent, StorageError>:
+      # thin wrapper over SafeComponent::new with the same guarantee.
+      - ["<roci_storage::FsStorage>::safe_component", "ReturnValue.Field[core::result::Result::Ok(0)]", "path-injection", "manual"]

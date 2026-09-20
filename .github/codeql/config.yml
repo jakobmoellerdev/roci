@@ -12,5 +12,12 @@ paths-ignore:
   - spec
   - "**/tests"
 
+# Load the in-repo model pack that declares roci's `SafeComponent` validator as
+# a path-injection barrier, so CodeQL stops re-flagging the CAS path joins that
+# only ever receive validated components (SECURITY.md inv. 8). See
+# `.github/codeql/extensions/roci-path-sanitizers/`.
+packs:
+  - roci/path-sanitizers
+
 # No `queries:` block — omitting it runs CodeQL's default query suite, which is
 # the fastest (security-and-quality / security-extended are slower).
