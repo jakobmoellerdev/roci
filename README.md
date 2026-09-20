@@ -107,6 +107,8 @@ Every recipe mirrors a CI gate, so passing locally means passing the required CI
 | `just coverage` | Enforce 100% line coverage (cargo-llvm-cov) |
 | `just coverage-report` | Show uncovered lines (developer aid) |
 | `just coverage-linux` | Reproduce the CI Linux 100%-coverage gate in a container (macOS devs; the only way to exercise the Linux-only fast paths) |
+| `just codeql-local` | Reproduce the CI CodeQL rust path-injection analysis in a container (macOS devs; fails if any alert remains) |
+| `just test-filesystems` | Run the storage suite on real ext4/btrfs/XFS loopback filesystems (privileged container) — exercises the actual reflink/hard-link/O_TMPFILE/copy behavior per FS, not the `FORCE_*` simulation |
 | `just ci` | Run the full local gate before pushing (actionlint + fmt + clippy + test + build + deps-guard + coverage + conformance) |
 | `just conformance` | Run the OCI dist-spec conformance suite against a local roci |
 | `just container` | Build the hardened scratch image and smoke-test it |
