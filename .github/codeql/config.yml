@@ -12,16 +12,15 @@ paths-ignore:
   - spec
   - "**/tests"
 
+# Apply roci's in-repo path-injection barrier model pack (declares
+# `SafeComponent::new` / `FsStorage::safe_component` as `path-injection`
+# barriers — the durable fix for the recurring false positives; the
+# `SafeComponent` newtype is the real sanitizer boundary). The pack lives at
+# `.github/codeql/extensions/roci-path-sanitizers/` and is resolved from the
+# local checkout via `--additional-packs` (set through
+# `CODEQL_ACTION_EXTRA_OPTIONS` in codeql.yml), not from GHCR.
+packs:
+  - roci/path-sanitizers
+
 # No `queries:` block — omitting it runs CodeQL's default query suite, which is
 # the fastest (security-and-quality / security-extended are slower).
-#
-# roci ships an in-repo path-injection barrier model pack at
-# `.github/codeql/extensions/roci-path-sanitizers/` (declaring
-# `SafeComponent::new` / `FsStorage::safe_component` as `path-injection`
-# barriers — the durable fix for the recurring false positives). It is NOT
-# referenced here via `packs:` because that key resolves packs from GHCR and a
-# local, unpublished pack fails `database init`. To activate it, publish the
-# pack (`codeql pack publish`) and add it to `packs:`, or load it locally with
-# `--additional-packs`. Until then the generated alerts are dismissed as
-# false positives (the `SafeComponent` newtype is the real sanitizer boundary).
-
