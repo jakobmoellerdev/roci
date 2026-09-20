@@ -1817,10 +1817,22 @@ mod tests {
             s.backrefs("r", &b2).await.unwrap(),
             vec![manifest.as_string()]
         );
-        // Deleting the manifest clears its edges from every referenced blob.
+        // A backref edge in a *different* repo is untouched by this repo's
+        // delete (exercises the `r != repo` skip in the drop path).
+        s.record_backrefs("other", &manifest, std::slice::from_ref(&b1))
+            .await
+            .unwrap();
+        // Recording an empty blob set is a no-op success.
+        s.record_backrefs("r", &manifest, &[]).await.unwrap();
+        // Deleting the manifest clears its edges from every referenced blob in
+        // this repo, but leaves the other repo's edge intact.
         s.delete_manifest("r", &manifest).await.unwrap();
         assert!(s.backrefs("r", &b1).await.unwrap().is_empty());
         assert!(s.backrefs("r", &b2).await.unwrap().is_empty());
+        assert_eq!(
+            s.backrefs("other", &b1).await.unwrap(),
+            vec![manifest.as_string()]
+        );
     }
 
     #[tokio::test]
@@ -1831,6 +1843,15 @@ mod tests {
         // First abort removes the staging file; a second is a no-op Ok(false).
         assert!(s.abort_upload("r", &id).await.unwrap());
         assert!(!s.abort_upload("r", &id).await.unwrap());
+        // A session id that names a directory yields a non-NotFound IO error.
+        let uploads = dir.path().join("r").join("uploads");
+        tokio::fs::create_dir_all(uploads.join("dirsess"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.abort_upload("r", "dirsess").await,
+            Err(StorageError::Io(_))
+        ));
     }
 
     #[tokio::test]
