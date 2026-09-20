@@ -747,21 +747,32 @@ async fn copy_file_atomic(src: &Path, dest: &Path) -> io::Result<()> {
     sync_dir(dest.parent().unwrap_or(dest)).await
 }
 
-/// Test-only switch: when set, the reflink (`ioctl_ficlone`) and `hard_link`
-/// fast paths are treated as failed so the streaming/copy fallbacks — the
-/// cross-device paths a single-filesystem test cannot otherwise reach — run
-/// deterministically. Zero cost and absent outside `cfg(test)`.
+/// Test-only switches: on a single filesystem a real `ioctl_ficlone`/`hard_link`
+/// neither fails (to exercise the copy fallback) nor succeeds (ext4 has no
+/// reflink), so both branches are otherwise unreachable. `FORCE_COPY_FALLBACK`
+/// makes the fast paths report failure; `FORCE_REFLINK_OK` makes `try_reflink`
+/// report success (after really transferring the bytes via the streaming copy,
+/// so the destination is correct). Zero cost and absent outside `cfg(test)`.
 #[cfg(all(test, target_os = "linux"))]
 static FORCE_COPY_FALLBACK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(test, target_os = "linux"))]
+static FORCE_REFLINK_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "linux")]
-fn try_reflink(output: &std::fs::File, input: &std::fs::File) -> bool {
+fn try_reflink(output: &mut std::fs::File, input: &mut std::fs::File) -> bool {
     #[cfg(test)]
     if FORCE_COPY_FALLBACK.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
-    rustix::fs::ioctl_ficlone(output, input).is_ok()
+    #[cfg(test)]
+    if FORCE_REFLINK_OK.load(std::sync::atomic::Ordering::Relaxed) {
+        // Simulate a successful whole-file reflink by actually moving the bytes
+        // (ext4 in CI has no CoW), so the "reflink succeeded" branch is covered
+        // with a correct destination.
+        return stream_copy(input, output).is_ok();
+    }
+    rustix::fs::ioctl_ficlone(&*output, &*input).is_ok()
 }
 
 /// `hard_link` with a test-only fault seam: when `FORCE_COPY_FALLBACK` is set
@@ -792,7 +803,7 @@ async fn copy_contents(input: &tokio::fs::File, output: &tokio::fs::File) -> io:
         let mut outfile = std::fs::File::from(outf);
         // Whole-file reflink first: instant CoW extent share on btrfs/XFS. On
         // any failure (unsupported fs, cross-device) stream the bytes instead.
-        if !try_reflink(&outfile, &infile) {
+        if !try_reflink(&mut outfile, &mut infile) {
             stream_copy(&mut infile, &mut outfile)?;
         }
         Ok(())
@@ -862,6 +873,8 @@ async fn publish_bytes(alg_dir: &Path, dest: &Path, data: &[u8]) -> io::Result<(
         // (linking the fd directly) needs CAP_DAC_READ_SEARCH, so the portable form
         // resolves the fd's magic symlink with AT_SYMLINK_FOLLOW.
         let proc_path = format!("/proc/self/fd/{}", f.as_raw_fd());
+        // Link the anonymous inode into place; EEXIST means the content-addressed
+        // blob already exists (dedup) and is success. Any other error propagates.
         match rustix::fs::linkat(
             rustix::fs::CWD,
             proc_path,
@@ -869,10 +882,9 @@ async fn publish_bytes(alg_dir: &Path, dest: &Path, data: &[u8]) -> io::Result<(
             &dest,
             rustix::fs::AtFlags::SYMLINK_FOLLOW,
         ) {
-            // EEXIST: the content-addressed blob is already present — dedup, success.
-            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-            Err(e) => return Err(io::Error::from(e)),
-        }
+            Ok(()) | Err(rustix::io::Errno::EXIST) => Ok(()),
+            Err(e) => Err(io::Error::from(e)),
+        }?;
         Ok(())
     })
     .await
@@ -2588,6 +2600,15 @@ mod tests {
         assert!(s.mount_blob("srcrepo", "dstrepo", &d).await.unwrap());
         assert_eq!(s.read_blob("dstrepo", &d).await.unwrap(), data);
         FORCE_COPY_FALLBACK.store(false, Ordering::Relaxed);
+        // Now the reflink-succeeds branch: try_reflink reports success (moving
+        // the bytes via the streaming copy) so copy_contents skips its own copy.
+        FORCE_REFLINK_OK.store(true, Ordering::Relaxed);
+        let rsrc = dir.path().join("reflink-src");
+        tokio::fs::write(&rsrc, &payload).await.unwrap();
+        let rdst = dir.path().join("reflink-dst");
+        copy_file_atomic(&rsrc, &rdst).await.unwrap();
+        assert_eq!(tokio::fs::read(&rdst).await.unwrap(), payload);
+        FORCE_REFLINK_OK.store(false, Ordering::Relaxed);
     }
 
     #[cfg(unix)]
