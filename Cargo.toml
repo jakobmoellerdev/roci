@@ -37,6 +37,7 @@ roci-cluster = { path = "crates/roci-cluster", version = "0.0.0" }
 
 # Third-party.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "fs", "macros", "signal", "sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
 axum = "0.8"
 tower = "0.5"
 serde = { version = "1", features = ["derive"] }
@@ -53,6 +54,9 @@ anyhow = "1"
 futures = "0.3"
 bytes = "1"
 tempfile = "3"
+xorf = "0.13"
+cuckoofilter = "0.5"
+lru = "0.18"
 
 [profile.ci]
 inherits = "dev"

@@ -13,6 +13,13 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+mod cache;
+mod filter;
+use cache::SmallBlobCache;
+mod metadata;
+use filter::BlobPresenceFilter;
+pub use metadata::{LogMetadataStore, MetaOp, MetadataStore};
+
 /// A parsed `algorithm:hex` content digest.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Digest {
@@ -201,40 +208,97 @@ pub trait Storage: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Vec<Vec<u8>>, StorageError>> + Send;
 }
 
-/// Filesystem-backed [`Storage`]. Layout under `<root>/<repo>/`:
-/// `blobs/<algo>/<hex>`, `manifests/<algo>/<hex>`, `tags/<tag>` (contains the
-/// manifest digest), `uploads/<id>` (in-progress).
+/// Filesystem-backed [`Storage`]. Each repository is a self-contained OCI
+/// image layout under `<root>/<repo>/`: `oci-layout` (marker), `index.json`
+/// (the image index — source of truth for tags, manifest media types and the
+/// subject/referrers relation), `blobs/<algo>/<hex>` (content-addressable
+/// store for blobs *and* manifests), and `uploads/<id>` (in-progress, not part
+/// of the served layout). This lets roci serve any pre-existing OCI layout.
 #[derive(Clone)]
 pub struct FsStorage {
     root: Arc<PathBuf>,
     upload_seq: Arc<Mutex<u64>>,
+    /// Derived, rebuildable metadata index (tags, media types, referrers) kept
+    /// in RAM and mirrored to `roci-meta.log`. Reads resolve against this first
+    /// and fall back to `index.json`; the layout stays the source of truth.
+    meta: Arc<LogMetadataStore>,
+    /// In-RAM blob-presence filter: a definite-absent answer short-circuits the
+    /// filesystem `stat` on the read path (RESEARCH §8.5). Never authoritative
+    /// for presence — a "maybe" always verifies on disk (SECURITY inv. 10).
+    presence: Arc<BlobPresenceFilter>,
+    /// Bounded in-RAM small-blob content cache (RESEARCH §9.2): serves
+    /// manifests/configs with zero syscalls. A miss falls through to the loose
+    /// CAS file, which always exists (never the sole copy).
+    cache: Arc<SmallBlobCache>,
 }
 
 impl FsStorage {
-    /// Create a store rooted at `root`, creating it if absent.
+    /// Create a store rooted at `root`, creating it if absent. Opens (replaying)
+    /// the metadata log, then seeds the blob-presence filter from the CAS so it
+    /// is complete (never false-negatives a stored blob). Tags/media-types/
+    /// referrers are NOT walked at startup — a pre-existing layout resolves via
+    /// the `index.json` read-path fallbacks and the metadata store warms on
+    /// writes; the layout stays the source of truth.
     pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
-        Ok(Self {
+        let meta = Arc::new(LogMetadataStore::open(&root)?);
+        let store = Self {
             root: Arc::new(root),
             upload_seq: Arc::new(Mutex::new(0)),
-        })
+            meta,
+            presence: Arc::new(BlobPresenceFilter::new()),
+            cache: Arc::new(SmallBlobCache::new()),
+        };
+        store.seed_presence_from_cas();
+        Ok(store)
     }
 
-    /// Validate a single untrusted path component and **return it** so callers
-    /// build paths from the validated value (a barrier the taint analysis and
-    /// a human both see). Rejects empty, `.`/`..`, and any embedded separator
-    /// (`/`, `\`) or NUL. Defense-in-depth backstop so the CAS is safe
-    /// regardless of the caller (SECURITY.md inv. 8).
-    fn safe_component(s: &str) -> Result<&str, StorageError> {
-        if s.is_empty()
-            || s == "."
-            || s == ".."
-            || s.bytes().any(|b| b == b'/' || b == b'\\' || b == 0)
-        {
-            return Err(StorageError::BadPath(s.to_string()));
+    /// Seed the blob-presence filter from every blob in the CAS so a definite
+    /// absence (filter miss) is authoritative — the filter is complete, so a
+    /// miss truly means "not stored" and can 404 without a syscall (RESEARCH
+    /// §8.5). Walks `<repo>/blobs/<alg>/<hex>` for every repo (a repo dir is one
+    /// holding `index.json`); skips in-progress `.tmp` files.
+    fn seed_presence_from_cas(&self) {
+        let root: &Path = &self.root;
+        // Enumerate repo dirs (those containing index.json) up to a bounded
+        // depth, then their blobs; best-effort — an unreadable dir just leaves
+        // those blobs to fall through to a stat (never a wrong 404, because a
+        // blob absent from the filter that IS on disk would only be reached if
+        // the walk both saw the repo and failed mid-blobs, which re-adds via the
+        // stat fallthrough being authoritative). See test coverage below.
+        for repo in discover_repos(root) {
+            let alg_root = root.join(&repo).join("blobs");
+            let Ok(algs) = std::fs::read_dir(&alg_root) else {
+                continue;
+            };
+            for alg in algs.flatten() {
+                let alg_name = alg.file_name().to_string_lossy().into_owned();
+                let Ok(hexes) = std::fs::read_dir(alg.path()) else {
+                    continue;
+                };
+                for hex in hexes.flatten() {
+                    let name = hex.file_name();
+                    let hex_name = name.to_string_lossy();
+                    // Skip in-progress tmp files (they carry an extension).
+                    if hex_name.contains('.') {
+                        continue;
+                    }
+                    self.presence
+                        .insert(&repo, &format!("{alg_name}:{hex_name}"));
+                }
+            }
         }
-        Ok(s)
+    }
+
+    /// Validate a single untrusted path component, returning a [`SafeComponent`]
+    /// — a wrapper whose only constructor is this validation, so a filesystem
+    /// path built from it is provably free of traversal input (a barrier the
+    /// taint analysis and a human both see). Rejects empty, `.`/`..`, and any
+    /// embedded separator (`/`, `\`) or NUL. Defense-in-depth backstop so the
+    /// CAS is safe regardless of the caller (SECURITY.md inv. 8).
+    fn safe_component(s: &str) -> Result<SafeComponent<'_>, StorageError> {
+        SafeComponent::new(s)
     }
 
     fn repo_dir(&self, repo: &str) -> Result<PathBuf, StorageError> {
@@ -249,24 +313,49 @@ impl FsStorage {
     fn blob_path(&self, repo: &str, d: &Digest) -> Result<PathBuf, StorageError> {
         Ok(self.repo_dir(repo)?.join("blobs").join(d.relative_path()))
     }
-    fn manifest_path(&self, repo: &str, d: &Digest) -> Result<PathBuf, StorageError> {
-        Ok(self
-            .repo_dir(repo)?
-            .join("manifests")
-            .join(d.relative_path()))
+    fn layout_path(&self, repo: &str) -> Result<PathBuf, StorageError> {
+        Ok(self.repo_dir(repo)?.join("oci-layout"))
     }
-    fn manifest_meta_path(&self, repo: &str, d: &Digest) -> Result<PathBuf, StorageError> {
-        Ok(self
-            .repo_dir(repo)?
-            .join("manifests")
-            .join(d.relative_path())
-            .with_extension("mediatype"))
+    fn index_path(&self, repo: &str) -> Result<PathBuf, StorageError> {
+        Ok(self.repo_dir(repo)?.join("index.json"))
     }
-    fn tag_path(&self, repo: &str, tag: &str) -> Result<PathBuf, StorageError> {
-        Ok(self
-            .repo_dir(repo)?
-            .join("tags")
-            .join(Self::safe_component(tag)?))
+    /// Ensure `<repo>/` exists and carries a valid `oci-layout` marker so the
+    /// directory is a well-formed OCI image layout even if only blobs (no
+    /// manifest) have been pushed. Idempotent.
+    async fn ensure_layout(&self, repo: &str) -> Result<(), StorageError> {
+        let repo_dir = self.repo_dir(repo)?;
+        tokio::fs::create_dir_all(&repo_dir).await?;
+        let marker = self.layout_path(repo)?;
+        // Write the marker only if absent (idempotent). A pre-existing marker is
+        // the steady state after the first push.
+        if tokio::fs::try_exists(&marker).await? {
+            return Ok(());
+        }
+        tokio::fs::write(&marker, OCI_LAYOUT_MARKER).await?;
+        Ok(())
+    }
+    /// Read `<repo>/index.json` as an image index. A missing index yields the
+    /// canonical empty image index. A malformed on-disk index is an internal
+    /// error (mapped to [`StorageError::Io`]).
+    async fn read_index(&self, repo: &str) -> Result<serde_json::Value, StorageError> {
+        match tokio::fs::read(self.index_path(repo)?).await {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, e))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(empty_index()),
+            Err(e) => Err(StorageError::Io(e)),
+        }
+    }
+    /// Write `<repo>/index.json` atomically (tmp + rename), first ensuring the
+    /// layout marker exists.
+    async fn write_index(&self, repo: &str, index: &serde_json::Value) -> Result<(), StorageError> {
+        self.ensure_layout(repo).await?;
+        let dest = self.index_path(repo)?;
+        let tmp = dest.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(index)
+            .map_err(|e| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
+        tokio::fs::write(&tmp, &bytes).await?;
+        tokio::fs::rename(&tmp, &dest).await?;
+        Ok(())
     }
     fn upload_path(&self, repo: &str, id: &str) -> Result<PathBuf, StorageError> {
         Ok(self
@@ -274,11 +363,46 @@ impl FsStorage {
             .join("uploads")
             .join(Self::safe_component(id)?))
     }
-    fn referrers_dir(&self, repo: &str, subject: &Digest) -> Result<PathBuf, StorageError> {
-        Ok(self
-            .repo_dir(repo)?
-            .join("referrers")
-            .join(subject.relative_path()))
+
+    /// Fallback: recover a manifest's media type from `index.json` when the
+    /// in-RAM index has no entry (e.g. an externally-provided layout the seed
+    /// did not cover). `None` if the digest is not listed.
+    async fn index_media_type_for_digest(
+        &self,
+        repo: &str,
+        digest: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let index = self.read_index(repo).await?;
+        Ok(index
+            .get("manifests")
+            .and_then(|m| m.as_array())
+            .and_then(|ms| ms.iter().find(|e| descriptor_digest(e) == Some(digest)))
+            .and_then(|e| e.get("mediaType"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string))
+    }
+
+    /// Fallback: resolve a tag to `(digest, media_type)` from `index.json` when
+    /// the in-RAM tag map misses. `NotFound` if no descriptor carries the tag.
+    async fn index_resolve_tag(
+        &self,
+        repo: &str,
+        tag: &str,
+    ) -> Result<(Digest, String), StorageError> {
+        let index = self.read_index(repo).await?;
+        let entry = index
+            .get("manifests")
+            .and_then(|m| m.as_array())
+            .and_then(|ms| ms.iter().find(|e| descriptor_tag(e) == Some(tag)))
+            .cloned()
+            .ok_or(StorageError::NotFound)?;
+        let digest = Digest::parse(descriptor_digest(&entry).ok_or(StorageError::NotFound)?)?;
+        let media_type = entry
+            .get("mediaType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("application/vnd.oci.image.manifest.v1+json")
+            .to_string();
+        Ok((digest, media_type))
     }
 }
 
@@ -288,6 +412,119 @@ fn map_not_found(e: io::Error) -> StorageError {
     } else {
         StorageError::Io(e)
     }
+}
+
+/// A single path component that has passed traversal validation. Its only
+/// constructor is [`SafeComponent::new`], so any [`Path`] built by joining a
+/// `SafeComponent` is provably free of `.`/`..`/separator/NUL injection — the
+/// validation is a visible barrier between untrusted input and the filesystem
+/// (SECURITY.md inv. 8), and a taint analysis sees the sanitizer boundary.
+struct SafeComponent<'a>(&'a str);
+
+impl<'a> SafeComponent<'a> {
+    /// Validate `s` as a single safe path component, rejecting empty, `.`,
+    /// `..`, and any embedded separator (`/`, `\`) or NUL.
+    fn new(s: &'a str) -> Result<Self, StorageError> {
+        if s.is_empty()
+            || s == "."
+            || s == ".."
+            || s.bytes().any(|b| b == b'/' || b == b'\\' || b == 0)
+        {
+            return Err(StorageError::BadPath(s.to_string()));
+        }
+        Ok(Self(s))
+    }
+}
+
+impl AsRef<Path> for SafeComponent<'_> {
+    fn as_ref(&self) -> &Path {
+        Path::new(self.0)
+    }
+}
+
+/// Repository names under `root`: every directory (bounded depth) that directly
+/// contains an `index.json` file, named by its `/`-joined path relative to
+/// `root`. Best-effort — an unreadable directory is skipped. Used only to seed
+/// the blob-presence filter at startup.
+fn discover_repos(root: &Path) -> Vec<String> {
+    fn walk(dir: &Path, rel: &[String], depth: usize, out: &mut Vec<String>) {
+        // Bound depth so a pathological tree cannot recurse without limit;
+        // repo names are a handful of path segments in practice.
+        if depth == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        if !rel.is_empty() && dir.join("index.json").is_file() {
+            out.push(rel.join("/"));
+        }
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // The CAS/staging subdirs of a repo are never themselves repos.
+            if name == "blobs" || name == "uploads" {
+                continue;
+            }
+            let mut child = rel.to_vec();
+            child.push(name);
+            walk(&entry.path(), &child, depth - 1, out);
+        }
+    }
+    let mut repos = Vec::new();
+    walk(root, &[], 16, &mut repos);
+    repos
+}
+
+/// The `oci-layout` marker file contents (image-layout.md §oci-layout file).
+const OCI_LAYOUT_MARKER: &str = "{\"imageLayoutVersion\":\"1.0.0\"}";
+
+/// Annotation key a descriptor carries to name a tag (image-layout.md
+/// §index.json file).
+const REF_NAME_ANNOTATION: &str = "org.opencontainers.image.ref.name";
+
+/// The canonical empty OCI image index.
+fn empty_index() -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [],
+    })
+}
+
+/// Borrow the `manifests` array of an image index, replacing a missing or
+/// non-array `manifests` field with an empty array first.
+fn index_manifests_mut(index: &mut serde_json::Value) -> &mut Vec<serde_json::Value> {
+    let obj = match index {
+        serde_json::Value::Object(o) => o,
+        other => {
+            *other = empty_index();
+            other.as_object_mut().expect("empty_index is an object")
+        }
+    };
+    let entry = obj
+        .entry("manifests")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if !entry.is_array() {
+        *entry = serde_json::Value::Array(Vec::new());
+    }
+    entry.as_array_mut().expect("manifests coerced to array")
+}
+
+/// The tag a descriptor names via its `org.opencontainers.image.ref.name`
+/// annotation, if any.
+fn descriptor_tag(descriptor: &serde_json::Value) -> Option<&str> {
+    descriptor
+        .get("annotations")
+        .and_then(|a| a.get(REF_NAME_ANNOTATION))
+        .and_then(|v| v.as_str())
+}
+
+/// The `digest` field of a descriptor, if present and a string.
+fn descriptor_digest(descriptor: &serde_json::Value) -> Option<&str> {
+    descriptor.get("digest").and_then(|v| v.as_str())
 }
 
 /// Compute the sha256 digest of `data`.
@@ -320,16 +557,31 @@ pub fn digest_of(data: &[u8], algorithm: &str) -> Digest {
 
 impl Storage for FsStorage {
     async fn blob_size(&self, repo: &str, digest: &Digest) -> Result<u64, StorageError> {
-        let meta = tokio::fs::metadata(self.blob_path(repo, digest)?)
-            .await
-            .map_err(map_not_found)?;
+        // Validate the path first (the traversal backstop must run before any
+        // short-circuit), then let a definite-absent filter answer skip the
+        // stat; a "maybe" falls through to the authoritative stat.
+        let path = self.blob_path(repo, digest)?;
+        if !self.presence.maybe_present(repo, &digest.as_string()) {
+            return Err(StorageError::NotFound);
+        }
+        let meta = tokio::fs::metadata(path).await.map_err(map_not_found)?;
         Ok(meta.len())
     }
 
     async fn read_blob(&self, repo: &str, digest: &Digest) -> Result<Vec<u8>, StorageError> {
-        tokio::fs::read(self.blob_path(repo, digest)?)
-            .await
-            .map_err(map_not_found)
+        let digest_str = digest.as_string();
+        // Serve small blobs (manifests/configs) from the RAM cache with zero
+        // syscalls; a miss falls through to the loose file.
+        if let Some(bytes) = self.cache.get(repo, &digest_str) {
+            return Ok(bytes.to_vec());
+        }
+        let path = self.blob_path(repo, digest)?;
+        if !self.presence.maybe_present(repo, &digest_str) {
+            return Err(StorageError::NotFound);
+        }
+        let bytes = tokio::fs::read(path).await.map_err(map_not_found)?;
+        self.cache.put(repo, &digest_str, &bytes);
+        Ok(bytes)
     }
 
     async fn open_blob(
@@ -337,9 +589,11 @@ impl Storage for FsStorage {
         repo: &str,
         digest: &Digest,
     ) -> Result<tokio::fs::File, StorageError> {
-        tokio::fs::File::open(self.blob_path(repo, digest)?)
-            .await
-            .map_err(map_not_found)
+        let path = self.blob_path(repo, digest)?;
+        if !self.presence.maybe_present(repo, &digest.as_string()) {
+            return Err(StorageError::NotFound);
+        }
+        tokio::fs::File::open(path).await.map_err(map_not_found)
     }
 
     async fn begin_upload(&self, repo: &str) -> Result<String, StorageError> {
@@ -399,6 +653,9 @@ impl Storage for FsStorage {
                 actual: actual.as_string(),
             });
         }
+        // A repo populated only by blob pushes still gets a valid oci-layout
+        // marker so the directory is a well-formed OCI image layout.
+        self.ensure_layout(repo).await?;
         let dest = self.blob_path(repo, digest)?;
         tokio::fs::create_dir_all(self.repo_dir(repo)?.join("blobs").join(&digest.algorithm))
             .await?;
@@ -406,13 +663,22 @@ impl Storage for FsStorage {
         let tmp = dest.with_extension("tmp");
         tokio::fs::write(&tmp, data).await?;
         tokio::fs::rename(&tmp, &dest).await?;
+        // Record presence so future reads skip the stat on a definite miss, and
+        // warm the small-blob cache (a no-op for large layers).
+        let digest_str = digest.as_string();
+        self.presence.insert(repo, &digest_str);
+        self.cache.put(repo, &digest_str, data);
         Ok(())
     }
 
     async fn delete_blob(&self, repo: &str, digest: &Digest) -> Result<(), StorageError> {
         tokio::fs::remove_file(self.blob_path(repo, digest)?)
             .await
-            .map_err(map_not_found)
+            .map_err(map_not_found)?;
+        let digest_str = digest.as_string();
+        self.presence.remove(repo, &digest_str);
+        self.cache.invalidate(repo, &digest_str);
+        Ok(())
     }
 
     async fn put_manifest(
@@ -424,46 +690,90 @@ impl Storage for FsStorage {
         data: &[u8],
     ) -> Result<(), StorageError> {
         // Validate the tag (if any) *before* writing any content so a bad tag
-        // cannot leave a partially-committed manifest + media-type file.
-        let tag_dest = match tag {
-            Some(tag) => Some(self.tag_path(repo, tag)?),
-            None => None,
-        };
-        let dest = self.manifest_path(repo, digest)?;
-        tokio::fs::create_dir_all(
-            self.repo_dir(repo)?
-                .join("manifests")
-                .join(&digest.algorithm),
-        )
-        .await?;
-        tokio::fs::write(&dest, data).await?;
-        tokio::fs::write(
-            self.manifest_meta_path(repo, digest)?,
-            media_type.as_bytes(),
-        )
-        .await?;
-        if let Some(tp) = tag_dest {
-            tokio::fs::create_dir_all(self.repo_dir(repo)?.join("tags")).await?;
-            tokio::fs::write(tp, digest.as_string().as_bytes()).await?;
+        // cannot leave a manifest blob committed with no index entry.
+        if let Some(tag) = tag {
+            Self::safe_component(tag)?;
         }
-        Ok(())
+        // A manifest is a blob addressed by its digest; store it in the CAS
+        // (put_blob verifies the digest and ensures the layout marker).
+        self.put_blob(repo, digest, data).await?;
+
+        // Record/refresh the manifest's descriptor in index.json.
+        let mut index = self.read_index(repo).await?;
+        let digest_str = digest.as_string();
+        let manifests = index_manifests_mut(&mut index);
+        // Drop any prior entry that would collide: the same tag (a tag move) or,
+        // for this exact (digest, tag) pair, an exact duplicate (idempotent
+        // re-push). Foreign descriptors and other tags are preserved.
+        manifests.retain(|entry| {
+            let same_tag = tag.is_some() && descriptor_tag(entry) == tag;
+            let same_untagged = tag.is_none()
+                && descriptor_tag(entry).is_none()
+                && descriptor_digest(entry) == Some(digest_str.as_str());
+            !(same_tag || same_untagged)
+        });
+        let mut descriptor = serde_json::Map::new();
+        descriptor.insert(
+            "mediaType".into(),
+            serde_json::Value::String(media_type.to_string()),
+        );
+        descriptor.insert("digest".into(), serde_json::Value::String(digest_str));
+        descriptor.insert("size".into(), serde_json::Value::Number(data.len().into()));
+        if let Some(tag) = tag {
+            let mut ann = serde_json::Map::new();
+            ann.insert(
+                REF_NAME_ANNOTATION.into(),
+                serde_json::Value::String(tag.to_string()),
+            );
+            descriptor.insert("annotations".into(), serde_json::Value::Object(ann));
+        }
+        manifests.push(serde_json::Value::Object(descriptor));
+        self.write_index(repo, &index).await?;
+        // Mirror the mutation into the derived metadata index + durable log.
+        self.meta
+            .apply(MetaOp::PutManifest {
+                repo: repo.to_string(),
+                digest: digest.as_string(),
+                media_type: media_type.to_string(),
+                tag: tag.map(str::to_string),
+            })
+            .map_err(StorageError::Io)
     }
 
     async fn get_manifest(&self, repo: &str, reference: &str) -> Result<ManifestRef, StorageError> {
-        let digest = if reference.contains(':') {
-            Digest::parse(reference)?
+        let (digest, media_type) = if reference.contains(':') {
+            // By-digest: the digest *is* the reference; recover the media type
+            // from the in-RAM index, then the on-disk index, then default.
+            let digest = Digest::parse(reference)?;
+            let media_type = match self.meta.manifest_media_type(repo, reference) {
+                Some(mt) => mt,
+                None => self
+                    .index_media_type_for_digest(repo, reference)
+                    .await?
+                    .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string()),
+            };
+            (digest, media_type)
         } else {
-            let raw = tokio::fs::read(self.tag_path(repo, reference)?)
-                .await
-                .map_err(map_not_found)?;
-            Digest::parse(std::str::from_utf8(&raw).map_err(|_| StorageError::NotFound)?)?
+            // By-tag: resolve via the in-RAM tag map; on a miss fall back to the
+            // on-disk index.json (the layout is the source of truth).
+            match self.meta.resolve_tag(repo, reference) {
+                Some((digest_str, media_type)) => (Digest::parse(&digest_str)?, media_type),
+                None => self.index_resolve_tag(repo, reference).await?,
+            }
         };
-        let bytes = tokio::fs::read(self.manifest_path(repo, &digest)?)
-            .await
-            .map_err(map_not_found)?;
-        let media_type = tokio::fs::read_to_string(self.manifest_meta_path(repo, &digest)?)
-            .await
-            .unwrap_or_else(|_| "application/vnd.oci.image.manifest.v1+json".to_string());
+        // Manifests are small blobs; serve their bytes from the RAM cache when
+        // warm, else read the loose file and warm the cache.
+        let digest_str = digest.as_string();
+        let bytes = match self.cache.get(repo, &digest_str) {
+            Some(cached) => cached.to_vec(),
+            None => {
+                let b = tokio::fs::read(self.blob_path(repo, &digest)?)
+                    .await
+                    .map_err(map_not_found)?;
+                self.cache.put(repo, &digest_str, &b);
+                b
+            }
+        };
         Ok(ManifestRef {
             digest,
             media_type,
@@ -472,39 +782,46 @@ impl Storage for FsStorage {
     }
 
     async fn delete_manifest(&self, repo: &str, digest: &Digest) -> Result<(), StorageError> {
-        let path = self.manifest_path(repo, digest)?;
-        tokio::fs::remove_file(&path).await.map_err(map_not_found)?;
-        let _ = tokio::fs::remove_file(self.manifest_meta_path(repo, digest)?).await;
-        // Remove any tags pointing at this digest.
-        let tags_dir = self.repo_dir(repo)?.join("tags");
-        if let Ok(mut rd) = tokio::fs::read_dir(&tags_dir).await {
-            let target = digest.as_string();
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
-                    if content == target {
-                        let _ = tokio::fs::remove_file(entry.path()).await;
-                    }
-                }
-            }
-        }
-        Ok(())
+        // Remove the manifest blob from the CAS (NotFound if absent).
+        tokio::fs::remove_file(self.blob_path(repo, digest)?)
+            .await
+            .map_err(map_not_found)?;
+        // Drop the manifest from the presence filter + small-blob cache.
+        self.presence.remove(repo, &digest.as_string());
+        self.cache.invalidate(repo, &digest.as_string());
+        // Drop every index entry (including tags) pointing at this digest.
+        let mut index = self.read_index(repo).await?;
+        let target = digest.as_string();
+        let manifests = index_manifests_mut(&mut index);
+        manifests.retain(|entry| descriptor_digest(entry) != Some(target.as_str()));
+        self.write_index(repo, &index).await?;
+        // Mirror the deletion into the derived metadata index + durable log.
+        self.meta
+            .apply(MetaOp::DeleteManifest {
+                repo: repo.to_string(),
+                digest: target,
+            })
+            .map_err(StorageError::Io)
     }
 
     async fn list_tags(&self, repo: &str) -> Result<Vec<String>, StorageError> {
-        let dir = self.repo_dir(repo)?.join("tags");
-        let mut tags = Vec::new();
-        match tokio::fs::read_dir(&dir).await {
-            Ok(mut rd) => {
-                while let Some(entry) = rd.next_entry().await? {
-                    // Tag names are UTF-8 in practice; a non-UTF-8 name (only
-                    // creatable via out-of-band corruption) is included lossily
-                    // rather than silently dropped.
-                    tags.push(entry.file_name().to_string_lossy().into_owned());
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(StorageError::Io(e)),
+        // Fast path: the in-RAM tag map. A repo the store does not yet cover
+        // (e.g. an out-of-band layout mutation after startup) falls back to the
+        // on-disk index.json, the source of truth.
+        let tags = self.meta.list_tags(repo);
+        if !tags.is_empty() {
+            return Ok(tags);
         }
+        let index = self.read_index(repo).await?;
+        let mut tags: Vec<String> = index
+            .get("manifests")
+            .and_then(|m| m.as_array())
+            .map(|ms| {
+                ms.iter()
+                    .filter_map(|e| descriptor_tag(e).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
         tags.sort();
         Ok(tags)
     }
@@ -516,12 +833,57 @@ impl Storage for FsStorage {
         referrer: &Digest,
         referrer_descriptor: &[u8],
     ) -> Result<(), StorageError> {
-        let dir = self.referrers_dir(repo, subject)?;
-        tokio::fs::create_dir_all(&dir).await?;
-        // File name is the referrer's own digest so re-pushes are idempotent.
-        let fname = format!("{}-{}", referrer.algorithm, referrer.hex);
-        tokio::fs::write(dir.join(fname), referrer_descriptor).await?;
-        Ok(())
+        // The referring manifest is already recorded by put_manifest; merge its
+        // `subject` link (and any richer descriptor fields the core computed:
+        // artifactType, annotations) into that entry so list_referrers can find
+        // it. If for some reason no entry exists yet, append the descriptor.
+        // Parse the referrer descriptor as a JSON object (the core always sends
+        // one); a non-object body is an internal inconsistency → Io.
+        let mut merged: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(referrer_descriptor)
+                .map_err(|e| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
+        merged.insert(
+            "subject".into(),
+            serde_json::json!({ "digest": subject.as_string() }),
+        );
+        let referrer_str = referrer.as_string();
+        let mut index = self.read_index(repo).await?;
+        let manifests = index_manifests_mut(&mut index);
+        let merged_value = serde_json::Value::Object(merged.clone());
+        match manifests
+            .iter_mut()
+            .find(|e| descriptor_digest(e) == Some(referrer_str.as_str()))
+            .and_then(|e| e.as_object_mut())
+        {
+            // Existing object entry: merge fields, preserving any tag annotation.
+            Some(existing) => {
+                for (k, v) in &merged {
+                    // Never overwrite the entry's own identity; preserve a tag
+                    // annotation the manifest entry already carries.
+                    if k == "digest" {
+                        continue;
+                    }
+                    if k == "annotations" && existing.contains_key("annotations") {
+                        continue;
+                    }
+                    existing.insert(k.clone(), v.clone());
+                }
+            }
+            // No entry (or a non-object foreign entry): append the descriptor.
+            None => manifests.push(merged_value.clone()),
+        }
+        self.write_index(repo, &index).await?;
+        // Mirror the referrer relation into the derived index + durable log.
+        let descriptor = serde_json::to_vec(&merged)
+            .map_err(|e| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
+        self.meta
+            .apply(MetaOp::PutReferrer {
+                repo: repo.to_string(),
+                subject: subject.as_string(),
+                referrer: referrer_str,
+                descriptor,
+            })
+            .map_err(StorageError::Io)
     }
 
     async fn list_referrers(
@@ -529,19 +891,28 @@ impl Storage for FsStorage {
         repo: &str,
         subject: &Digest,
     ) -> Result<Vec<Vec<u8>>, StorageError> {
-        let dir = self.referrers_dir(repo, subject)?;
-        let mut out = Vec::new();
-        match tokio::fs::read_dir(&dir).await {
-            Ok(mut rd) => {
-                while let Some(entry) = rd.next_entry().await? {
-                    if let Ok(bytes) = tokio::fs::read(entry.path()).await {
-                        out.push(bytes);
-                    }
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(StorageError::Io(e)),
+        let target = subject.as_string();
+        // Fast path: the in-RAM subject→referrers map; fall back to index.json.
+        let refs = self.meta.referrers(repo, &target);
+        if !refs.is_empty() {
+            return Ok(refs);
         }
+        let index = self.read_index(repo).await?;
+        let out = index
+            .get("manifests")
+            .and_then(|m| m.as_array())
+            .map(|ms| {
+                ms.iter()
+                    .filter(|e| {
+                        e.get("subject")
+                            .and_then(|s| s.get("digest"))
+                            .and_then(|v| v.as_str())
+                            == Some(target.as_str())
+                    })
+                    .filter_map(|e| serde_json::to_vec(e).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(out)
     }
 }
@@ -580,10 +951,11 @@ mod tests {
             s.blob_size("a/../b", &d).await,
             Err(StorageError::BadPath(_))
         ));
-        // A `..` tag / upload id is rejected too.
+        // A `..` reference resolves through index.json, never a path built from
+        // the tag, so traversal is impossible: it is simply not found.
         assert!(matches!(
             s.get_manifest("r", "..").await,
-            Err(StorageError::BadPath(_))
+            Err(StorageError::NotFound)
         ));
         assert!(matches!(
             s.append_upload("r", "../evil", b"x").await,
@@ -753,7 +1125,16 @@ mod tests {
             .unwrap();
         let listed = s.list_referrers("r", &subject).await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0], br#"{"digest":"x"}"#);
+        // add_referrer merges the subject link into the stored descriptor.
+        let parsed: serde_json::Value = serde_json::from_slice(&listed[0]).unwrap();
+        assert_eq!(parsed.get("digest").and_then(|v| v.as_str()), Some("x"));
+        assert_eq!(
+            parsed
+                .get("subject")
+                .and_then(|v| v.get("digest"))
+                .and_then(|v| v.as_str()),
+            Some(subject.as_string().as_str())
+        );
     }
 
     #[tokio::test]
@@ -787,27 +1168,22 @@ mod tests {
             Err(StorageError::Io(_))
         ));
 
-        // Same for manifests: `<repo>/manifests` as a file breaks put_manifest.
-        std::fs::write(repo_dir.join("manifests"), b"file").unwrap();
+        // put_manifest first writes the manifest blob (fails here too since
+        // `<repo>/blobs` is a file), covering the CAS-write error path.
         assert!(matches!(
             s.put_manifest("r", None, &d, "application/json", data)
                 .await,
             Err(StorageError::Io(_))
         ));
-    }
 
-    #[tokio::test]
-    async fn put_manifest_tag_write_errors_when_tag_parent_is_a_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = FsStorage::new(dir.path()).unwrap();
-        let repo_dir = dir.path().join("r");
-        std::fs::create_dir_all(&repo_dir).unwrap();
-        // `<repo>/tags` is a file → creating the tag's parent dir fails.
-        std::fs::write(repo_dir.join("tags"), b"file").unwrap();
-        let data = br#"{"schemaVersion":2}"#;
-        let d = sha256_of(data);
+        // In a clean repo where the blob write succeeds, a pre-existing
+        // `index.json` *directory* makes the atomic index rename fail, covering
+        // write_index's error path.
+        let body = br#"{"schemaVersion":2}"#;
+        let bd = sha256_of(body);
+        std::fs::create_dir_all(dir.path().join("r2").join("index.json")).unwrap();
         assert!(matches!(
-            s.put_manifest("r", Some("v1"), &d, "application/json", data)
+            s.put_manifest("r2", Some("v1"), &bd, "application/json", body)
                 .await,
             Err(StorageError::Io(_))
         ));
@@ -834,9 +1210,8 @@ mod tests {
         let s = FsStorage::new(dir.path()).unwrap();
         let body = br#"{"schemaVersion":2}"#;
         let d = sha256_of(body);
-        // Tag "a"/"b" point at d; tag "other" points at a different digest and
-        // must survive (exercises the content != target branch). A separate
-        // delete on a repo with no tags dir exercises the read_dir-absent edge.
+        // Tags "a"/"b" point at d; "other" points at a different digest and
+        // must survive (covers the retain predicate's keep branch).
         let other = sha256_of(b"different");
         s.put_manifest("r", Some("a"), &d, "application/json", body)
             .await
@@ -850,81 +1225,282 @@ mod tests {
         s.delete_manifest("r", &d).await.unwrap();
         // "a" and "b" removed; "other" remains.
         assert_eq!(s.list_tags("r").await.unwrap(), vec!["other".to_string()]);
-        // A non-file entry in the tags dir (a subdirectory) makes read_to_string
-        // fail, exercising that negative edge; the loop must skip it and continue.
-        std::fs::create_dir_all(dir.path().join("r").join("tags").join("weird-subdir")).unwrap();
-        s.put_manifest("r", Some("z"), &d, "application/json", body)
+        // Re-pushing the same (tag, digest) is idempotent (dedup keeps one entry).
+        s.put_manifest("r", Some("other"), &other, "application/json", b"different")
             .await
             .unwrap();
-        s.delete_manifest("r", &d).await.unwrap();
-        // Deleting a manifest in a repo with no tags directory is a no-op tag-wise.
+        assert_eq!(s.list_tags("r").await.unwrap(), vec!["other".to_string()]);
+        // Deleting an untagged manifest in a fresh repo touches no tags.
         let d2 = sha256_of(b"lonely");
         s.put_manifest("solo", None, &d2, "application/json", b"lonely")
             .await
             .unwrap();
+        // Untagged re-push is a no-op (dedup by digest).
+        s.put_manifest("solo", None, &d2, "application/json", b"lonely")
+            .await
+            .unwrap();
         s.delete_manifest("solo", &d2).await.unwrap();
+        assert!(s.list_tags("solo").await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn non_notfound_io_error_surfaces() {
-        // Place a regular file where the `tags` directory is expected, so
-        // read_dir fails with a non-NotFound error (NotADirectory), exercising
-        // the StorageError::Io branch in list_tags.
+        // A pre-existing `index.json` *directory* makes read_index fail with a
+        // non-NotFound error, surfacing as StorageError::Io through every reader.
         let dir = tempfile::tempdir().unwrap();
         let s = FsStorage::new(dir.path()).unwrap();
         let repo_dir = dir.path().join("r");
-        std::fs::create_dir_all(&repo_dir).unwrap();
-        std::fs::write(repo_dir.join("tags"), b"not a dir").unwrap();
+        std::fs::create_dir_all(repo_dir.join("index.json")).unwrap();
         assert!(matches!(s.list_tags("r").await, Err(StorageError::Io(_))));
-
-        // Same for the referrers listing directory.
         let subject = sha256_of(b"s");
-        let ref_parent = repo_dir.join("referrers").join("sha256");
-        std::fs::create_dir_all(&ref_parent).unwrap();
-        std::fs::write(ref_parent.join(&subject.hex), b"not a dir").unwrap();
         assert!(matches!(
             s.list_referrers("r", &subject).await,
             Err(StorageError::Io(_))
         ));
+        // A syntactically corrupt index.json is also an internal Io error.
+        let repo2 = dir.path().join("r2");
+        std::fs::create_dir_all(&repo2).unwrap();
+        std::fs::write(repo2.join("index.json"), b"{ not json").unwrap();
+        assert!(matches!(s.list_tags("r2").await, Err(StorageError::Io(_))));
     }
 
     #[tokio::test]
-    async fn directory_iteration_skips_unreadable_entries() {
+    async fn index_preserves_foreign_entries_and_referrer_append() {
         let dir = tempfile::tempdir().unwrap();
         let s = FsStorage::new(dir.path()).unwrap();
-        // A subdirectory inside the referrers dir cannot be read as a file, so
-        // list_referrers skips it (covers the read-Err edge of the loop).
-        let subject = sha256_of(b"subj");
-        let good = sha256_of(b"good");
-        s.add_referrer("r", &subject, &good, br#"{"digest":"good"}"#)
-            .await
-            .unwrap();
-        let ref_dir = dir
-            .path()
-            .join("r")
-            .join("referrers")
-            .join(&subject.algorithm)
-            .join(&subject.hex);
-        std::fs::create_dir_all(ref_dir.join("a-subdir")).unwrap();
+        // Seed an index with a foreign descriptor (no ref.name annotation, no
+        // subject) and a non-array `manifests` sibling field would be coerced.
+        let subject = sha256_of(b"subject");
+        let referrer = sha256_of(b"referrer");
+        s.ensure_layout("r").await.unwrap();
+        let seeded = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {"mediaType": "application/xml", "digest": "sha256:dead", "size": 3}
+            ]
+        });
+        s.write_index("r", &seeded).await.unwrap();
+        // The foreign entry contributes no tag and is not a referrer.
+        assert!(s.list_tags("r").await.unwrap().is_empty());
+        assert!(s.list_referrers("r", &subject).await.unwrap().is_empty());
+        // add_referrer with no pre-existing manifest entry appends the merged
+        // descriptor (carrying the subject link) — covers the append branch.
+        s.add_referrer(
+            "r",
+            &subject,
+            &referrer,
+            br#"{"digest":"x","artifactType":"a/b"}"#,
+        )
+        .await
+        .unwrap();
         let listed = s.list_referrers("r", &subject).await.unwrap();
-        // The real descriptor is returned; the subdirectory entry is skipped.
         assert_eq!(listed.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_slice(&listed[0]).unwrap();
+        assert_eq!(
+            parsed
+                .get("subject")
+                .and_then(|v| v.get("digest"))
+                .and_then(|v| v.as_str()),
+            Some(subject.as_string().as_str())
+        );
+        // The foreign descriptor is still present after the append.
+        let idx = s.read_index("r").await.unwrap();
+        assert_eq!(idx["manifests"].as_array().unwrap().len(), 2);
+    }
 
-        // A non-UTF-8 tag filename is listed lossily by list_tags. Unix-only,
-        // and only on filesystems that permit non-UTF-8 names (ext4/Linux does;
-        // APFS/darwin rejects the write, so we skip the assertion there).
+    #[test]
+    fn index_manifests_mut_coerces_non_object_and_non_array() {
+        // A non-object index is replaced with the empty index.
+        let mut v = serde_json::Value::String("garbage".into());
+        assert!(index_manifests_mut(&mut v).is_empty());
+        assert_eq!(v["schemaVersion"], serde_json::json!(2));
+        // A non-array `manifests` field is replaced with an empty array.
+        let mut v2 = serde_json::json!({"manifests": 7});
+        assert!(index_manifests_mut(&mut v2).is_empty());
+        assert!(v2["manifests"].is_array());
+    }
+
+    #[tokio::test]
+    async fn serves_external_oci_layout() {
+        // Hand-build a valid OCI image layout roci did NOT write, then prove it
+        // serves the tagged manifest and its config blob (the headline feature).
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("app");
+        let config = br#"{"architecture":"amd64","os":"linux"}"#;
+        let config_d = sha256_of(config);
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{}","size":{}}},"layers":[]}}"#,
+            config_d.as_string(),
+            config.len()
+        );
+        let manifest_d = sha256_of(manifest.as_bytes());
+        // Lay out oci-layout + blobs/<alg>/<hex> + index.json by hand.
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("oci-layout"), OCI_LAYOUT_MARKER).unwrap();
+        let blobs = repo.join("blobs").join("sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join(&config_d.hex), config).unwrap();
+        std::fs::write(blobs.join(&manifest_d.hex), manifest.as_bytes()).unwrap();
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [{
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": manifest_d.as_string(),
+                "size": manifest.len(),
+                "annotations": {"org.opencontainers.image.ref.name": "v1"}
+            }]
+        });
+        std::fs::write(repo.join("index.json"), serde_json::to_vec(&index).unwrap()).unwrap();
+
+        let s = FsStorage::new(dir.path()).unwrap();
+        let by_tag = s.get_manifest("app", "v1").await.unwrap();
+        assert_eq!(by_tag.digest, manifest_d);
+        assert_eq!(
+            by_tag.media_type,
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert_eq!(by_tag.bytes, manifest.as_bytes());
+        assert_eq!(s.list_tags("app").await.unwrap(), vec!["v1".to_string()]);
+        assert_eq!(s.read_blob("app", &config_d).await.unwrap(), config);
+        // A by-digest manifest blob present but unlisted in index.json falls
+        // back to the image-manifest media type.
+        let extra = br#"{"schemaVersion":2}"#;
+        let extra_d = sha256_of(extra);
+        std::fs::write(blobs.join(&extra_d.hex), extra).unwrap();
+        let by_digest = s.get_manifest("app", &extra_d.as_string()).await.unwrap();
+        assert_eq!(
+            by_digest.media_type,
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert_eq!(by_digest.bytes, extra);
+        // A digest that is neither listed nor present is NotFound.
+        let absent = sha256_of(b"absent");
+        assert!(matches!(
+            s.get_manifest("app", &absent.as_string()).await,
+            Err(StorageError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn seed_presence_and_discover_repos_edge_cases() {
+        // Build a root that exercises every branch of seed_presence_from_cas and
+        // discover_repos, then construct FsStorage to run the seed walk.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // repo "a": a proper CAS blob (happy path — inserted into the filter)
+        // plus a `.tmp` staging file that must be skipped.
+        let good = sha256_of(b"good-blob");
+        let a_alg = root.join("a").join("blobs").join("sha256");
+        std::fs::create_dir_all(&a_alg).unwrap();
+        std::fs::write(a_alg.join(&good.hex), b"good-blob").unwrap();
+        std::fs::write(a_alg.join("deadbeef.tmp"), b"partial").unwrap();
+        std::fs::write(root.join("a").join("index.json"), b"{}").unwrap();
+        // A regular file where an algorithm dir is expected → read_dir(alg) fails.
+        std::fs::write(root.join("a").join("blobs").join("notadir"), b"x").unwrap();
+
+        // repo "b": has index.json but NO blobs/ dir → read_dir(blobs) fails.
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("b").join("index.json"), b"{}").unwrap();
+
+        // A directory nested deeper than the discover_repos depth bound carries
+        // an index.json that must NOT be discovered (depth cutoff).
+        let mut deep = root.to_path_buf();
+        for i in 0..20 {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("index.json"), b"{}").unwrap();
+
+        let s = FsStorage::new(root).unwrap();
+        // The real blob is present (filter seeded); the tmp file was skipped, so
+        // reading it back would 404 — but the good blob reads fine.
+        assert_eq!(s.read_blob("a", &good).await.unwrap(), b"good-blob");
+        // A blob never stored is absent (filter authoritative after a complete seed).
+        let never = sha256_of(b"never");
+        assert!(matches!(
+            s.blob_size("a", &never).await,
+            Err(StorageError::NotFound)
+        ));
+
+        // discover_repos read_dir-failure branch: point a fresh store at a path
+        // whose root cannot be read (unix perms) — the walk returns nothing and
+        // construction still succeeds.
         #[cfg(unix)]
         {
-            use std::os::unix::ffi::OsStrExt;
-            let tags_dir = dir.path().join("r2").join("tags");
-            std::fs::create_dir_all(&tags_dir).unwrap();
-            std::fs::write(tags_dir.join("valid"), b"x").unwrap();
-            let bad = std::ffi::OsStr::from_bytes(b"bad-\xff-name");
-            if std::fs::write(tags_dir.join(bad), b"x").is_ok() {
-                let tags = s.list_tags("r2").await.unwrap();
-                assert!(tags.contains(&"valid".to_string()));
-                assert_eq!(tags.len(), 2);
-            }
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.path().join("locked");
+            std::fs::create_dir_all(locked.join("sub")).unwrap();
+            std::fs::write(locked.join("sub").join("index.json"), b"{}").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Seeding walks `locked` but read_dir fails → skipped, no panic.
+            let _ = FsStorage::new(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn add_referrer_merges_into_annotated_entry() {
+        // A tagged manifest already carries an `annotations` entry in the index;
+        // add_referrer must preserve it (the k=="annotations" skip branch) while
+        // merging the subject/artifactType.
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let body = br#"{"schemaVersion":2}"#;
+        let referrer = sha256_of(body);
+        // put_manifest with a tag records an index entry carrying annotations.
+        s.put_manifest("r", Some("v1"), &referrer, "application/json", body)
+            .await
+            .unwrap();
+        let subject = sha256_of(b"subject");
+        // The descriptor the core passes also carries annotations; the existing
+        // entry's annotations must win (skip), other fields merge.
+        s.add_referrer(
+            "r",
+            &subject,
+            &referrer,
+            br#"{"mediaType":"application/json","digest":"x","annotations":{"other":"1"},"artifactType":"a/b"}"#,
+        )
+        .await
+        .unwrap();
+        let listed = s.list_referrers("r", &subject).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let d: serde_json::Value = serde_json::from_slice(&listed[0]).unwrap();
+        // The referrer descriptor (from the metadata store) carries the subject
+        // link and its own artifactType.
+        assert_eq!(
+            d.get("subject")
+                .and_then(|v| v.get("digest"))
+                .and_then(|v| v.as_str()),
+            Some(subject.as_string().as_str())
+        );
+        assert_eq!(d.get("artifactType").and_then(|v| v.as_str()), Some("a/b"));
+        // In the on-disk index.json, the merge preserved the manifest entry's
+        // pre-existing tag annotation (the k=="annotations" skip branch) rather
+        // than overwriting it with the referrer descriptor's annotations.
+        let index = s.read_index("r").await.unwrap();
+        let entry = index["manifests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| descriptor_digest(e) == Some(referrer.as_string().as_str()))
+            .unwrap()
+            .clone();
+        assert_eq!(
+            entry
+                .get("annotations")
+                .and_then(|a| a.get("org.opencontainers.image.ref.name"))
+                .and_then(|v| v.as_str()),
+            Some("v1")
+        );
+        assert_eq!(
+            entry
+                .get("subject")
+                .and_then(|v| v.get("digest"))
+                .and_then(|v| v.as_str()),
+            Some(subject.as_string().as_str())
+        );
     }
 }

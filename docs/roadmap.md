@@ -8,9 +8,9 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 
 ## Core distribution
 
-- [ ] Conforms to OCI Distribution Spec APIs (v1.1.1)
-- [ ] Uses OCI image layout for image storage
-- [ ] Can serve any OCI image layout as a registry
+- [~] Conforms to OCI Distribution Spec APIs (v1.1.1)
+- [x] Uses OCI image layout for image storage
+- [x] Can serve any OCI image layout as a registry
 - [~] Single binary for all features
 - [~] Runs without root privileges
 - [~] Clear separation between core dist-spec and roci-specific extensions

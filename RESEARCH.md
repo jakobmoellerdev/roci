@@ -246,6 +246,20 @@ Log replay costs ~20–40 ms at 1M records on NVMe (negligible) but **300–500 
 - **io_uring read path: KEEP `sendfile`** — `IORING_OP_SPLICE` is **10–25% slower** (Axboe/Netty #15747), not ~8%; no `IORING_OP_SENDFILE` planned; `SEND_ZC` ⊗ kTLS. io_uring is **ADOPT on the write path only**, **FUTURE** as a full thread-per-core redesign — **compio** is the named carrier runtime (only actively-maintained TPC Rust runtime with an HTTP-compat bridge; tokio-uring's `!Send` futures can't host hyper), worth **−46% P95 / +18% throughput at high load** (Apache Iggy TPC migration) but **zero gain at light load** and ~18–36 months from production HTTP maturity (RESEARCH: NettyAxboe25, Jasny-PVLDB26, IggyTPC, CompioTPC).
 - **Small-object packing (Haystack/f4/Venti-arenas): KEEP-CURRENT / FUTURE.** roci's content-addressed path already achieves Haystack's O(1)-IOP goal without an offset map; 2-level fanout already solves dcache (GIGA+: 99.99% of dirs <8k entries); `roci-meta.log` already *is* the Venti arena applied to metadata. Packing would save the 30–60% small-file block-alignment waste (BfFS) but regress GC O(garbage)→O(live), break the `blobs/<alg>/<hex>` MUST rule for external tools, and violate minimal-deps. Only a sealed **`roci-ext-coldstore`** tier for 100M+ dormant manifests (interop explicitly out of scope) justifies it — **FUTURE**. Deployment mitigation now: **ext4 `bigalloc`** cuts alignment waste 30%→~5–15% with zero code (RESEARCH: Haystack, f4, BfFS, GIGA+).
 
+### 9.6 MEASURED — metadata residency crossover (in-RAM maps vs redb KV vs cuckoo filter)
+A first-party benchmark (M4 Pro, 48 GB, APFS/NVMe, `--release`+LTO; each structure isolated for clean peak-RSS attribution; keys mirror roci's repo-qualified `(repo,tag)→sha256:<hex>`, ~276 B/ref; 1M random hot lookups per point — RESEARCH: RociScaleBench) turns §8.6/§9.4's "benchmark-first" guidance into numbers:
+
+| refs | in-RAM `HashMap` RSS | HashMap lookup | redb lookup | redb on-disk | cuckoo RAM | cuckoo definite-miss |
+|---|---|---|---|---|---|---|
+| 1M | 298 MB | 296 ns | 991 ns | 270 MB | 3.2 MB | 177 ns |
+| 5M | 1.38 GB | 380 ns | 1947 ns | 2.16 GB | 10.5 MB | 199 ns |
+| 10M | 2.76 GB | 417 ns | 2704 ns | 4.30 GB | 18.9 MB | 240 ns |
+
+- **In-RAM maps: 273 B/ref, linear hard heap** (corrects §9.4's ~130 B/ref — richer repo-qualified keys push it up). Heap-budget crossovers: **0.5 GB ≈ 1.8M refs, 1 GB ≈ 3.7M, 2 GB ≈ 7.3M, 4 GB ≈ 14.6M**.
+- **Lookups: RAM wins at every size** — HashMap 62–417 ns vs redb 400–2704 ns (**3–6.5× slower**, widening with N as the B-tree deepens + page-faults). Confirms §9.1: while the working set fits RAM, moving maps to a KV is a *latency regression*, not a win.
+- **Cuckoo filter is effectively free: 1.74 B/ref (~14 bits/key)** → **18.9 MB for 10M blobs**, flat. A definite-miss answer (~240 ns) replaces a `stat(ENOENT)` (**1042 ns**) → **~800 ns saved per absent probe** at a **~1.9% false-positive rate** (a false positive costs only the stat you'd have done — never a wrong answer). **VALIDATES** the shipped blob-presence filter.
+- **Verdict (roci's decision line):** in-RAM `LogMetadataStore` is strictly better **below ~2–4M references** (smaller RSS *and* faster) — **roci's current single-node target, adopted up to ~2–4M refs (≈0.5–1 GB heap)**. The rkyv mmap snapshot (§9.4) is the first RSS lever *at* that band; the **redb map-to-disk KV earns its place only at ≥~10M refs, a hard RAM cap, or a shared-cluster store** (RSS becomes evictable page cache ~430 B/ref on disk instead of unbounded heap, accepting the 3–6× read hit). All three sit behind the `MetadataStore` trait seam; none is built ahead of its threshold.
+
 
 
 ## Sources
@@ -329,5 +343,6 @@ Log replay costs ~20–40 ms at 1M records on NVMe (negligible) but **300–500 
 | Jasny-PVLDB26 | High-Performance DBMSs with io_uring: When and How | Jasny et al. — TUD/TUM/TigerBeetle | PVLDB 2026 | Naive io_uring 1.06–1.10×; batched writes +14–18%; SQPoll +32% (1 core). io_uring = write-path ADOPT, not read-path. |
 | IggyTPC | Thread-per-Core io_uring migration (tokio→compio) | Apache Iggy | blog 2026 | TPC+compio: +18% throughput, −46% P95 at high load; zero gain at light load. compio = named future TPC runtime. |
 | CompioTPC | compio async runtime | compio-rs | GitHub 2025 | Most-maintained TPC Rust runtime; compio-compat bridges hyper; tokio-uring !Send can't host hyper. FUTURE carrier. |
+| RociScaleBench | roci metadata-residency scale benchmark (first-party) | roci | 2026-09-20, M4 Pro/48 GB/APFS-NVMe | in-RAM map 273 B/ref linear (2.76 GB @ 10M), 62–417 ns lookup; redb 3–6.5× slower reads, evictable ~430 B/ref on disk; cuckoo 1.74 B/ref (18.9 MB @ 10M), saves ~800 ns/miss vs stat(ENOENT), ~1.9% FP. → in-RAM maps to ~2–4M refs; KV at ≥~10M / RAM-cap / cluster. Backs §9.6. |
 
 *Compiled 2026-09-19. §1–7 from the first scout wave + CHBL/Venti primary reads; §8 from LayoutHashCAS/IndexEngineFilters/DedupGCScrub/IOServingObjStore + BLAKE3/binary-fuse reads; §9 from IoUringE2E/SmallObjectPacking/ZeroCopyIndexMem/WholeRegistryEngine + Haystack/AIStore reads. All §8–9 scouts delivered briefs in yield text (local:// write avoided per prior lesson); one §9 scout wedged on a yield-schema mismatch and was harvested via recovered result.*
