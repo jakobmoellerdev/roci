@@ -7,7 +7,7 @@
 
 # roci
 
-![coverage](https://img.shields.io/badge/coverage-99.91%25-red)
+![coverage](https://img.shields.io/badge/coverage-100.00%25-brightgreen)
 
 **roci** is a Rust implementation of the [OCI Distribution Specification](spec/distribution-spec/spec.md) — an OCI container registry.
 
@@ -81,7 +81,7 @@ git submodule update --init --depth 1   # or: just init
 ```
 
 Install the git pre-commit hook (when Rust sources are staged, runs fmt,
-clippy, the 100% coverage gate, and the full OCI conformance suite; refreshes
+clippy, the coverage gate, and the full OCI conformance suite; refreshes
 [`COVERAGE.md`](COVERAGE.md) + the badge on every commit):
 
 ```sh
@@ -104,9 +104,9 @@ Every recipe mirrors a CI gate, so passing locally means passing the required CI
 | `just lint-workflows` | Lint the GitHub Actions workflows (actionlint) |
 | `just zizmor` | Security-audit the workflows (zizmor) |
 | `just audit` | `cargo deny` supply-chain check |
-| `just coverage` | Enforce 100% line coverage (cargo-llvm-cov) |
+| `just coverage` | Enforce the line-coverage floor (95%, cargo-llvm-cov) |
 | `just coverage-report` | Show uncovered lines (developer aid) |
-| `just coverage-linux` | Reproduce the CI Linux 100%-coverage gate in a container (macOS devs; the only way to exercise the Linux-only fast paths) |
+| `just coverage-linux` | Reproduce the CI Linux coverage gate in a container (macOS devs; the only way to exercise the Linux-only fast paths) |
 | `just codeql-local` | Reproduce the CI CodeQL rust path-injection analysis in a container (macOS devs; fails if any alert remains) |
 | `just test-filesystems` | Run the storage suite on real ext4/btrfs/XFS loopback filesystems (privileged container) — exercises the actual reflink/hard-link/O_TMPFILE/copy behavior per FS, not the `FORCE_*` simulation |
 | `just ci` | Run the full local gate before pushing (actionlint + fmt + clippy + test + build + deps-guard + coverage + conformance) |
