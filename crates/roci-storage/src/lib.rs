@@ -469,22 +469,33 @@ impl FsStorage {
     /// (no-follow, beneath-root) and warm the small-blob cache. Any IO hiccup
     /// simply skips the warm — the loose CAS file is always the source of truth.
     async fn warm_small_blob_cache(&self, repo: &str, digest: &Digest, digest_str: &str) {
+        // The blob was just promoted, so it is present and regular. Read it back
+        // (no-follow, beneath-root) and cache it only if small; any IO hiccup on
+        // this optional warm is simply skipped (the loose CAS file is truth).
         let Ok(rel) = self.blob_rel(repo, digest) else {
             return;
         };
-        let Ok(Some((_, size))) = stat_beneath(&self.root, &rel).await else {
-            return;
-        };
-        if size > self.cache.threshold() as u64 {
-            return;
-        }
         let Ok(mut f) = open_beneath(&self.root, &rel).await else {
             return;
         };
-        let mut bytes = Vec::new();
-        if f.read_to_end(&mut bytes).await.is_ok() {
-            self.cache.put(repo, digest_str, &bytes);
+        let threshold = self.cache.threshold();
+        // Read up to the cache threshold + 1: if the blob is larger it is not
+        // cacheable, so stop early rather than buffer a multi-GiB layer.
+        let mut bytes = Vec::with_capacity(threshold.min(64 * 1024));
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            match f.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if bytes.len() > threshold {
+                        return; // too large to cache
+                    }
+                }
+                Err(_) => return,
+            }
         }
+        self.cache.put(repo, digest_str, &bytes);
     }
     fn layout_path(&self, repo: &str) -> Result<PathBuf, StorageError> {
         Ok(self.repo_dir(repo)?.join("oci-layout"))
