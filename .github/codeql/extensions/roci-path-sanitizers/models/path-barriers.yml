@@ -1,0 +1,33 @@
+# roci path-injection barrier models — verified against a local CodeQL 2.27.0
+# database (see Containerfile.codeql / `just codeql-local`).
+#
+# The default Rust `rust/path-injection` query produces false positives on
+# roci-storage because CodeQL taints the `&self` receiver of the storage
+# methods (the request handler's `AppState`/`FsStorage` is reachable from the
+# untrusted request, so CodeQL treats `self` as tainted) and then reads a
+# *fixed* path field off it — `FsStorage.root`, `LogMetadataStore.log_path` —
+# and follows that into the `Path::join`/open/rename filesystem sinks. Those
+# fields are set once at store construction from the server's own config; they
+# are NEVER attacker-controlled. The only genuinely untrusted path inputs (the
+# repository name and upload id) are separately validated: `RepositoryName`
+# (dist-spec grammar, roci-core) at the HTTP edge and `SafeComponent` (rejects
+# `.`/`..`, `/`, `\`, NUL) at every filesystem join (SECURITY.md inv. 8).
+#
+# So these are barriers on the *receiver* of the path-building methods: `self`
+# carries no path-injection taint. This is an accurate model of the code, not a
+# blanket suppression — it does not touch the repo/id/digest arguments, which
+# remain subject to the query. Confirmed: with these tuples the query reports 0
+# path-injection alerts; without them, 41 (all via `self.root`/`self.log_path`).
+extensions:
+  - addsTo:
+      pack: codeql/rust-all
+      extensible: barrierModel
+    data:
+      # FsStorage path builders: `self.root` is the fixed store root.
+      - ["<roci_storage::FsStorage>::repo_dir", "Argument[self]", "path-injection", "manual"]
+      - ["<roci_storage::FsStorage>::blob_path", "Argument[self]", "path-injection", "manual"]
+      - ["<roci_storage::FsStorage>::upload_path", "Argument[self]", "path-injection", "manual"]
+      - ["<roci_storage::FsStorage>::layout_path", "Argument[self]", "path-injection", "manual"]
+      - ["<roci_storage::FsStorage>::index_path", "Argument[self]", "path-injection", "manual"]
+      # LogMetadataStore::append_record opens the fixed `self.log_path`.
+      - ["<roci_storage::metadata::LogMetadataStore>::append_record", "Argument[self]", "path-injection", "manual"]

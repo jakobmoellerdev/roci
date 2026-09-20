@@ -111,6 +111,37 @@ coverage-linux:
     done
     exit $rc
 
+# Reproduce the CI CodeQL rust analysis locally (macOS devs cannot run the
+# CodeQL check, which is Linux-only) and print the path-injection alert count.
+# Builds the pinned CodeQL bundle image, extracts a database with the in-repo
+# barrier model pack applied, and fails if any path-injection alert remains —
+# so the sanitizer model can be validated without blind CI round-trips.
+# Requires Docker.
+codeql-local:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="$(git rev-parse --show-toplevel)"
+    docker build -t roci-codeql:local -f Containerfile.codeql .
+    name="roci-codeql-$$"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker create --name "$name" -w /roci roci-codeql:local sleep infinity >/dev/null
+    trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+    docker start "$name" >/dev/null
+    COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata \
+      --exclude=./target --exclude='._*' --exclude='*/fsmonitor--daemon.ipc' \
+      -C "$root" -cf - . | docker cp - "$name:/roci"
+    docker exec "$name" bash -c '
+      set -euo pipefail
+      cd /roci
+      codeql database create /db --language=rust --build-mode=none --overwrite >/dev/null 2>&1
+      codeql database analyze /db --rerun --format=sarif-latest --output=/tmp/r.sarif \
+        --additional-packs=/roci/.github/codeql/extensions \
+        --model-packs=roci/path-sanitizers rust-code-scanning.qls >/dev/null 2>&1
+      n=$(jq "[.runs[].results[]|select(.ruleId==\"rust/path-injection\")]|length" /tmp/r.sarif)
+      echo "rust/path-injection alerts: $n"
+      test "$n" = "0"
+    '
+
 # Full local gate — run before pushing (the required CI checks).
 ci: lint-workflows fmt clippy test build deps-guard coverage conformance
 

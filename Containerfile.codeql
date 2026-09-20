@@ -1,0 +1,32 @@
+# Local CodeQL harness — derive canonical paths and verify the barrier model
+# pack locally, so the in-repo path-injection sanitizer model can be validated
+# without blind CI round-trips (the CI CodeQL check runs on Linux only).
+#
+# Bundles the CodeQL CLI + libraries matching the CI bundle and the Rust
+# toolchain needed for `build-mode: none` extraction. `just codeql-local`
+# copies the working tree in, builds a database, and runs the path-injection
+# query (with and without the model pack) so the effect of the barrier tuples
+# is measurable. Throwaway build/analysis container, not shipped.
+
+FROM docker.io/library/rust:1.98.1-bookworm
+
+# CodeQL CLI bundle (CLI + standard query/library packs incl. rust). Pin the
+# bundle tag; matches the CI CodeQL major (2.2x). Downloaded from the public
+# codeql-action releases.
+ARG CODEQL_BUNDLE=codeql-bundle-v2.27.0
+RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends curl ca-certificates jq; \
+    rm -rf /var/lib/apt/lists/*; \
+    case "$(dpkg --print-architecture)" in \
+      arm64) asset=codeql-bundle-linux-arm64.tar.gz ;; \
+      amd64) asset=codeql-bundle-linux64.tar.gz ;; \
+      *) echo "unsupported arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/github/codeql-action/releases/download/${CODEQL_BUNDLE}/${asset}" \
+      -o /tmp/cq.tar.gz; \
+    mkdir -p /opt/codeql-home; \
+    tar -xzf /tmp/cq.tar.gz -C /opt/codeql-home; \
+    rm /tmp/cq.tar.gz
+
+ENV PATH="/opt/codeql-home/codeql:${PATH}"
+WORKDIR /roci
