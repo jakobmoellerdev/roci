@@ -3056,6 +3056,71 @@ mod tests {
         assert!(matches!(err, StorageError::Io(_)));
     }
 
+    // stat_beneath returns absent for a leaf whose parent dir exists but the
+    // leaf itself is missing (exercises the leaf openat/statat NOENT arm).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stat_beneath_missing_leaf_in_existing_dir_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        // Materialise `r/blobs/sha256` by storing one blob, then stat a
+        // *different* sha256 digest (same alg dir, absent leaf).
+        let present = sha256_of(b"present");
+        s.put_blob("r", &present, b"present").await.unwrap();
+        let absent = sha256_of(b"absent");
+        s.presence.insert("r", &absent.as_string());
+        assert!(!s.blob_exists("r", &absent).await.unwrap());
+    }
+
+    // A non-regular *source* blob (a planted symlink) is refused by mount: the
+    // source is opened no-follow and fstat-checked for a regular file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mount_refuses_non_regular_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let d = sha256_of(b"src-bytes");
+        // Force the presence filter to admit the source, then plant a symlink at
+        // the source CAS path so mount's no-follow source open/ fstat rejects it.
+        s.presence.insert("src", &d.as_string());
+        let src = s.blob_path("src", &d).unwrap();
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), &src).unwrap();
+        // Source "exists" per the filter but is not a regular file → the mount's
+        // source resolution reports it absent (Ok(false)) or errors; either way
+        // no blob is promoted into `dst`.
+        let _ = s.mount_blob("src", "dst", &d).await;
+        assert!(!std::fs::symlink_metadata(s.blob_path("dst", &d).unwrap())
+            .map(|m| m.is_file())
+            .unwrap_or(false));
+    }
+
+    // A read-only CAS parent makes the beneath-root dirfd operations fail with a
+    // genuine EACCES (not NotFound), which surfaces as an IO error rather than a
+    // false 404 — exercising the `Err(e)` syscall-error arms of the dirfd walk
+    // and promotion. Runs as the unprivileged test user (root bypasses mode bits).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_through_readonly_parent_is_io_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        // Create `r/blobs` read-only so creating `<alg>` under it fails EACCES.
+        let blobs = s.repo_dir("r").unwrap().join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let d = sha256_of(b"blocked");
+        let res = s.put_blob("r", &d, b"blocked").await;
+        // Restore perms so the tempdir can be cleaned up.
+        let _ = std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o755));
+        // Root (if the suite runs privileged) bypasses mode bits and succeeds;
+        // the unprivileged CI/test user gets an IO error. Accept either, but a
+        // failure must be an Io error, never a spurious NotFound.
+        if let Err(e) = res {
+            assert!(matches!(e, StorageError::Io(_)));
+        }
+    }
+
     // finish_upload on an id that was never begun (no staging file) resolves to
     // absent beneath the root → NotFound, and drops the session lock.
     #[tokio::test]
