@@ -677,14 +677,10 @@ async fn hash_file(path: &Path, algorithm: &str) -> io::Result<Digest> {
 async fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        let dir = dir.to_path_buf();
-        match tokio::fs::File::open(&dir).await {
-            Ok(f) => f.sync_all().await,
-            // A filesystem that refuses to open a directory for sync cannot
-            // offer the guarantee; treat it as best-effort.
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Ok(()),
-            Err(e) => Err(e),
-        }
+        // Opening a directory read-only and fsyncing it persists a prior rename
+        // into it. The CAS dir was just created, so the open succeeds; any error
+        // propagates through `?` into the caller's single error path.
+        tokio::fs::File::open(dir).await?.sync_all().await
     }
     #[cfg(not(unix))]
     {
