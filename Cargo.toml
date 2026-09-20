@@ -54,6 +54,9 @@ anyhow = "1"
 futures = "0.3"
 bytes = "1"
 tempfile = "3"
+xorf = "0.13"
+cuckoofilter = "0.5"
+lru = "0.18"
 
 [profile.ci]
 inherits = "dev"

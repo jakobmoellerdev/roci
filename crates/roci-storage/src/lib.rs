@@ -13,6 +13,13 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+mod cache;
+mod filter;
+use cache::SmallBlobCache;
+mod metadata;
+use filter::BlobPresenceFilter;
+pub use metadata::{LogMetadataStore, MetaOp, MetadataStore};
+
 /// A parsed `algorithm:hex` content digest.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Digest {
@@ -211,17 +218,127 @@ pub trait Storage: Send + Sync + 'static {
 pub struct FsStorage {
     root: Arc<PathBuf>,
     upload_seq: Arc<Mutex<u64>>,
+    /// Derived, rebuildable metadata index (tags, media types, referrers) kept
+    /// in RAM and mirrored to `roci-meta.log`. Reads resolve against this first
+    /// and fall back to `index.json`; the layout stays the source of truth.
+    meta: Arc<LogMetadataStore>,
+    /// In-RAM blob-presence filter: a definite-absent answer short-circuits the
+    /// filesystem `stat` on the read path (RESEARCH §8.5). Never authoritative
+    /// for presence — a "maybe" always verifies on disk (SECURITY inv. 10).
+    presence: Arc<BlobPresenceFilter>,
+    /// Bounded in-RAM small-blob content cache (RESEARCH §9.2): serves
+    /// manifests/configs with zero syscalls. A miss falls through to the loose
+    /// CAS file, which always exists (never the sole copy).
+    cache: Arc<SmallBlobCache>,
 }
 
 impl FsStorage {
-    /// Create a store rooted at `root`, creating it if absent.
+    /// Create a store rooted at `root`, creating it if absent. Opens (replaying)
+    /// the metadata log and seeds any repo the log does not yet cover from its
+    /// on-disk `index.json`, then seeds the blob-presence filter from the CAS,
+    /// so a pre-existing OCI layout is fully indexed.
     pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
-        Ok(Self {
+        let meta = Arc::new(LogMetadataStore::open(&root)?);
+        let store = Self {
             root: Arc::new(root),
             upload_seq: Arc::new(Mutex::new(0)),
-        })
+            meta,
+            presence: Arc::new(BlobPresenceFilter::new()),
+            cache: Arc::new(SmallBlobCache::new()),
+        };
+        store.seed_metadata_from_layout();
+        store.seed_presence_from_cas();
+        Ok(store)
+    }
+
+    /// Seed the blob-presence filter from every blob already in the CAS so it
+    /// never false-negatives a stored blob. A best-effort walk of each repo's
+    /// `blobs/<alg>/<hex>`; unreadable entries are skipped (a missed seed only
+    /// costs an extra `stat`, never a wrong 404, since a filter is authoritative
+    /// only for *absence* and inserts also happen on every write).
+    fn seed_presence_from_cas(&self) {
+        let root: &Path = &self.root;
+        for repo in discover_repos(root) {
+            let blobs = root.join(&repo).join("blobs");
+            let Ok(algs) = std::fs::read_dir(&blobs) else {
+                continue;
+            };
+            for alg in algs.flatten() {
+                let Some(alg_name) = alg.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                let Ok(hexes) = std::fs::read_dir(alg.path()) else {
+                    continue;
+                };
+                for hex in hexes.flatten() {
+                    // Skip in-progress tmp files (they carry an extension).
+                    if hex.path().extension().is_some() {
+                        continue;
+                    }
+                    if let Some(hex_name) = hex.file_name().to_str() {
+                        self.presence
+                            .insert(&repo, &format!("{alg_name}:{hex_name}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Walk each repo directory that carries an `index.json` and seed the
+    /// metadata store from it — but only for repos the log did not already
+    /// cover, so log-backed state (authoritative within a process lifetime) is
+    /// never double-applied. Best-effort: an unreadable/foreign entry is skipped
+    /// (the layout remains the truth; a missing seed only forces an index.json
+    /// re-read on that repo's first request).
+    fn seed_metadata_from_layout(&self) {
+        let root: &Path = &self.root;
+        for repo in discover_repos(root) {
+            if self.meta.knows_repo(&repo) {
+                continue;
+            }
+            let index_path = root.join(&repo).join("index.json");
+            let Ok(bytes) = std::fs::read(&index_path) else {
+                continue;
+            };
+            let Ok(index) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            let Some(manifests) = index.get("manifests").and_then(|m| m.as_array()) else {
+                continue;
+            };
+            for entry in manifests {
+                let Some(digest) = descriptor_digest(entry) else {
+                    continue;
+                };
+                let media_type = entry
+                    .get("mediaType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("application/vnd.oci.image.manifest.v1+json");
+                self.meta.seed(&MetaOp::PutManifest {
+                    repo: repo.clone(),
+                    digest: digest.to_string(),
+                    media_type: media_type.to_string(),
+                    tag: descriptor_tag(entry).map(str::to_string),
+                });
+                // Seed the subject→referrers relation for referring manifests.
+                if let Some(subject) = entry
+                    .get("subject")
+                    .and_then(|s| s.get("digest"))
+                    .and_then(|v| v.as_str())
+                {
+                    if let Ok(descriptor) = serde_json::to_vec(entry) {
+                        self.meta.seed(&MetaOp::PutReferrer {
+                            repo: repo.clone(),
+                            subject: subject.to_string(),
+                            referrer: digest.to_string(),
+                            descriptor,
+                        });
+                    }
+                }
+            }
+        }
     }
 
     /// Validate a single untrusted path component and **return it** so callers
@@ -303,6 +420,47 @@ impl FsStorage {
             .join("uploads")
             .join(Self::safe_component(id)?))
     }
+
+    /// Fallback: recover a manifest's media type from `index.json` when the
+    /// in-RAM index has no entry (e.g. an externally-provided layout the seed
+    /// did not cover). `None` if the digest is not listed.
+    async fn index_media_type_for_digest(
+        &self,
+        repo: &str,
+        digest: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let index = self.read_index(repo).await?;
+        Ok(index
+            .get("manifests")
+            .and_then(|m| m.as_array())
+            .and_then(|ms| ms.iter().find(|e| descriptor_digest(e) == Some(digest)))
+            .and_then(|e| e.get("mediaType"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string))
+    }
+
+    /// Fallback: resolve a tag to `(digest, media_type)` from `index.json` when
+    /// the in-RAM tag map misses. `NotFound` if no descriptor carries the tag.
+    async fn index_resolve_tag(
+        &self,
+        repo: &str,
+        tag: &str,
+    ) -> Result<(Digest, String), StorageError> {
+        let index = self.read_index(repo).await?;
+        let entry = index
+            .get("manifests")
+            .and_then(|m| m.as_array())
+            .and_then(|ms| ms.iter().find(|e| descriptor_tag(e) == Some(tag)))
+            .cloned()
+            .ok_or(StorageError::NotFound)?;
+        let digest = Digest::parse(descriptor_digest(&entry).ok_or(StorageError::NotFound)?)?;
+        let media_type = entry
+            .get("mediaType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("application/vnd.oci.image.manifest.v1+json")
+            .to_string();
+        Ok((digest, media_type))
+    }
 }
 
 fn map_not_found(e: io::Error) -> StorageError {
@@ -311,6 +469,50 @@ fn map_not_found(e: io::Error) -> StorageError {
     } else {
         StorageError::Io(e)
     }
+}
+
+/// Discover repository names under `root`: every directory (at any depth,
+/// bounded) that directly contains an `index.json` file is a repo, its name the
+/// `/`-joined path relative to `root`. Symlinks are not followed. Errors on any
+/// entry are skipped — this is a best-effort seed, not an authority.
+fn discover_repos(root: &Path) -> Vec<String> {
+    let mut repos = Vec::new();
+    let mut stack: Vec<(PathBuf, Vec<String>)> = vec![(root.to_path_buf(), Vec::new())];
+    // Bound the walk depth so a pathological tree cannot blow the stack; repo
+    // names in practice are 1–3 segments (OCI grammar allows more but the
+    // filesystem depth mirrors the name).
+    const MAX_DEPTH: usize = 16;
+    while let Some((dir, rel)) = stack.pop() {
+        if rel.len() > MAX_DEPTH {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        // A directory containing index.json is a repo root.
+        if !rel.is_empty() && dir.join("index.json").is_file() {
+            repos.push(rel.join("/"));
+        }
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Skip the CAS/staging subdirs of a repo and non-directories.
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name == "blobs" || name == "uploads" {
+                continue;
+            }
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => {
+                    let mut child_rel = rel.clone();
+                    child_rel.push(name.to_string());
+                    stack.push((path, child_rel));
+                }
+                _ => {}
+            }
+        }
+    }
+    repos
 }
 
 /// The `oci-layout` marker file contents (image-layout.md §oci-layout file).
@@ -392,16 +594,31 @@ pub fn digest_of(data: &[u8], algorithm: &str) -> Digest {
 
 impl Storage for FsStorage {
     async fn blob_size(&self, repo: &str, digest: &Digest) -> Result<u64, StorageError> {
-        let meta = tokio::fs::metadata(self.blob_path(repo, digest)?)
-            .await
-            .map_err(map_not_found)?;
+        // Validate the path first (the traversal backstop must run before any
+        // short-circuit), then let a definite-absent filter answer skip the
+        // stat; a "maybe" falls through to the authoritative stat.
+        let path = self.blob_path(repo, digest)?;
+        if !self.presence.maybe_present(repo, &digest.as_string()) {
+            return Err(StorageError::NotFound);
+        }
+        let meta = tokio::fs::metadata(path).await.map_err(map_not_found)?;
         Ok(meta.len())
     }
 
     async fn read_blob(&self, repo: &str, digest: &Digest) -> Result<Vec<u8>, StorageError> {
-        tokio::fs::read(self.blob_path(repo, digest)?)
-            .await
-            .map_err(map_not_found)
+        let digest_str = digest.as_string();
+        // Serve small blobs (manifests/configs) from the RAM cache with zero
+        // syscalls; a miss falls through to the loose file.
+        if let Some(bytes) = self.cache.get(repo, &digest_str) {
+            return Ok(bytes.to_vec());
+        }
+        let path = self.blob_path(repo, digest)?;
+        if !self.presence.maybe_present(repo, &digest_str) {
+            return Err(StorageError::NotFound);
+        }
+        let bytes = tokio::fs::read(path).await.map_err(map_not_found)?;
+        self.cache.put(repo, &digest_str, &bytes);
+        Ok(bytes)
     }
 
     async fn open_blob(
@@ -409,9 +626,11 @@ impl Storage for FsStorage {
         repo: &str,
         digest: &Digest,
     ) -> Result<tokio::fs::File, StorageError> {
-        tokio::fs::File::open(self.blob_path(repo, digest)?)
-            .await
-            .map_err(map_not_found)
+        let path = self.blob_path(repo, digest)?;
+        if !self.presence.maybe_present(repo, &digest.as_string()) {
+            return Err(StorageError::NotFound);
+        }
+        tokio::fs::File::open(path).await.map_err(map_not_found)
     }
 
     async fn begin_upload(&self, repo: &str) -> Result<String, StorageError> {
@@ -481,13 +700,22 @@ impl Storage for FsStorage {
         let tmp = dest.with_extension("tmp");
         tokio::fs::write(&tmp, data).await?;
         tokio::fs::rename(&tmp, &dest).await?;
+        // Record presence so future reads skip the stat on a definite miss, and
+        // warm the small-blob cache (a no-op for large layers).
+        let digest_str = digest.as_string();
+        self.presence.insert(repo, &digest_str);
+        self.cache.put(repo, &digest_str, data);
         Ok(())
     }
 
     async fn delete_blob(&self, repo: &str, digest: &Digest) -> Result<(), StorageError> {
         tokio::fs::remove_file(self.blob_path(repo, digest)?)
             .await
-            .map_err(map_not_found)
+            .map_err(map_not_found)?;
+        let digest_str = digest.as_string();
+        self.presence.remove(repo, &digest_str);
+        self.cache.invalidate(repo, &digest_str);
+        Ok(())
     }
 
     async fn put_manifest(
@@ -537,40 +765,61 @@ impl Storage for FsStorage {
             descriptor.insert("annotations".into(), serde_json::Value::Object(ann));
         }
         manifests.push(serde_json::Value::Object(descriptor));
-        self.write_index(repo, &index).await
+        self.write_index(repo, &index).await?;
+        // Mirror the mutation into the derived metadata index + durable log.
+        self.meta
+            .apply(MetaOp::PutManifest {
+                repo: repo.to_string(),
+                digest: digest.as_string(),
+                media_type: media_type.to_string(),
+                tag: tag.map(str::to_string),
+            })
+            .map_err(StorageError::Io)
     }
 
     async fn get_manifest(&self, repo: &str, reference: &str) -> Result<ManifestRef, StorageError> {
-        let index = self.read_index(repo).await?;
-        let manifests = index.get("manifests").and_then(|m| m.as_array());
         let (digest, media_type) = if reference.contains(':') {
-            // By-digest: recover the media type from the index if listed; a blob
-            // present but unlisted (e.g. an externally-provided layout) defaults
-            // to the image-manifest media type.
+            // By-digest: the digest *is* the reference; recover the media type
+            // from the in-RAM index, then the on-disk index, then default.
             let digest = Digest::parse(reference)?;
-            let media_type = manifests
-                .and_then(|ms| ms.iter().find(|e| descriptor_digest(e) == Some(reference)))
-                .and_then(|e| e.get("mediaType"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
+            let media_type = match self.meta.manifest_media_type(repo, reference) {
+                Some(mt) => mt,
+                None => self
+                    .index_media_type_for_digest(repo, reference)
+                    .await?
+                    .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string()),
+            };
             (digest, media_type)
         } else {
-            // By-tag: resolve via the ref.name annotation.
-            let entry = manifests
-                .and_then(|ms| ms.iter().find(|e| descriptor_tag(e) == Some(reference)))
-                .ok_or(StorageError::NotFound)?;
-            let digest = Digest::parse(descriptor_digest(entry).ok_or(StorageError::NotFound)?)?;
-            let media_type = entry
-                .get("mediaType")
-                .and_then(|v| v.as_str())
-                .unwrap_or("application/vnd.oci.image.manifest.v1+json")
-                .to_string();
-            (digest, media_type)
+            // By-tag: resolve via the in-RAM tag map; on a miss fall back to the
+            // on-disk index.json (the layout is the source of truth).
+            match self.meta.resolve_tag(repo, reference) {
+                Some(digest_str) => {
+                    let digest = Digest::parse(&digest_str)?;
+                    let media_type = self
+                        .meta
+                        .manifest_media_type(repo, &digest_str)
+                        .unwrap_or_else(|| {
+                            "application/vnd.oci.image.manifest.v1+json".to_string()
+                        });
+                    (digest, media_type)
+                }
+                None => self.index_resolve_tag(repo, reference).await?,
+            }
         };
-        let bytes = tokio::fs::read(self.blob_path(repo, &digest)?)
-            .await
-            .map_err(map_not_found)?;
+        // Manifests are small blobs; serve their bytes from the RAM cache when
+        // warm, else read the loose file and warm the cache.
+        let digest_str = digest.as_string();
+        let bytes = match self.cache.get(repo, &digest_str) {
+            Some(cached) => cached.to_vec(),
+            None => {
+                let b = tokio::fs::read(self.blob_path(repo, &digest)?)
+                    .await
+                    .map_err(map_not_found)?;
+                self.cache.put(repo, &digest_str, &b);
+                b
+            }
+        };
         Ok(ManifestRef {
             digest,
             media_type,
@@ -583,15 +832,32 @@ impl Storage for FsStorage {
         tokio::fs::remove_file(self.blob_path(repo, digest)?)
             .await
             .map_err(map_not_found)?;
+        // Drop the manifest from the presence filter + small-blob cache.
+        self.presence.remove(repo, &digest.as_string());
+        self.cache.invalidate(repo, &digest.as_string());
         // Drop every index entry (including tags) pointing at this digest.
         let mut index = self.read_index(repo).await?;
         let target = digest.as_string();
         let manifests = index_manifests_mut(&mut index);
         manifests.retain(|entry| descriptor_digest(entry) != Some(target.as_str()));
-        self.write_index(repo, &index).await
+        self.write_index(repo, &index).await?;
+        // Mirror the deletion into the derived metadata index + durable log.
+        self.meta
+            .apply(MetaOp::DeleteManifest {
+                repo: repo.to_string(),
+                digest: target,
+            })
+            .map_err(StorageError::Io)
     }
 
     async fn list_tags(&self, repo: &str) -> Result<Vec<String>, StorageError> {
+        // Fast path: the in-RAM tag map. A repo the store does not yet cover
+        // (e.g. an out-of-band layout mutation after startup) falls back to the
+        // on-disk index.json, the source of truth.
+        let tags = self.meta.list_tags(repo);
+        if !tags.is_empty() {
+            return Ok(tags);
+        }
         let index = self.read_index(repo).await?;
         let mut tags: Vec<String> = index
             .get("manifests")
@@ -617,35 +883,48 @@ impl Storage for FsStorage {
         // `subject` link (and any richer descriptor fields the core computed:
         // artifactType, annotations) into that entry so list_referrers can find
         // it. If for some reason no entry exists yet, append the descriptor.
-        let mut merged: serde_json::Value = serde_json::from_slice(referrer_descriptor)
-            .map_err(|e| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
-        if let Some(obj) = merged.as_object_mut() {
-            obj.insert(
-                "subject".into(),
-                serde_json::json!({ "digest": subject.as_string() }),
-            );
-        }
+        // Parse the referrer descriptor as a JSON object (the core always sends
+        // one); a non-object body is an internal inconsistency → Io.
+        let mut merged: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(referrer_descriptor)
+                .map_err(|e| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
+        merged.insert(
+            "subject".into(),
+            serde_json::json!({ "digest": subject.as_string() }),
+        );
         let referrer_str = referrer.as_string();
         let mut index = self.read_index(repo).await?;
         let manifests = index_manifests_mut(&mut index);
+        let merged_value = serde_json::Value::Object(merged.clone());
         match manifests
             .iter_mut()
             .find(|e| descriptor_digest(e) == Some(referrer_str.as_str()))
+            .and_then(|e| e.as_object_mut())
         {
-            Some(entry) => {
-                // Preserve the tag annotation the existing entry may carry.
-                if let (Some(existing), Some(new)) = (entry.as_object_mut(), merged.as_object()) {
-                    for (k, v) in new {
-                        if k == "annotations" && existing.contains_key("annotations") {
-                            continue;
-                        }
-                        existing.insert(k.clone(), v.clone());
+            // Existing object entry: merge fields, preserving any tag annotation.
+            Some(existing) => {
+                for (k, v) in &merged {
+                    if k == "annotations" && existing.contains_key("annotations") {
+                        continue;
                     }
+                    existing.insert(k.clone(), v.clone());
                 }
             }
-            None => manifests.push(merged),
+            // No entry (or a non-object foreign entry): append the descriptor.
+            None => manifests.push(merged_value.clone()),
         }
-        self.write_index(repo, &index).await
+        self.write_index(repo, &index).await?;
+        // Mirror the referrer relation into the derived index + durable log.
+        let descriptor = serde_json::to_vec(&merged)
+            .map_err(|e| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
+        self.meta
+            .apply(MetaOp::PutReferrer {
+                repo: repo.to_string(),
+                subject: subject.as_string(),
+                referrer: referrer_str,
+                descriptor,
+            })
+            .map_err(StorageError::Io)
     }
 
     async fn list_referrers(
@@ -653,8 +932,13 @@ impl Storage for FsStorage {
         repo: &str,
         subject: &Digest,
     ) -> Result<Vec<Vec<u8>>, StorageError> {
-        let index = self.read_index(repo).await?;
         let target = subject.as_string();
+        // Fast path: the in-RAM subject→referrers map; fall back to index.json.
+        let refs = self.meta.referrers(repo, &target);
+        if !refs.is_empty() {
+            return Ok(refs);
+        }
+        let index = self.read_index(repo).await?;
         let out = index
             .get("manifests")
             .and_then(|m| m.as_array())

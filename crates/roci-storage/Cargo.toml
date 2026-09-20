@@ -14,9 +14,11 @@ hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-bytes.workspace = true
-futures.workspace = true
 tracing.workspace = true
+xorf.workspace = true
+cuckoofilter.workspace = true
+lru.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

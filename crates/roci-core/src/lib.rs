@@ -2079,24 +2079,33 @@ mod tests {
 
     #[tokio::test]
     async fn blob_and_manifest_io_errors_map_to_500() {
-        // `<repo>/blobs/sha256` as a *file* makes both metadata (HEAD) and read
-        // (GET) of `.../sha256/<hex>` fail with ENOTDIR (non-NotFound Io),
-        // exercising get_blob's Io arms on both the HEAD and GET paths.
+        // A *present* blob (recorded in the presence filter) whose CAS directory
+        // is made unreadable yields a non-NotFound IO error (EACCES) on both the
+        // HEAD stat and GET open paths, exercising get_blob's Io → 500 arms. The
+        // filter guards *absence*, so the blob must actually exist for the read
+        // to reach the filesystem.
         let dir = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(dir.path()).unwrap();
-        let repo_dir = dir.path().join("r").join("blobs");
-        std::fs::create_dir_all(&repo_dir).unwrap();
-        std::fs::write(repo_dir.join("sha256"), b"not a dir").unwrap();
+        let data = b"present";
+        let d = sha256_of(data);
+        storage.put_blob("r", &d, data).await.unwrap();
         let app = build_router(AppState::new(storage));
-        let d = sha256_of(b"x");
-        for req in [
-            HttpRequest::get(format!("/v2/r/blobs/{}", d.as_string())),
-            HttpRequest::head(format!("/v2/r/blobs/{}", d.as_string())),
-        ] {
-            assert_eq!(
-                status_of(&app, req.body(Body::empty()).unwrap()).await,
-                StatusCode::INTERNAL_SERVER_ERROR
-            );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let alg_dir = dir.path().join("r").join("blobs").join("sha256");
+            std::fs::set_permissions(&alg_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+            for req in [
+                HttpRequest::get(format!("/v2/r/blobs/{}", d.as_string())),
+                HttpRequest::head(format!("/v2/r/blobs/{}", d.as_string())),
+            ] {
+                assert_eq!(
+                    status_of(&app, req.body(Body::empty()).unwrap()).await,
+                    StatusCode::INTERNAL_SERVER_ERROR
+                );
+            }
+            // Restore perms so the tempdir cleans up.
+            std::fs::set_permissions(&alg_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         // `<repo2>/index.json` as a directory makes get_manifest by digest fail
         // with a non-NotFound Io error (read_index), exercising its Io arm.
@@ -2167,10 +2176,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_io_error_maps_to_500() {
-        // Make `<repo>/blobs/sha256` a *file* so open_blob of `.../sha256/<hex>`
-        // fails with ENOTDIR (a non-NotFound IO error), exercising get_blob's
-        // StorageError::Io → 500 mapping arm on the GET (open) path.
+    async fn absent_blob_is_404_even_with_malformed_cas() {
+        // The presence filter answers a definite absence without touching the
+        // filesystem, so a blob the registry never stored is a clean 404 even
+        // when the CAS path underneath is malformed (here `<repo>/blobs/sha256`
+        // is a file). This pins the filter's absence guarantee.
         let dir = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(dir.path()).unwrap();
         let alg_dir = dir.path().join("r").join("blobs");
@@ -2186,7 +2196,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // Extract the hex part of a digest for path construction in the IO-error test.
