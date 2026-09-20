@@ -7,7 +7,7 @@
 
 # roci
 
-![coverage](https://img.shields.io/badge/coverage-99.98%25-red)
+![coverage](https://img.shields.io/badge/coverage-100.00%25-brightgreen)
 
 **roci** is a Rust implementation of the [OCI Distribution Specification](spec/distribution-spec/spec.md) — an OCI container registry.
 
@@ -204,7 +204,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 ### Storage
 
 - [ ] Online, O(garbage) garbage collection (grace-period, backref index; never offline)
-- [x] Copy-on-write (reflink `FICLONE`) deduplication across repos, `copy_file_range` then hard-link fallback
+- [x] Copy-on-write (reflink `FICLONE`) deduplication across repos, hard-link then streaming-copy fallback
 - [ ] Data scrubbing (CRC32C staggered, FS-scrub offload, BLAKE3 escalation)
 - [ ] Serve multiple storage paths (and backends) from a single server
 - [ ] Per-repo / per-total storage quotas
