@@ -6,7 +6,7 @@ at least once (lcov), excluding the thin binary entrypoint
 `crates/roci-cli/src/main.rs` (a `#[tokio::main]` shim over the fully-covered
 library).
 
-Current line coverage: **99.87%** (5363/5370 lines).
+Current line coverage: **99.93%** (5358/5362 lines).
 
 Regenerate with `just coverage` (or on every commit via the pre-commit hook).
 Inspect region-level gaps with `just coverage-report`.
@@ -28,9 +28,9 @@ roci-ext-sync/src/lib.rs               3                 0   100.00%           1
 roci-storage-s3/src/lib.rs             3                 0   100.00%           1                 0   100.00%           3                 0   100.00%           0                 0         -
 roci-storage/src/cache.rs            304                 0   100.00%          15                 0   100.00%         112                 0   100.00%           0                 0         -
 roci-storage/src/filter.rs           169                 0   100.00%          12                 0   100.00%          83                 0   100.00%           0                 0         -
-roci-storage/src/lib.rs             3829               180    95.30%         221                10    95.48%        1763                17    99.04%           0                 0         -
+roci-storage/src/lib.rs             3812               175    95.41%         221                10    95.48%        1755                14    99.20%           0                 0         -
 roci-storage/src/metadata.rs         962                17    98.23%          43                 0   100.00%         451                 0   100.00%           0                 0         -
 roci-telemetry/src/lib.rs             33                 0   100.00%           5                 0   100.00%          22                 0   100.00%           0                 0         -
 --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-TOTAL                              10754               209    98.06%         587                11    98.13%        5925                18    99.70%           0                 0         -
+TOTAL                              10737               204    98.10%         587                11    98.13%        5917                15    99.75%           0                 0         -
 ```

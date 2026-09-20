@@ -747,6 +747,34 @@ async fn copy_file_atomic(src: &Path, dest: &Path) -> io::Result<()> {
     sync_dir(dest.parent().unwrap_or(dest)).await
 }
 
+/// Test-only switch: when set, the reflink (`ioctl_ficlone`) and `hard_link`
+/// fast paths are treated as failed so the streaming/copy fallbacks — the
+/// cross-device paths a single-filesystem test cannot otherwise reach — run
+/// deterministically. Zero cost and absent outside `cfg(test)`.
+#[cfg(all(test, target_os = "linux"))]
+static FORCE_COPY_FALLBACK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+fn try_reflink(output: &std::fs::File, input: &std::fs::File) -> bool {
+    #[cfg(test)]
+    if FORCE_COPY_FALLBACK.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    rustix::fs::ioctl_ficlone(output, input).is_ok()
+}
+
+/// `hard_link` with a test-only fault seam: when `FORCE_COPY_FALLBACK` is set
+/// it returns an `EXDEV`-shaped error so the copy fallback runs deterministically
+/// on a single filesystem. Outside `cfg(test)` it is a plain `hard_link`.
+async fn try_hardlink(src: &Path, dest: &Path) -> io::Result<()> {
+    #[cfg(all(test, target_os = "linux"))]
+    if FORCE_COPY_FALLBACK.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(io::Error::from_raw_os_error(18)); // EXDEV
+    }
+    tokio::fs::hard_link(src, dest).await
+}
+
 /// Copy all bytes from `input` to `output`. Linux first attempts a whole-file
 /// reflink (`FICLONE`): on btrfs/XFS/bcachefs this shares the source extents
 /// copy-on-write in O(1) with zero data transit (RESEARCH §8.8). On any
@@ -764,7 +792,7 @@ async fn copy_contents(input: &tokio::fs::File, output: &tokio::fs::File) -> io:
         let mut outfile = std::fs::File::from(outf);
         // Whole-file reflink first: instant CoW extent share on btrfs/XFS. On
         // any failure (unsupported fs, cross-device) stream the bytes instead.
-        if rustix::fs::ioctl_ficlone(&outfile, &infile).is_err() {
+        if !try_reflink(&outfile, &infile) {
             stream_copy(&mut infile, &mut outfile)?;
         }
         Ok(())
@@ -1511,9 +1539,9 @@ impl Storage for FsStorage {
         }
         // Promote by a hard link — O(1), copy-free on one filesystem. Any link
         // failure (cross-device, or a filesystem without hard links) falls back
-        // to a crash-atomic copy (reflink → copy_file_range → streaming; unique
-        // temp, fsync, rename — never a partial blob under the digest).
-        match tokio::fs::hard_link(&src, &dest).await {
+        // to a crash-atomic copy (reflink → streaming; unique temp, fsync,
+        // rename — never a partial blob under the digest).
+        match try_hardlink(&src, &dest).await {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 // A destination already exists. Treat it as an idempotent success
@@ -2517,9 +2545,9 @@ mod tests {
 
     #[tokio::test]
     async fn copy_file_atomic_transfers_contents() {
-        // The in-kernel copy fallback (copy_file_range on Linux, tokio copy
-        // elsewhere) transfers a non-empty file and an empty file into distinct
-        // destinations via a unique temp + rename.
+        // The copy fallback (reflink on Linux, tokio copy elsewhere) transfers a
+        // non-empty and an empty file into distinct destinations via a unique
+        // temp + rename.
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         let payload = vec![0x5au8; 70000];
@@ -2532,6 +2560,33 @@ mod tests {
         let empty_dst = dir.path().join("empty-dst");
         copy_file_atomic(&empty_src, &empty_dst).await.unwrap();
         assert_eq!(tokio::fs::read(&empty_dst).await.unwrap(), b"");
+    }
+
+    // Force the reflink + hard-link fast paths to "fail" so the cross-device
+    // copy fallback (streaming copy in copy_file_atomic, and mount_blob's copy
+    // branch) runs deterministically on a single filesystem. Guards the paths a
+    // single-fs CI cannot otherwise reach.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn copy_fallback_paths_when_reflink_and_hardlink_unavailable() {
+        use std::sync::atomic::Ordering;
+        FORCE_COPY_FALLBACK.store(true, Ordering::Relaxed);
+        // copy_file_atomic streams (reflink forced off) — bytes still land.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let payload = vec![0x5au8; 70000];
+        tokio::fs::write(&src, &payload).await.unwrap();
+        let dst = dir.path().join("dst");
+        copy_file_atomic(&src, &dst).await.unwrap();
+        assert_eq!(tokio::fs::read(&dst).await.unwrap(), payload);
+        // mount_blob's hard link is forced to fail → copy fallback promotes.
+        let s = FsStorage::new(dir.path()).unwrap();
+        let data = b"mount-via-copy";
+        let d = sha256_of(data);
+        s.put_blob("src", &d, data).await.unwrap();
+        assert!(s.mount_blob("src", "dst", &d).await.unwrap());
+        assert_eq!(s.read_blob("dst", &d).await.unwrap(), data);
+        FORCE_COPY_FALLBACK.store(false, Ordering::Relaxed);
     }
 
     #[cfg(unix)]
