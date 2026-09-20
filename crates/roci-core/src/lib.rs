@@ -2060,6 +2060,40 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_manifest_readonly_parent_is_500() {
+        // A genuine IO error (EACCES from a read-only CAS `<alg>` parent, not a
+        // symlink/broken-parent NotFound) on the unlink surfaces as 500, not a
+        // false 404. Runs as the unprivileged test user (root bypasses modes).
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path()).unwrap();
+        let d = sha256_of(b"present-manifest");
+        // Put the manifest, then make its `<alg>` dir read-only so unlink fails.
+        storage
+            .put_blob("r", &d, b"present-manifest")
+            .await
+            .unwrap();
+        let alg = dir.path().join("r").join("blobs").join("sha256");
+        std::fs::set_permissions(&alg, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let app = build_router(AppState::new(storage));
+        let resp = app
+            .oneshot(
+                HttpRequest::delete(format!("/v2/r/manifests/{}", d.as_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = std::fs::set_permissions(&alg, std::fs::Permissions::from_mode(0o755));
+        // Unprivileged: EACCES → 500. Privileged (root): unlink succeeds → 202.
+        assert!(matches!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR | StatusCode::ACCEPTED
+        ));
+    }
+
     // Uppercase the hex of a digest for the case-insensitive match test.
     fn md_hex_upper(d: &Digest) -> String {
         d.as_string()

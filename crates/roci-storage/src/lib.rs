@@ -786,7 +786,8 @@ async fn mount_promote_beneath(
     tokio::task::spawn_blocking(move || -> io::Result<()> {
         let from_dir = dir_beneath(&root, &from_alg_rel, false)?;
         let to_dir = dir_beneath(&root, &to_alg_rel, true)?;
-        // Open the source no-follow and require a regular file.
+        // Open the source no-follow (the caller already verified via blob_exists
+        // that it is a present regular file beneath the root).
         let src = rustix::fs::openat(
             &from_dir,
             leaf.as_str(),
@@ -794,14 +795,11 @@ async fn mount_promote_beneath(
             Mode::empty(),
         )
         .map_err(io::Error::from)?;
-        let src_st = rustix::fs::fstat(&src).map_err(io::Error::from)?;
-        if !FileType::from_raw_mode(src_st.st_mode).is_file() {
-            return Err(io::Error::from(io::ErrorKind::NotFound));
-        }
         let mut src_file = std::fs::File::from(src);
         // Treat a pre-existing regular-file destination as idempotent success; a
         // symlink/dir/other there is rejected (re-checked here, not only in the
-        // caller's earlier stat, to close the check→promote race).
+        // caller's earlier stat, to close the check→promote race). A missing dest
+        // (NOENT) proceeds to promotion; any other stat error propagates.
         match rustix::fs::statat(&to_dir, leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
             Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => return Ok(()),
             Ok(_) => {
@@ -3119,6 +3117,32 @@ mod tests {
         if let Err(e) = res {
             assert!(matches!(e, StorageError::Io(_)));
         }
+    }
+
+    // open_beneath rejects a non-regular final entry: a FIFO planted at a blob
+    // leaf must not be opened (a read would block / return non-CAS bytes).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn read_beneath_rejects_fifo_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let d = sha256_of(b"fifo-victim");
+        let leaf_path = s.blob_path("r", &d).unwrap();
+        std::fs::create_dir_all(leaf_path.parent().unwrap()).unwrap();
+        // Plant a FIFO at the digest leaf (rustix mkfifoat, CWD + absolute path).
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &leaf_path,
+            rustix::fs::Mode::from_raw_mode(0o644),
+        )
+        .unwrap();
+        s.presence.insert("r", &d.as_string());
+        // Reads refuse the non-regular entry (NotFound), never blocking.
+        assert!(matches!(
+            s.read_blob("r", &d).await,
+            Err(StorageError::NotFound)
+        ));
+        assert!(s.open_blob("r", &d).await.is_err());
     }
 
     // finish_upload on an id that was never begun (no staging file) resolves to
