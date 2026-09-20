@@ -441,9 +441,9 @@ impl FsStorage {
             f.sync_all().await?;
         }
         sync_dir(&repo_dir).await?;
-        if let Some(parent) = repo_dir.parent() {
-            sync_dir(parent).await?;
-        }
+        // A repo dir is always `<root>/…/<name>`, so it has a parent; sync it so
+        // the repo path entry itself is durable.
+        sync_dir(repo_dir.parent().unwrap_or(&repo_dir)).await?;
         Ok(())
     }
     /// Read `<repo>/index.json` as an image index. A missing index yields the
@@ -723,11 +723,11 @@ async fn hash_file(path: &Path, algorithm: &str) -> io::Result<Digest> {
 /// Copy `src` into the CAS at `dest` crash-atomically: copy to a per-operation
 /// unique temp sibling, fsync it, then rename into place (so a reader never
 /// sees a partial blob and a crash leaves at most an orphan temp, never a
-/// corrupt-but-named digest). The copy step uses `copy_file_range` on Linux
-/// (btrfs/XFS share extents O(1) — reflink; ext4 in-kernel copy; NFS
-/// server-side copy — no userspace byte transit; RESEARCH §8.8) and a plain
-/// streaming copy elsewhere. Used as the cross-repo mount fallback when a hard
-/// link is not possible (cross-device / no-hardlink filesystem).
+/// corrupt-but-named digest). The copy step uses a whole-file reflink
+/// (`FICLONE`) on Linux (btrfs/XFS share extents O(1) — CoW, no userspace byte
+/// transit; RESEARCH §8.8), falling back to a streaming copy on any filesystem
+/// that cannot reflink and on non-Linux platforms. Used as the cross-repo mount
+/// fallback when a hard link is not possible (cross-device / no-hardlink fs).
 async fn copy_file_atomic(src: &Path, dest: &Path) -> io::Result<()> {
     let tmp = unique_tmp(dest)?;
     let input = tokio::fs::File::open(src).await?;
@@ -749,37 +749,23 @@ async fn copy_file_atomic(src: &Path, dest: &Path) -> io::Result<()> {
 
 /// Copy all bytes from `input` to `output`. Linux first attempts a whole-file
 /// reflink (`FICLONE`): on btrfs/XFS/bcachefs this shares the source extents
-/// copy-on-write in O(1) with zero data transit (RESEARCH §8.8). If the
-/// filesystem cannot reflink it tries `copy_file_range` (in-kernel copy, still
-/// server-side on NFS), and if that is unsupported or crosses devices
-/// (`EXDEV`/`ENOSYS`/`EOPNOTSUPP`/`EINVAL`/`ENOTSUP`) it streams the bytes with
-/// a plain read/write loop after truncating any partial kernel copy. All of
-/// this runs on a blocking thread so a multi-GiB copy never stalls a Tokio
-/// worker. Other platforms stream via tokio.
+/// copy-on-write in O(1) with zero data transit (RESEARCH §8.8). On any
+/// filesystem that cannot reflink (ext4/tmpfs) or a cross-device target it
+/// falls back to a streaming read/write loop. Both run on a blocking thread so
+/// a multi-GiB copy never stalls a Tokio worker. Other platforms stream via
+/// tokio.
 #[cfg(target_os = "linux")]
 async fn copy_contents(input: &tokio::fs::File, output: &tokio::fs::File) -> io::Result<()> {
     use std::os::fd::AsFd;
-    let total = input.metadata().await?.len() as usize;
     let inf = input.as_fd().try_clone_to_owned()?;
     let outf = output.as_fd().try_clone_to_owned()?;
     tokio::task::spawn_blocking(move || -> io::Result<()> {
         let mut infile = std::fs::File::from(inf);
         let mut outfile = std::fs::File::from(outf);
         // Whole-file reflink first: instant CoW extent share on btrfs/XFS. On
-        // any failure (unsupported fs, cross-device) fall through to the byte
-        // copy, which covers those cases.
+        // any failure (unsupported fs, cross-device) stream the bytes instead.
         if rustix::fs::ioctl_ficlone(&outfile, &infile).is_err() {
-            // In-kernel copy_file_range next (server-side on NFS, in-kernel on
-            // ext4). A recoverable failure (cross-device EXDEV, unsupported
-            // syscall/fs) falls back to a streaming loop that always works.
-            let mut remaining = total;
-            while remaining > 0 {
-                match rustix::fs::copy_file_range(&infile, None, &outfile, None, remaining) {
-                    Ok(0) => break,
-                    Ok(n) => remaining -= n,
-                    Err(_) => return stream_copy(&mut infile, &mut outfile),
-                }
-            }
+            stream_copy(&mut infile, &mut outfile)?;
         }
         Ok(())
     })
@@ -788,8 +774,9 @@ async fn copy_contents(input: &tokio::fs::File, output: &tokio::fs::File) -> io:
 }
 
 /// Rewind both files and copy `input` to `output` with a buffered read/write
-/// loop, truncating any bytes a partial `copy_file_range` already wrote. Runs
-/// on the blocking thread that owns the file handles.
+/// loop, first truncating the destination so a retry never leaves stale tail
+/// bytes. The streaming fallback used when a reflink is not possible. Runs on
+/// the blocking thread that owns the file handles.
 #[cfg(target_os = "linux")]
 fn stream_copy(input: &mut std::fs::File, output: &mut std::fs::File) -> io::Result<()> {
     use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
