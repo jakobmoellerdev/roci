@@ -5,10 +5,11 @@
 #![forbid(unsafe_code)]
 
 use sha2::{Digest as _, Sha256, Sha512};
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -153,7 +154,8 @@ pub trait Storage: Send + Sync + 'static {
         id: &str,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send;
     /// Abort an in-progress upload session, discarding its staging file.
-    /// Idempotent: a missing session is `Ok(())`.
+    /// Idempotent: returns `Ok(true)` if a session was removed, `Ok(false)` if
+    /// none existed.
     fn abort_upload(
         &self,
         repo: &str,
@@ -252,6 +254,10 @@ pub trait Storage: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Vec<String>, StorageError>> + Send;
 }
 
+/// Per-session upload locks: `(repo, id) → async lock` serializing an upload's
+/// append/finish/abort so they never interleave (see [`FsStorage::session_lock`]).
+type UploadLocks = Arc<StdMutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>>;
+
 /// Filesystem-backed [`Storage`]. Each repository is a self-contained OCI
 /// image layout under `<root>/<repo>/`: `oci-layout` (marker), `index.json`
 /// (the image index — source of truth for tags, manifest media types and the
@@ -273,6 +279,12 @@ pub struct FsStorage {
     /// manifests/configs with zero syscalls. A miss falls through to the loose
     /// CAS file, which always exists (never the sole copy).
     cache: Arc<SmallBlobCache>,
+    /// Per-session async locks serializing `append`/`finish`/`abort` on one
+    /// upload id, so a concurrent PATCH cannot inject bytes between a finish's
+    /// hash-verify and its promote (a TOCTOU that would commit unverified data
+    /// or bypass the size cap). Keyed by `(repo, id)`; entries are dropped when
+    /// a session finishes or aborts.
+    upload_locks: UploadLocks,
 }
 
 impl FsStorage {
@@ -291,9 +303,30 @@ impl FsStorage {
             meta,
             presence: Arc::new(BlobPresenceFilter::new()),
             cache: Arc::new(SmallBlobCache::new()),
+            upload_locks: Arc::new(StdMutex::new(HashMap::new())),
         };
         store.seed_presence_from_cas();
         Ok(store)
+    }
+
+    /// The async lock for one upload session, creating it on first use. Held
+    /// across `append`/`finish`/`abort` so those never interleave on one id.
+    fn session_lock(&self, repo: &str, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.upload_locks.lock().expect("upload-locks poisoned");
+        Arc::clone(
+            locks
+                .entry((repo.to_string(), id.to_string()))
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
+    /// Drop a finished/aborted session's lock entry so the map does not grow
+    /// unbounded across many uploads.
+    fn drop_session_lock(&self, repo: &str, id: &str) {
+        self.upload_locks
+            .lock()
+            .expect("upload-locks poisoned")
+            .remove(&(repo.to_string(), id.to_string()));
     }
 
     /// Seed the blob-presence filter from every blob in the CAS so a definite
@@ -485,9 +518,11 @@ impl AsRef<Path> for SafeComponent<'_> {
 }
 
 /// Repository names under `root`: every directory (bounded depth) that directly
-/// contains an `index.json` file, named by its `/`-joined path relative to
-/// `root`. Best-effort — an unreadable directory is skipped. Used only to seed
-/// the blob-presence filter at startup.
+/// contains an `index.json` file **or** an `oci-layout` marker — the latter
+/// catches a blob-only repo (blobs pushed before its first manifest, so no
+/// `index.json` yet) whose blobs must still seed the presence filter. Named by
+/// its `/`-joined path relative to `root`. Best-effort — an unreadable
+/// directory is skipped. Used only to seed the blob-presence filter at startup.
 fn discover_repos(root: &Path) -> Vec<String> {
     fn walk(dir: &Path, rel: &[String], depth: usize, out: &mut Vec<String>) {
         // Bound depth so a pathological tree cannot recurse without limit;
@@ -498,7 +533,8 @@ fn discover_repos(root: &Path) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
-        if !rel.is_empty() && dir.join("index.json").is_file() {
+        if !rel.is_empty() && (dir.join("index.json").is_file() || dir.join("oci-layout").is_file())
+        {
             out.push(rel.join("/"));
         }
         for entry in entries.flatten() {
@@ -634,6 +670,29 @@ async fn hash_file(path: &Path, algorithm: &str) -> io::Result<Digest> {
     }
 }
 
+/// Fsync a directory so a prior `rename` into it is durable (the rename's
+/// effect on the directory entry is not persisted by syncing the file alone).
+/// On Unix this opens the directory and `fsync`s it; on platforms where a
+/// directory handle cannot be synced this is a best-effort no-op.
+async fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = dir.to_path_buf();
+        match tokio::fs::File::open(&dir).await {
+            Ok(f) => f.sync_all().await,
+            // A filesystem that refuses to open a directory for sync cannot
+            // offer the guarantee; treat it as best-effort.
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 impl Storage for FsStorage {
     async fn blob_size(&self, repo: &str, digest: &Digest) -> Result<u64, StorageError> {
         // Validate the path first (the traversal backstop must run before any
@@ -701,6 +760,10 @@ impl Storage for FsStorage {
     }
 
     async fn append_upload(&self, repo: &str, id: &str, chunk: &[u8]) -> Result<u64, StorageError> {
+        // Serialize with any concurrent finish/abort on this session so bytes
+        // cannot be appended between a finish's hash-verify and its promote.
+        let lock = self.session_lock(repo, id);
+        let _guard = lock.lock().await;
         let path = self.upload_path(repo, id)?;
         let mut f = tokio::fs::OpenOptions::new()
             .append(true)
@@ -725,6 +788,10 @@ impl Storage for FsStorage {
         id: &str,
         expected: &Digest,
     ) -> Result<(), StorageError> {
+        // Hold the session lock across the whole verify+promote so a concurrent
+        // append cannot inject unverified bytes between the hash and the rename.
+        let lock = self.session_lock(repo, id);
+        let _guard = lock.lock().await;
         let staging = self.upload_path(repo, id)?;
         // Stream-hash the staging file (no full-blob buffer), verifying it
         // matches the client-declared digest before promoting it.
@@ -734,6 +801,7 @@ impl Storage for FsStorage {
         if !actual.ct_eq(expected) {
             // Reject and drop the staging file so a bad upload leaves nothing.
             let _ = tokio::fs::remove_file(&staging).await;
+            self.drop_session_lock(repo, id);
             return Err(StorageError::DigestMismatch {
                 expected: expected.as_string(),
                 actual: actual.as_string(),
@@ -746,12 +814,11 @@ impl Storage for FsStorage {
         // `uploads/` and is discarded on the next finish).
         self.ensure_layout(repo).await?;
         let dest = self.blob_path(repo, expected)?;
-        tokio::fs::create_dir_all(
-            self.repo_dir(repo)?
-                .join("blobs")
-                .join(expected.algorithm()),
-        )
-        .await?;
+        let alg_dir = self
+            .repo_dir(repo)?
+            .join("blobs")
+            .join(expected.algorithm());
+        tokio::fs::create_dir_all(&alg_dir).await?;
         {
             let f = tokio::fs::OpenOptions::new()
                 .write(true)
@@ -761,6 +828,10 @@ impl Storage for FsStorage {
             f.sync_all().await?;
         }
         tokio::fs::rename(&staging, &dest).await?;
+        // Sync the CAS directory so the renamed entry survives a crash/power
+        // loss (syncing the file alone does not persist the directory entry).
+        sync_dir(&alg_dir).await?;
+        self.drop_session_lock(repo, id);
         // Record presence so future reads skip the stat on a definite miss.
         let digest_str = expected.as_string();
         self.presence.insert(repo, &digest_str);
@@ -777,12 +848,18 @@ impl Storage for FsStorage {
     }
 
     async fn abort_upload(&self, repo: &str, id: &str) -> Result<bool, StorageError> {
+        // Serialize with any concurrent append/finish, then drop the session.
+        let lock = self.session_lock(repo, id);
+        let guard = lock.lock().await;
         // Idempotent: a missing session is `Ok(false)` (nothing removed).
-        match tokio::fs::remove_file(self.upload_path(repo, id)?).await {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(StorageError::Io(e)),
-        }
+        let removed = match tokio::fs::remove_file(self.upload_path(repo, id)?).await {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(StorageError::Io(e)),
+        };
+        drop(guard);
+        self.drop_session_lock(repo, id);
+        Ok(removed)
     }
 
     async fn put_blob(&self, repo: &str, digest: &Digest, data: &[u8]) -> Result<(), StorageError> {
@@ -799,8 +876,8 @@ impl Storage for FsStorage {
         // marker so the directory is a well-formed OCI image layout.
         self.ensure_layout(repo).await?;
         let dest = self.blob_path(repo, digest)?;
-        tokio::fs::create_dir_all(self.repo_dir(repo)?.join("blobs").join(&digest.algorithm))
-            .await?;
+        let alg_dir = self.repo_dir(repo)?.join("blobs").join(&digest.algorithm);
+        tokio::fs::create_dir_all(&alg_dir).await?;
         // Write to a temp file, fsync it durable, then atomically rename into
         // the CAS so a crash cannot leave a corrupt-but-named blob.
         let tmp = dest.with_extension("tmp");
@@ -810,6 +887,8 @@ impl Storage for FsStorage {
             f.sync_all().await?;
         }
         tokio::fs::rename(&tmp, &dest).await?;
+        // Sync the CAS directory so the renamed entry is durable.
+        sync_dir(&alg_dir).await?;
         // Record presence so future reads skip the stat on a definite miss, and
         // warm the small-blob cache (a no-op for large layers).
         let digest_str = digest.as_string();
@@ -1644,6 +1723,31 @@ mod tests {
             let _ = FsStorage::new(&locked).unwrap();
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn blob_only_repo_is_seeded_after_restart() {
+        // A repo that received only a blob push (no manifest) has an oci-layout
+        // marker + blobs/ but no index.json. After a restart the presence filter
+        // must still be seeded from it, or a valid blob would be reported absent
+        // (and a later manifest push would 404 MANIFEST_BLOB_UNKNOWN).
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"blob-only-layer";
+        let d = sha256_of(data);
+        {
+            let s = FsStorage::new(dir.path()).unwrap();
+            s.put_blob("blobonly", &d, data).await.unwrap();
+            // Sanity: no index.json exists for this repo (blob-only).
+            assert!(!dir.path().join("blobonly").join("index.json").exists());
+            assert!(dir.path().join("blobonly").join("oci-layout").exists());
+        }
+        // Reopen: the seed walk must discover the blob-only repo via its marker.
+        let s2 = FsStorage::new(dir.path()).unwrap();
+        assert!(s2.blob_exists("blobonly", &d).await.unwrap());
+        assert_eq!(
+            s2.blob_size("blobonly", &d).await.unwrap(),
+            data.len() as u64
+        );
     }
 
     #[tokio::test]

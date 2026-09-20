@@ -702,30 +702,37 @@ async fn put_manifest<S: Storage>(
 
     // Referenced-blob existence (MANIFEST_BLOB_UNKNOWN): for an image manifest,
     // every blob it references (its `config` and each `layers` entry) MUST be
-    // present. An image index (`manifests` entries are manifests, not blobs) and
-    // a `subject` (may reference an absent manifest per spec) are not checked.
+    // present. A descriptor that is present but malformed (not an object, or no
+    // string `digest`) is a bad manifest → MANIFEST_INVALID.
     let mut referenced: Vec<Digest> = Vec::new();
-    if let Some(cfg) = parsed
-        .get("config")
-        .and_then(|c| c.get("digest"))
-        .and_then(|v| v.as_str())
-    {
-        match Digest::parse(cfg) {
-            Ok(d) => referenced.push(d),
-            Err(_) => {
-                return ApiError::manifest_invalid("config digest is malformed").into_response()
+    // `config`, when present, must be an object carrying a valid string digest.
+    if let Some(cfg) = parsed.get("config") {
+        match descriptor_digest_str(cfg) {
+            Some(s) => match Digest::parse(s) {
+                Ok(d) => referenced.push(d),
+                Err(_) => {
+                    return ApiError::manifest_invalid("config digest is malformed").into_response()
+                }
+            },
+            None => {
+                return ApiError::manifest_invalid("config descriptor is malformed").into_response()
             }
         }
     }
+    // Each `layers` entry must be a descriptor with a valid string digest.
     if let Some(layers) = parsed.get("layers").and_then(|v| v.as_array()) {
         for layer in layers {
-            let Some(dig) = layer.get("digest").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            match Digest::parse(dig) {
-                Ok(d) => referenced.push(d),
-                Err(_) => {
-                    return ApiError::manifest_invalid("layer digest is malformed").into_response()
+            match descriptor_digest_str(layer) {
+                Some(s) => match Digest::parse(s) {
+                    Ok(d) => referenced.push(d),
+                    Err(_) => {
+                        return ApiError::manifest_invalid("layer digest is malformed")
+                            .into_response()
+                    }
+                },
+                None => {
+                    return ApiError::manifest_invalid("layer descriptor is malformed")
+                        .into_response()
                 }
             }
         }
@@ -752,13 +759,28 @@ async fn put_manifest<S: Storage>(
         return map_storage_err(e);
     }
 
-    // Record the reverse edges blob→manifest for the referenced blobs so a
-    // future GC can reclaim a blob when its last manifest is deleted. The
-    // backref index is a derived, rebuildable-from-the-layout cache (never the
-    // source of truth), so a failed append must not fail an otherwise-valid
-    // push — the edges are reconstructable by walking the manifest.
-    if !referenced.is_empty() {
-        let _ = st.storage.record_backrefs(repo, &digest, &referenced).await;
+    // Record the reverse edges blob→manifest so a future GC (Phase 3) can
+    // reclaim an object once its last referencing manifest is deleted. Beyond
+    // the config+layers checked above, also record an image index's child
+    // `manifests[*]` and a `subject` descriptor — those are CAS objects a GC
+    // must treat as reachable (their existence is NOT enforced here: a subject
+    // may reference an absent manifest per spec, and an index child may be
+    // pushed later). The backref index is a derived, rebuildable-from-the-layout
+    // cache (never the source of truth), so a failed append must not fail an
+    // otherwise-valid push; Phase 3 GC rebuilds/verifies before consuming it.
+    let mut edges = referenced.clone();
+    if let Some(children) = parsed.get("manifests").and_then(|v| v.as_array()) {
+        for child in children {
+            if let Some(d) = descriptor_digest_str(child).and_then(|s| Digest::parse(s).ok()) {
+                edges.push(d);
+            }
+        }
+    }
+    if let Some(subject) = subject_digest.as_ref() {
+        edges.push(subject.clone());
+    }
+    if !edges.is_empty() {
+        let _ = st.storage.record_backrefs(repo, &digest, &edges).await;
     }
 
     if let Some(subject) = subject_digest.as_ref() {
@@ -887,6 +909,11 @@ async fn start_upload<S: Storage>(
             Ok(b) => b,
             Err(resp) => return *resp,
         };
+        // A monolithic body is a complete upload, so the per-session cap applies
+        // here too (e.g. when max_upload is configured below max_body).
+        if body.len() as u64 > st.max_upload {
+            return ApiError::payload_too_large("upload exceeds maximum blob size").into_response();
+        }
         return match st.storage.put_blob(repo, &d, &body).await {
             Ok(()) => {
                 let mut headers = HeaderMap::new();
@@ -1151,6 +1178,15 @@ const MAX_JSON_DEPTH: usize = 32;
 
 /// Maximum page size for list endpoints (tags/referrers); server-side cap.
 const MAX_PAGE: usize = 1000;
+
+/// The `digest` string of an OCI descriptor: `Some(&str)` only when `value` is
+/// a JSON object carrying a string `digest`. A non-object descriptor, or one
+/// missing a string `digest`, yields `None` — the caller treats that as a
+/// malformed descriptor. A descriptor field that is entirely absent is handled
+/// by the caller before calling this (an omitted `config`/`layers` is legal).
+fn descriptor_digest_str(value: &serde_json::Value) -> Option<&str> {
+    value.as_object()?.get("digest")?.as_str()
+}
 
 /// Returns true if `bytes` contains JSON bracket/brace nesting deeper than
 /// `max`. A cheap, allocation-free pre-scan that treats string literals
@@ -3390,26 +3426,42 @@ mod tests {
         )
         .await;
         assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
-        // A layer entry with no `digest` field is skipped (not a blob to check),
-        // so a manifest carrying only such an entry is accepted.
+        // A layer descriptor with no `digest` is malformed → MANIFEST_INVALID.
         let no_digest_layer = serde_json::json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "layers": [ { "mediaType": "application/vnd.oci.image.layer.v1.tar", "size": 0 } ]
         });
-        let resp = app
-            .oneshot(
-                HttpRequest::put("/v2/r/manifests/v3")
-                    .header(
-                        header::CONTENT_TYPE,
-                        "application/vnd.oci.image.manifest.v1+json",
-                    )
-                    .body(Body::from(serde_json::to_vec(&no_digest_layer).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v3")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .body(Body::from(serde_json::to_vec(&no_digest_layer).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
+        // A non-object config descriptor is likewise malformed → MANIFEST_INVALID.
+        let bad_config_shape = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": "not-a-descriptor"
+        });
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v4")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .body(Body::from(serde_json::to_vec(&bad_config_shape).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
     }
 
     #[cfg(unix)]
@@ -3446,5 +3498,100 @@ mod tests {
         // Restore perms so the tempdir cleans up.
         std::fs::set_permissions(&alg_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn monolithic_upload_over_session_cap_is_413() {
+        // A monolithic POST ?digest= whose body exceeds max_upload → 413, even
+        // though it is under max_body (the cap applies to monolithic too).
+        let (app, _d) = app_tiny_upload(4);
+        let data = b"way over the four byte cap";
+        let d = sha256_of(data);
+        let resp = app
+            .oneshot(
+                HttpRequest::post(format!("/v2/r/blobs/uploads/?digest={}", d.as_string()))
+                    .body(Body::from(data.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(v["errors"][0]["code"], "SIZE_INVALID");
+    }
+
+    #[tokio::test]
+    async fn image_index_records_child_and_subject_backrefs() {
+        // Pushing an image index records a backref edge from each child manifest
+        // digest to the index; a manifest with a subject records the subject
+        // edge. Neither child nor subject existence is enforced (they may be
+        // pushed later / a subject may be absent per spec).
+        let (app, storage, _d) = app_with_storage();
+        let child_a = sha256_of(b"child-a");
+        let child_b = sha256_of(b"child-b");
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                { "mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": child_a.as_string(), "size": 1 },
+                { "mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": child_b.as_string(), "size": 1 }
+            ]
+        });
+        let body = serde_json::to_vec(&index).unwrap();
+        let idx_digest = sha256_of(&body);
+        let resp = app
+            .oneshot(
+                HttpRequest::put("/v2/r/manifests/idx")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "application/vnd.oci.image.index.v1+json",
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        // Each child carries a backref to the index manifest.
+        assert_eq!(
+            storage.backrefs("r", &child_a).await.unwrap(),
+            vec![idx_digest.as_string()]
+        );
+        assert_eq!(
+            storage.backrefs("r", &child_b).await.unwrap(),
+            vec![idx_digest.as_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_subject_is_recorded_as_backref() {
+        let (app, storage, _d) = app_with_storage();
+        let subject = sha256_of(b"the-subject");
+        // An artifact-style manifest with no config/layers but a subject.
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "subject": { "mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": subject.as_string(), "size": 2 }
+        });
+        let body = serde_json::to_vec(&manifest).unwrap();
+        let m_digest = sha256_of(&body);
+        let resp = app
+            .oneshot(
+                HttpRequest::put("/v2/r/manifests/art")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "application/vnd.oci.image.manifest.v1+json",
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            storage.backrefs("r", &subject).await.unwrap(),
+            vec![m_digest.as_string()]
+        );
     }
 }
