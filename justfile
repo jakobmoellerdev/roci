@@ -83,15 +83,20 @@ coverage-linux:
     set -euo pipefail
     root="$(git rev-parse --show-toplevel)"
     docker build -t roci-coverage:local -f Containerfile.coverage .
-    docker volume create roci-coverage-target >/dev/null
     name="roci-cov-$$"
-    # A long-lived helper container with the target volume mounted; we cp the
-    # source in, run the gate, cp results out, then remove it.
+    # A fresh per-run target volume: reusing one across runs let stale
+    # `.profraw`/artifacts from a previous commit skew the measured line set
+    # (a false 100%). An ephemeral volume guarantees the gate reflects the
+    # current tree — the price is a full Linux recompile each run.
+    vol="roci-coverage-target-$$"
+    docker volume create "$vol" >/dev/null
+    # A helper container with the target volume mounted; we cp the source in,
+    # run the gate as non-root, cp results out, then remove container + volume.
     docker rm -f "$name" >/dev/null 2>&1 || true
-    docker create --name "$name" -v roci-coverage-target:/target -w /roci \
+    docker create --name "$name" -v "$vol":/target -w /roci \
       roci-coverage:local \
       bash -c "chown -R roci:roci /roci /target && su roci -c 'export CARGO_HOME=/home/roci/.cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:\$PATH && git config --global --add safe.directory /roci && cd /roci && bash scripts/coverage.sh'" >/dev/null
-    trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+    trap 'docker rm -f "$name" >/dev/null 2>&1 || true; docker volume rm "$vol" >/dev/null 2>&1 || true' EXIT
     # Copy the tracked tree in (including .git so coverage.sh's `git rev-parse`
     # works). COPYFILE_DISABLE + --no-xattrs/--no-mac-metadata strip macOS
     # AppleDouble and com.apple.provenance xattrs the Linux extractor rejects;

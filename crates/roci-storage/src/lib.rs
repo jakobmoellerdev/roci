@@ -719,11 +719,10 @@ async fn copy_file_atomic(src: &Path, dest: &Path) -> io::Result<()> {
     drop(input);
     drop(output);
     tokio::fs::rename(&tmp, dest).await?;
-    // Sync the containing directory so the renamed entry survives a crash.
-    if let Some(parent) = dest.parent() {
-        sync_dir(parent).await?;
-    }
-    Ok(())
+    // Sync the containing directory so the renamed entry survives a crash. A
+    // CAS blob path always has a parent (`blobs/<alg>/`); fall back to `dest`
+    // only to keep this total.
+    sync_dir(dest.parent().unwrap_or(dest)).await
 }
 
 /// Copy all bytes from `input` to `output`. Linux uses `copy_file_range`
