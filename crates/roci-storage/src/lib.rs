@@ -464,6 +464,28 @@ impl FsStorage {
         Self::safe_component(id)?;
         Ok((dir, id.to_string()))
     }
+
+    /// Best-effort: if the just-promoted blob is small enough, read it back
+    /// (no-follow, beneath-root) and warm the small-blob cache. Any IO hiccup
+    /// simply skips the warm — the loose CAS file is always the source of truth.
+    async fn warm_small_blob_cache(&self, repo: &str, digest: &Digest, digest_str: &str) {
+        let Ok(rel) = self.blob_rel(repo, digest) else {
+            return;
+        };
+        let Ok(Some((_, size))) = stat_beneath(&self.root, &rel).await else {
+            return;
+        };
+        if size > self.cache.threshold() as u64 {
+            return;
+        }
+        let Ok(mut f) = open_beneath(&self.root, &rel).await else {
+            return;
+        };
+        let mut bytes = Vec::new();
+        if f.read_to_end(&mut bytes).await.is_ok() {
+            self.cache.put(repo, digest_str, &bytes);
+        }
+    }
     fn layout_path(&self, repo: &str) -> Result<PathBuf, StorageError> {
         Ok(self.repo_dir(repo)?.join("oci-layout"))
     }
@@ -1594,18 +1616,12 @@ impl Storage for FsStorage {
         // — read it back through the same no-follow beneath-root open. Reading a
         // multi-GiB layer back to feed a cache that would reject it is the
         // buffering this rework exists to avoid, so gate on the stat first.
-        if let Ok(Some((true, size))) =
-            stat_beneath(&self.root, &self.blob_rel(repo, expected)?).await
-        {
-            if size <= self.cache.threshold() as u64 {
-                if let Ok(mut f) = open_beneath(&self.root, &self.blob_rel(repo, expected)?).await {
-                    let mut bytes = Vec::new();
-                    if f.read_to_end(&mut bytes).await.is_ok() {
-                        self.cache.put(repo, &digest_str, &bytes);
-                    }
-                }
-            }
-        }
+        // Warm the small-blob cache only for a blob small enough to be cacheable
+        // — read it back through the same no-follow beneath-root open. The blob
+        // was just promoted, so it is present and regular; a stat/open failure
+        // here is a genuine IO fault that simply skips the (optional) cache warm.
+        self.warm_small_blob_cache(repo, expected, &digest_str)
+            .await;
         Ok(())
     }
 
@@ -3116,6 +3132,32 @@ mod tests {
         // failure must be an Io error, never a spurious NotFound.
         if let Err(e) = res {
             assert!(matches!(e, StorageError::Io(_)));
+        }
+    }
+
+    // A read through an unsearchable intermediate CAS dir (mode 0o000) hits a
+    // genuine EACCES in the beneath-root open/stat walk (not NotFound) — an IO
+    // error, never a false 404. Unprivileged test user only (root bypasses).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_through_unsearchable_parent_is_io_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let d = sha256_of(b"present");
+        s.put_blob("r", &d, b"present").await.unwrap();
+        // Make the `<alg>` dir unsearchable so opening/stat-ing the leaf EACCES.
+        let alg = s.repo_dir("r").unwrap().join("blobs").join(&d.algorithm);
+        std::fs::set_permissions(&alg, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let read = s.read_blob("r", &d).await;
+        let sized = s.blob_size("r", &d).await;
+        let _ = std::fs::set_permissions(&alg, std::fs::Permissions::from_mode(0o755));
+        // Unprivileged: EACCES → Io. Privileged (root): succeeds. Never a false
+        // NotFound on a genuine permission error.
+        for r in [read.map(|_| ()), sized.map(|_| ())] {
+            if let Err(e) = r {
+                assert!(matches!(e, StorageError::Io(_)));
+            }
         }
     }
 
