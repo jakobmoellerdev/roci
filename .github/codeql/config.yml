@@ -14,3 +14,17 @@ paths-ignore:
 
 # No `queries:` block — omitting it runs CodeQL's default query suite, which is
 # the fastest (security-and-quality / security-extended are slower).
+#
+# roci ships an in-repo path-injection barrier model pack at
+# `.github/codeql/extensions/roci-path-sanitizers/` (`models/path-barriers.yml`
+# declares the `FsStorage` path-building methods' and `LogMetadataStore`'s
+# `Argument[self]` as `path-injection` barriers — their `root`/`log_path`
+# fields are fixed at construction, never attacker-controlled, so CodeQL's
+# default model spuriously taints them).
+#
+# `packs:` is intentionally NOT set here: a `packs:` entry resolves from GHCR
+# and a local unpublished pack fails `database init`. Instead the pack is loaded
+# at run-queries time by `.github/workflows/codeql.yml` via
+# `CODEQL_ACTION_EXTRA_OPTIONS` (`--additional-packs=<repo>/.github/codeql/extensions`
+# + `--model-packs=roci/path-sanitizers`). Verified locally with
+# `just codeql-local`: 0 `rust/path-injection` alerts with the pack, 41 without.

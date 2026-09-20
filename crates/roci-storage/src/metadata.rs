@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// A tag/manifest/referrer mutation the store can record and replay.
@@ -23,6 +24,14 @@ pub enum MetaOp {
         digest: String,
         media_type: String,
         tag: Option<String>,
+    },
+    /// The reverse edges for a manifest: every `blob` the manifest references
+    /// (config + layers) gains `manifest` in its backref set. Recorded after
+    /// the manifest is stored so a future GC can reclaim an unreferenced blob.
+    PutBackrefs {
+        repo: String,
+        manifest: String,
+        blobs: Vec<String>,
     },
     /// A manifest (and every tag pointing at it) was deleted: `(repo, digest)`.
     DeleteManifest { repo: String, digest: String },
@@ -48,14 +57,39 @@ pub trait MetadataStore: Send + Sync + 'static {
     fn list_tags(&self, repo: &str) -> Vec<String>;
     /// The referrer descriptors recorded for a subject digest, as raw JSON.
     fn referrers(&self, repo: &str, subject: &str) -> Vec<Vec<u8>>;
+    /// The manifest digests currently recorded as referencing `blob` in `repo`.
+    fn backrefs(&self, repo: &str, blob: &str) -> Vec<String>;
     /// Apply and durably record a mutation.
     fn apply(&self, op: MetaOp) -> io::Result<()>;
 }
 
 /// In-RAM metadata maps mirrored to an append-only CRC32C-framed log.
+///
+/// Writes are **group-committed**: the append (buffered `write` + `flush` into
+/// the kernel) happens under the fast `inner` lock and bumps `appended`; the
+/// durability barrier (`fdatasync`) is coalesced behind a separate `sync` lock,
+/// so N appends that pile up while one `fdatasync` is in flight are made
+/// durable by that single sync — a caller whose record is already covered
+/// (`synced >= my_seq`) returns without its own sync (RESEARCH §8.8, PLAN
+/// Phase 2 group-commit).
 pub struct LogMetadataStore {
     inner: Mutex<State>,
+    /// Records appended to the kernel so far (monotonic; the append seq).
+    appended: AtomicU64,
+    /// Coalesced durability barrier: the highest `appended` made durable, plus
+    /// a `fdatasync`-capable clone of the log handle.
+    sync: Mutex<SyncCoord>,
     log_path: PathBuf,
+}
+
+/// Durability-barrier state, guarded independently of `inner` so a `fdatasync`
+/// never holds the append lock.
+#[derive(Default)]
+struct SyncCoord {
+    /// Highest `appended` seq made durable by a completed `fdatasync`.
+    synced: u64,
+    /// A clone of the log file used only for `sync_data`; set on first append.
+    handle: Option<std::fs::File>,
 }
 
 /// A repo-scoped map key: `(repo, name)` so repositories stay isolated.
@@ -74,6 +108,10 @@ struct State {
     /// `(repo, subject) → [(referrer_digest, descriptor_bytes)]`. The referrer
     /// digest keys de-dup so a re-push replaces rather than appends.
     referrers: HashMap<RepoKey, Vec<Referrer>>,
+    /// `(repo, blob_digest) → [manifest_digest]`: reverse edges from a blob to
+    /// every manifest that references it. Maintained on manifest put/delete for
+    /// a future online GC; manifest digests de-dup within a set.
+    backrefs: HashMap<RepoKey, Vec<String>>,
     /// Buffered log writer (`None` until a mutation opens/creates the log).
     log: Option<std::fs::File>,
 }
@@ -91,6 +129,8 @@ impl LogMetadataStore {
         }
         Ok(Self {
             inner: Mutex::new(state),
+            appended: AtomicU64::new(0),
+            sync: Mutex::new(SyncCoord::default()),
             log_path,
         })
     }
@@ -124,6 +164,29 @@ impl LogMetadataStore {
                 // Drop the deleted manifest as a referrer of any subject.
                 for refs in state.referrers.values_mut() {
                     refs.retain(|(rd, _)| rd != digest);
+                }
+                // Drop the deleted manifest from every blob's backref set in
+                // this repo; a set that empties is removed entirely.
+                state.backrefs.retain(|(r, _), manifests| {
+                    if r == repo {
+                        manifests.retain(|m| m != digest);
+                    }
+                    !manifests.is_empty()
+                });
+            }
+            MetaOp::PutBackrefs {
+                repo,
+                manifest,
+                blobs,
+            } => {
+                for blob in blobs {
+                    let set = state
+                        .backrefs
+                        .entry((repo.clone(), blob.clone()))
+                        .or_default();
+                    if !set.iter().any(|m| m == manifest) {
+                        set.push(manifest.clone());
+                    }
                 }
             }
             MetaOp::PutReferrer {
@@ -185,21 +248,74 @@ impl MetadataStore for LogMetadataStore {
             .unwrap_or_default()
     }
 
+    fn backrefs(&self, repo: &str, blob: &str) -> Vec<String> {
+        let state = self.inner.lock().expect("metadata lock poisoned");
+        state
+            .backrefs
+            .get(&(repo.to_string(), blob.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn apply(&self, op: MetaOp) -> io::Result<()> {
-        let record = encode(&op);
+        // Append the record and reflect it in RAM under one lock (so the
+        // in-memory maps always match log-replay order even under concurrent
+        // appends), then coalesce the durability barrier. The in-RAM maps are a
+        // rebuildable cache and the log is the source of truth: if the barrier
+        // fails, the record is already in the log (replayed on restart) and the
+        // in-RAM state already matches that replay — the caller gets the error.
+        let my_seq = self.append_record(&op)?;
+        self.group_commit_through(my_seq)
+    }
+}
+
+impl LogMetadataStore {
+    /// Phase 1 of a group-committed apply: under the fast `inner` lock, buffer
+    /// the record into the kernel (write + flush, no fsync), apply it to the
+    /// in-RAM maps **in append order** (same lock → no reordering across
+    /// concurrent callers), and return this write's monotonic sequence number.
+    /// On the first mutation, open the log and hand a `sync_data`-capable clone
+    /// to the durability coordinator.
+    fn append_record(&self, op: &MetaOp) -> io::Result<u64> {
+        let record = encode(op);
         let mut state = self.inner.lock().expect("metadata lock poisoned");
-        // Open the log lazily on first mutation (append + create).
         if state.log.is_none() {
             let f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&self.log_path)?;
+            let clone = f.try_clone()?;
             state.log = Some(f);
+            self.sync.lock().expect("sync lock poisoned").handle = Some(clone);
         }
         let log = state.log.as_mut().expect("log opened above");
         log.write_all(&record)?;
         log.flush()?;
-        Self::apply_in_ram(&mut state, &op);
+        let seq = self.appended.fetch_add(1, Ordering::AcqRel) + 1;
+        Self::apply_in_ram(&mut state, op);
+        Ok(seq)
+    }
+
+    /// Phase 2 of a group-committed apply: the coalesced durability barrier.
+    /// If a prior `fdatasync` already covered `my_seq` this returns without a
+    /// syscall; otherwise one `fdatasync` makes every append up to now durable
+    /// (the group-commit win — concurrent appends piled up during an in-flight
+    /// sync share it). N appends between two syncs cost one fsync.
+    fn group_commit_through(&self, my_seq: u64) -> io::Result<()> {
+        let mut sync = self.sync.lock().expect("sync lock poisoned");
+        if sync.synced >= my_seq {
+            return Ok(());
+        }
+        // Snapshot the append seq *before* syncing so we only claim durability
+        // for records already flushed to the kernel.
+        let covered = self.appended.load(Ordering::Acquire);
+        // The handle is set on the first append (before any seq is returned), so
+        // it is always present by the time a commit runs.
+        sync.handle
+            .as_ref()
+            .expect("log handle set on first append")
+            .sync_data()?;
+        sync.synced = sync.synced.max(covered);
         Ok(())
     }
 }
@@ -284,6 +400,16 @@ fn serialize_op(op: &MetaOp) -> Vec<u8> {
             // record a single flat object and survive any byte content.
             "descriptor": String::from_utf8_lossy(descriptor),
         }),
+        MetaOp::PutBackrefs {
+            repo,
+            manifest,
+            blobs,
+        } => serde_json::json!({
+            "op": "put_backrefs",
+            "repo": repo,
+            "manifest": manifest,
+            "blobs": blobs,
+        }),
     };
     serde_json::to_vec(&v).expect("MetaOp serializes")
 }
@@ -307,6 +433,19 @@ fn deserialize_op(payload: &[u8]) -> Option<MetaOp> {
             subject: s("subject")?,
             referrer: s("referrer")?,
             descriptor: s("descriptor")?.into_bytes(),
+        }),
+        "put_backrefs" => Some(MetaOp::PutBackrefs {
+            repo: s("repo")?,
+            manifest: s("manifest")?,
+            blobs: v
+                .get("blobs")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }),
         _ => None,
     }
@@ -427,6 +566,39 @@ mod tests {
     }
 
     #[test]
+    fn backrefs_apply_query_and_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = LogMetadataStore::open(dir.path()).unwrap();
+            s.apply(MetaOp::PutBackrefs {
+                repo: "r".into(),
+                manifest: "sha256:m".into(),
+                blobs: vec!["sha256:b1".into(), "sha256:b2".into()],
+            })
+            .unwrap();
+            // Idempotent: re-recording the same edge does not duplicate it.
+            s.apply(MetaOp::PutBackrefs {
+                repo: "r".into(),
+                manifest: "sha256:m".into(),
+                blobs: vec!["sha256:b1".into()],
+            })
+            .unwrap();
+            assert_eq!(s.backrefs("r", "sha256:b1"), vec!["sha256:m".to_string()]);
+            assert!(s.backrefs("r", "sha256:absent").is_empty());
+        }
+        // A fresh store replays the log (serialize → deserialize round-trip).
+        let s2 = LogMetadataStore::open(dir.path()).unwrap();
+        assert_eq!(s2.backrefs("r", "sha256:b2"), vec!["sha256:m".to_string()]);
+        // Deleting the manifest clears its backref edges on replay too.
+        s2.apply(MetaOp::DeleteManifest {
+            repo: "r".into(),
+            digest: "sha256:m".into(),
+        })
+        .unwrap();
+        assert!(s2.backrefs("r", "sha256:b1").is_empty());
+    }
+
+    #[test]
     fn log_replays_on_reopen() {
         let dir = tempfile::tempdir().unwrap();
         {
@@ -515,5 +687,37 @@ mod tests {
     fn deserialize_rejects_malformed_payloads() {
         assert!(deserialize_op(b"not json").is_none());
         assert!(deserialize_op(b"{\"no_op_field\":1}").is_none());
+    }
+
+    #[test]
+    fn group_commit_coalesces_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = LogMetadataStore::open(dir.path()).unwrap();
+        // Append two records without syncing between them (phase 1 only).
+        let seq1 = s.append_record(&put("r", "sha256:aa", Some("v1"))).unwrap();
+        let seq2 = s.append_record(&put("r", "sha256:bb", Some("v2"))).unwrap();
+        assert_eq!((seq1, seq2), (1, 2));
+        // One durability barrier covering seq 2 makes both records durable.
+        s.group_commit_through(seq2).unwrap();
+        // A later barrier for an already-covered seq is a no-op (the coalesced
+        // fast path: `synced >= my_seq`, no second fsync).
+        s.group_commit_through(seq1).unwrap();
+        // Both records survive a reopen (they were flushed + synced).
+        drop(s);
+        let s2 = LogMetadataStore::open(dir.path()).unwrap();
+        assert_eq!(
+            s2.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
+        assert_eq!(
+            s2.resolve_tag("r", "v2").map(|(d, _)| d).as_deref(),
+            Some("sha256:bb")
+        );
+        // The public `apply` still works end-to-end (append + immediate sync).
+        s2.apply(put("r", "sha256:cc", Some("v3"))).unwrap();
+        assert_eq!(
+            s2.resolve_tag("r", "v3").map(|(d, _)| d).as_deref(),
+            Some("sha256:cc")
+        );
     }
 }

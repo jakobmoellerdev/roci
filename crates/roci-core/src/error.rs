@@ -110,6 +110,9 @@ impl ApiError {
     pub fn manifest_invalid(message: impl Into<String>) -> Self {
         ApiError::new(ErrorCode::ManifestInvalid, message)
     }
+    pub fn manifest_blob_unknown(message: impl Into<String>) -> Self {
+        ApiError::new(ErrorCode::ManifestBlobUnknown, message)
+    }
     pub fn manifest_unknown() -> Self {
         ApiError::new(ErrorCode::ManifestUnknown, "manifest unknown to registry")
     }
@@ -175,6 +178,15 @@ impl From<StorageError> for ApiError {
             StorageError::BadPath(p) => {
                 ApiError::name_invalid(format!("unsafe path component: {p}"))
             }
+            // The upload endpoints translate this to a 416 with a Range header
+            // at the call site; the generic fallback is a 400 BLOB_UPLOAD_INVALID.
+            StorageError::RangeNotSatisfiable { .. } => ApiError::new(
+                ErrorCode::BlobUploadInvalid,
+                "content range does not match offset",
+            ),
+            StorageError::TooLarge { limit, actual } => ApiError::payload_too_large(format!(
+                "upload size {actual} exceeds maximum blob size {limit}"
+            )),
             StorageError::Io(_) => ApiError::Internal("internal error".to_string()),
         }
     }
@@ -257,6 +269,14 @@ mod tests {
             })
             .code(),
             "DIGEST_INVALID"
+        );
+        assert_eq!(
+            ApiError::from(StorageError::RangeNotSatisfiable {
+                expected: 3,
+                got: 0
+            })
+            .code(),
+            "BLOB_UPLOAD_INVALID"
         );
         let io = StorageError::Io(std::io::Error::other("x"));
         assert_eq!(ApiError::from(io).code(), "UNKNOWN");

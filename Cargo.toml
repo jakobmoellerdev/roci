@@ -57,6 +57,8 @@ tempfile = "3"
 xorf = "0.13"
 cuckoofilter = "0.5"
 lru = "0.18"
+getrandom = "0.4"
+rustix = { version = "1", features = ["fs"] }
 
 [profile.ci]
 inherits = "dev"

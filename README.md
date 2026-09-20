@@ -7,7 +7,7 @@
 
 # roci
 
-![coverage](https://img.shields.io/badge/coverage-100.00%25-brightgreen)
+![coverage](https://img.shields.io/badge/coverage-99.96%25-red)
 
 **roci** is a Rust implementation of the [OCI Distribution Specification](spec/distribution-spec/spec.md) — an OCI container registry.
 
@@ -106,6 +106,7 @@ Every recipe mirrors a CI gate, so passing locally means passing the required CI
 | `just audit` | `cargo deny` supply-chain check |
 | `just coverage` | Enforce 100% line coverage (cargo-llvm-cov) |
 | `just coverage-report` | Show uncovered lines (developer aid) |
+| `just coverage-linux` | Reproduce the CI Linux 100%-coverage gate in a container (macOS devs; the only way to exercise the Linux-only fast paths) |
 | `just ci` | Run the full local gate before pushing (actionlint + fmt + clippy + test + build + deps-guard + coverage + conformance) |
 | `just conformance` | Run the OCI dist-spec conformance suite against a local roci |
 | `just container` | Build the hardened scratch image and smoke-test it |
@@ -203,7 +204,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 ### Storage
 
 - [ ] Online, O(garbage) garbage collection (grace-period, backref index; never offline)
-- [ ] Copy-on-write (reflink) deduplication across repos, hard-link fallback
+- [x] Copy-on-write (reflink `FICLONE`) deduplication across repos, `copy_file_range` then hard-link fallback
 - [ ] Data scrubbing (CRC32C staggered, FS-scrub offload, BLAKE3 escalation)
 - [ ] Serve multiple storage paths (and backends) from a single server
 - [ ] Per-repo / per-total storage quotas

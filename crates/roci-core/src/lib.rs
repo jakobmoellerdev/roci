@@ -30,6 +30,8 @@ pub struct AppState<S: Storage> {
     storage: Arc<S>,
     /// Maximum accepted request-body size; bodies larger are rejected with 413.
     max_body: usize,
+    /// Maximum cumulative size of one upload session; exceeding it is 413.
+    max_upload: u64,
 }
 
 // Manual Clone: `Arc<S>` is always cloneable regardless of whether `S` is.
@@ -38,22 +40,31 @@ impl<S: Storage> Clone for AppState<S> {
         Self {
             storage: Arc::clone(&self.storage),
             max_body: self.max_body,
+            max_upload: self.max_upload,
         }
     }
 }
 
 impl<S: Storage> AppState<S> {
-    /// Wrap a storage backend, accepting bodies up to [`MAX_BODY`] (256 MiB).
+    /// Wrap a storage backend, accepting bodies up to [`MAX_BODY`] (256 MiB)
+    /// and upload sessions up to [`MAX_UPLOAD`] (5 GiB).
     pub fn new(storage: S) -> Self {
         Self {
             storage: Arc::new(storage),
             max_body: MAX_BODY,
+            max_upload: MAX_UPLOAD,
         }
     }
 
     /// Override the maximum accepted request-body size (bytes).
     pub fn with_max_body(mut self, max_body: usize) -> Self {
         self.max_body = max_body;
+        self
+    }
+
+    /// Override the maximum cumulative upload-session size (bytes).
+    pub fn with_max_upload(mut self, max_upload: u64) -> Self {
+        self.max_upload = max_upload;
         self
     }
 }
@@ -676,12 +687,110 @@ async fn put_manifest<S: Storage>(
         .and_then(|d| d.as_str())
         .and_then(|d| Digest::parse(d).ok());
 
+    // Content-Type ↔ manifest `mediaType` agreement (CVE-2021-41190): when the
+    // body carries a top-level string `mediaType`, it MUST equal the request
+    // Content-Type (compared on the bare type, `;`-params stripped). A body with
+    // no `mediaType` (image index / some artifacts) skips the check — never
+    // inferred. A mismatch is a malformed manifest.
+    if let Some(mt) = parsed.get("mediaType") {
+        // A present `mediaType` must be a string; a non-string is malformed and
+        // must not silently bypass the agreement check (CVE-2021-41190).
+        let Some(body_mt) = mt.as_str() else {
+            return ApiError::manifest_invalid("manifest mediaType is not a string")
+                .into_response();
+        };
+        let bare = |s: &str| s.split(';').next().unwrap_or(s).trim().to_string();
+        if bare(&media_type) != bare(body_mt) {
+            return ApiError::manifest_invalid("Content-Type does not match manifest mediaType")
+                .into_response();
+        }
+    }
+
+    // Referenced-blob existence (MANIFEST_BLOB_UNKNOWN): for an image manifest,
+    // every blob it references (its `config` and each `layers` entry) MUST be
+    // present. A descriptor that is present but malformed (not an object, or no
+    // string `digest`) is a bad manifest → MANIFEST_INVALID.
+    let mut referenced: Vec<Digest> = Vec::new();
+    // `config`, when present, must be an object carrying a valid string digest.
+    if let Some(cfg) = parsed.get("config") {
+        match descriptor_digest_str(cfg) {
+            Some(s) => match Digest::parse(s) {
+                Ok(d) => referenced.push(d),
+                Err(_) => {
+                    return ApiError::manifest_invalid("config digest is malformed").into_response()
+                }
+            },
+            None => {
+                return ApiError::manifest_invalid("config descriptor is malformed").into_response()
+            }
+        }
+    }
+    // A present `layers` must be an array; a non-array is a malformed manifest
+    // (not silently skipped). Each entry must be a descriptor with a digest.
+    if let Some(layers) = parsed.get("layers") {
+        let Some(layers) = layers.as_array() else {
+            return ApiError::manifest_invalid("manifest layers is not an array").into_response();
+        };
+        for layer in layers {
+            match descriptor_digest_str(layer) {
+                Some(s) => match Digest::parse(s) {
+                    Ok(d) => referenced.push(d),
+                    Err(_) => {
+                        return ApiError::manifest_invalid("layer digest is malformed")
+                            .into_response()
+                    }
+                },
+                None => {
+                    return ApiError::manifest_invalid("layer descriptor is malformed")
+                        .into_response()
+                }
+            }
+        }
+    }
+    for d in &referenced {
+        match st.storage.blob_exists(repo, d).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return ApiError::manifest_blob_unknown(format!(
+                    "referenced blob {} is not present",
+                    d.as_string()
+                ))
+                .into_response()
+            }
+            Err(e) => return map_storage_err(e),
+        }
+    }
+
     if let Err(e) = st
         .storage
         .put_manifest(repo, tag, &digest, &media_type, &body)
         .await
     {
         return map_storage_err(e);
+    }
+
+    // Record the reverse edges blob→manifest so a future GC (Phase 3) can
+    // reclaim an object once its last referencing manifest is deleted. Beyond
+    // the config+layers checked above, also record an image index's child
+    // `manifests[*]` and a `subject` descriptor — those are CAS objects a GC
+    // must treat as reachable (their existence is NOT enforced here: a subject
+    // may reference an absent manifest per spec, and an index child may be
+    // pushed later). The backref index is a derived, rebuildable-from-the-layout
+    // cache (never the source of truth), so a failed append must not fail an
+    // otherwise-valid push; Phase 3 GC rebuilds/verifies before consuming it.
+    let mut edges = referenced.clone();
+    if let Some(children) = parsed.get("manifests").and_then(|v| v.as_array()) {
+        for child in children {
+            if let Some(d) = descriptor_digest_str(child).and_then(|s| Digest::parse(s).ok()) {
+                edges.push(d);
+            }
+        }
+    }
+    if let Some(subject) = subject_digest.as_ref() {
+        edges.push(subject.clone());
+    }
+    if !edges.is_empty() {
+        let _ = st.storage.record_backrefs(repo, &digest, &edges).await;
     }
 
     if let Some(subject) = subject_digest.as_ref() {
@@ -780,20 +889,20 @@ async fn start_upload<S: Storage>(
     // end-11: cross-repository mount.
     if let (Some(mount), Some(from)) = (q.mount.as_ref(), q.from.as_ref()) {
         if let Ok(d) = Digest::parse(mount) {
-            if let Ok(data) = st.storage.read_blob(from, &d).await {
-                if st.storage.put_blob(repo, &d, &data).await.is_ok() {
-                    let mut headers = HeaderMap::new();
-                    headers.insert(
-                        header::LOCATION,
-                        HeaderValue::from_str(&format!("/v2/{repo}/blobs/{}", d.as_string()))
-                            .unwrap(),
-                    );
-                    headers.insert(
-                        "docker-content-digest",
-                        HeaderValue::from_str(&d.as_string()).unwrap(),
-                    );
-                    return (StatusCode::CREATED, headers).into_response();
-                }
+            // Promote via a filesystem link (copy-free on one filesystem); no
+            // blob bytes pass through memory. `Ok(false)` (source absent) or an
+            // error falls through to a normal upload session.
+            if let Ok(true) = st.storage.mount_blob(from, repo, &d).await {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::LOCATION,
+                    HeaderValue::from_str(&format!("/v2/{repo}/blobs/{}", d.as_string())).unwrap(),
+                );
+                headers.insert(
+                    "docker-content-digest",
+                    HeaderValue::from_str(&d.as_string()).unwrap(),
+                );
+                return (StatusCode::CREATED, headers).into_response();
             }
         }
         // Fall through to a normal upload session if the mount source is absent.
@@ -810,6 +919,11 @@ async fn start_upload<S: Storage>(
             Ok(b) => b,
             Err(resp) => return *resp,
         };
+        // A monolithic body is a complete upload, so the per-session cap applies
+        // here too (e.g. when max_upload is configured below max_body).
+        if body.len() as u64 > st.max_upload {
+            return ApiError::payload_too_large("upload exceeds maximum blob size").into_response();
+        }
         return match st.storage.put_blob(repo, &d, &body).await {
             Ok(()) => {
                 let mut headers = HeaderMap::new();
@@ -848,13 +962,9 @@ async fn patch_upload<S: Storage>(
     id: &str,
     req: Request,
 ) -> Response {
-    // Current committed size of the session.
-    let current = match st.storage.upload_size(repo, id).await {
-        Ok(s) => s,
-        Err(e) => return map_storage_err(e),
-    };
-    // If the client supplied a Content-Range, its start MUST equal the current
-    // offset; out-of-order or retried chunks are rejected with 416.
+    // Parse a Content-Range start offset, if supplied; the storage layer
+    // enforces it against the current size *atomically under the session lock*
+    // (a pre-check here would race two concurrent PATCHes with the same range).
     let range_start = req
         .headers()
         .get(header::CONTENT_RANGE)
@@ -862,8 +972,15 @@ async fn patch_upload<S: Storage>(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split('-').next())
         .and_then(|s| s.trim().parse::<u64>().ok());
-    if let Some(start) = range_start {
-        if start != current {
+    let body = match read_body_limited(req, st.max_body).await {
+        Ok(b) => b,
+        Err(resp) => return *resp,
+    };
+    let total = match st.storage.append_upload(repo, id, &body, range_start).await {
+        Ok(t) => t,
+        // The atomic under-lock offset check rejects a concurrent/duplicate
+        // chunk the pre-check above raced past → 416 with the current range.
+        Err(StorageError::RangeNotSatisfiable { expected, .. }) => {
             let mut headers = HeaderMap::new();
             headers.insert(
                 header::LOCATION,
@@ -871,19 +988,19 @@ async fn patch_upload<S: Storage>(
             );
             headers.insert(
                 "range",
-                HeaderValue::from_str(&format!("0-{}", current.saturating_sub(1))).unwrap(),
+                HeaderValue::from_str(&format!("0-{}", expected.saturating_sub(1))).unwrap(),
             );
             return (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response();
         }
-    }
-    let body = match read_body_limited(req, st.max_body).await {
-        Ok(b) => b,
-        Err(resp) => return *resp,
-    };
-    let total = match st.storage.append_upload(repo, id, &body).await {
-        Ok(t) => t,
         Err(e) => return map_storage_err(e),
     };
+    // Reject a session whose cumulative size exceeds the per-upload cap: drop
+    // the staging file and return 413 / SIZE_INVALID so a client cannot exhaust
+    // disk with one open upload.
+    if total > st.max_upload {
+        let _ = st.storage.abort_upload(repo, id).await;
+        return ApiError::payload_too_large("upload exceeds maximum blob size").into_response();
+    }
     let mut headers = HeaderMap::new();
     headers.insert(
         header::LOCATION,
@@ -919,11 +1036,15 @@ async fn finish_upload<S: Storage>(
         Err(resp) => return *resp,
     };
     if !body.is_empty() {
-        if let Err(e) = st.storage.append_upload(repo, id, &body).await {
+        // Append the trailing chunk; the per-session cap is enforced
+        // authoritatively inside finish_upload under the session lock (below),
+        // so a chunk that pushes the session over the cap is rejected there —
+        // no separate, race-prone check here.
+        if let Err(e) = st.storage.append_upload(repo, id, &body, None).await {
             return map_storage_err(e);
         }
     }
-    match st.storage.finish_upload(repo, id, &d).await {
+    match st.storage.finish_upload(repo, id, &d, st.max_upload).await {
         Ok(()) => {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -1051,11 +1172,25 @@ const MAX_BODY: usize = 256 * 1024 * 1024;
 /// Maximum accepted manifest size (4 MiB) — bounded-input guard (PLAN Phase 0).
 const MAX_MANIFEST: usize = 4 * 1024 * 1024;
 
+/// Maximum cumulative size of a single blob upload session (5 GiB). A session
+/// (chunked or monolithic) exceeding this is rejected with 413 / SIZE_INVALID
+/// and dropped, so a client cannot exhaust disk with one open upload.
+const MAX_UPLOAD: u64 = 5 * 1024 * 1024 * 1024;
+
 /// Maximum JSON nesting depth accepted in a manifest body.
 const MAX_JSON_DEPTH: usize = 32;
 
 /// Maximum page size for list endpoints (tags/referrers); server-side cap.
 const MAX_PAGE: usize = 1000;
+
+/// The `digest` string of an OCI descriptor: `Some(&str)` only when `value` is
+/// a JSON object carrying a string `digest`. A non-object descriptor, or one
+/// missing a string `digest`, yields `None` — the caller treats that as a
+/// malformed descriptor. A descriptor field that is entirely absent is handled
+/// by the caller before calling this (an omitted `config`/`layers` is legal).
+fn descriptor_digest_str(value: &serde_json::Value) -> Option<&str> {
+    value.as_object()?.get("digest")?.as_str()
+}
 
 /// Returns true if `bytes` contains JSON bracket/brace nesting deeper than
 /// `max`. A cheap, allocation-free pre-scan that treats string literals
@@ -2294,6 +2429,17 @@ mod tests {
         });
         let body = serde_json::to_vec(&referrer).unwrap();
         let rd = sha256_of(&body);
+        // The config blob the manifest references must exist (referenced-blob
+        // existence is enforced on push); upload it monolithically first.
+        let cfg = sha256_of(b"c");
+        app.clone()
+            .oneshot(
+                HttpRequest::post(format!("/v2/r/blobs/uploads/?digest={}", cfg.as_string()))
+                    .body(Body::from(b"c".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         app.clone()
             .oneshot(
                 HttpRequest::put(format!("/v2/r/manifests/{}", rd.as_string()))
@@ -2375,7 +2521,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(put.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // finish_upload's non-regular-file guard rejects a directory session as
+        // a bad path (400 NAME_INVALID) before hashing, rather than a generic 500.
+        assert_eq!(put.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -3059,5 +3207,430 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(hv(&resp, header::CACHE_CONTROL), Some("no-cache"));
+    }
+
+    #[tokio::test]
+    async fn manifest_content_type_must_match_media_type() {
+        let (app, _d) = app();
+        // Body declares an image-manifest mediaType; request Content-Type is an
+        // index — the CVE-2021-41190 disagreement → 400 MANIFEST_INVALID.
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json"
+        });
+        let body = serde_json::to_vec(&manifest).unwrap();
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v1")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.index.v1+json",
+                )
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
+        // Matching Content-Type (params tolerated) → accepted (201).
+        let resp = app
+            .oneshot(
+                HttpRequest::put("/v2/r/manifests/v1")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "application/vnd.oci.image.manifest.v1+json; charset=utf-8",
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn manifest_referencing_absent_blob_is_manifest_blob_unknown() {
+        let (app, _d) = app();
+        let cfg = sha256_of(b"cfg");
+        let layer = sha256_of(b"layer");
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": cfg.as_string(), "size": 3 },
+            "layers": [ { "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": layer.as_string(), "size": 5 } ]
+        });
+        let body = serde_json::to_vec(&manifest).unwrap();
+        // The config/layer blobs were never uploaded → 400 MANIFEST_BLOB_UNKNOWN.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::put("/v2/r/manifests/v1")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "application/vnd.oci.image.manifest.v1+json",
+                    )
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
+        // Upload the referenced blobs, then the same manifest is accepted.
+        for (data, d) in [(&b"cfg"[..], &cfg), (&b"layer"[..], &layer)] {
+            app.clone()
+                .oneshot(
+                    HttpRequest::post(format!("/v2/r/blobs/uploads/?digest={}", d.as_string()))
+                        .body(Body::from(data.to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let resp = app
+            .oneshot(
+                HttpRequest::put("/v2/r/manifests/v1")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "application/vnd.oci.image.manifest.v1+json",
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // App whose upload sessions are capped at `limit` bytes so the over-cap
+    // (413/SIZE_INVALID) path is reachable without a multi-GiB fixture.
+    fn app_tiny_upload(limit: u64) -> (Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path()).unwrap();
+        (
+            build_router(AppState::new(storage).with_max_upload(limit)),
+            dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn chunked_upload_over_session_cap_is_413_and_drops_session() {
+        let (app, _d) = app_tiny_upload(4);
+        // Open a session.
+        let start = app
+            .clone()
+            .oneshot(
+                HttpRequest::post("/v2/r/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::ACCEPTED);
+        let loc = start
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        // A PATCH exceeding the 4-byte session cap → 413 SIZE_INVALID.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::patch(&loc)
+                    .body(Body::from("too many bytes"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(v["errors"][0]["code"], "SIZE_INVALID");
+        // The session was dropped: a status GET now 404s (BLOB_UPLOAD_UNKNOWN).
+        let status = app
+            .oneshot(HttpRequest::get(&loc).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn finish_upload_over_session_cap_is_413() {
+        let (app, _d) = app_tiny_upload(4);
+        // Open a session, then a monolithic PUT whose trailing body exceeds the
+        // 4-byte session cap → 413 SIZE_INVALID (the finish-path cap branch).
+        let start = app
+            .clone()
+            .oneshot(
+                HttpRequest::post("/v2/r/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let loc = start
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let d = sha256_of(b"too many bytes");
+        let resp = app
+            .oneshot(
+                HttpRequest::put(format!("{loc}?digest={}", d.as_string()))
+                    .body(Body::from("too many bytes"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(v["errors"][0]["code"], "SIZE_INVALID");
+    }
+
+    #[tokio::test]
+    async fn manifest_malformed_referenced_digests_are_manifest_invalid() {
+        let (app, _d) = app();
+        // A malformed config digest → MANIFEST_INVALID.
+        let bad_config = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": "sha256:notavaliddigest", "size": 1 }
+        });
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v1")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .body(Body::from(serde_json::to_vec(&bad_config).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
+        // A malformed layer digest → MANIFEST_INVALID.
+        let bad_layer = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "layers": [ { "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:zzzz", "size": 1 } ]
+        });
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v2")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .body(Body::from(serde_json::to_vec(&bad_layer).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
+        // A layer descriptor with no `digest` is malformed → MANIFEST_INVALID.
+        let no_digest_layer = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "layers": [ { "mediaType": "application/vnd.oci.image.layer.v1.tar", "size": 0 } ]
+        });
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v3")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .body(Body::from(serde_json::to_vec(&no_digest_layer).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
+        // A non-object config descriptor is likewise malformed → MANIFEST_INVALID.
+        let bad_config_shape = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": "not-a-descriptor"
+        });
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v4")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .body(Body::from(serde_json::to_vec(&bad_config_shape).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
+        // A present but non-string `mediaType` must not bypass the CVE-2021-41190
+        // agreement check → MANIFEST_INVALID.
+        let non_string_mt = serde_json::json!({ "schemaVersion": 2, "mediaType": 123 });
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v5")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .body(Body::from(serde_json::to_vec(&non_string_mt).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
+        // A present but non-array `layers` is malformed → MANIFEST_INVALID.
+        let non_array_layers = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "layers": "not-an-array"
+        });
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v6")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .body(Body::from(serde_json::to_vec(&non_array_layers).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manifest_blob_existence_io_error_is_500() {
+        // A referenced blob that is present (so the presence filter waves it
+        // through to the filesystem) but whose CAS directory is unreadable
+        // yields a non-NotFound IO error from blob_exists → 500.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path()).unwrap();
+        let cfg_data = b"cfg";
+        let cfg = sha256_of(cfg_data);
+        storage.put_blob("r", &cfg, cfg_data).await.unwrap();
+        let app = build_router(AppState::new(storage));
+        let alg_dir = dir.path().join("r").join("blobs").join("sha256");
+        std::fs::set_permissions(&alg_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": cfg.as_string(), "size": 3 }
+        });
+        let status = status_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v1")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .body(Body::from(serde_json::to_vec(&manifest).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        // Restore perms so the tempdir cleans up.
+        std::fs::set_permissions(&alg_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn monolithic_upload_over_session_cap_is_413() {
+        // A monolithic POST ?digest= whose body exceeds max_upload → 413, even
+        // though it is under max_body (the cap applies to monolithic too).
+        let (app, _d) = app_tiny_upload(4);
+        let data = b"way over the four byte cap";
+        let d = sha256_of(data);
+        let resp = app
+            .oneshot(
+                HttpRequest::post(format!("/v2/r/blobs/uploads/?digest={}", d.as_string()))
+                    .body(Body::from(data.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(v["errors"][0]["code"], "SIZE_INVALID");
+    }
+
+    #[tokio::test]
+    async fn image_index_records_child_and_subject_backrefs() {
+        // Pushing an image index records a backref edge from each child manifest
+        // digest to the index; a manifest with a subject records the subject
+        // edge. Neither child nor subject existence is enforced (they may be
+        // pushed later / a subject may be absent per spec).
+        let (app, storage, _d) = app_with_storage();
+        let child_a = sha256_of(b"child-a");
+        let child_b = sha256_of(b"child-b");
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                { "mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": child_a.as_string(), "size": 1 },
+                { "mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": child_b.as_string(), "size": 1 }
+            ]
+        });
+        let body = serde_json::to_vec(&index).unwrap();
+        let idx_digest = sha256_of(&body);
+        let resp = app
+            .oneshot(
+                HttpRequest::put("/v2/r/manifests/idx")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "application/vnd.oci.image.index.v1+json",
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        // Each child carries a backref to the index manifest.
+        assert_eq!(
+            storage.backrefs("r", &child_a).await.unwrap(),
+            vec![idx_digest.as_string()]
+        );
+        assert_eq!(
+            storage.backrefs("r", &child_b).await.unwrap(),
+            vec![idx_digest.as_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_subject_is_recorded_as_backref() {
+        let (app, storage, _d) = app_with_storage();
+        let subject = sha256_of(b"the-subject");
+        // An artifact-style manifest with no config/layers but a subject.
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "subject": { "mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": subject.as_string(), "size": 2 }
+        });
+        let body = serde_json::to_vec(&manifest).unwrap();
+        let m_digest = sha256_of(&body);
+        let resp = app
+            .oneshot(
+                HttpRequest::put("/v2/r/manifests/art")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "application/vnd.oci.image.manifest.v1+json",
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            storage.backrefs("r", &subject).await.unwrap(),
+            vec![m_digest.as_string()]
+        );
     }
 }

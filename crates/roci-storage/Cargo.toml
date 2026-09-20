@@ -19,6 +19,8 @@ xorf.workspace = true
 cuckoofilter.workspace = true
 lru.workspace = true
 futures.workspace = true
+getrandom.workspace = true
+rustix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

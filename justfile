@@ -70,6 +70,78 @@ coverage-report:
     cargo llvm-cov --workspace --all-features --summary-only
     cargo llvm-cov report --show-missing-lines
 
+# Reproduce the CI Linux 100%-coverage gate locally in a container (for darwin
+# devs, and the only way to exercise the Linux-only fast paths). Builds the
+# toolchain image once, copies the tracked working tree into a container via
+# `docker cp` (no bind-mount, so it works regardless of Docker Desktop file
+# sharing), runs scripts/coverage.sh on real Linux, and copies the regenerated
+# lcov.info / cobertura.xml / COVERAGE.md / README badge back to the host.
+# A named volume holds the Linux build artifacts across runs (fast re-runs);
+# they never touch the host's macOS target/. Requires Docker.
+coverage-linux:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="$(git rev-parse --show-toplevel)"
+    docker build -t roci-coverage:local -f Containerfile.coverage .
+    name="roci-cov-$$"
+    # A fresh per-run target volume: reusing one across runs let stale
+    # `.profraw`/artifacts from a previous commit skew the measured line set
+    # (a false 100%). An ephemeral volume guarantees the gate reflects the
+    # current tree — the price is a full Linux recompile each run.
+    vol="roci-coverage-target-$$"
+    docker volume create "$vol" >/dev/null
+    # A helper container with the target volume mounted; we cp the source in,
+    # run the gate as non-root, cp results out, then remove container + volume.
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker create --name "$name" -v "$vol":/target -w /roci \
+      roci-coverage:local \
+      bash -c "chown -R roci:roci /roci /target && su roci -c 'export CARGO_HOME=/home/roci/.cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:\$PATH && git config --global --add safe.directory /roci && cd /roci && bash scripts/coverage.sh'" >/dev/null
+    trap 'docker rm -f "$name" >/dev/null 2>&1 || true; docker volume rm "$vol" >/dev/null 2>&1 || true' EXIT
+    # Copy the tracked tree in (including .git so coverage.sh's `git rev-parse`
+    # works). COPYFILE_DISABLE + --no-xattrs/--no-mac-metadata strip macOS
+    # AppleDouble and com.apple.provenance xattrs the Linux extractor rejects;
+    # target/ is excluded so host macOS artifacts never enter the Linux build.
+    COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata \
+      --exclude=./target --exclude='._*' --exclude='*/fsmonitor--daemon.ipc' \
+      -C "$root" -cf - . | docker cp - "$name:/roci"
+    docker start -a "$name" && rc=0 || rc=$?
+    # Copy the regenerated reports back regardless of pass/fail.
+    for f in lcov.info cobertura.xml COVERAGE.md README.md; do
+      docker cp "$name:/roci/$f" "$root/$f" 2>/dev/null || true
+    done
+    exit $rc
+
+# Reproduce the CI CodeQL rust analysis locally (macOS devs cannot run the
+# CodeQL check, which is Linux-only) and print the path-injection alert count.
+# Builds the pinned CodeQL bundle image, extracts a database with the in-repo
+# barrier model pack applied, and fails if any path-injection alert remains —
+# so the sanitizer model can be validated without blind CI round-trips.
+# Requires Docker.
+codeql-local:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="$(git rev-parse --show-toplevel)"
+    docker build -t roci-codeql:local -f Containerfile.codeql .
+    name="roci-codeql-$$"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker create --name "$name" -w /roci roci-codeql:local sleep infinity >/dev/null
+    trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+    docker start "$name" >/dev/null
+    COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata \
+      --exclude=./target --exclude='._*' --exclude='*/fsmonitor--daemon.ipc' \
+      -C "$root" -cf - . | docker cp - "$name:/roci"
+    docker exec "$name" bash -c '
+      set -euo pipefail
+      cd /roci
+      codeql database create /db --language=rust --build-mode=none --overwrite >/dev/null 2>&1
+      codeql database analyze /db --rerun --format=sarif-latest --output=/tmp/r.sarif \
+        --additional-packs=/roci/.github/codeql/extensions \
+        --model-packs=roci/path-sanitizers rust-code-scanning.qls >/dev/null 2>&1
+      n=$(jq "[.runs[].results[]|select(.ruleId==\"rust/path-injection\")]|length" /tmp/r.sarif)
+      echo "rust/path-injection alerts: $n"
+      test "$n" = "0"
+    '
+
 # Full local gate — run before pushing (the required CI checks).
 ci: lint-workflows fmt clippy test build deps-guard coverage conformance
 

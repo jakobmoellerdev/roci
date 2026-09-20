@@ -1,0 +1,34 @@
+# Local Linux coverage harness (toolchain image; the repo is bind-mounted at run).
+#
+# roci's CI runs the 100%-line-coverage gate on `ubuntu-latest`, but a
+# developer on macOS/darwin cannot reproduce it locally: llvm-cov attributes
+# some `match`/`if let` and `let-else` arms differently across platforms, and
+# the Linux-only fast paths (`copy_file_range`, reflink/`FICLONE`,
+# `O_TMPFILE`+`linkat`, `openat2 RESOLVE_BENEATH`) are compiled out on darwin,
+# so their coverage can only be measured on real Linux.
+#
+# This image carries the exact CI toolchain + coverage tools; `just
+# coverage-linux` bind-mounts the working tree and runs `scripts/coverage.sh`
+# (the same script the CI `test + coverage` job runs) inside it, writing
+# lcov.info / cobertura.xml / COVERAGE.md back to the host. A container-local
+# CARGO_TARGET_DIR keeps the Linux build artifacts off the host's macOS target/.
+#
+# It is NOT the production image (that is `Containerfile`, a hardened scratch
+# image). This is a throwaway build/test container only.
+
+# Match rust-toolchain.toml (channel = "1.98.1"). Bump both in one change.
+FROM docker.io/library/rust:1.98.1-bookworm
+
+# llvm-tools-preview provides the instrumentation runtime cargo-llvm-cov needs.
+RUN rustup component add llvm-tools-preview \
+    && cargo install cargo-nextest --locked \
+    && cargo install cargo-llvm-cov --locked
+
+# Run the coverage suite as a non-root user so permission-based tests behave as
+# they do on CI's non-root `ubuntu-latest` runner (root bypasses directory mode
+# bits, so a chmod-000 "unreadable" fixture would wrongly succeed as root).
+RUN useradd --create-home --uid 1000 roci
+
+# Build artifacts go here (a mounted volume), never into the bind-mounted repo.
+ENV CARGO_TARGET_DIR=/target CARGO_TERM_COLOR=never
+WORKDIR /roci
