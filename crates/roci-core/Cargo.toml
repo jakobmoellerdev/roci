@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 roci-storage.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true

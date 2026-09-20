@@ -7,12 +7,15 @@
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_util::io::ReaderStream;
 
 use roci_storage::{digest_of, sha256_of, Digest, Storage, StorageError};
 
@@ -226,10 +229,11 @@ async fn route_get<S: Storage>(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
+    let headers = req.headers();
     match parsed {
-        Parsed::Blob { repo, digest } => get_blob(&st, &repo, &digest, false).await,
+        Parsed::Blob { repo, digest } => get_blob(&st, &repo, &digest, false, headers).await,
         Parsed::ManifestRef { repo, reference } => {
-            get_manifest(&st, &repo, &reference, false).await
+            get_manifest(&st, &repo, &reference, false, headers).await
         }
         Parsed::TagsList { repo } => {
             let q: TagsQuery =
@@ -249,14 +253,18 @@ async fn route_get<S: Storage>(
 async fn route_head<S: Storage>(
     State(st): State<AppState<S>>,
     Path(rest): Path<String>,
+    req: Request,
 ) -> Response {
     let parsed = match parse_path(&rest) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
+    let headers = req.headers();
     match parsed {
-        Parsed::Blob { repo, digest } => get_blob(&st, &repo, &digest, true).await,
-        Parsed::ManifestRef { repo, reference } => get_manifest(&st, &repo, &reference, true).await,
+        Parsed::Blob { repo, digest } => get_blob(&st, &repo, &digest, true, headers).await,
+        Parsed::ManifestRef { repo, reference } => {
+            get_manifest(&st, &repo, &reference, true, headers).await
+        }
         _ => ApiError::name_unknown().into_response(),
     }
 }
@@ -332,36 +340,198 @@ async fn route_delete<S: Storage>(
 
 // ---- end-2 / end-10: blobs ----------------------------------------------
 
-async fn get_blob<S: Storage>(st: &AppState<S>, repo: &str, d: &Digest, head: bool) -> Response {
-    // HEAD needs only the length; GET reads the bytes (and derives the length
-    // from them, avoiding a redundant stat + a TOCTOU-only NotFound arm).
-    let (size, body) = if head {
-        match st.storage.blob_size(repo, d).await {
-            Ok(s) => (s, None),
-            Err(StorageError::NotFound) => return ApiError::blob_unknown().into_response(),
-            Err(e) => return map_storage_err(e),
+/// Parsed outcome of a `Range` header against a known content `size`.
+enum RangeOutcome {
+    /// No usable range: serve the full entity (200).
+    Full,
+    /// A satisfiable inclusive byte range `[start, end]`.
+    Partial { start: u64, end: u64 },
+    /// A syntactically valid but unsatisfiable range: 416.
+    Unsatisfiable,
+}
+
+/// Parse a single-range `bytes=` header (RFC 9110 §14.1.2) against `size`.
+/// Multi-range, malformed, or absent headers yield [`RangeOutcome::Full`] so
+/// the caller serves the whole entity with 200 (RFC 9110 §14.2).
+fn parse_byte_range(headers: &HeaderMap, size: u64) -> RangeOutcome {
+    let Some(raw) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) else {
+        return RangeOutcome::Full;
+    };
+    let Some(spec) = raw.strip_prefix("bytes=") else {
+        return RangeOutcome::Full;
+    };
+    // Only single-range requests are supported; a comma (multi-range) or any
+    // parse failure falls back to a full response.
+    if spec.contains(',') {
+        return RangeOutcome::Full;
+    }
+    let Some((start_s, end_s)) = spec.split_once('-') else {
+        return RangeOutcome::Full;
+    };
+    let (start, end) = match (start_s.trim(), end_s.trim()) {
+        // Suffix range: last N bytes.
+        ("", suffix) => {
+            let Ok(n) = suffix.parse::<u64>() else {
+                return RangeOutcome::Full;
+            };
+            if n == 0 {
+                return RangeOutcome::Unsatisfiable;
+            }
+            let start = size.saturating_sub(n);
+            (start, size - 1)
         }
-    } else {
-        match st.storage.read_blob(repo, d).await {
-            Ok(bytes) => (bytes.len() as u64, Some(bytes)),
-            Err(StorageError::NotFound) => return ApiError::blob_unknown().into_response(),
-            Err(e) => return map_storage_err(e),
+        // Open-ended: start to end of entity.
+        (start, "") => {
+            let Ok(start) = start.parse::<u64>() else {
+                return RangeOutcome::Full;
+            };
+            (start, size.saturating_sub(1))
+        }
+        // Closed range.
+        (start, end) => {
+            let (Ok(start), Ok(end)) = (start.parse::<u64>(), end.parse::<u64>()) else {
+                return RangeOutcome::Full;
+            };
+            if end < start {
+                return RangeOutcome::Full;
+            }
+            (start, end.min(size.saturating_sub(1)))
         }
     };
+    if size == 0 || start >= size {
+        return RangeOutcome::Unsatisfiable;
+    }
+    RangeOutcome::Partial { start, end }
+}
+
+/// Whether an `If-None-Match` header matches the blob/manifest ETag (the
+/// quoted digest). Compares tolerant of surrounding quotes and the `W/` weak
+/// prefix, and honors `*` (any current representation).
+fn if_none_match_hit(headers: &HeaderMap, digest: &str) -> bool {
+    let Some(inm) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    inm.split(',').any(|tag| {
+        let tag = tag.trim();
+        if tag == "*" {
+            return true;
+        }
+        let tag = tag.strip_prefix("W/").unwrap_or(tag);
+        tag.trim_matches('"') == digest
+    })
+}
+
+async fn get_blob<S: Storage>(
+    st: &AppState<S>,
+    repo: &str,
+    d: &Digest,
+    head: bool,
+    headers: &HeaderMap,
+) -> Response {
+    let digest_str = d.as_string();
+    // Blobs are content-addressed and therefore immutable; a client holding the
+    // digest ETag needs no body (304).
+    if if_none_match_hit(headers, &digest_str) {
+        return blob_not_modified(&digest_str);
+    }
+    if head {
+        let size = match st.storage.blob_size(repo, d).await {
+            Ok(s) => s,
+            Err(StorageError::NotFound) => return ApiError::blob_unknown().into_response(),
+            Err(e) => return map_storage_err(e),
+        };
+        let mut resp_headers = blob_headers(&digest_str);
+        resp_headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
+        return (StatusCode::OK, resp_headers).into_response();
+    }
+    // GET: open the file and stream it (never buffer the whole blob). Size is
+    // read by seeking to the end and back — a seek on a regular file cannot
+    // fail, so no separate stat is needed.
+    let mut file = match st.storage.open_blob(repo, d).await {
+        Ok(f) => f,
+        Err(StorageError::NotFound) => return ApiError::blob_unknown().into_response(),
+        Err(e) => return map_storage_err(e),
+    };
+    let size = match file.seek(std::io::SeekFrom::End(0)).await {
+        Ok(s) => s,
+        Err(e) => return map_storage_err(StorageError::Io(e)),
+    };
+    if let Err(e) = file.rewind().await {
+        return map_storage_err(StorageError::Io(e));
+    }
+    match parse_byte_range(headers, size) {
+        RangeOutcome::Full => {
+            let mut resp_headers = blob_headers(&digest_str);
+            resp_headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
+            let body = Body::from_stream(ReaderStream::new(file));
+            (StatusCode::OK, resp_headers, body).into_response()
+        }
+        RangeOutcome::Partial { start, end } => {
+            match file.seek(std::io::SeekFrom::Start(start)).await {
+                Ok(_) => {}
+                Err(e) => return map_storage_err(StorageError::Io(e)),
+            }
+            let len = end - start + 1;
+            let mut resp_headers = blob_headers(&digest_str);
+            resp_headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+            resp_headers.insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes {start}-{end}/{size}")).unwrap(),
+            );
+            let body = Body::from_stream(ReaderStream::new(file.take(len)));
+            (StatusCode::PARTIAL_CONTENT, resp_headers, body).into_response()
+        }
+        RangeOutcome::Unsatisfiable => {
+            let mut resp_headers = HeaderMap::new();
+            resp_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            resp_headers.insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{size}")).unwrap(),
+            );
+            (StatusCode::RANGE_NOT_SATISFIABLE, resp_headers).into_response()
+        }
+    }
+}
+
+/// Common headers for a blob GET/HEAD 200/206 response: digest, octet-stream
+/// content type, range support, and immutable-cache validators.
+fn blob_headers(digest_str: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
     headers.insert(
         "docker-content-digest",
-        HeaderValue::from_str(&d.as_string()).unwrap(),
+        HeaderValue::from_str(digest_str).unwrap(),
     );
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
-    match body {
-        Some(bytes) => (StatusCode::OK, headers, bytes).into_response(),
-        None => (StatusCode::OK, headers).into_response(),
-    }
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{digest_str}\"")).unwrap(),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("max-age=31536000, immutable"),
+    );
+    headers
+}
+
+/// A `304 Not Modified` for an immutable blob, carrying its cache validators.
+fn blob_not_modified(digest_str: &str) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{digest_str}\"")).unwrap(),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("max-age=31536000, immutable"),
+    );
+    (StatusCode::NOT_MODIFIED, headers).into_response()
 }
 
 async fn delete_blob<S: Storage>(st: &AppState<S>, repo: &str, d: &Digest) -> Response {
@@ -379,31 +549,69 @@ async fn get_manifest<S: Storage>(
     repo: &str,
     reference: &str,
     head: bool,
+    headers: &HeaderMap,
 ) -> Response {
+    // A digest reference names immutable content; a tag can be repointed. The
+    // `Accept` header is advisory — the stored media type is always returned
+    // (dist-spec: the registry serves the manifest's real Content-Type).
+    let by_digest = reference.contains(':');
     match st.storage.get_manifest(repo, reference).await {
         Ok(m) => {
-            let mut headers = HeaderMap::new();
-            headers.insert(
+            let digest_str = m.digest.as_string();
+            // Conditional request: the ETag is the manifest digest. For a tag,
+            // a matching digest means the tag still resolves to the same content.
+            if if_none_match_hit(headers, &digest_str) {
+                return manifest_not_modified(&digest_str, by_digest);
+            }
+            let mut resp = HeaderMap::new();
+            resp.insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_str(&m.media_type).unwrap(),
             );
-            headers.insert(
+            resp.insert(
                 header::CONTENT_LENGTH,
                 HeaderValue::from(m.bytes.len() as u64),
             );
-            headers.insert(
+            resp.insert(
                 "docker-content-digest",
-                HeaderValue::from_str(&m.digest.as_string()).unwrap(),
+                HeaderValue::from_str(&digest_str).unwrap(),
             );
+            resp.insert(
+                header::ETAG,
+                HeaderValue::from_str(&format!("\"{digest_str}\"")).unwrap(),
+            );
+            resp.insert(header::CACHE_CONTROL, manifest_cache_control(by_digest));
             if head {
-                (StatusCode::OK, headers).into_response()
+                (StatusCode::OK, resp).into_response()
             } else {
-                (StatusCode::OK, headers, m.bytes).into_response()
+                (StatusCode::OK, resp, m.bytes).into_response()
             }
         }
         Err(StorageError::NotFound) => ApiError::manifest_unknown().into_response(),
         Err(e) => map_storage_err(e),
     }
+}
+
+/// Cache-Control for a manifest read: by-digest is immutable; by-tag must be
+/// revalidated (`no-cache`) since a tag can be repointed.
+fn manifest_cache_control(by_digest: bool) -> HeaderValue {
+    if by_digest {
+        HeaderValue::from_static("max-age=31536000, immutable")
+    } else {
+        HeaderValue::from_static("no-cache")
+    }
+}
+
+/// A `304 Not Modified` for a manifest, carrying its ETag and the cache-control
+/// appropriate to how it was addressed.
+fn manifest_not_modified(digest_str: &str, by_digest: bool) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{digest_str}\"")).unwrap(),
+    );
+    headers.insert(header::CACHE_CONTROL, manifest_cache_control(by_digest));
+    (StatusCode::NOT_MODIFIED, headers).into_response()
 }
 
 async fn put_manifest<S: Storage>(
@@ -1331,12 +1539,12 @@ mod tests {
 
     #[tokio::test]
     async fn delete_manifest_by_tag_io_error_maps_to_500() {
-        // `<repo>/tags/<tag>` as a directory makes tag→digest resolution fail
-        // with a non-NotFound IO error, exercising delete_manifest's Io arm.
+        // `<repo>/index.json` as a directory makes tag→digest resolution fail
+        // with a non-NotFound IO error (read_index), exercising the Io arm on
+        // the delete-by-tag path.
         let dir = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(dir.path()).unwrap();
-        let tag_path = dir.path().join("r").join("tags").join("t");
-        std::fs::create_dir_all(&tag_path).unwrap();
+        std::fs::create_dir_all(dir.path().join("r").join("index.json")).unwrap();
         let app = build_router(AppState::new(storage));
         let resp = app
             .oneshot(
@@ -1691,14 +1899,15 @@ mod tests {
 
     #[tokio::test]
     async fn delete_manifest_io_error_maps_to_500() {
-        // `<repo>/manifests/sha256` as a file makes remove_file of
+        // `<repo>/blobs/sha256` as a file makes remove_file of
         // `.../sha256/<hex>` fail with ENOTDIR (non-NotFound Io), exercising
-        // delete_manifest's Io arm on the delete-by-digest path.
+        // delete_manifest's Io arm on the delete-by-digest path (a manifest is
+        // a blob in the CAS).
         let dir = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(dir.path()).unwrap();
-        let m_dir = dir.path().join("r").join("manifests");
-        std::fs::create_dir_all(&m_dir).unwrap();
-        std::fs::write(m_dir.join("sha256"), b"not a dir").unwrap();
+        let b_dir = dir.path().join("r").join("blobs");
+        std::fs::create_dir_all(&b_dir).unwrap();
+        std::fs::write(b_dir.join("sha256"), b"not a dir").unwrap();
         let app = build_router(AppState::new(storage));
         let d = sha256_of(b"x");
         let resp = app
@@ -1889,11 +2098,9 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR
             );
         }
-        // `<repo2>/manifests/sha256` as a file makes get_manifest by digest fail
-        // with ENOTDIR, exercising get_manifest's Io arm.
-        let m_dir = dir.path().join("r2").join("manifests");
-        std::fs::create_dir_all(&m_dir).unwrap();
-        std::fs::write(m_dir.join("sha256"), b"not a dir").unwrap();
+        // `<repo2>/index.json` as a directory makes get_manifest by digest fail
+        // with a non-NotFound Io error (read_index), exercising its Io arm.
+        std::fs::create_dir_all(dir.path().join("r2").join("index.json")).unwrap();
         assert_eq!(
             status_of(
                 &app,
@@ -1961,15 +2168,15 @@ mod tests {
 
     #[tokio::test]
     async fn storage_io_error_maps_to_500() {
-        // Make a repo's blobs path a file so blob_size/read fails with a non-NotFound
-        // IO error, exercising the StorageError::Io → 500 mapping arm.
+        // Make `<repo>/blobs/sha256` a *file* so open_blob of `.../sha256/<hex>`
+        // fails with ENOTDIR (a non-NotFound IO error), exercising get_blob's
+        // StorageError::Io → 500 mapping arm on the GET (open) path.
         let dir = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(dir.path()).unwrap();
-        let repo_dir = dir.path().join("r").join("blobs").join("sha256");
-        std::fs::create_dir_all(&repo_dir).unwrap();
-        // Put a directory where the blob file should be so open/read yields EISDIR.
+        let alg_dir = dir.path().join("r").join("blobs");
+        std::fs::create_dir_all(&alg_dir).unwrap();
+        std::fs::write(alg_dir.join("sha256"), b"not a dir").unwrap();
         let d = sha256_of(b"x");
-        std::fs::create_dir_all(repo_dir.join(hex_of(&d))).unwrap();
         let app = build_router(AppState::new(storage));
         let resp = app
             .oneshot(
@@ -2101,14 +2308,12 @@ mod tests {
         );
     }
 
-    // Build an app whose repo `r` has `tags` as a file, so list_tags fails with a
-    // non-NotFound IO error and the handler maps it to 500.
+    // Build an app whose repo `r` has `index.json` as a directory, so read_index
+    // fails with a non-NotFound IO error and the handler maps it to 500.
     fn app_with_broken_repo() -> (Router, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(dir.path()).unwrap();
-        let repo = dir.path().join("r");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(repo.join("tags"), b"file").unwrap();
+        std::fs::create_dir_all(dir.path().join("r").join("index.json")).unwrap();
         (build_router(AppState::new(storage)), dir)
     }
 
@@ -2348,7 +2553,9 @@ mod tests {
         let storage = FsStorage::new(dir.path()).unwrap();
         let repo = dir.path().join("r");
         std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(repo.join("manifests"), b"file").unwrap();
+        // put_manifest writes the manifest to the CAS first; `<repo>/blobs` as a
+        // file makes that write fail, exercising the handler's 500 mapping.
+        std::fs::write(repo.join("blobs"), b"file").unwrap();
         let app = build_router(AppState::new(storage));
         let m = br#"{"schemaVersion":2}"#;
         assert_eq!(
@@ -2544,5 +2751,299 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(v["tags"], serde_json::json!(["a"]));
+    }
+
+    // ---- Phase 1: streaming Range + cache-control read-path tests ----------
+
+    /// Header value as a str for assertions.
+    fn hv(resp: &Response, name: header::HeaderName) -> Option<&str> {
+        resp.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn blob_range_requests() {
+        let (app, storage, _d) = app_with_storage();
+        let data = b"0123456789"; // 10 bytes
+        let d = sha256_of(data);
+        storage.put_blob("r", &d, data).await.unwrap();
+        let uri = format!("/v2/r/blobs/{}", d.as_string());
+
+        // Closed range 2-5 → 206, 4 bytes "2345".
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(&uri)
+                    .header(header::RANGE, "bytes=2-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(hv(&resp, header::CONTENT_RANGE), Some("bytes 2-5/10"));
+        assert_eq!(hv(&resp, header::CONTENT_LENGTH), Some("4"));
+        assert_eq!(hv(&resp, header::ACCEPT_RANGES), Some("bytes"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"2345");
+
+        // Suffix range -3 → last 3 bytes "789".
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(&uri)
+                    .header(header::RANGE, "bytes=-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(hv(&resp, header::CONTENT_RANGE), Some("bytes 7-9/10"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"789");
+
+        // Open-ended range 7- → bytes 7..9, clamped to end.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(&uri)
+                    .header(header::RANGE, "bytes=7-")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(hv(&resp, header::CONTENT_RANGE), Some("bytes 7-9/10"));
+
+        // Overlong end clamps to the last byte.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(&uri)
+                    .header(header::RANGE, "bytes=8-99")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(hv(&resp, header::CONTENT_RANGE), Some("bytes 8-9/10"));
+
+        // Unsatisfiable (start ≥ size) → 416 + Content-Range: bytes */10.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(&uri)
+                    .header(header::RANGE, "bytes=10-20")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(hv(&resp, header::CONTENT_RANGE), Some("bytes */10"));
+
+        // A zero-length suffix is unsatisfiable.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(&uri)
+                    .header(header::RANGE, "bytes=-0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[tokio::test]
+    async fn blob_ignored_ranges_serve_full() {
+        let (app, storage, _d) = app_with_storage();
+        let data = b"0123456789";
+        let d = sha256_of(data);
+        storage.put_blob("r", &d, data).await.unwrap();
+        let uri = format!("/v2/r/blobs/{}", d.as_string());
+        // Each of these is ignored (malformed/multi/reversed/non-bytes-unit) →
+        // full 200 with the whole body and Accept-Ranges advertised.
+        for range in [
+            "items=0-1",
+            "bytes=1-0",
+            "bytes=2-5,7-8",
+            "bytes=abc",
+            "bytes=-xy",
+            "bytes=xy-",
+            "bytes=a-b",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::get(&uri)
+                        .header(header::RANGE, range)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "range {range}");
+            assert_eq!(hv(&resp, header::ACCEPT_RANGES), Some("bytes"));
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], data, "range {range}");
+        }
+        // No Range header at all → full 200 with immutable cache validators.
+        let resp = app
+            .oneshot(HttpRequest::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            hv(&resp, header::CACHE_CONTROL),
+            Some("max-age=31536000, immutable")
+        );
+        assert_eq!(
+            hv(&resp, header::ETAG),
+            Some(format!("\"{}\"", d.as_string()).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_conditional_get_and_head() {
+        let (app, storage, _d) = app_with_storage();
+        let data = b"cacheable";
+        let d = sha256_of(data);
+        storage.put_blob("r", &d, data).await.unwrap();
+        let uri = format!("/v2/r/blobs/{}", d.as_string());
+        let etag = format!("\"{}\"", d.as_string());
+
+        // HEAD advertises ranges + immutable cache + ETag.
+        let resp = app
+            .clone()
+            .oneshot(HttpRequest::head(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hv(&resp, header::ACCEPT_RANGES), Some("bytes"));
+        assert_eq!(hv(&resp, header::CONTENT_LENGTH), Some("9"));
+        assert_eq!(hv(&resp, header::ETAG), Some(etag.as_str()));
+
+        // If-None-Match matching the digest ETag → 304 (GET and HEAD).
+        for method in ["GET", "HEAD"] {
+            let req = HttpRequest::builder()
+                .method(method)
+                .uri(&uri)
+                .header(header::IF_NONE_MATCH, &etag)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_MODIFIED, "{method}");
+            assert_eq!(hv(&resp, header::ETAG), Some(etag.as_str()));
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert!(body.is_empty(), "304 has no body ({method})");
+        }
+        // A `*` If-None-Match also short-circuits to 304.
+        let resp = app
+            .oneshot(
+                HttpRequest::get(&uri)
+                    .header(header::IF_NONE_MATCH, "*")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn manifest_cache_control_and_conditional() {
+        let (app, storage, _d) = app_with_storage();
+        let body =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
+        let d = sha256_of(body);
+        storage
+            .put_manifest(
+                "r",
+                Some("v1"),
+                &d,
+                "application/vnd.oci.image.manifest.v1+json",
+                body,
+            )
+            .await
+            .unwrap();
+        let etag = format!("\"{}\"", d.as_string());
+
+        // By-digest GET → immutable cache + ETag.
+        let by_digest = format!("/v2/r/manifests/{}", d.as_string());
+        let resp = app
+            .clone()
+            .oneshot(HttpRequest::get(&by_digest).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            hv(&resp, header::CACHE_CONTROL),
+            Some("max-age=31536000, immutable")
+        );
+        assert_eq!(hv(&resp, header::ETAG), Some(etag.as_str()));
+
+        // By-digest If-None-Match → 304.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(&by_digest)
+                    .header(header::IF_NONE_MATCH, &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            hv(&resp, header::CACHE_CONTROL),
+            Some("max-age=31536000, immutable")
+        );
+
+        // By-tag GET → no-cache (revalidate), but still carries an ETag.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get("/v2/r/manifests/v1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hv(&resp, header::CACHE_CONTROL), Some("no-cache"));
+        assert_eq!(hv(&resp, header::ETAG), Some(etag.as_str()));
+        // Accept mismatch is advisory: still 200 with the stored Content-Type.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get("/v2/r/manifests/v1")
+                    .header(header::ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            hv(&resp, header::CONTENT_TYPE),
+            Some("application/vnd.oci.image.manifest.v1+json")
+        );
+
+        // By-tag If-None-Match with the current digest → 304 + no-cache (HEAD).
+        let resp = app
+            .oneshot(
+                HttpRequest::head("/v2/r/manifests/v1")
+                    .header(header::IF_NONE_MATCH, &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(hv(&resp, header::CACHE_CONTROL), Some("no-cache"));
     }
 }

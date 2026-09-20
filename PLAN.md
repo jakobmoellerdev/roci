@@ -58,15 +58,15 @@ Rules:
 
 **Goal:** serve a pre-populated OCI image layout as a registry. **Pull conformance passes.** This is the MUST-support minimum for any conforming registry.
 
-- [ ] **`Storage` trait** (read surface): `blob_read`/`blob_stat`, `manifest_read`, existence checks; blob path = pure function of a validated digest → O(1) `open`.
-- [ ] **`MetadataStore` trait** — default backend: append-only WAL + in-RAM maps (tag→digest, subject→referrers), rebuildable from the layout; read/resolve surface first (write in Phase 2). Embedded B-tree KV (heed/redb) is the feature-gated upgrade (bake-off in cross-cutting).
-- [ ] **Existence filters:** cuckoo (mutable) + BinaryFuse8 (static) front the "present?" hot path so HEAD/dedup checks stay off disk; a filter hit is never the sole authority for `200` (membership checked — SECURITY inv. 10).
-- [ ] **Small-blob LRU content cache** (<100 KB, capped): serve manifests/configs with zero syscall; miss → loose file. Keyed by `(repo, digest)` for cross-repo isolation.
-- [ ] **Local backend on OCI image layout** ([`image-layout.md`](spec/image-spec/image-layout.md)): `blobs/<alg>/<hex>` CAS (default new digests `sha512`); `index.json` + `oci-layout`. Serve **any pre-existing OCI layout**, incl. **foreign media-type blobs** (Nydus/eStargz/SBOM/sig) as opaque bytes.
-- [ ] `GET`/`HEAD /v2/<name>/blobs/<digest>` (end-2) — zero-copy `sendfile` (kTLS `SSL_sendfile` under HTTPS) + `fadvise` hints, `Docker-Content-Digest`+`Content-Length`, `404` on miss.
-- [ ] `GET`/`HEAD /v2/<name>/manifests/<reference>` (end-3) — `Accept` negotiation, correct `Content-Type`, digest header. **Cache-control split:** by-digest → `ETag`+`immutable`+`If-None-Match`→`304`; by-tag → `no-cache` (SECURITY §HTTP boundary).
-- [ ] **`Range` request support** (RFC 9110) for resumable + lazy-pull (eStargz/SOCI) partial reads.
-- [ ] "Serve any OCI layout as a registry" verified: point roci at an existing layout dir, pull with skopeo.
+- [x] **`Storage` trait** (read surface): `read_blob`/`blob_size`/`open_blob`, `get_manifest`, existence checks; blob path = pure function of a validated digest → O(1) `open`.
+- [ ] **`MetadataStore` trait** — default backend: append-only WAL + in-RAM maps (tag→digest, subject→referrers), rebuildable from the layout; read/resolve surface first (write in Phase 2). Embedded B-tree KV (heed/redb) is the feature-gated upgrade (bake-off in cross-cutting). *(Deferred: tags/referrers/media-types are read directly from `index.json`; a WAL/in-RAM store is a later performance pass, not observable behavior.)*
+- [ ] **Existence filters:** cuckoo (mutable) + BinaryFuse8 (static) front the "present?" hot path so HEAD/dedup checks stay off disk; a filter hit is never the sole authority for `200` (membership checked — SECURITY inv. 10). *(Deferred: internal optimization, no wire-visible effect.)*
+- [ ] **Small-blob LRU content cache** (<100 KB, capped): serve manifests/configs with zero syscall; miss → loose file. Keyed by `(repo, digest)` for cross-repo isolation. *(Deferred: internal optimization, no wire-visible effect.)*
+- [x] **Local backend on OCI image layout** ([`image-layout.md`](spec/image-spec/image-layout.md)): `blobs/<alg>/<hex>` CAS (manifests are blobs); `index.json` (source of truth for tags/media-types/subject relation, tags via `org.opencontainers.image.ref.name`) + `oci-layout`. Serves **any pre-existing OCI layout**, incl. **foreign media-type blobs** (unknown descriptors preserved on read-modify-write). One image-layout root per repository.
+- [x] `GET`/`HEAD /v2/<name>/blobs/<digest>` (end-2) — streamed via `open_blob` + `tokio_util::io::ReaderStream` (no whole-blob buffering; `sendfile`/`fadvise`/kTLS is a later optimization), `Docker-Content-Digest`+`Content-Length`, `404` on miss.
+- [x] `GET`/`HEAD /v2/<name>/manifests/<reference>` (end-3) — `Accept` read (advisory; stored `Content-Type` always returned), digest header. **Cache-control split:** by-digest → `ETag`+`immutable`+`If-None-Match`→`304`; by-tag → `no-cache` + `ETag` revalidation (SECURITY §HTTP boundary).
+- [x] **`Range` request support** (RFC 9110): single-range `bytes=start-end`/`start-`/`-suffix` → `206`+`Content-Range`; unsatisfiable → `416`; malformed/multi-range ignored → full `200`; `Accept-Ranges: bytes` always advertised.
+- [x] "Serve any OCI layout as a registry" verified: `FsStorage` reads a pre-existing `<repo>/{oci-layout,index.json,blobs/}` lazily (test `serves_external_oci_layout`).
 
 **Correctness gate:** **Pull** conformance category passes. Smoke: `skopeo copy` *from* roci succeeds; digest verification on client matches.
 
