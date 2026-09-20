@@ -735,16 +735,7 @@ impl Storage for FsStorage {
             // By-tag: resolve via the in-RAM tag map; on a miss fall back to the
             // on-disk index.json (the layout is the source of truth).
             match self.meta.resolve_tag(repo, reference) {
-                Some(digest_str) => {
-                    let digest = Digest::parse(&digest_str)?;
-                    let media_type = self
-                        .meta
-                        .manifest_media_type(repo, &digest_str)
-                        .unwrap_or_else(|| {
-                            "application/vnd.oci.image.manifest.v1+json".to_string()
-                        });
-                    (digest, media_type)
-                }
+                Some((digest_str, media_type)) => (Digest::parse(&digest_str)?, media_type),
                 None => self.index_resolve_tag(repo, reference).await?,
             }
         };
@@ -845,6 +836,11 @@ impl Storage for FsStorage {
             // Existing object entry: merge fields, preserving any tag annotation.
             Some(existing) => {
                 for (k, v) in &merged {
+                    // Never overwrite the entry's own identity; preserve a tag
+                    // annotation the manifest entry already carries.
+                    if k == "digest" {
+                        continue;
+                    }
                     if k == "annotations" && existing.contains_key("annotations") {
                         continue;
                     }
@@ -1363,5 +1359,126 @@ mod tests {
             s.get_manifest("app", &absent.as_string()).await,
             Err(StorageError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn seed_presence_and_discover_repos_edge_cases() {
+        // Build a root that exercises every branch of seed_presence_from_cas and
+        // discover_repos, then construct FsStorage to run the seed walk.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // repo "a": a proper CAS blob (happy path — inserted into the filter)
+        // plus a `.tmp` staging file that must be skipped.
+        let good = sha256_of(b"good-blob");
+        let a_alg = root.join("a").join("blobs").join("sha256");
+        std::fs::create_dir_all(&a_alg).unwrap();
+        std::fs::write(a_alg.join(&good.hex), b"good-blob").unwrap();
+        std::fs::write(a_alg.join("deadbeef.tmp"), b"partial").unwrap();
+        std::fs::write(root.join("a").join("index.json"), b"{}").unwrap();
+        // A regular file where an algorithm dir is expected → read_dir(alg) fails.
+        std::fs::write(root.join("a").join("blobs").join("notadir"), b"x").unwrap();
+
+        // repo "b": has index.json but NO blobs/ dir → read_dir(blobs) fails.
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("b").join("index.json"), b"{}").unwrap();
+
+        // A directory nested deeper than the discover_repos depth bound carries
+        // an index.json that must NOT be discovered (depth cutoff).
+        let mut deep = root.to_path_buf();
+        for i in 0..20 {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("index.json"), b"{}").unwrap();
+
+        let s = FsStorage::new(root).unwrap();
+        // The real blob is present (filter seeded); the tmp file was skipped, so
+        // reading it back would 404 — but the good blob reads fine.
+        assert_eq!(s.read_blob("a", &good).await.unwrap(), b"good-blob");
+        // A blob never stored is absent (filter authoritative after a complete seed).
+        let never = sha256_of(b"never");
+        assert!(matches!(
+            s.blob_size("a", &never).await,
+            Err(StorageError::NotFound)
+        ));
+
+        // discover_repos read_dir-failure branch: point a fresh store at a path
+        // whose root cannot be read (unix perms) — the walk returns nothing and
+        // construction still succeeds.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.path().join("locked");
+            std::fs::create_dir_all(locked.join("sub")).unwrap();
+            std::fs::write(locked.join("sub").join("index.json"), b"{}").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Seeding walks `locked` but read_dir fails → skipped, no panic.
+            let _ = FsStorage::new(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn add_referrer_merges_into_annotated_entry() {
+        // A tagged manifest already carries an `annotations` entry in the index;
+        // add_referrer must preserve it (the k=="annotations" skip branch) while
+        // merging the subject/artifactType.
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let body = br#"{"schemaVersion":2}"#;
+        let referrer = sha256_of(body);
+        // put_manifest with a tag records an index entry carrying annotations.
+        s.put_manifest("r", Some("v1"), &referrer, "application/json", body)
+            .await
+            .unwrap();
+        let subject = sha256_of(b"subject");
+        // The descriptor the core passes also carries annotations; the existing
+        // entry's annotations must win (skip), other fields merge.
+        s.add_referrer(
+            "r",
+            &subject,
+            &referrer,
+            br#"{"mediaType":"application/json","digest":"x","annotations":{"other":"1"},"artifactType":"a/b"}"#,
+        )
+        .await
+        .unwrap();
+        let listed = s.list_referrers("r", &subject).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let d: serde_json::Value = serde_json::from_slice(&listed[0]).unwrap();
+        // The referrer descriptor (from the metadata store) carries the subject
+        // link and its own artifactType.
+        assert_eq!(
+            d.get("subject")
+                .and_then(|v| v.get("digest"))
+                .and_then(|v| v.as_str()),
+            Some(subject.as_string().as_str())
+        );
+        assert_eq!(d.get("artifactType").and_then(|v| v.as_str()), Some("a/b"));
+        // In the on-disk index.json, the merge preserved the manifest entry's
+        // pre-existing tag annotation (the k=="annotations" skip branch) rather
+        // than overwriting it with the referrer descriptor's annotations.
+        let index = s.read_index("r").await.unwrap();
+        let entry = index["manifests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| descriptor_digest(e) == Some(referrer.as_string().as_str()))
+            .unwrap()
+            .clone();
+        assert_eq!(
+            entry
+                .get("annotations")
+                .and_then(|a| a.get("org.opencontainers.image.ref.name"))
+                .and_then(|v| v.as_str()),
+            Some("v1")
+        );
+        assert_eq!(
+            entry
+                .get("subject")
+                .and_then(|v| v.get("digest"))
+                .and_then(|v| v.as_str()),
+            Some(subject.as_string().as_str())
+        );
     }
 }

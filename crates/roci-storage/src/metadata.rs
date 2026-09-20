@@ -38,8 +38,10 @@ pub enum MetaOp {
 /// The read/mutate surface for derived metadata. AuthN/AuthZ is enforced before
 /// any call (ARCHITECTURE.md invariant 3), exactly like [`crate::Storage`].
 pub trait MetadataStore: Send + Sync + 'static {
-    /// Resolve a tag to its manifest digest string, if the tag exists.
-    fn resolve_tag(&self, repo: &str, tag: &str) -> Option<String>;
+    /// Resolve a tag to `(digest, media_type)`, if the tag exists. Both come
+    /// from the same locked read, so a resolved tag always carries its media
+    /// type (no second lookup, no fallback default).
+    fn resolve_tag(&self, repo: &str, tag: &str) -> Option<(String, String)>;
     /// The stored media type for a manifest digest, if known.
     fn manifest_media_type(&self, repo: &str, digest: &str) -> Option<String>;
     /// All tags in a repo, sorted lexically.
@@ -64,8 +66,9 @@ type Referrer = (String, Vec<u8>);
 /// The mutable in-RAM state. Keyed by `(repo, key)` so repos stay isolated.
 #[derive(Default)]
 struct State {
-    /// `(repo, tag) → digest`.
-    tags: HashMap<RepoKey, String>,
+    /// `(repo, tag) → (digest, media_type)` — media type stored alongside so a
+    /// tag resolution needs no second lookup and carries no fallback default.
+    tags: HashMap<RepoKey, (String, String)>,
     /// `(repo, digest) → media_type`.
     media_types: HashMap<RepoKey, String>,
     /// `(repo, subject) → [(referrer_digest, descriptor_bytes)]`. The referrer
@@ -106,15 +109,18 @@ impl LogMetadataStore {
                     .media_types
                     .insert((repo.clone(), digest.clone()), media_type.clone());
                 if let Some(tag) = tag {
-                    state
-                        .tags
-                        .insert((repo.clone(), tag.clone()), digest.clone());
+                    state.tags.insert(
+                        (repo.clone(), tag.clone()),
+                        (digest.clone(), media_type.clone()),
+                    );
                 }
             }
             MetaOp::DeleteManifest { repo, digest } => {
                 state.media_types.remove(&(repo.clone(), digest.clone()));
                 // Drop every tag pointing at this digest.
-                state.tags.retain(|(r, _), d| !(r == repo && d == digest));
+                state
+                    .tags
+                    .retain(|(r, _), (d, _)| !(r == repo && d == digest));
                 // Drop the deleted manifest as a referrer of any subject.
                 for refs in state.referrers.values_mut() {
                     refs.retain(|(rd, _)| rd != digest);
@@ -142,7 +148,7 @@ impl LogMetadataStore {
 }
 
 impl MetadataStore for LogMetadataStore {
-    fn resolve_tag(&self, repo: &str, tag: &str) -> Option<String> {
+    fn resolve_tag(&self, repo: &str, tag: &str) -> Option<(String, String)> {
         let state = self.inner.lock().expect("metadata lock poisoned");
         state
             .tags
@@ -356,7 +362,10 @@ mod tests {
         s.apply(put("r", "sha256:bb", Some("v2"))).unwrap();
         // Untagged manifest records only its media type.
         s.apply(put("r", "sha256:cc", None)).unwrap();
-        assert_eq!(s.resolve_tag("r", "v1").as_deref(), Some("sha256:aa"));
+        assert_eq!(
+            s.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
         assert_eq!(s.resolve_tag("r", "missing"), None);
         assert_eq!(
             s.manifest_media_type("r", "sha256:cc").as_deref(),
@@ -441,7 +450,10 @@ mod tests {
         }
         // A fresh store over the same dir replays the log.
         let s2 = LogMetadataStore::open(dir.path()).unwrap();
-        assert_eq!(s2.resolve_tag("r", "v1").as_deref(), Some("sha256:aa"));
+        assert_eq!(
+            s2.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
         assert_eq!(s2.referrers("r", "sha256:aa").len(), 1);
         // The deleted manifest's tag did not survive replay.
         assert_eq!(s2.resolve_tag("r", "v2"), None);
@@ -463,7 +475,10 @@ mod tests {
         torn.extend_from_slice(b"partial");
         std::fs::write(&log, &torn).unwrap();
         let s1 = LogMetadataStore::open(dir.path()).unwrap();
-        assert_eq!(s1.resolve_tag("r", "v1").as_deref(), Some("sha256:aa"));
+        assert_eq!(
+            s1.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
         drop(s1);
 
         // Case 2: a record with a corrupted CRC halts replay at that point.
@@ -475,7 +490,10 @@ mod tests {
         std::fs::write(&log, &bad).unwrap();
         let s2 = LogMetadataStore::open(dir.path()).unwrap();
         // The corrupt delete was skipped, so the tag survives.
-        assert_eq!(s2.resolve_tag("r", "v1").as_deref(), Some("sha256:aa"));
+        assert_eq!(
+            s2.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
 
         // Case 3: a valid-CRC but unknown-op record is skipped, replay continues.
         let mut unknown = good.clone();
@@ -487,7 +505,10 @@ mod tests {
         unknown.extend_from_slice(&encode(&put("r", "sha256:bb", Some("v2"))));
         std::fs::write(&log, &unknown).unwrap();
         let s3 = LogMetadataStore::open(dir.path()).unwrap();
-        assert_eq!(s3.resolve_tag("r", "v2").as_deref(), Some("sha256:bb"));
+        assert_eq!(
+            s3.resolve_tag("r", "v2").map(|(d, _)| d).as_deref(),
+            Some("sha256:bb")
+        );
     }
 
     #[test]
