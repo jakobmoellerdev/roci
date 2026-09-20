@@ -24,6 +24,14 @@ pub enum MetaOp {
         media_type: String,
         tag: Option<String>,
     },
+    /// The reverse edges for a manifest: every `blob` the manifest references
+    /// (config + layers) gains `manifest` in its backref set. Recorded after
+    /// the manifest is stored so a future GC can reclaim an unreferenced blob.
+    PutBackrefs {
+        repo: String,
+        manifest: String,
+        blobs: Vec<String>,
+    },
     /// A manifest (and every tag pointing at it) was deleted: `(repo, digest)`.
     DeleteManifest { repo: String, digest: String },
     /// A referrer descriptor was recorded against a subject digest.
@@ -48,6 +56,8 @@ pub trait MetadataStore: Send + Sync + 'static {
     fn list_tags(&self, repo: &str) -> Vec<String>;
     /// The referrer descriptors recorded for a subject digest, as raw JSON.
     fn referrers(&self, repo: &str, subject: &str) -> Vec<Vec<u8>>;
+    /// The manifest digests currently recorded as referencing `blob` in `repo`.
+    fn backrefs(&self, repo: &str, blob: &str) -> Vec<String>;
     /// Apply and durably record a mutation.
     fn apply(&self, op: MetaOp) -> io::Result<()>;
 }
@@ -74,6 +84,10 @@ struct State {
     /// `(repo, subject) → [(referrer_digest, descriptor_bytes)]`. The referrer
     /// digest keys de-dup so a re-push replaces rather than appends.
     referrers: HashMap<RepoKey, Vec<Referrer>>,
+    /// `(repo, blob_digest) → [manifest_digest]`: reverse edges from a blob to
+    /// every manifest that references it. Maintained on manifest put/delete for
+    /// a future online GC; manifest digests de-dup within a set.
+    backrefs: HashMap<RepoKey, Vec<String>>,
     /// Buffered log writer (`None` until a mutation opens/creates the log).
     log: Option<std::fs::File>,
 }
@@ -124,6 +138,29 @@ impl LogMetadataStore {
                 // Drop the deleted manifest as a referrer of any subject.
                 for refs in state.referrers.values_mut() {
                     refs.retain(|(rd, _)| rd != digest);
+                }
+                // Drop the deleted manifest from every blob's backref set in
+                // this repo; a set that empties is removed entirely.
+                state.backrefs.retain(|(r, _), manifests| {
+                    if r == repo {
+                        manifests.retain(|m| m != digest);
+                    }
+                    !manifests.is_empty()
+                });
+            }
+            MetaOp::PutBackrefs {
+                repo,
+                manifest,
+                blobs,
+            } => {
+                for blob in blobs {
+                    let set = state
+                        .backrefs
+                        .entry((repo.clone(), blob.clone()))
+                        .or_default();
+                    if !set.iter().any(|m| m == manifest) {
+                        set.push(manifest.clone());
+                    }
                 }
             }
             MetaOp::PutReferrer {
@@ -182,6 +219,15 @@ impl MetadataStore for LogMetadataStore {
             .referrers
             .get(&(repo.to_string(), subject.to_string()))
             .map(|v| v.iter().map(|(_, d)| d.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn backrefs(&self, repo: &str, blob: &str) -> Vec<String> {
+        let state = self.inner.lock().expect("metadata lock poisoned");
+        state
+            .backrefs
+            .get(&(repo.to_string(), blob.to_string()))
+            .cloned()
             .unwrap_or_default()
     }
 
@@ -284,6 +330,16 @@ fn serialize_op(op: &MetaOp) -> Vec<u8> {
             // record a single flat object and survive any byte content.
             "descriptor": String::from_utf8_lossy(descriptor),
         }),
+        MetaOp::PutBackrefs {
+            repo,
+            manifest,
+            blobs,
+        } => serde_json::json!({
+            "op": "put_backrefs",
+            "repo": repo,
+            "manifest": manifest,
+            "blobs": blobs,
+        }),
     };
     serde_json::to_vec(&v).expect("MetaOp serializes")
 }
@@ -307,6 +363,19 @@ fn deserialize_op(payload: &[u8]) -> Option<MetaOp> {
             subject: s("subject")?,
             referrer: s("referrer")?,
             descriptor: s("descriptor")?.into_bytes(),
+        }),
+        "put_backrefs" => Some(MetaOp::PutBackrefs {
+            repo: s("repo")?,
+            manifest: s("manifest")?,
+            blobs: v
+                .get("blobs")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }),
         _ => None,
     }
@@ -424,6 +493,39 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0], br#"{"v":2}"#);
         assert!(s.referrers("r", "sha256:none").is_empty());
+    }
+
+    #[test]
+    fn backrefs_apply_query_and_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = LogMetadataStore::open(dir.path()).unwrap();
+            s.apply(MetaOp::PutBackrefs {
+                repo: "r".into(),
+                manifest: "sha256:m".into(),
+                blobs: vec!["sha256:b1".into(), "sha256:b2".into()],
+            })
+            .unwrap();
+            // Idempotent: re-recording the same edge does not duplicate it.
+            s.apply(MetaOp::PutBackrefs {
+                repo: "r".into(),
+                manifest: "sha256:m".into(),
+                blobs: vec!["sha256:b1".into()],
+            })
+            .unwrap();
+            assert_eq!(s.backrefs("r", "sha256:b1"), vec!["sha256:m".to_string()]);
+            assert!(s.backrefs("r", "sha256:absent").is_empty());
+        }
+        // A fresh store replays the log (serialize → deserialize round-trip).
+        let s2 = LogMetadataStore::open(dir.path()).unwrap();
+        assert_eq!(s2.backrefs("r", "sha256:b2"), vec!["sha256:m".to_string()]);
+        // Deleting the manifest clears its backref edges on replay too.
+        s2.apply(MetaOp::DeleteManifest {
+            repo: "r".into(),
+            digest: "sha256:m".into(),
+        })
+        .unwrap();
+        assert!(s2.backrefs("r", "sha256:b1").is_empty());
     }
 
     #[test]

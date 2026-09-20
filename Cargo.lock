@@ -874,6 +874,7 @@ version = "0.0.0"
 dependencies = [
  "cuckoofilter",
  "futures",
+ "getrandom 0.4.3",
  "hex",
  "lru",
  "serde",

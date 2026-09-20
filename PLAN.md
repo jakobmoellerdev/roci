@@ -76,17 +76,17 @@ Rules:
 
 **Goal:** accept pushes. **Push conformance passes.** Round-trip: push then pull an identical image.
 
-- [ ] Extend `Storage`/`MetadataStore`: `blob_write`, staged uploads, `manifest_put`, `tag_set`, **WAL append (group-commit)** for tag/backref writes.
-- [ ] **Upload session manager** — the algorithmically interesting part:
-  - [ ] `POST /v2/<name>/blobs/uploads/` (end-4a) → `202` + `Location` (server-generated UUID; validated before any path use — SECURITY inv. 8).
-  - [ ] `PATCH …/blobs/uploads/<ref>` (end-5) — chunked upload, `Content-Range`, `416` on gap. Stream into an **`O_TMPFILE` staging inode** (namespace-invisible → no orphan temp, no TOCTOU); **per-session size cap** (`413`/`SIZE_INVALID`).
-  - [ ] `PUT …/blobs/uploads/<ref>?digest=` (end-6) — finalize: **hash-on-write, verify digest BEFORE `linkat(AT_EMPTY_PATH)` promotes into CAS** (`DIGEST_INVALID`/`SIZE_INVALID`); `EEXIST` on link = dedup signal.
-  - [ ] `GET …/blobs/uploads/<ref>` (end-13) — upload status → `204` + range.
-  - [ ] Monolithic single-`POST` (end-4b) and POST-then-PUT paths.
-- [ ] `PUT /v2/<name>/manifests/<reference>` (end-7) — size cap + bounded JSON parse (depth/dup-key), referenced-blob existence (`MANIFEST_BLOB_UNKNOWN`), **`Content-Type`↔`mediaType` agreement** (CVE-2021-41190), accept `subject` referencing absent manifest; updates tag + referrers + **backref** in one atomic WAL record.
-- [ ] **Deduplication = reflink (`FICLONE`), hard-link fallback** — independent deletion, no write-through-shared-inode hazard; intra-path dedup is free (same digest → same file), extended across paths/repos. `open` with `O_NOFOLLOW`/`openat2 RESOLVE_BENEATH`.
-- [ ] Cross-repo **blob mount** (end-11) → `201` via `copy_file_range` (btrfs/XFS O(1); no read+write roundtrip) when source has it, else `202`. (Double-authz enforced in Phase 6.)
-- [ ] Crash-safety: `O_TMPFILE`+`linkat` + atomic WAL so an interrupted push never corrupts the CAS or desyncs the index.
+- [~] Extend `Storage`/`MetadataStore`: staged uploads, `put_manifest`, tag set, and a `blob → manifests` **backref index** maintained on manifest put/delete. *(WAL group-commit deferred — the metadata log flushes per-op; group-commit pays only behind a KV upgrade, RESEARCH §8.6.)*
+- [x] **Upload session manager:**
+  - [x] `POST /v2/<name>/blobs/uploads/` (end-4a) → `202` + `Location` with a **server-generated random 128-bit id** (validated by the `SafeComponent` backstop before any path use — SECURITY inv. 8; replaces the old pid-counter scheme).
+  - [x] `PATCH …/blobs/uploads/<ref>` (end-5) — chunked upload, `Content-Range`, `416` on gap; **per-session size cap** (`413`/`SIZE_INVALID`, `MAX_UPLOAD` = 5 GiB) drops the session on breach. *(`O_TMPFILE` staging deferred — staging is a named `uploads/<id>` file; portable across darwin, which lacks `O_TMPFILE`.)*
+  - [x] `PUT …/blobs/uploads/<ref>?digest=` (end-6) — finalize: **stream-hash the staging file (no full-blob buffer), verify the digest, `fsync`, then atomically `rename` in place** into the CAS. *(`linkat(AT_EMPTY_PATH)` promotion deferred with `O_TMPFILE`; the tmp+`fsync`+rename gives the same crash-safety portably.)*
+  - [x] `GET …/blobs/uploads/<ref>` (end-13) — upload status → `204` + range.
+  - [x] Monolithic single-`POST` (end-4b) and POST-then-PUT paths.
+- [x] `PUT /v2/<name>/manifests/<reference>` (end-7) — size cap + bounded JSON parse (depth), **referenced-blob existence** (config + layers → `MANIFEST_BLOB_UNKNOWN`), **`Content-Type`↔`mediaType` agreement** (CVE-2021-41190 → `MANIFEST_INVALID`), accepts a `subject` referencing an absent manifest; records the tag, referrers, and **backref** edges. *(Single-atomic-WAL-record coupling deferred with group-commit.)*
+- [~] **Deduplication:** cross-path/-repo dedup via `std::fs::hard_link` (O(1), copy-free on one filesystem) with a `tokio::fs::copy` fallback (cross-device / no-hardlink); intra-path dedup is free (same digest → same CAS file). *(`FICLONE` reflink + `O_NOFOLLOW`/`openat2 RESOLVE_BENEATH` deferred — Linux-specific; the `SafeComponent` backstop already bars traversal.)*
+- [x] Cross-repo **blob mount** (end-11) → `201` via the portable hard-link path above (no read+write roundtrip), else falls through to a `202` session. *(`copy_file_range` fast path deferred — Linux-specific; darwin lacks it. Double-authz in Phase 6.)*
+- [~] Crash-safety: tmp/staging + `fsync` + atomic `rename` so an interrupted push never leaves a corrupt-but-named blob. *(`O_TMPFILE`+`linkat` + single-record atomic WAL deferred as the Linux fast path.)*
 
 **Correctness gate:** **Push** conformance passes. Smoke: `skopeo copy` *to* roci, then pull back → byte-identical. Resumable push (interrupt mid-chunk, resume) works.
 

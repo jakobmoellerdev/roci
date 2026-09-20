@@ -10,8 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod cache;
 mod filter;
@@ -116,6 +115,15 @@ pub trait Storage: Send + Sync + 'static {
         repo: &str,
         digest: &Digest,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send;
+    /// Whether a blob is present in the CAS. A dedicated presence check the
+    /// manifest push path uses to enforce referenced-blob existence; cheaper
+    /// than [`Storage::blob_size`] for the common absent case (the presence
+    /// filter answers a definite miss without a `stat`).
+    fn blob_exists(
+        &self,
+        repo: &str,
+        digest: &Digest,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send;
     /// Read a whole blob (used by manifests; large blobs stream via [`Storage::open_blob`]).
     fn read_blob(
         &self,
@@ -144,6 +152,25 @@ pub trait Storage: Send + Sync + 'static {
         repo: &str,
         id: &str,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send;
+    /// Abort an in-progress upload session, discarding its staging file.
+    /// Idempotent: a missing session is `Ok(())`.
+    fn abort_upload(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send;
+    /// Mount a blob from `from_repo` into `to_repo` without re-uploading it
+    /// (dist-spec end-11 cross-repository blob mount). Returns `Ok(true)` when
+    /// the blob was present in `from_repo` and is now linked into `to_repo`;
+    /// `Ok(false)` when the source blob is absent (the caller falls back to a
+    /// normal upload session). Promotion is a filesystem hard-link with a copy
+    /// fallback — no blob bytes pass through memory.
+    fn mount_blob(
+        &self,
+        from_repo: &str,
+        to_repo: &str,
+        digest: &Digest,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send;
     /// Finalize an upload, verifying it hashes to `expected`, moving it into the CAS.
     fn finish_upload(
         &self,
@@ -206,6 +233,23 @@ pub trait Storage: Send + Sync + 'static {
         repo: &str,
         subject: &Digest,
     ) -> impl Future<Output = Result<Vec<Vec<u8>>, StorageError>> + Send;
+    /// Record the reverse edges `blob_digest → manifest_digest` for every blob
+    /// a manifest references (its config + layers), so a future GC can reclaim
+    /// a blob the moment its last referencing manifest is deleted. Called by
+    /// the core after a successful [`Storage::put_manifest`]; the delete side
+    /// is handled inside [`Storage::delete_manifest`].
+    fn record_backrefs(
+        &self,
+        repo: &str,
+        manifest: &Digest,
+        blobs: &[Digest],
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+    /// The manifest digests currently known to reference `blob` in `repo`.
+    fn backrefs(
+        &self,
+        repo: &str,
+        blob: &Digest,
+    ) -> impl Future<Output = Result<Vec<String>, StorageError>> + Send;
 }
 
 /// Filesystem-backed [`Storage`]. Each repository is a self-contained OCI
@@ -217,7 +261,6 @@ pub trait Storage: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct FsStorage {
     root: Arc<PathBuf>,
-    upload_seq: Arc<Mutex<u64>>,
     /// Derived, rebuildable metadata index (tags, media types, referrers) kept
     /// in RAM and mirrored to `roci-meta.log`. Reads resolve against this first
     /// and fall back to `index.json`; the layout stays the source of truth.
@@ -245,7 +288,6 @@ impl FsStorage {
         let meta = Arc::new(LogMetadataStore::open(&root)?);
         let store = Self {
             root: Arc::new(root),
-            upload_seq: Arc::new(Mutex::new(0)),
             meta,
             presence: Arc::new(BlobPresenceFilter::new()),
             cache: Arc::new(SmallBlobCache::new()),
@@ -555,6 +597,43 @@ pub fn digest_of(data: &[u8], algorithm: &str) -> Digest {
     }
 }
 
+/// Stream the file at `path` through the hasher selected by `algorithm`
+/// (sha256/sha512), returning its [`Digest`] without buffering the whole file.
+/// Used to verify a staged upload before promoting it into the CAS.
+async fn hash_file(path: &Path, algorithm: &str) -> io::Result<Digest> {
+    let mut f = tokio::fs::File::open(path).await?;
+    let mut buf = [0u8; 64 * 1024];
+    // One hasher per algorithm keeps the loop monomorphic without dynamic
+    // dispatch; sha256 is the default for any non-sha512 (allowlisted) value.
+    if algorithm == "sha512" {
+        let mut h = Sha512::new();
+        loop {
+            let n = f.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+        Ok(Digest {
+            algorithm: "sha512".into(),
+            hex: hex::encode(h.finalize()),
+        })
+    } else {
+        let mut h = Sha256::new();
+        loop {
+            let n = f.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+        Ok(Digest {
+            algorithm: "sha256".into(),
+            hex: hex::encode(h.finalize()),
+        })
+    }
+}
+
 impl Storage for FsStorage {
     async fn blob_size(&self, repo: &str, digest: &Digest) -> Result<u64, StorageError> {
         // Validate the path first (the traversal backstop must run before any
@@ -566,6 +645,17 @@ impl Storage for FsStorage {
         }
         let meta = tokio::fs::metadata(path).await.map_err(map_not_found)?;
         Ok(meta.len())
+    }
+
+    async fn blob_exists(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError> {
+        // Validate the path first (traversal backstop before any short-circuit),
+        // then let a definite-absent filter answer skip the stat; a "maybe"
+        // falls through to an authoritative `try_exists`.
+        let path = self.blob_path(repo, digest)?;
+        if !self.presence.maybe_present(repo, &digest.as_string()) {
+            return Ok(false);
+        }
+        Ok(tokio::fs::try_exists(path).await?)
     }
 
     async fn read_blob(&self, repo: &str, digest: &Digest) -> Result<Vec<u8>, StorageError> {
@@ -597,11 +687,12 @@ impl Storage for FsStorage {
     }
 
     async fn begin_upload(&self, repo: &str) -> Result<String, StorageError> {
-        let id = {
-            let mut seq = self.upload_seq.lock().await;
-            *seq += 1;
-            format!("{}-{}", std::process::id(), *seq)
-        };
+        // A random 128-bit id: unguessable and independent of pid/restart (the
+        // old `{pid}-{counter}` scheme collided across restarts). Hex-encoded,
+        // so `upload_path`→`safe_component` accepts it unchanged.
+        let mut buf = [0u8; 16];
+        getrandom::fill(&mut buf).map_err(|e| StorageError::Io(io::Error::other(e)))?;
+        let id = hex::encode(buf);
         let path = self.upload_path(repo, &id)?;
         let uploads_dir = self.repo_dir(repo)?.join("uploads");
         tokio::fs::create_dir_all(&uploads_dir).await?;
@@ -634,13 +725,64 @@ impl Storage for FsStorage {
         id: &str,
         expected: &Digest,
     ) -> Result<(), StorageError> {
-        let path = self.upload_path(repo, id)?;
-        let data = tokio::fs::read(&path).await.map_err(map_not_found)?;
-        // put_blob verifies the digest (hashing with the expected algorithm);
-        // only promote into the CAS and drop the staging file on success.
-        self.put_blob(repo, expected, &data).await?;
-        let _ = tokio::fs::remove_file(&path).await;
+        let staging = self.upload_path(repo, id)?;
+        // Stream-hash the staging file (no full-blob buffer), verifying it
+        // matches the client-declared digest before promoting it.
+        let actual = hash_file(&staging, expected.algorithm())
+            .await
+            .map_err(map_not_found)?;
+        if !actual.ct_eq(expected) {
+            // Reject and drop the staging file so a bad upload leaves nothing.
+            let _ = tokio::fs::remove_file(&staging).await;
+            return Err(StorageError::DigestMismatch {
+                expected: expected.as_string(),
+                actual: actual.as_string(),
+            });
+        }
+        // Ensure the layout marker + the target `blobs/<alg>` dir exist, then
+        // fsync the staging file's contents durable and rename it *in place*
+        // into the CAS — atomic on the same filesystem, copy-free, so a crash
+        // can never leave a corrupt-but-named blob (a torn write stays under
+        // `uploads/` and is discarded on the next finish).
+        self.ensure_layout(repo).await?;
+        let dest = self.blob_path(repo, expected)?;
+        tokio::fs::create_dir_all(
+            self.repo_dir(repo)?
+                .join("blobs")
+                .join(expected.algorithm()),
+        )
+        .await?;
+        {
+            let f = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&staging)
+                .await
+                .map_err(map_not_found)?;
+            f.sync_all().await?;
+        }
+        tokio::fs::rename(&staging, &dest).await?;
+        // Record presence so future reads skip the stat on a definite miss.
+        let digest_str = expected.as_string();
+        self.presence.insert(repo, &digest_str);
+        // Warm the small-blob cache only for a blob small enough to be cacheable
+        // — reading a multi-GiB layer back just to feed a cache that would
+        // reject it is the buffering this rework exists to avoid.
+        let size = tokio::fs::metadata(&dest).await?.len();
+        if size <= self.cache.threshold() as u64 {
+            if let Ok(bytes) = tokio::fs::read(&dest).await {
+                self.cache.put(repo, &digest_str, &bytes);
+            }
+        }
         Ok(())
+    }
+
+    async fn abort_upload(&self, repo: &str, id: &str) -> Result<bool, StorageError> {
+        // Idempotent: a missing session is `Ok(false)` (nothing removed).
+        match tokio::fs::remove_file(self.upload_path(repo, id)?).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(StorageError::Io(e)),
+        }
     }
 
     async fn put_blob(&self, repo: &str, digest: &Digest, data: &[u8]) -> Result<(), StorageError> {
@@ -659,9 +801,14 @@ impl Storage for FsStorage {
         let dest = self.blob_path(repo, digest)?;
         tokio::fs::create_dir_all(self.repo_dir(repo)?.join("blobs").join(&digest.algorithm))
             .await?;
-        // Write to a temp file then atomically rename into the CAS.
+        // Write to a temp file, fsync it durable, then atomically rename into
+        // the CAS so a crash cannot leave a corrupt-but-named blob.
         let tmp = dest.with_extension("tmp");
-        tokio::fs::write(&tmp, data).await?;
+        {
+            let mut f = tokio::fs::File::create(&tmp).await?;
+            f.write_all(data).await?;
+            f.sync_all().await?;
+        }
         tokio::fs::rename(&tmp, &dest).await?;
         // Record presence so future reads skip the stat on a definite miss, and
         // warm the small-blob cache (a no-op for large layers).
@@ -914,6 +1061,64 @@ impl Storage for FsStorage {
             })
             .unwrap_or_default();
         Ok(out)
+    }
+
+    async fn mount_blob(
+        &self,
+        from_repo: &str,
+        to_repo: &str,
+        digest: &Digest,
+    ) -> Result<bool, StorageError> {
+        let src = self.blob_path(from_repo, digest)?;
+        // Source absent → the caller falls back to a normal upload session.
+        if !self.blob_exists(from_repo, digest).await? {
+            return Ok(false);
+        }
+        // Ensure the destination layout + `blobs/<alg>` dir exist, then link the
+        // source into it. A hard link is O(1) and copy-free on one filesystem;
+        // an already-present destination (concurrent mount / re-mount) is a
+        // success; a cross-device or unsupported link falls back to a copy.
+        self.ensure_layout(to_repo).await?;
+        let dest = self.blob_path(to_repo, digest)?;
+        tokio::fs::create_dir_all(
+            self.repo_dir(to_repo)?
+                .join("blobs")
+                .join(digest.algorithm()),
+        )
+        .await?;
+        // Promote by a hard link — O(1) and copy-free on one filesystem. On any
+        // failure (a destination that already exists from a concurrent/repeat
+        // mount, a cross-device link, or a filesystem without hard links) fall
+        // back to a byte copy; `copy` streams and overwrites, so a re-mount of
+        // identical content is harmless.
+        if tokio::fs::hard_link(&src, &dest).await.is_err() {
+            tokio::fs::copy(&src, &dest).await?;
+        }
+        let digest_str = digest.as_string();
+        self.presence.insert(to_repo, &digest_str);
+        Ok(true)
+    }
+
+    async fn record_backrefs(
+        &self,
+        repo: &str,
+        manifest: &Digest,
+        blobs: &[Digest],
+    ) -> Result<(), StorageError> {
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        self.meta
+            .apply(MetaOp::PutBackrefs {
+                repo: repo.to_string(),
+                manifest: manifest.as_string(),
+                blobs: blobs.iter().map(Digest::as_string).collect(),
+            })
+            .map_err(StorageError::Io)
+    }
+
+    async fn backrefs(&self, repo: &str, blob: &Digest) -> Result<Vec<String>, StorageError> {
+        Ok(self.meta.backrefs(repo, &blob.as_string()))
     }
 }
 
@@ -1502,5 +1707,129 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some(subject.as_string().as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn begin_upload_ids_are_distinct_random_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let a = s.begin_upload("r").await.unwrap();
+        let b = s.begin_upload("r").await.unwrap();
+        assert_ne!(a, b);
+        // 128 random bits → 32 lowercase hex chars.
+        assert_eq!(a.len(), 32);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn mount_blob_hard_links_and_reports_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let data = b"shared-layer";
+        let d = sha256_of(data);
+        s.put_blob("src", &d, data).await.unwrap();
+        // Present source → first mount hard-links: byte-identical and sharing
+        // one inode (a link, not a copy).
+        assert!(s.mount_blob("src", "dst", &d).await.unwrap());
+        assert_eq!(s.read_blob("dst", &d).await.unwrap(), data);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let src_ino = std::fs::metadata(s.blob_path("src", &d).unwrap())
+                .unwrap()
+                .ino();
+            let dst_ino = std::fs::metadata(s.blob_path("dst", &d).unwrap())
+                .unwrap()
+                .ino();
+            assert_eq!(src_ino, dst_ino);
+        }
+        // Re-mounting a destination that already exists exercises the copy
+        // fallback (the hard link fails on the existing path) and stays correct.
+        assert!(s.mount_blob("src", "dst", &d).await.unwrap());
+        assert_eq!(s.read_blob("dst", &d).await.unwrap(), data);
+        // Absent source → Ok(false) (caller falls back to a session).
+        let absent = sha256_of(b"never-stored");
+        assert!(!s.mount_blob("src", "dst", &absent).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn finish_upload_promotes_staging_without_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        // A ~1 MiB blob pushed in two chunks, then finished.
+        let data = vec![0x5au8; 1024 * 1024];
+        let d = sha256_of(&data);
+        let id = s.begin_upload("r").await.unwrap();
+        s.append_upload("r", &id, &data[..512 * 1024])
+            .await
+            .unwrap();
+        s.append_upload("r", &id, &data[512 * 1024..])
+            .await
+            .unwrap();
+        s.finish_upload("r", &id, &d).await.unwrap();
+        // Content is retrievable byte-identical, the staging file is gone, and
+        // the CAS file exists (promotion happened in place, no buffering leak).
+        assert_eq!(s.read_blob("r", &d).await.unwrap(), data);
+        assert!(!tokio::fs::try_exists(s.upload_path("r", &id).unwrap())
+            .await
+            .unwrap());
+        assert!(tokio::fs::try_exists(s.blob_path("r", &d).unwrap())
+            .await
+            .unwrap());
+        // A finish whose bytes do not hash to the declared digest is rejected
+        // and drops the staging file.
+        let id2 = s.begin_upload("r").await.unwrap();
+        s.append_upload("r", &id2, b"mismatch").await.unwrap();
+        assert!(matches!(
+            s.finish_upload("r", &id2, &d).await,
+            Err(StorageError::DigestMismatch { .. })
+        ));
+        assert!(!tokio::fs::try_exists(s.upload_path("r", &id2).unwrap())
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn backrefs_track_referenced_blobs_across_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let b1 = sha256_of(b"blob-1");
+        let b2 = sha256_of(b"blob-2");
+        let manifest = sha256_of(b"the-manifest");
+        // Store the manifest blob then record its backrefs (mirrors the core).
+        s.put_manifest(
+            "r",
+            None,
+            &manifest,
+            "application/vnd.oci.image.manifest.v1+json",
+            b"the-manifest",
+        )
+        .await
+        .unwrap();
+        s.record_backrefs("r", &manifest, &[b1.clone(), b2.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            s.backrefs("r", &b1).await.unwrap(),
+            vec![manifest.as_string()]
+        );
+        assert_eq!(
+            s.backrefs("r", &b2).await.unwrap(),
+            vec![manifest.as_string()]
+        );
+        // Deleting the manifest clears its edges from every referenced blob.
+        s.delete_manifest("r", &manifest).await.unwrap();
+        assert!(s.backrefs("r", &b1).await.unwrap().is_empty());
+        assert!(s.backrefs("r", &b2).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn abort_upload_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let id = s.begin_upload("r").await.unwrap();
+        // First abort removes the staging file; a second is a no-op Ok(false).
+        assert!(s.abort_upload("r", &id).await.unwrap());
+        assert!(!s.abort_upload("r", &id).await.unwrap());
     }
 }

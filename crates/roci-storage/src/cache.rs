@@ -62,6 +62,12 @@ impl SmallBlobCache {
         }
     }
 
+    /// The maximum cacheable blob size (bytes). A caller streaming a blob from
+    /// disk uses this to avoid buffering a large blob purely to warm the cache.
+    pub fn threshold(&self) -> usize {
+        self.threshold
+    }
+
     /// Return the cached bytes for `(repo, digest)`, marking it most-recently
     /// used, or `None` on a miss.
     pub fn get(&self, repo: &str, digest: &str) -> Option<Arc<[u8]>> {

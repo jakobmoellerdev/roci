@@ -54,7 +54,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 ## Storage
 
 - [ ] Online, O(garbage) garbage collection (grace-period, backref index; never offline)
-- [ ] Copy-on-write (reflink) deduplication across repos, hard-link fallback
+- [~] Copy-on-write (reflink) deduplication across repos, hard-link fallback
 - [ ] Data scrubbing (CRC32C staggered, FS-scrub offload, BLAKE3 escalation)
 - [ ] Serve multiple storage paths (and backends) from a single server
 - [ ] Per-repo / per-total storage quotas

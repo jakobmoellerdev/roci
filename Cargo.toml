@@ -57,6 +57,7 @@ tempfile = "3"
 xorf = "0.13"
 cuckoofilter = "0.5"
 lru = "0.18"
+getrandom = "0.4"
 
 [profile.ci]
 inherits = "dev"

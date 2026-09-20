@@ -110,6 +110,9 @@ impl ApiError {
     pub fn manifest_invalid(message: impl Into<String>) -> Self {
         ApiError::new(ErrorCode::ManifestInvalid, message)
     }
+    pub fn manifest_blob_unknown(message: impl Into<String>) -> Self {
+        ApiError::new(ErrorCode::ManifestBlobUnknown, message)
+    }
     pub fn manifest_unknown() -> Self {
         ApiError::new(ErrorCode::ManifestUnknown, "manifest unknown to registry")
     }
