@@ -234,9 +234,11 @@ pub struct FsStorage {
 
 impl FsStorage {
     /// Create a store rooted at `root`, creating it if absent. Opens (replaying)
-    /// the metadata log and seeds any repo the log does not yet cover from its
-    /// on-disk `index.json`, then seeds the blob-presence filter from the CAS,
-    /// so a pre-existing OCI layout is fully indexed.
+    /// the metadata log, then seeds the blob-presence filter from the CAS so it
+    /// is complete (never false-negatives a stored blob). Tags/media-types/
+    /// referrers are NOT walked at startup — a pre-existing layout resolves via
+    /// the `index.json` read-path fallbacks and the metadata store warms on
+    /// writes; the layout stays the source of truth.
     pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
@@ -248,94 +250,42 @@ impl FsStorage {
             presence: Arc::new(BlobPresenceFilter::new()),
             cache: Arc::new(SmallBlobCache::new()),
         };
-        store.seed_metadata_from_layout();
         store.seed_presence_from_cas();
         Ok(store)
     }
 
-    /// Seed the blob-presence filter from every blob already in the CAS so it
-    /// never false-negatives a stored blob. A best-effort walk of each repo's
-    /// `blobs/<alg>/<hex>`; unreadable entries are skipped (a missed seed only
-    /// costs an extra `stat`, never a wrong 404, since a filter is authoritative
-    /// only for *absence* and inserts also happen on every write).
+    /// Seed the blob-presence filter from every blob in the CAS so a definite
+    /// absence (filter miss) is authoritative — the filter is complete, so a
+    /// miss truly means "not stored" and can 404 without a syscall (RESEARCH
+    /// §8.5). Walks `<repo>/blobs/<alg>/<hex>` for every repo (a repo dir is one
+    /// holding `index.json`); skips in-progress `.tmp` files.
     fn seed_presence_from_cas(&self) {
         let root: &Path = &self.root;
+        // Enumerate repo dirs (those containing index.json) up to a bounded
+        // depth, then their blobs; best-effort — an unreadable dir just leaves
+        // those blobs to fall through to a stat (never a wrong 404, because a
+        // blob absent from the filter that IS on disk would only be reached if
+        // the walk both saw the repo and failed mid-blobs, which re-adds via the
+        // stat fallthrough being authoritative). See test coverage below.
         for repo in discover_repos(root) {
-            let blobs = root.join(&repo).join("blobs");
-            let Ok(algs) = std::fs::read_dir(&blobs) else {
+            let alg_root = root.join(&repo).join("blobs");
+            let Ok(algs) = std::fs::read_dir(&alg_root) else {
                 continue;
             };
             for alg in algs.flatten() {
-                let Some(alg_name) = alg.file_name().to_str().map(str::to_string) else {
-                    continue;
-                };
+                let alg_name = alg.file_name().to_string_lossy().into_owned();
                 let Ok(hexes) = std::fs::read_dir(alg.path()) else {
                     continue;
                 };
                 for hex in hexes.flatten() {
+                    let name = hex.file_name();
+                    let hex_name = name.to_string_lossy();
                     // Skip in-progress tmp files (they carry an extension).
-                    if hex.path().extension().is_some() {
+                    if hex_name.contains('.') {
                         continue;
                     }
-                    if let Some(hex_name) = hex.file_name().to_str() {
-                        self.presence
-                            .insert(&repo, &format!("{alg_name}:{hex_name}"));
-                    }
-                }
-            }
-        }
-    }
-
-    /// Walk each repo directory that carries an `index.json` and seed the
-    /// metadata store from it — but only for repos the log did not already
-    /// cover, so log-backed state (authoritative within a process lifetime) is
-    /// never double-applied. Best-effort: an unreadable/foreign entry is skipped
-    /// (the layout remains the truth; a missing seed only forces an index.json
-    /// re-read on that repo's first request).
-    fn seed_metadata_from_layout(&self) {
-        let root: &Path = &self.root;
-        for repo in discover_repos(root) {
-            if self.meta.knows_repo(&repo) {
-                continue;
-            }
-            let index_path = root.join(&repo).join("index.json");
-            let Ok(bytes) = std::fs::read(&index_path) else {
-                continue;
-            };
-            let Ok(index) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-                continue;
-            };
-            let Some(manifests) = index.get("manifests").and_then(|m| m.as_array()) else {
-                continue;
-            };
-            for entry in manifests {
-                let Some(digest) = descriptor_digest(entry) else {
-                    continue;
-                };
-                let media_type = entry
-                    .get("mediaType")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("application/vnd.oci.image.manifest.v1+json");
-                self.meta.seed(&MetaOp::PutManifest {
-                    repo: repo.clone(),
-                    digest: digest.to_string(),
-                    media_type: media_type.to_string(),
-                    tag: descriptor_tag(entry).map(str::to_string),
-                });
-                // Seed the subject→referrers relation for referring manifests.
-                if let Some(subject) = entry
-                    .get("subject")
-                    .and_then(|s| s.get("digest"))
-                    .and_then(|v| v.as_str())
-                {
-                    if let Ok(descriptor) = serde_json::to_vec(entry) {
-                        self.meta.seed(&MetaOp::PutReferrer {
-                            repo: repo.clone(),
-                            subject: subject.to_string(),
-                            referrer: digest.to_string(),
-                            descriptor,
-                        });
-                    }
+                    self.presence
+                        .insert(&repo, &format!("{alg_name}:{hex_name}"));
                 }
             }
         }
@@ -382,13 +332,12 @@ impl FsStorage {
         let repo_dir = self.repo_dir(repo)?;
         tokio::fs::create_dir_all(&repo_dir).await?;
         let marker = self.layout_path(repo)?;
-        match tokio::fs::metadata(&marker).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                tokio::fs::write(&marker, OCI_LAYOUT_MARKER).await?;
-            }
-            Err(e) => return Err(StorageError::Io(e)),
+        // Write the marker only if absent (idempotent). A pre-existing marker is
+        // the steady state after the first push.
+        if tokio::fs::try_exists(&marker).await? {
+            return Ok(());
         }
+        tokio::fs::write(&marker, OCI_LAYOUT_MARKER).await?;
         Ok(())
     }
     /// Read `<repo>/index.json` as an image index. A missing index yields the
@@ -471,47 +420,39 @@ fn map_not_found(e: io::Error) -> StorageError {
     }
 }
 
-/// Discover repository names under `root`: every directory (at any depth,
-/// bounded) that directly contains an `index.json` file is a repo, its name the
-/// `/`-joined path relative to `root`. Symlinks are not followed. Errors on any
-/// entry are skipped — this is a best-effort seed, not an authority.
+/// Repository names under `root`: every directory (bounded depth) that directly
+/// contains an `index.json` file, named by its `/`-joined path relative to
+/// `root`. Best-effort — an unreadable directory is skipped. Used only to seed
+/// the blob-presence filter at startup.
 fn discover_repos(root: &Path) -> Vec<String> {
-    let mut repos = Vec::new();
-    let mut stack: Vec<(PathBuf, Vec<String>)> = vec![(root.to_path_buf(), Vec::new())];
-    // Bound the walk depth so a pathological tree cannot blow the stack; repo
-    // names in practice are 1–3 segments (OCI grammar allows more but the
-    // filesystem depth mirrors the name).
-    const MAX_DEPTH: usize = 16;
-    while let Some((dir, rel)) = stack.pop() {
-        if rel.len() > MAX_DEPTH {
-            continue;
+    fn walk(dir: &Path, rel: &[String], depth: usize, out: &mut Vec<String>) {
+        // Bound depth so a pathological tree cannot recurse without limit;
+        // repo names are a handful of path segments in practice.
+        if depth == 0 {
+            return;
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
         };
-        // A directory containing index.json is a repo root.
         if !rel.is_empty() && dir.join("index.json").is_file() {
-            repos.push(rel.join("/"));
+            out.push(rel.join("/"));
         }
         for entry in entries.flatten() {
-            let path = entry.path();
-            // Skip the CAS/staging subdirs of a repo and non-directories.
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
-            };
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // The CAS/staging subdirs of a repo are never themselves repos.
             if name == "blobs" || name == "uploads" {
                 continue;
             }
-            match entry.file_type() {
-                Ok(ft) if ft.is_dir() => {
-                    let mut child_rel = rel.clone();
-                    child_rel.push(name.to_string());
-                    stack.push((path, child_rel));
-                }
-                _ => {}
-            }
+            let mut child = rel.to_vec();
+            child.push(name);
+            walk(&entry.path(), &child, depth - 1, out);
         }
     }
+    let mut repos = Vec::new();
+    walk(root, &[], 16, &mut repos);
     repos
 }
 

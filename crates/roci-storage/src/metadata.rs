@@ -139,22 +139,6 @@ impl LogMetadataStore {
             }
         }
     }
-
-    /// Apply a mutation to the in-RAM maps **without** logging it — used to
-    /// seed the store from an existing layout (`index.json`) at startup, where
-    /// the layout, not the log, is the source of the fact.
-    pub fn seed(&self, op: &MetaOp) {
-        let mut state = self.inner.lock().expect("metadata lock poisoned");
-        Self::apply_in_ram(&mut state, op);
-    }
-
-    /// Whether the store already holds any tag or manifest media type for a
-    /// repo — used to skip a layout re-seed for repos the log already covers.
-    pub fn knows_repo(&self, repo: &str) -> bool {
-        let state = self.inner.lock().expect("metadata lock poisoned");
-        state.tags.keys().any(|(r, _)| r == repo)
-            || state.media_types.keys().any(|(r, _)| r == repo)
-    }
 }
 
 impl MetadataStore for LogMetadataStore {

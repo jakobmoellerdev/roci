@@ -447,42 +447,46 @@ async fn get_blob<S: Storage>(
         resp_headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
         return (StatusCode::OK, resp_headers).into_response();
     }
-    // GET: open the file and stream it (never buffer the whole blob). Size is
-    // read by seeking to the end and back — a seek on a regular file cannot
-    // fail, so no separate stat is needed.
-    let mut file = match st.storage.open_blob(repo, d).await {
-        Ok(f) => f,
-        Err(StorageError::NotFound) => return ApiError::blob_unknown().into_response(),
-        Err(e) => return map_storage_err(e),
-    };
-    let size = match file.seek(std::io::SeekFrom::End(0)).await {
-        Ok(s) => s,
-        Err(e) => return map_storage_err(StorageError::Io(e)),
-    };
-    if let Err(e) = file.rewind().await {
-        return map_storage_err(StorageError::Io(e));
+    // GET: build the (possibly ranged) streamed body. Every IO step funnels its
+    // error through `?` into the single match below, so there are no separate
+    // unreachable error arms for the infallible-on-a-regular-file seek/stat.
+    match blob_get_body(st, repo, d, &digest_str, headers).await {
+        Ok(resp) => resp,
+        Err(StorageError::NotFound) => ApiError::blob_unknown().into_response(),
+        Err(e) => map_storage_err(e),
     }
+}
+
+/// Open the blob and produce its GET response — full `200`, ranged `206`, or
+/// `416` — streaming the file. All IO errors propagate to the caller's single
+/// error mapping (a missing blob is `NotFound`).
+async fn blob_get_body<S: Storage>(
+    st: &AppState<S>,
+    repo: &str,
+    d: &Digest,
+    digest_str: &str,
+    headers: &HeaderMap,
+) -> Result<Response, StorageError> {
+    let mut file = st.storage.open_blob(repo, d).await?;
+    let size = file.metadata().await?.len();
     match parse_byte_range(headers, size) {
         RangeOutcome::Full => {
-            let mut resp_headers = blob_headers(&digest_str);
+            let mut resp_headers = blob_headers(digest_str);
             resp_headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
             let body = Body::from_stream(ReaderStream::new(file));
-            (StatusCode::OK, resp_headers, body).into_response()
+            Ok((StatusCode::OK, resp_headers, body).into_response())
         }
         RangeOutcome::Partial { start, end } => {
-            match file.seek(std::io::SeekFrom::Start(start)).await {
-                Ok(_) => {}
-                Err(e) => return map_storage_err(StorageError::Io(e)),
-            }
+            file.seek(std::io::SeekFrom::Start(start)).await?;
             let len = end - start + 1;
-            let mut resp_headers = blob_headers(&digest_str);
+            let mut resp_headers = blob_headers(digest_str);
             resp_headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
             resp_headers.insert(
                 header::CONTENT_RANGE,
                 HeaderValue::from_str(&format!("bytes {start}-{end}/{size}")).unwrap(),
             );
             let body = Body::from_stream(ReaderStream::new(file.take(len)));
-            (StatusCode::PARTIAL_CONTENT, resp_headers, body).into_response()
+            Ok((StatusCode::PARTIAL_CONTENT, resp_headers, body).into_response())
         }
         RangeOutcome::Unsatisfiable => {
             let mut resp_headers = HeaderMap::new();
@@ -491,7 +495,7 @@ async fn get_blob<S: Storage>(
                 header::CONTENT_RANGE,
                 HeaderValue::from_str(&format!("bytes */{size}")).unwrap(),
             );
-            (StatusCode::RANGE_NOT_SATISFIABLE, resp_headers).into_response()
+            Ok((StatusCode::RANGE_NOT_SATISFIABLE, resp_headers).into_response())
         }
     }
 }
