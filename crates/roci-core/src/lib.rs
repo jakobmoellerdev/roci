@@ -753,13 +753,12 @@ async fn put_manifest<S: Storage>(
     }
 
     // Record the reverse edges blob→manifest for the referenced blobs so a
-    // future GC can reclaim a blob when its last manifest is deleted. A failure
-    // here is non-fatal to the push (the index is the source of truth) but is
-    // surfaced as 500 for now so a broken metadata log is not silent.
+    // future GC can reclaim a blob when its last manifest is deleted. The
+    // backref index is a derived, rebuildable-from-the-layout cache (never the
+    // source of truth), so a failed append must not fail an otherwise-valid
+    // push — the edges are reconstructable by walking the manifest.
     if !referenced.is_empty() {
-        if let Err(e) = st.storage.record_backrefs(repo, &digest, &referenced).await {
-            return map_storage_err(e);
-        }
+        let _ = st.storage.record_backrefs(repo, &digest, &referenced).await;
     }
 
     if let Some(subject) = subject_digest.as_ref() {
@@ -3314,5 +3313,138 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn finish_upload_over_session_cap_is_413() {
+        let (app, _d) = app_tiny_upload(4);
+        // Open a session, then a monolithic PUT whose trailing body exceeds the
+        // 4-byte session cap → 413 SIZE_INVALID (the finish-path cap branch).
+        let start = app
+            .clone()
+            .oneshot(
+                HttpRequest::post("/v2/r/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let loc = start
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let d = sha256_of(b"too many bytes");
+        let resp = app
+            .oneshot(
+                HttpRequest::put(format!("{loc}?digest={}", d.as_string()))
+                    .body(Body::from("too many bytes"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(v["errors"][0]["code"], "SIZE_INVALID");
+    }
+
+    #[tokio::test]
+    async fn manifest_malformed_referenced_digests_are_manifest_invalid() {
+        let (app, _d) = app();
+        // A malformed config digest → MANIFEST_INVALID.
+        let bad_config = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": "sha256:notavaliddigest", "size": 1 }
+        });
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v1")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .body(Body::from(serde_json::to_vec(&bad_config).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
+        // A malformed layer digest → MANIFEST_INVALID.
+        let bad_layer = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "layers": [ { "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:zzzz", "size": 1 } ]
+        });
+        let v = body_json_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v2")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .body(Body::from(serde_json::to_vec(&bad_layer).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["errors"][0]["code"], "MANIFEST_INVALID");
+        // A layer entry with no `digest` field is skipped (not a blob to check),
+        // so a manifest carrying only such an entry is accepted.
+        let no_digest_layer = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "layers": [ { "mediaType": "application/vnd.oci.image.layer.v1.tar", "size": 0 } ]
+        });
+        let resp = app
+            .oneshot(
+                HttpRequest::put("/v2/r/manifests/v3")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "application/vnd.oci.image.manifest.v1+json",
+                    )
+                    .body(Body::from(serde_json::to_vec(&no_digest_layer).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manifest_blob_existence_io_error_is_500() {
+        // A referenced blob that is present (so the presence filter waves it
+        // through to the filesystem) but whose CAS directory is unreadable
+        // yields a non-NotFound IO error from blob_exists → 500.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path()).unwrap();
+        let cfg_data = b"cfg";
+        let cfg = sha256_of(cfg_data);
+        storage.put_blob("r", &cfg, cfg_data).await.unwrap();
+        let app = build_router(AppState::new(storage));
+        let alg_dir = dir.path().join("r").join("blobs").join("sha256");
+        std::fs::set_permissions(&alg_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": cfg.as_string(), "size": 3 }
+        });
+        let status = status_of(
+            &app,
+            HttpRequest::put("/v2/r/manifests/v1")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .body(Body::from(serde_json::to_vec(&manifest).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        // Restore perms so the tempdir cleans up.
+        std::fs::set_permissions(&alg_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

@@ -1832,4 +1832,25 @@ mod tests {
         assert!(s.abort_upload("r", &id).await.unwrap());
         assert!(!s.abort_upload("r", &id).await.unwrap());
     }
+
+    #[tokio::test]
+    async fn finish_upload_honors_sha512_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let data = b"sha512-streamed-blob";
+        // A sha512 upload exercises the sha512 branch of the streaming hasher.
+        let d = digest_of(data, "sha512");
+        assert_eq!(d.algorithm(), "sha512");
+        let id = s.begin_upload("r").await.unwrap();
+        s.append_upload("r", &id, data).await.unwrap();
+        s.finish_upload("r", &id, &d).await.unwrap();
+        assert_eq!(s.read_blob("r", &d).await.unwrap(), data);
+        // A sha512 mismatch is rejected by the streamed verify.
+        let id2 = s.begin_upload("r").await.unwrap();
+        s.append_upload("r", &id2, b"different").await.unwrap();
+        assert!(matches!(
+            s.finish_upload("r", &id2, &d).await,
+            Err(StorageError::DigestMismatch { .. })
+        ));
+    }
 }

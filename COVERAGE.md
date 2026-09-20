@@ -6,7 +6,7 @@ at least once (lcov), excluding the thin binary entrypoint
 `crates/roci-cli/src/main.rs` (a `#[tokio::main]` shim over the fully-covered
 library).
 
-Current line coverage: **100.00%** (5961/5961 lines).
+Current line coverage: **100.00%** (6076/6076 lines).
 
 Regenerate with `just coverage` (or on every commit via the pre-commit hook).
 Inspect region-level gaps with `just coverage-report`.
@@ -19,7 +19,7 @@ roci-cli/src/main.rs                  17                 0   100.00%           4
 roci-cluster/src/lib.rs                3                 0   100.00%           1                 0   100.00%           3                 0   100.00%           0                 0         -
 roci-config/src/lib.rs                22                 0   100.00%           4                 0   100.00%          17                 0   100.00%           0                 0         -
 roci-core/src/error.rs               376                 0   100.00%          34                 0   100.00%         256                 0   100.00%           0                 0         -
-roci-core/src/lib.rs               18217                42    99.77%         897                 0   100.00%       11696                10    99.91%           0                 0         -
+roci-core/src/lib.rs               18377                25    99.86%         901                 0   100.00%       11812                 3    99.97%           0                 0         -
 roci-core/src/names.rs               156                 0   100.00%          13                 0   100.00%         111                 0   100.00%           0                 0         -
 roci-ext-scan/src/lib.rs               3                 0   100.00%           1                 0   100.00%           3                 0   100.00%           0                 0         -
 roci-ext-search/src/lib.rs             3                 0   100.00%           1                 0   100.00%           3                 0   100.00%           0                 0         -
@@ -28,9 +28,9 @@ roci-ext-sync/src/lib.rs               3                 0   100.00%           1
 roci-storage-s3/src/lib.rs             3                 0   100.00%           1                 0   100.00%           3                 0   100.00%           0                 0         -
 roci-storage/src/cache.rs            579                 0   100.00%          25                 0   100.00%         197                 0   100.00%           0                 0         -
 roci-storage/src/filter.rs           169                 0   100.00%          12                 0   100.00%          83                 0   100.00%           0                 0         -
-roci-storage/src/lib.rs             9164               427    95.34%         578                24    95.85%        4277                46    98.92%           0                 0         -
+roci-storage/src/lib.rs             9227               411    95.55%         580                24    95.86%        4297                36    99.16%           0                 0         -
 roci-storage/src/metadata.rs        1531                27    98.24%          70                 0   100.00%         727                 1    99.86%           0                 0         -
 roci-telemetry/src/lib.rs             46                 0   100.00%           8                 0   100.00%          31                 0   100.00%           0                 0         -
 --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-TOTAL                              30457               501    98.36%        1666                25    98.50%       17531                58    99.67%           0                 0         -
+TOTAL                              30680               468    98.47%        1672                25    98.50%       17667                41    99.77%           0                 0         -
 ```
