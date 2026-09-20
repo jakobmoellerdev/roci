@@ -2611,6 +2611,18 @@ mod tests {
         FORCE_REFLINK_OK.store(false, Ordering::Relaxed);
     }
 
+    // publish_bytes surfaces a genuine linkat failure (not EEXIST): linking the
+    // O_TMPFILE inode to a dest whose parent directory does not exist fails with
+    // ENOENT, which must propagate rather than be swallowed as dedup success.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn publish_bytes_propagates_linkat_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let alg_dir = dir.path().to_path_buf();
+        let err = publish_bytes(&alg_dir, &dest, b"x").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn finish_rejects_non_regular_staging_file() {
