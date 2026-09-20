@@ -1,0 +1,90 @@
+name: filesystems
+
+# Run the roci-storage suite on real ext4 / btrfs / XFS filesystems. The single
+# overlay/ext4 filesystem the other jobs run on only exercises one set of the
+# storage fast-path branches; reflink (FICLONE) genuinely succeeds on btrfs/XFS
+# and genuinely fails on ext4, hard links / O_TMPFILE / the copy fallback vary,
+# and those differences are otherwise only simulated by the #[cfg(test)] FORCE_*
+# seams. This job makes a loopback image of each filesystem, mounts it, and runs
+# the suite with TMPDIR on the mount so FsStorage exercises the real syscall
+# behavior of that filesystem.
+#
+# Fork-safe like the other CI jobs: default-deny read-only token, no secrets. It
+# uses passwordless sudo (available on GitHub-hosted runners) only to mkfs/mount
+# loopback images; the tests themselves run as the unprivileged runner user so
+# the chmod-000 permission fixtures behave.
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: filesystems-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  filesystems:
+    name: storage suite on ${{ matrix.fs }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fs: [ext4, btrfs, xfs]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: filesystems
+      - name: Install filesystem tools + nextest
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends btrfs-progs xfsprogs
+          cargo install cargo-nextest --locked
+
+      - name: Create, mount, and run the suite on ${{ matrix.fs }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          fs='${{ matrix.fs }}'
+          # btrfs/XFS need a larger minimum image than ext4.
+          case "$fs" in
+            ext4)  mb=128 ;;
+            btrfs) mb=320 ;;
+            xfs)   mb=320 ;;
+          esac
+          img="$(mktemp)"
+          mnt="$(mktemp -d)"
+          dd if=/dev/zero of="$img" bs=1M count="$mb" status=none
+          case "$fs" in
+            ext4)  mkfs.ext4  -q -F "$img" ;;
+            btrfs) mkfs.btrfs -q -f "$img" ;;
+            xfs)   mkfs.xfs   -q -f "$img" ;;
+          esac
+          sudo mount -o loop "$img" "$mnt"
+          sudo chown "$(id -u):$(id -g)" "$mnt"
+          echo "mounted $(findmnt -no FSTYPE "$mnt") at $mnt"
+          # Confirm the filesystem's reflink capability matches expectation so a
+          # green run proves the reflink path (btrfs/XFS) vs fallback (ext4) was
+          # actually taken.
+          echo seed > "$mnt/reflink-probe-src"
+          if cp --reflink=always "$mnt/reflink-probe-src" "$mnt/reflink-probe-dst" 2>/dev/null; then
+            reflink=supported
+          else
+            reflink=unsupported
+          fi
+          echo "$fs: reflink $reflink"
+          case "$fs" in
+            btrfs|xfs) [ "$reflink" = supported ]   || { echo "$fs unexpectedly lacks reflink"; exit 1; } ;;
+            ext4)      [ "$reflink" = unsupported ] || echo "note: ext4 reports reflink (kernel-dependent); fallback still valid" ;;
+          esac
+          # Run the storage suite rooted on the mounted filesystem.
+          TMPDIR="$mnt" cargo nextest run -p roci-storage --all-features
+          sudo umount "$mnt"

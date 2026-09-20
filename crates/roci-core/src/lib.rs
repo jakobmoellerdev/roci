@@ -1035,16 +1035,14 @@ async fn finish_upload<S: Storage>(
         Ok(b) => b,
         Err(resp) => return *resp,
     };
-    if !body.is_empty() {
-        // Append the trailing chunk; the per-session cap is enforced
-        // authoritatively inside finish_upload under the session lock (below),
-        // so a chunk that pushes the session over the cap is rejected there —
-        // no separate, race-prone check here.
-        if let Err(e) = st.storage.append_upload(repo, id, &body, None).await {
-            return map_storage_err(e);
-        }
-    }
-    match st.storage.finish_upload(repo, id, &d, st.max_upload).await {
+    // Hand the trailing body to finish_upload so the append and the
+    // verify+promote happen under one session-lock hold — a concurrent PATCH
+    // cannot inject bytes between them. The per-session cap is enforced there.
+    match st
+        .storage
+        .finish_upload(repo, id, &d, st.max_upload, &body)
+        .await
+    {
         Ok(()) => {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -2693,9 +2691,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn patch_upload_size_error_is_500() {
-        // `<repo>/uploads` is a file, so upload_size for any session id errors
-        // (NotADirectory) rather than NotFound → 500.
+    async fn patch_upload_missing_session_is_404() {
+        // `<repo>/uploads` is a regular file, so the no-follow beneath-root
+        // resolver cannot open a staging file under it (`ENOTDIR`) — the session
+        // does not exist, which is a 404 (BLOB_UPLOAD_UNKNOWN), not a 500. The
+        // resolver refuses to distinguish a broken store from a symlink attack:
+        // both mean "no valid session here".
         let (app, _d) = app_broken_uploads();
         assert_eq!(
             status_of(
@@ -2705,7 +2706,7 @@ mod tests {
                     .unwrap()
             )
             .await,
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::NOT_FOUND
         );
     }
 
