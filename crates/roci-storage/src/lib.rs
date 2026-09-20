@@ -758,7 +758,6 @@ async fn copy_file_atomic(src: &Path, dest: &Path) -> io::Result<()> {
 /// worker. Other platforms stream via tokio.
 #[cfg(target_os = "linux")]
 async fn copy_contents(input: &tokio::fs::File, output: &tokio::fs::File) -> io::Result<()> {
-    use rustix::io::Errno;
     use std::os::fd::AsFd;
     let total = input.metadata().await?.len() as usize;
     let inf = input.as_fd().try_clone_to_owned()?;
@@ -766,27 +765,23 @@ async fn copy_contents(input: &tokio::fs::File, output: &tokio::fs::File) -> io:
     tokio::task::spawn_blocking(move || -> io::Result<()> {
         let mut infile = std::fs::File::from(inf);
         let mut outfile = std::fs::File::from(outf);
-        // Whole-file reflink first: instant CoW extent share on btrfs/XFS.
-        // "Not supported here" errors fall through to the byte copy.
-        match rustix::fs::ioctl_ficlone(&outfile, &infile) {
-            Ok(()) => return Ok(()),
-            Err(Errno::OPNOTSUPP | Errno::NOTTY | Errno::XDEV | Errno::INVAL | Errno::BADF) => {}
-            Err(e) => return Err(io::Error::from(e)),
-        }
-        // In-kernel copy_file_range next. On EXDEV (cross-device — the very
-        // case a failed hard link hits) or an unsupported syscall/filesystem,
-        // fall back to a streaming read/write loop.
-        let mut remaining = total;
-        loop {
-            match rustix::fs::copy_file_range(&infile, None, &outfile, None, remaining) {
-                Ok(0) => return Ok(()),
-                Ok(n) => remaining -= n,
-                Err(Errno::XDEV | Errno::NOSYS | Errno::OPNOTSUPP | Errno::INVAL) => {
-                    return stream_copy(&mut infile, &mut outfile);
+        // Whole-file reflink first: instant CoW extent share on btrfs/XFS. On
+        // any failure (unsupported fs, cross-device) fall through to the byte
+        // copy, which covers those cases.
+        if rustix::fs::ioctl_ficlone(&outfile, &infile).is_err() {
+            // In-kernel copy_file_range next (server-side on NFS, in-kernel on
+            // ext4). A recoverable failure (cross-device EXDEV, unsupported
+            // syscall/fs) falls back to a streaming loop that always works.
+            let mut remaining = total;
+            while remaining > 0 {
+                match rustix::fs::copy_file_range(&infile, None, &outfile, None, remaining) {
+                    Ok(0) => break,
+                    Ok(n) => remaining -= n,
+                    Err(_) => return stream_copy(&mut infile, &mut outfile),
                 }
-                Err(e) => return Err(io::Error::from(e)),
             }
         }
+        Ok(())
     })
     .await
     .map_err(io::Error::other)?
@@ -2570,5 +2565,51 @@ mod tests {
             s.finish_upload("r", "linksess", &d, u64::MAX).await,
             Err(StorageError::BadPath(_))
         ));
+    }
+
+    // stream_copy is the portable fallback the in-kernel copy path uses on a
+    // cross-device/unsupported-fs mount. Exercise it directly: it rewinds and
+    // truncates the destination (dropping any partial kernel copy) and streams
+    // the full source across.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stream_copy_rewinds_truncates_and_copies() {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("src");
+        let dst_path = dir.path().join("dst");
+        let payload = vec![0x42u8; 70000];
+        std::fs::write(&src_path, &payload).unwrap();
+        // Pre-seed the destination with stale bytes + a stale cursor to prove
+        // stream_copy truncates and rewinds rather than appending.
+        let mut dst = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dst_path)
+            .unwrap();
+        dst.write_all(b"stale-tail-that-must-be-dropped").unwrap();
+        dst.seek(SeekFrom::End(0)).unwrap();
+        let mut src = std::fs::File::open(&src_path).unwrap();
+        super::stream_copy(&mut src, &mut dst).unwrap();
+        let mut out = Vec::new();
+        let mut check = std::fs::File::open(&dst_path).unwrap();
+        check.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
+    }
+
+    // Pushing the identical blob twice is idempotent dedup: on Linux the second
+    // put's `linkat` hits `EEXIST` (the content-addressed name already exists)
+    // and is treated as success; the bytes remain correct.
+    #[tokio::test]
+    async fn put_blob_same_digest_twice_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let data = b"dedup-me";
+        let d = sha256_of(data);
+        s.put_blob("r", &d, data).await.unwrap();
+        s.put_blob("r", &d, data).await.unwrap();
+        assert_eq!(s.read_blob("r", &d).await.unwrap(), data);
     }
 }

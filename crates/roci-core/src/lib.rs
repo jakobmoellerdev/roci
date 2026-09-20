@@ -1036,14 +1036,12 @@ async fn finish_upload<S: Storage>(
         Err(resp) => return *resp,
     };
     if !body.is_empty() {
-        let total = match st.storage.append_upload(repo, id, &body, None).await {
-            Ok(t) => t,
-            Err(e) => return map_storage_err(e),
-        };
-        // A trailing chunk that pushes the session over the cap is a 413 too.
-        if total > st.max_upload {
-            let _ = st.storage.abort_upload(repo, id).await;
-            return ApiError::payload_too_large("upload exceeds maximum blob size").into_response();
+        // Append the trailing chunk; the per-session cap is enforced
+        // authoritatively inside finish_upload under the session lock (below),
+        // so a chunk that pushes the session over the cap is rejected there —
+        // no separate, race-prone check here.
+        if let Err(e) = st.storage.append_upload(repo, id, &body, None).await {
+            return map_storage_err(e);
         }
     }
     match st.storage.finish_upload(repo, id, &d, st.max_upload).await {
