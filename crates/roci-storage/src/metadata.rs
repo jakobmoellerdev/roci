@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// A tag/manifest/referrer mutation the store can record and replay.
@@ -63,9 +64,32 @@ pub trait MetadataStore: Send + Sync + 'static {
 }
 
 /// In-RAM metadata maps mirrored to an append-only CRC32C-framed log.
+///
+/// Writes are **group-committed**: the append (buffered `write` + `flush` into
+/// the kernel) happens under the fast `inner` lock and bumps `appended`; the
+/// durability barrier (`fdatasync`) is coalesced behind a separate `sync` lock,
+/// so N appends that pile up while one `fdatasync` is in flight are made
+/// durable by that single sync — a caller whose record is already covered
+/// (`synced >= my_seq`) returns without its own sync (RESEARCH §8.8, PLAN
+/// Phase 2 group-commit).
 pub struct LogMetadataStore {
     inner: Mutex<State>,
+    /// Records appended to the kernel so far (monotonic; the append seq).
+    appended: AtomicU64,
+    /// Coalesced durability barrier: the highest `appended` made durable, plus
+    /// a `fdatasync`-capable clone of the log handle.
+    sync: Mutex<SyncCoord>,
     log_path: PathBuf,
+}
+
+/// Durability-barrier state, guarded independently of `inner` so a `fdatasync`
+/// never holds the append lock.
+#[derive(Default)]
+struct SyncCoord {
+    /// Highest `appended` seq made durable by a completed `fdatasync`.
+    synced: u64,
+    /// A clone of the log file used only for `sync_data`; set on first append.
+    handle: Option<std::fs::File>,
 }
 
 /// A repo-scoped map key: `(repo, name)` so repositories stay isolated.
@@ -105,6 +129,8 @@ impl LogMetadataStore {
         }
         Ok(Self {
             inner: Mutex::new(state),
+            appended: AtomicU64::new(0),
+            sync: Mutex::new(SyncCoord::default()),
             log_path,
         })
     }
@@ -232,20 +258,54 @@ impl MetadataStore for LogMetadataStore {
     }
 
     fn apply(&self, op: MetaOp) -> io::Result<()> {
-        let record = encode(&op);
+        let my_seq = self.append_record(&op)?;
+        self.group_commit_through(my_seq)
+    }
+}
+
+impl LogMetadataStore {
+    /// Phase 1 of a group-committed apply: under the fast `inner` lock, buffer
+    /// the record into the kernel (write + flush, no fsync), update the in-RAM
+    /// maps, and return this write's monotonic sequence number. On the first
+    /// mutation, open the log and hand a `sync_data`-capable clone to the
+    /// durability coordinator.
+    fn append_record(&self, op: &MetaOp) -> io::Result<u64> {
+        let record = encode(op);
         let mut state = self.inner.lock().expect("metadata lock poisoned");
-        // Open the log lazily on first mutation (append + create).
         if state.log.is_none() {
             let f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&self.log_path)?;
+            let clone = f.try_clone()?;
             state.log = Some(f);
+            self.sync.lock().expect("sync lock poisoned").handle = Some(clone);
         }
         let log = state.log.as_mut().expect("log opened above");
         log.write_all(&record)?;
         log.flush()?;
-        Self::apply_in_ram(&mut state, &op);
+        let seq = self.appended.fetch_add(1, Ordering::AcqRel) + 1;
+        Self::apply_in_ram(&mut state, op);
+        Ok(seq)
+    }
+
+    /// Phase 2 of a group-committed apply: the coalesced durability barrier.
+    /// If a prior `fdatasync` already covered `my_seq` this returns without a
+    /// syscall; otherwise one `fdatasync` makes every append up to now durable
+    /// (the group-commit win — concurrent appends piled up during an in-flight
+    /// sync share it). N appends between two syncs cost one fsync.
+    fn group_commit_through(&self, my_seq: u64) -> io::Result<()> {
+        let mut sync = self.sync.lock().expect("sync lock poisoned");
+        if sync.synced >= my_seq {
+            return Ok(());
+        }
+        // Snapshot the append seq *before* syncing so we only claim durability
+        // for records already flushed to the kernel.
+        let covered = self.appended.load(Ordering::Acquire);
+        if let Some(handle) = sync.handle.as_ref() {
+            handle.sync_data()?;
+        }
+        sync.synced = sync.synced.max(covered);
         Ok(())
     }
 }
@@ -617,5 +677,37 @@ mod tests {
     fn deserialize_rejects_malformed_payloads() {
         assert!(deserialize_op(b"not json").is_none());
         assert!(deserialize_op(b"{\"no_op_field\":1}").is_none());
+    }
+
+    #[test]
+    fn group_commit_coalesces_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = LogMetadataStore::open(dir.path()).unwrap();
+        // Append two records without syncing between them (phase 1 only).
+        let seq1 = s.append_record(&put("r", "sha256:aa", Some("v1"))).unwrap();
+        let seq2 = s.append_record(&put("r", "sha256:bb", Some("v2"))).unwrap();
+        assert_eq!((seq1, seq2), (1, 2));
+        // One durability barrier covering seq 2 makes both records durable.
+        s.group_commit_through(seq2).unwrap();
+        // A later barrier for an already-covered seq is a no-op (the coalesced
+        // fast path: `synced >= my_seq`, no second fsync).
+        s.group_commit_through(seq1).unwrap();
+        // Both records survive a reopen (they were flushed + synced).
+        drop(s);
+        let s2 = LogMetadataStore::open(dir.path()).unwrap();
+        assert_eq!(
+            s2.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
+        assert_eq!(
+            s2.resolve_tag("r", "v2").map(|(d, _)| d).as_deref(),
+            Some("sha256:bb")
+        );
+        // The public `apply` still works end-to-end (append + immediate sync).
+        s2.apply(put("r", "sha256:cc", Some("v3"))).unwrap();
+        assert_eq!(
+            s2.resolve_tag("r", "v3").map(|(d, _)| d).as_deref(),
+            Some("sha256:cc")
+        );
     }
 }

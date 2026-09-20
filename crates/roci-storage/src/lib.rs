@@ -634,6 +634,49 @@ async fn hash_file(path: &Path, algorithm: &str) -> io::Result<Digest> {
     }
 }
 
+/// Copy `src` to `dest`, preferring an in-kernel copy. On Linux this is
+/// `copy_file_range` (btrfs/XFS reflink O(1), ext4 in-kernel copy, NFS
+/// server-side copy — no userspace byte transit; RESEARCH §8.8); elsewhere it
+/// is a plain streaming copy. Used as the mount fallback when a hard link is
+/// not possible.
+#[cfg(target_os = "linux")]
+async fn copy_file(src: &Path, dest: &Path) -> io::Result<()> {
+    let src = src.to_path_buf();
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
+        let input = std::fs::File::open(&src)?;
+        let output = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dest)?;
+        // copy_file_range may transfer fewer bytes than requested and returns 0
+        // at EOF; loop until the source is exhausted. A `len` request that the
+        // kernel satisfies in one shot still passes through the loop once.
+        let mut remaining = input.metadata()?.len() as usize;
+        loop {
+            let n = rustix::fs::copy_file_range(&input, None, &output, None, remaining)
+                .map_err(io::Error::from)?;
+            if n == 0 {
+                break;
+            }
+            remaining -= n;
+            if remaining == 0 {
+                break;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+/// Copy `src` to `dest` with a plain streaming copy (non-Linux fallback).
+#[cfg(not(target_os = "linux"))]
+async fn copy_file(src: &Path, dest: &Path) -> io::Result<()> {
+    tokio::fs::copy(src, dest).await.map(|_| ())
+}
+
 impl Storage for FsStorage {
     async fn blob_size(&self, repo: &str, digest: &Digest) -> Result<u64, StorageError> {
         // Validate the path first (the traversal backstop must run before any
@@ -1089,10 +1132,12 @@ impl Storage for FsStorage {
         // Promote by a hard link — O(1) and copy-free on one filesystem. On any
         // failure (a destination that already exists from a concurrent/repeat
         // mount, a cross-device link, or a filesystem without hard links) fall
-        // back to a byte copy; `copy` streams and overwrites, so a re-mount of
-        // identical content is harmless.
+        // back to an in-kernel copy: `copy_file_range` on Linux (btrfs/XFS
+        // reflink O(1), ext4 in-kernel, NFS server-side — no userspace transit;
+        // RESEARCH §8.8), `tokio::fs::copy` elsewhere. Both overwrite, so a
+        // re-mount of identical content is harmless.
         if tokio::fs::hard_link(&src, &dest).await.is_err() {
-            tokio::fs::copy(&src, &dest).await?;
+            copy_file(&src, &dest).await?;
         }
         let digest_str = digest.as_string();
         self.presence.insert(to_repo, &digest_str);
@@ -1750,6 +1795,13 @@ mod tests {
         // Absent source → Ok(false) (caller falls back to a session).
         let absent = sha256_of(b"never-stored");
         assert!(!s.mount_blob("src", "dst", &absent).await.unwrap());
+        // An empty blob mounted then re-mounted exercises the copy path with a
+        // zero-length source (the `n == 0` arm of the in-kernel copy loop).
+        let empty = sha256_of(b"");
+        s.put_blob("src", &empty, b"").await.unwrap();
+        assert!(s.mount_blob("src", "dst", &empty).await.unwrap());
+        assert!(s.mount_blob("src", "dst", &empty).await.unwrap());
+        assert_eq!(s.read_blob("dst", &empty).await.unwrap(), b"");
     }
 
     #[tokio::test]

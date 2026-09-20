@@ -76,7 +76,7 @@ Rules:
 
 **Goal:** accept pushes. **Push conformance passes.** Round-trip: push then pull an identical image.
 
-- [~] Extend `Storage`/`MetadataStore`: staged uploads, `put_manifest`, tag set, and a `blob → manifests` **backref index** maintained on manifest put/delete. *(WAL group-commit deferred — the metadata log flushes per-op; group-commit pays only behind a KV upgrade, RESEARCH §8.6.)*
+- [x] Extend `Storage`/`MetadataStore`: staged uploads, `put_manifest`, tag set, a `blob → manifests` **backref index** maintained on manifest put/delete, and **WAL group-commit** — the append (buffered write + flush + in-RAM apply) runs under the fast state lock while the durability `fdatasync` is coalesced behind a separate barrier, so N appends piled up during one in-flight sync share it.
 - [x] **Upload session manager:**
   - [x] `POST /v2/<name>/blobs/uploads/` (end-4a) → `202` + `Location` with a **server-generated random 128-bit id** (validated by the `SafeComponent` backstop before any path use — SECURITY inv. 8; replaces the old pid-counter scheme).
   - [x] `PATCH …/blobs/uploads/<ref>` (end-5) — chunked upload, `Content-Range`, `416` on gap; **per-session size cap** (`413`/`SIZE_INVALID`, `MAX_UPLOAD` = 5 GiB) drops the session on breach. *(`O_TMPFILE` staging deferred — staging is a named `uploads/<id>` file; portable across darwin, which lacks `O_TMPFILE`.)*
@@ -84,8 +84,8 @@ Rules:
   - [x] `GET …/blobs/uploads/<ref>` (end-13) — upload status → `204` + range.
   - [x] Monolithic single-`POST` (end-4b) and POST-then-PUT paths.
 - [x] `PUT /v2/<name>/manifests/<reference>` (end-7) — size cap + bounded JSON parse (depth), **referenced-blob existence** (config + layers → `MANIFEST_BLOB_UNKNOWN`), **`Content-Type`↔`mediaType` agreement** (CVE-2021-41190 → `MANIFEST_INVALID`), accepts a `subject` referencing an absent manifest; records the tag, referrers, and **backref** edges. *(Single-atomic-WAL-record coupling deferred with group-commit.)*
-- [~] **Deduplication:** cross-path/-repo dedup via `std::fs::hard_link` (O(1), copy-free on one filesystem) with a `tokio::fs::copy` fallback (cross-device / no-hardlink); intra-path dedup is free (same digest → same CAS file). *(`FICLONE` reflink + `O_NOFOLLOW`/`openat2 RESOLVE_BENEATH` deferred — Linux-specific; the `SafeComponent` backstop already bars traversal.)*
-- [x] Cross-repo **blob mount** (end-11) → `201` via the portable hard-link path above (no read+write roundtrip), else falls through to a `202` session. *(`copy_file_range` fast path deferred — Linux-specific; darwin lacks it. Double-authz in Phase 6.)*
+- [~] **Deduplication:** cross-path/-repo dedup via `std::fs::hard_link` (O(1), copy-free on one filesystem) with an in-kernel copy fallback — **`copy_file_range` on Linux** (btrfs/XFS reflink O(1), ext4 in-kernel, NFS server-side; no userspace transit), `tokio::fs::copy` elsewhere; intra-path dedup is free (same digest → same CAS file). *(`FICLONE` reflink + `O_NOFOLLOW`/`openat2 RESOLVE_BENEATH` deferred — their Linux-only vs. portable-fallback arms cannot both reach the 100%-Linux-coverage gate; the `SafeComponent` backstop already bars traversal.)*
+- [x] Cross-repo **blob mount** (end-11) → `201` via the hard-link path above with the `copy_file_range`/copy fallback (no read+write roundtrip), else falls through to a `202` session. *(Double-authz in Phase 6.)*
 - [~] Crash-safety: tmp/staging + `fsync` + atomic `rename` so an interrupted push never leaves a corrupt-but-named blob. *(`O_TMPFILE`+`linkat` + single-record atomic WAL deferred as the Linux fast path.)*
 
 **Correctness gate:** **Push** conformance passes. Smoke: `skopeo copy` *to* roci, then pull back → byte-identical. Resumable push (interrupt mid-chunk, resume) works.
