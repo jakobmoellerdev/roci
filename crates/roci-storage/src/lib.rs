@@ -2573,19 +2573,20 @@ mod tests {
         FORCE_COPY_FALLBACK.store(true, Ordering::Relaxed);
         // copy_file_atomic streams (reflink forced off) — bytes still land.
         let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src");
+        let src = dir.path().join("plain-src");
         let payload = vec![0x5au8; 70000];
         tokio::fs::write(&src, &payload).await.unwrap();
-        let dst = dir.path().join("dst");
+        let dst = dir.path().join("plain-dst");
         copy_file_atomic(&src, &dst).await.unwrap();
         assert_eq!(tokio::fs::read(&dst).await.unwrap(), payload);
         // mount_blob's hard link is forced to fail → copy fallback promotes.
-        let s = FsStorage::new(dir.path()).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(store.path()).unwrap();
         let data = b"mount-via-copy";
         let d = sha256_of(data);
-        s.put_blob("src", &d, data).await.unwrap();
-        assert!(s.mount_blob("src", "dst", &d).await.unwrap());
-        assert_eq!(s.read_blob("dst", &d).await.unwrap(), data);
+        s.put_blob("srcrepo", &d, data).await.unwrap();
+        assert!(s.mount_blob("srcrepo", "dstrepo", &d).await.unwrap());
+        assert_eq!(s.read_blob("dstrepo", &d).await.unwrap(), data);
         FORCE_COPY_FALLBACK.store(false, Ordering::Relaxed);
     }
 
