@@ -2619,6 +2619,7 @@ mod tests {
     async fn publish_bytes_propagates_linkat_error() {
         let dir = tempfile::tempdir().unwrap();
         let alg_dir = dir.path().to_path_buf();
+        let dest = dir.path().join("missing-subdir").join("blob");
         let err = publish_bytes(&alg_dir, &dest, b"x").await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
