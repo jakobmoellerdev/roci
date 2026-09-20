@@ -468,14 +468,11 @@ impl FsStorage {
     /// Best-effort: if the just-promoted blob is small enough, read it back
     /// (no-follow, beneath-root) and warm the small-blob cache. Any IO hiccup
     /// simply skips the warm — the loose CAS file is always the source of truth.
-    async fn warm_small_blob_cache(&self, repo: &str, digest: &Digest, digest_str: &str) {
+    async fn warm_small_blob_cache(&self, repo: &str, rel: &Path, digest_str: &str) {
         // The blob was just promoted, so it is present and regular. Read it back
         // (no-follow, beneath-root) and cache it only if small; any IO hiccup on
         // this optional warm is simply skipped (the loose CAS file is truth).
-        let Ok(rel) = self.blob_rel(repo, digest) else {
-            return;
-        };
-        let Ok(mut f) = open_beneath(&self.root, &rel).await else {
+        let Ok(mut f) = open_beneath(&self.root, rel).await else {
             return;
         };
         let threshold = self.cache.threshold();
@@ -1623,16 +1620,13 @@ impl Storage for FsStorage {
         // Record presence so future reads skip the stat on a definite miss.
         let digest_str = expected.as_string();
         self.presence.insert(repo, &digest_str);
-        // Warm the small-blob cache only for a blob small enough to be cacheable
-        // — read it back through the same no-follow beneath-root open. Reading a
-        // multi-GiB layer back to feed a cache that would reject it is the
-        // buffering this rework exists to avoid, so gate on the stat first.
-        // Warm the small-blob cache only for a blob small enough to be cacheable
-        // — read it back through the same no-follow beneath-root open. The blob
-        // was just promoted, so it is present and regular; a stat/open failure
-        // here is a genuine IO fault that simply skips the (optional) cache warm.
-        self.warm_small_blob_cache(repo, expected, &digest_str)
-            .await;
+
+        // Warm the small-blob cache for a cacheable blob: read it back through
+        // the same no-follow beneath-root open. The blob was just promoted, so a
+        // resolve failure here is a genuine IO fault that simply skips the warm.
+        if let Ok(rel) = self.blob_rel(repo, expected) {
+            self.warm_small_blob_cache(repo, &rel, &digest_str).await;
+        }
         Ok(())
     }
 
@@ -3170,6 +3164,30 @@ mod tests {
                 assert!(matches!(e, StorageError::Io(_)));
             }
         }
+    }
+
+    // Directly exercise the best-effort cache warm: an absent blob path is a
+    // no-op (open fails → skipped), and a present small blob is cached.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warm_small_blob_cache_open_error_is_noop_and_small_blob_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let d = sha256_of(b"warmable");
+        let (alg_rel, hex) = s.blob_dir_rel("r", &d).unwrap();
+        let mut rel = alg_rel.clone();
+        rel.push(&hex);
+        // (a) No blob at rel yet → open fails → warm is a no-op (nothing cached).
+        s.warm_small_blob_cache("r", &rel, &d.as_string()).await;
+        assert!(s.cache.get("r", &d.as_string()).is_none());
+        // (b) Materialise the blob, then warm → it is read back and cached.
+        s.put_blob("r", &d, b"warmable").await.unwrap();
+        s.cache.invalidate("r", &d.as_string());
+        s.warm_small_blob_cache("r", &rel, &d.as_string()).await;
+        assert_eq!(
+            s.cache.get("r", &d.as_string()).map(|b| b.to_vec()),
+            Some(b"warmable".to_vec())
+        );
     }
 
     // open_beneath rejects a non-regular final entry: a FIFO planted at a blob
