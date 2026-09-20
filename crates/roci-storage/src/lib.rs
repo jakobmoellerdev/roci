@@ -3081,17 +3081,26 @@ mod tests {
             .is_none());
     }
 
-    // publish_bytes surfaces a genuine linkat failure (not EEXIST): linking the
-    // O_TMPFILE inode to a dest whose parent directory does not exist fails with
-    // ENOENT, which must propagate rather than be swallowed as dedup success.
+    // publish_bytes rejects an EEXIST destination that is not a regular file:
+    // a symlink planted at the digest leaf (inside a valid, beneath-root alg
+    // dir) makes `linkat` return EEXIST, and the no-follow fstat then refuses it
+    // rather than reporting false dedup success.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn publish_bytes_propagates_linkat_error() {
+    async fn publish_bytes_rejects_non_regular_eexist() {
         let dir = tempfile::tempdir().unwrap();
-        let alg_dir = dir.path().to_path_buf();
-        let dest = dir.path().join("missing-subdir").join("blob");
-        let err = publish_bytes(&alg_dir, &dest, b"x").await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let s = FsStorage::new(dir.path()).unwrap();
+        let data = b"collide";
+        let d = sha256_of(data);
+        let (alg_rel, leaf) = s.blob_dir_rel("r", &d).unwrap();
+        // Materialise the alg dir and plant a symlink at the digest leaf.
+        let alg_abs = dir.path().join(&alg_rel);
+        std::fs::create_dir_all(&alg_abs).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), alg_abs.join(&leaf)).unwrap();
+        let err = publish_bytes(&s.root, &alg_rel, &leaf, data)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     }
 
     #[cfg(unix)]
