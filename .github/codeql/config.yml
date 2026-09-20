@@ -16,12 +16,15 @@ paths-ignore:
 # the fastest (security-and-quality / security-extended are slower).
 #
 # roci ships an in-repo path-injection barrier model pack at
-# `.github/codeql/extensions/roci-path-sanitizers/` (declaring
-# `SafeComponent::new` / `FsStorage::safe_component` as `path-injection`
-# barriers). It is NOT wired here yet: `packs:` resolves from GHCR (local
-# unpublished pack fails init) and `database init` rejects `--additional-packs`.
-# Activating it requires publishing the pack to GHCR (`codeql pack publish`,
-# needs `packages: write`) or seeding it into the CLI package cache via a
-# pre-init `setup-codeql` + `codeql pack create` step. Until then the generated
-# path-injection alerts are dismissed as false positives (the `SafeComponent`
-# newtype is the real, human-visible sanitizer boundary).
+# `.github/codeql/extensions/roci-path-sanitizers/` (`models/path-barriers.yml`
+# declares the `FsStorage` path-building methods' and `LogMetadataStore`'s
+# `Argument[self]` as `path-injection` barriers — their `root`/`log_path`
+# fields are fixed at construction, never attacker-controlled, so CodeQL's
+# default model spuriously taints them).
+#
+# `packs:` is intentionally NOT set here: a `packs:` entry resolves from GHCR
+# and a local unpublished pack fails `database init`. Instead the pack is loaded
+# at run-queries time by `.github/workflows/codeql.yml` via
+# `CODEQL_ACTION_EXTRA_OPTIONS` (`--additional-packs=<repo>/.github/codeql/extensions`
+# + `--model-packs=roci/path-sanitizers`). Verified locally with
+# `just codeql-local`: 0 `rust/path-injection` alerts with the pack, 41 without.

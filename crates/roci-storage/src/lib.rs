@@ -98,6 +98,8 @@ pub enum StorageError {
     BadPath(String),
     #[error("content range start {got} does not match current offset {expected}")]
     RangeNotSatisfiable { expected: u64, got: u64 },
+    #[error("upload size {actual} exceeds maximum {limit}")]
+    TooLarge { limit: u64, actual: u64 },
 }
 
 /// A resolved reference target: either a tag pointing at a manifest digest, or
@@ -180,12 +182,16 @@ pub trait Storage: Send + Sync + 'static {
         to_repo: &str,
         digest: &Digest,
     ) -> impl Future<Output = Result<bool, StorageError>> + Send;
-    /// Finalize an upload, verifying it hashes to `expected`, moving it into the CAS.
+    /// Finalize an upload, verifying it hashes to `expected` and does not exceed
+    /// `max_size` bytes (the per-session cap, re-checked here under the session
+    /// lock so a promote cannot race past the handler's append-time check), then
+    /// moving it into the CAS.
     fn finish_upload(
         &self,
         repo: &str,
         id: &str,
         expected: &Digest,
+        max_size: u64,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
     /// Store a blob given its bytes (verifies digest), used by monolithic/mount paths.
     fn put_blob(
@@ -421,7 +427,23 @@ impl FsStorage {
         if tokio::fs::try_exists(&marker).await? {
             return Ok(());
         }
+        // fsync the marker and the repo directory so a blob-only repository (only
+        // `oci-layout` + `blobs/`) is discoverable after a crash — otherwise a
+        // restart's CAS walk misses it and a valid referenced blob is reported
+        // absent (MANIFEST_BLOB_UNKNOWN). The parent (`root/<repo-parents>`)
+        // entry is persisted too so the repo path itself survives.
         tokio::fs::write(&marker, OCI_LAYOUT_MARKER).await?;
+        {
+            let f = tokio::fs::OpenOptions::new()
+                .read(true)
+                .open(&marker)
+                .await?;
+            f.sync_all().await?;
+        }
+        sync_dir(&repo_dir).await?;
+        if let Some(parent) = repo_dir.parent() {
+            sync_dir(parent).await?;
+        }
         Ok(())
     }
     /// Read `<repo>/index.json` as an image index. A missing index yields the
@@ -725,29 +747,69 @@ async fn copy_file_atomic(src: &Path, dest: &Path) -> io::Result<()> {
     sync_dir(dest.parent().unwrap_or(dest)).await
 }
 
-/// Copy all bytes from `input` to `output`. Linux uses `copy_file_range`
-/// (in-kernel, reflink-capable); other platforms stream via tokio.
+/// Copy all bytes from `input` to `output`. Linux first attempts a whole-file
+/// reflink (`FICLONE`): on btrfs/XFS/bcachefs this shares the source extents
+/// copy-on-write in O(1) with zero data transit (RESEARCH §8.8). If the
+/// filesystem cannot reflink it tries `copy_file_range` (in-kernel copy, still
+/// server-side on NFS), and if that is unsupported or crosses devices
+/// (`EXDEV`/`ENOSYS`/`EOPNOTSUPP`/`EINVAL`/`ENOTSUP`) it streams the bytes with
+/// a plain read/write loop after truncating any partial kernel copy. All of
+/// this runs on a blocking thread so a multi-GiB copy never stalls a Tokio
+/// worker. Other platforms stream via tokio.
 #[cfg(target_os = "linux")]
 async fn copy_contents(input: &tokio::fs::File, output: &tokio::fs::File) -> io::Result<()> {
+    use rustix::io::Errno;
     use std::os::fd::AsFd;
-    let mut remaining = input.metadata().await?.len() as usize;
+    let total = input.metadata().await?.len() as usize;
     let inf = input.as_fd().try_clone_to_owned()?;
     let outf = output.as_fd().try_clone_to_owned()?;
     tokio::task::spawn_blocking(move || -> io::Result<()> {
-        loop {
-            // A zero return means EOF (also the case for an empty source on the
-            // first call); otherwise advance by the bytes the kernel copied.
-            let n = rustix::fs::copy_file_range(&inf, None, &outf, None, remaining)
-                .map_err(io::Error::from)?;
-            if n == 0 {
-                break;
-            }
-            remaining -= n;
+        let mut infile = std::fs::File::from(inf);
+        let mut outfile = std::fs::File::from(outf);
+        // Whole-file reflink first: instant CoW extent share on btrfs/XFS.
+        // "Not supported here" errors fall through to the byte copy.
+        match rustix::fs::ioctl_ficlone(&outfile, &infile) {
+            Ok(()) => return Ok(()),
+            Err(Errno::OPNOTSUPP | Errno::NOTTY | Errno::XDEV | Errno::INVAL | Errno::BADF) => {}
+            Err(e) => return Err(io::Error::from(e)),
         }
-        Ok(())
+        // In-kernel copy_file_range next. On EXDEV (cross-device — the very
+        // case a failed hard link hits) or an unsupported syscall/filesystem,
+        // fall back to a streaming read/write loop.
+        let mut remaining = total;
+        loop {
+            match rustix::fs::copy_file_range(&infile, None, &outfile, None, remaining) {
+                Ok(0) => return Ok(()),
+                Ok(n) => remaining -= n,
+                Err(Errno::XDEV | Errno::NOSYS | Errno::OPNOTSUPP | Errno::INVAL) => {
+                    return stream_copy(&mut infile, &mut outfile);
+                }
+                Err(e) => return Err(io::Error::from(e)),
+            }
+        }
     })
     .await
     .map_err(io::Error::other)?
+}
+
+/// Rewind both files and copy `input` to `output` with a buffered read/write
+/// loop, truncating any bytes a partial `copy_file_range` already wrote. Runs
+/// on the blocking thread that owns the file handles.
+#[cfg(target_os = "linux")]
+fn stream_copy(input: &mut std::fs::File, output: &mut std::fs::File) -> io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+    input.seek(SeekFrom::Start(0))?;
+    output.seek(SeekFrom::Start(0))?;
+    output.set_len(0)?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        output.write_all(&buf[..n])?;
+    }
+    Ok(())
 }
 
 /// Non-Linux copy: stream the whole file through tokio.
@@ -757,6 +819,74 @@ async fn copy_contents(input: &tokio::fs::File, output: &tokio::fs::File) -> io:
     let mut writer = output.try_clone().await?;
     tokio::io::copy(&mut reader, &mut writer).await?;
     Ok(())
+}
+
+/// Publish `data` as the CAS blob at `dest` (whose parent is `alg_dir`)
+/// crash-atomically. On Linux this opens an anonymous `O_TMPFILE` inode in
+/// `alg_dir`, writes+fsyncs it, then `linkat`s it into place: a partial blob is
+/// never visible under its digest name, and there is no orphan temp to reap on
+/// a crash. `linkat` returning `EEXIST` means an identical blob already exists
+/// (content-addressed dedup) and is treated as success. Elsewhere it writes a
+/// per-operation unique temp sibling, fsyncs, and atomically renames.
+#[cfg(target_os = "linux")]
+async fn publish_bytes(alg_dir: &Path, dest: &Path, data: &[u8]) -> io::Result<()> {
+    use rustix::fs::{Mode, OFlags};
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd;
+    let alg_dir = alg_dir.to_path_buf();
+    let dest = dest.to_path_buf();
+    let data = data.to_vec();
+    let sync_target = alg_dir.clone();
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
+        // Anonymous inode in the target directory: it has no name until linkat.
+        let fd = rustix::fs::open(
+            &alg_dir,
+            OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )
+        .map_err(io::Error::from)?;
+        let mut f = std::fs::File::from(fd);
+        f.write_all(&data)?;
+        f.sync_all()?;
+        // Link the anonymous inode to its digest name via /proc/self/fd. AT_EMPTY_PATH
+        // (linking the fd directly) needs CAP_DAC_READ_SEARCH, so the portable form
+        // resolves the fd's magic symlink with AT_SYMLINK_FOLLOW.
+        let proc_path = format!("/proc/self/fd/{}", f.as_raw_fd());
+        match rustix::fs::linkat(
+            rustix::fs::CWD,
+            proc_path,
+            rustix::fs::CWD,
+            &dest,
+            rustix::fs::AtFlags::SYMLINK_FOLLOW,
+        ) {
+            // EEXIST: the content-addressed blob is already present — dedup, success.
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(e) => return Err(io::Error::from(e)),
+        }
+        Ok(())
+    })
+    .await
+    .map_err(io::Error::other)??;
+    // Persist the new directory entry.
+    sync_dir(&sync_target).await
+}
+
+/// Non-Linux publish: write a per-operation unique temp sibling, fsync, rename.
+#[cfg(not(target_os = "linux"))]
+async fn publish_bytes(alg_dir: &Path, dest: &Path, data: &[u8]) -> io::Result<()> {
+    let tmp = unique_tmp(dest)?;
+    {
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await?;
+        f.write_all(data).await?;
+        f.sync_all().await?;
+    }
+    tokio::fs::rename(&tmp, dest).await?;
+    let _ = alg_dir;
+    sync_dir(dest.parent().unwrap_or(dest)).await
 }
 
 /// Fsync a directory so a prior `rename` into it is durable (the rename's
@@ -778,6 +908,83 @@ async fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// Open `rel` (a path relative to `dir`) read-only, refusing to traverse a
+/// symlink or escape `dir`. On Linux this is `openat2` with
+/// `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`: the kernel enforces that no
+/// component — not just the final one — is a symlink and that resolution never
+/// leaves `dir`, closing the TOCTOU window between a stat and the open
+/// (defense in depth behind `SafeComponent`). Other Unix platforms open the
+/// joined path with `O_NOFOLLOW`, rejecting a final-component symlink.
+async fn open_beneath(dir: &Path, rel: &Path) -> io::Result<tokio::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    let dir = dir.to_path_buf();
+    let rel = rel.to_path_buf();
+    let std_file = tokio::task::spawn_blocking(move || -> io::Result<std::fs::File> {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::ResolveFlags;
+            let dirfd = rustix::fs::open(
+                &dir,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?;
+            let fd = rustix::fs::openat2(
+                &dirfd,
+                &rel,
+                OFlags::RDONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            )
+            .map_err(io::Error::from)?;
+            Ok(std::fs::File::from(fd))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // O_NOFOLLOW rejects a final-component symlink; the validated
+            // relative path plus the traversal backstop guards the rest.
+            let fd = rustix::fs::open(
+                dir.join(&rel),
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?;
+            Ok(std::fs::File::from(fd))
+        }
+    })
+    .await
+    .map_err(io::Error::other)??;
+    Ok(tokio::fs::File::from_std(std_file))
+}
+
+/// Open `path` for appending, refusing to follow a final-component symlink
+/// (`O_NOFOLLOW`). A planted `uploads/<id>` symlink therefore cannot redirect a
+/// PATCH append to an arbitrary target; the append fails instead. Returns the
+/// same "not found" error as a missing session when the entry is a symlink.
+#[cfg(unix)]
+async fn open_append_nofollow(path: &Path) -> io::Result<tokio::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    let path = path.to_path_buf();
+    let std_file = tokio::task::spawn_blocking(move || -> io::Result<std::fs::File> {
+        let fd = rustix::fs::open(
+            &path,
+            OFlags::WRONLY | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        Ok(std::fs::File::from(fd))
+    })
+    .await
+    .map_err(io::Error::other)??;
+    Ok(tokio::fs::File::from_std(std_file))
+}
+
+/// Non-Unix append open (no symlink semantics to guard).
+#[cfg(not(unix))]
+async fn open_append_nofollow(path: &Path) -> io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new().append(true).open(path).await
+}
+
 impl Storage for FsStorage {
     async fn blob_size(&self, repo: &str, digest: &Digest) -> Result<u64, StorageError> {
         // Validate the path first (the traversal backstop must run before any
@@ -787,19 +994,34 @@ impl Storage for FsStorage {
         if !self.presence.maybe_present(repo, &digest.as_string()) {
             return Err(StorageError::NotFound);
         }
-        let meta = tokio::fs::metadata(path).await.map_err(map_not_found)?;
+        // `symlink_metadata` does not follow: a planted symlink under the CAS
+        // name is not a valid blob (its target could be outside the store), so
+        // a non-regular entry is reported absent, never sized/served.
+        let meta = tokio::fs::symlink_metadata(path)
+            .await
+            .map_err(map_not_found)?;
+        if !meta.is_file() {
+            return Err(StorageError::NotFound);
+        }
         Ok(meta.len())
     }
 
     async fn blob_exists(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError> {
         // Validate the path first (traversal backstop before any short-circuit),
         // then let a definite-absent filter answer skip the stat; a "maybe"
-        // falls through to an authoritative `try_exists`.
+        // falls through to an authoritative no-follow stat. A CAS entry only
+        // counts as present if it is a *regular file*: a planted symlink (which
+        // `try_exists` would follow and accept) must not satisfy a manifest's
+        // referenced-blob check and then be served from outside the store.
         let path = self.blob_path(repo, digest)?;
         if !self.presence.maybe_present(repo, &digest.as_string()) {
             return Ok(false);
         }
-        Ok(tokio::fs::try_exists(path).await?)
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(meta) => Ok(meta.is_file()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(StorageError::Io(e)),
+        }
     }
 
     async fn read_blob(&self, repo: &str, digest: &Digest) -> Result<Vec<u8>, StorageError> {
@@ -823,11 +1045,15 @@ impl Storage for FsStorage {
         repo: &str,
         digest: &Digest,
     ) -> Result<tokio::fs::File, StorageError> {
-        let path = self.blob_path(repo, digest)?;
         if !self.presence.maybe_present(repo, &digest.as_string()) {
             return Err(StorageError::NotFound);
         }
-        tokio::fs::File::open(path).await.map_err(map_not_found)
+        // Open rooted at the repo dir, refusing any symlink traversal: a planted
+        // `blobs/<alg>/<hex>` symlink can never stream bytes from outside the CAS
+        // (Linux `openat2 RESOLVE_BENEATH|NO_SYMLINKS`; `O_NOFOLLOW` elsewhere).
+        let repo_dir = self.repo_dir(repo)?;
+        let rel = Path::new("blobs").join(digest.relative_path());
+        open_beneath(&repo_dir, &rel).await.map_err(map_not_found)
     }
 
     async fn begin_upload(&self, repo: &str) -> Result<String, StorageError> {
@@ -858,7 +1084,7 @@ impl Storage for FsStorage {
         let lock = self.session_lock(repo, id)?;
         let _guard = lock.lock().await;
         let path = self.upload_path(repo, id)?;
-        let mut f = match tokio::fs::OpenOptions::new().append(true).open(&path).await {
+        let mut f = match open_append_nofollow(&path).await {
             Ok(f) => f,
             Err(e) => {
                 // No such session: drop the just-created lock entry so a stream
@@ -895,6 +1121,7 @@ impl Storage for FsStorage {
         repo: &str,
         id: &str,
         expected: &Digest,
+        max_size: u64,
     ) -> Result<(), StorageError> {
         // Hold the session lock across the whole verify+promote so a concurrent
         // append cannot inject unverified bytes between the hash and the rename.
@@ -904,7 +1131,7 @@ impl Storage for FsStorage {
         // Reject a staging entry that is not a regular file (e.g. a symlink
         // planted into the uploads dir): `symlink_metadata` does not follow, so
         // a non-regular entry never gets hashed-through and promoted into the
-        // CAS. Interim stand-in for `O_NOFOLLOW`/`openat2 RESOLVE_BENEATH`.
+        // CAS.
         let st_meta = tokio::fs::symlink_metadata(&staging)
             .await
             .map_err(map_not_found)?;
@@ -914,6 +1141,18 @@ impl Storage for FsStorage {
             return Err(StorageError::BadPath(format!(
                 "upload {id} is not a regular file"
             )));
+        }
+        // Re-check the per-session cap *under the lock*: a PATCH that appended
+        // past the cap and was preempted before aborting cannot be promoted by a
+        // racing empty-body PUT, because finalize itself rejects an oversized
+        // staging file (and drops it) here.
+        if st_meta.len() > max_size {
+            let _ = tokio::fs::remove_file(&staging).await;
+            self.drop_session_lock(repo, id);
+            return Err(StorageError::TooLarge {
+                limit: max_size,
+                actual: st_meta.len(),
+            });
         }
         // Stream-hash the staging file (no full-blob buffer), verifying it
         // matches the client-declared digest before promoting it.
@@ -1000,24 +1239,12 @@ impl Storage for FsStorage {
         let dest = self.blob_path(repo, digest)?;
         let alg_dir = self.repo_dir(repo)?.join("blobs").join(&digest.algorithm);
         tokio::fs::create_dir_all(&alg_dir).await?;
-        // Write to a per-operation unique temp (so concurrent writers of the
-        // same digest never share a staging path), fsync it durable, then
-        // atomically rename into the CAS — a crash cannot leave a
-        // corrupt-but-named blob, and publishing is idempotent (identical
-        // content, so a rename over an existing blob is harmless).
-        let tmp = unique_tmp(&dest)?;
-        {
-            let mut f = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-                .await?;
-            f.write_all(data).await?;
-            f.sync_all().await?;
-        }
-        tokio::fs::rename(&tmp, &dest).await?;
-        // Sync the CAS directory so the renamed entry is durable.
-        sync_dir(&alg_dir).await?;
+        // Publish the bytes into the CAS crash-atomically. On Linux this uses an
+        // anonymous `O_TMPFILE` inode + `linkat` (a partial blob is never
+        // namespace-visible, and `EEXIST` on link is the dedup signal — an
+        // identical blob already exists, which is success); elsewhere it writes
+        // a per-operation unique temp, fsyncs, and atomically renames.
+        publish_bytes(&alg_dir, &dest, data).await?;
         // Record presence so future reads skip the stat on a definite miss, and
         // warm the small-blob cache (a no-op for large layers).
         let digest_str = digest.as_string();
@@ -1284,31 +1511,55 @@ impl Storage for FsStorage {
         }
         // Ensure the destination layout + `blobs/<alg>` dir exist, then link the
         // source into it. A hard link is O(1) and copy-free on one filesystem;
-        // an already-present destination (concurrent mount / re-mount) is a
-        // success; a cross-device or unsupported link falls back to a copy.
+        // an already-present *valid* destination (concurrent mount / re-mount)
+        // is a success; a cross-device or unsupported link falls back to a copy.
         self.ensure_layout(to_repo).await?;
         let dest = self.blob_path(to_repo, digest)?;
-        tokio::fs::create_dir_all(
-            self.repo_dir(to_repo)?
-                .join("blobs")
-                .join(digest.algorithm()),
-        )
-        .await?;
-        // Promote by a hard link — O(1), copy-free on one filesystem. A
-        // destination that already exists (a concurrent or repeat mount) is a
-        // success: blobs are content-addressed, so the existing file is already
-        // the correct bytes — never copy over it (that would truncate a
-        // hard-linked source). Any other link failure (cross-device, or a
-        // filesystem without hard links) falls back to a crash-atomic in-kernel
-        // copy (`copy_file_range` on Linux → reflink on btrfs/XFS): copy to a
-        // unique temp, fsync, rename — never a partial blob under the digest.
+        let alg_dir = self
+            .repo_dir(to_repo)?
+            .join("blobs")
+            .join(digest.algorithm());
+        tokio::fs::create_dir_all(&alg_dir).await?;
+        // Same-repo mount: source and destination are the same path — it is
+        // already present, nothing to link/copy (and a copy-onto-self would
+        // truncate it).
+        if src == dest {
+            self.presence.insert(to_repo, &digest.as_string());
+            return Ok(true);
+        }
+        // Promote by a hard link — O(1), copy-free on one filesystem. Any link
+        // failure (cross-device, or a filesystem without hard links) falls back
+        // to a crash-atomic copy (reflink → copy_file_range → streaming; unique
+        // temp, fsync, rename — never a partial blob under the digest).
         match tokio::fs::hard_link(&src, &dest).await {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(_) => copy_file_atomic(&src, &dest).await?,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // A destination already exists. Treat it as an idempotent success
+                // only if it is a *regular file* (a content-addressed blob is the
+                // correct bytes by construction). A symlink/dir/other entry is not
+                // a valid CAS blob: reject it rather than report a false 201.
+                let meta = tokio::fs::symlink_metadata(&dest)
+                    .await
+                    .map_err(map_not_found)?;
+                if !meta.is_file() {
+                    return Err(StorageError::BadPath(format!(
+                        "mount destination for {} is not a regular file",
+                        digest.as_string()
+                    )));
+                }
+            }
+            // copy_file_atomic already fsyncs the file + its directory.
+            Err(_) => {
+                copy_file_atomic(&src, &dest).await?;
+                self.presence.insert(to_repo, &digest.as_string());
+                return Ok(true);
+            }
         }
-        let digest_str = digest.as_string();
-        self.presence.insert(to_repo, &digest_str);
+        // Persist the new (or validated) directory entry so a successful 201
+        // mount survives a crash — the hard-link and AlreadyExists paths need
+        // this too, not only the copy fallback.
+        sync_dir(&alg_dir).await?;
+        self.presence.insert(to_repo, &digest.as_string());
         Ok(true)
     }
 
@@ -1413,7 +1664,7 @@ mod tests {
         let total = s.append_upload("r", &id, b"chunk2", None).await.unwrap();
         assert_eq!(total, 12);
         let d = sha256_of(b"chunk1chunk2");
-        s.finish_upload("r", &id, &d).await.unwrap();
+        s.finish_upload("r", &id, &d, u64::MAX).await.unwrap();
         assert_eq!(s.read_blob("r", &d).await.unwrap(), b"chunk1chunk2");
     }
 
@@ -1516,7 +1767,7 @@ mod tests {
         s.append_upload("r", &id, b"abc", None).await.unwrap();
         let wrong = sha256_of(b"xyz");
         assert!(matches!(
-            s.finish_upload("r", &id, &wrong).await,
+            s.finish_upload("r", &id, &wrong, u64::MAX).await,
             Err(StorageError::DigestMismatch { .. })
         ));
         // Missing upload session size / append errors are NotFound.
@@ -1617,7 +1868,7 @@ mod tests {
         std::fs::create_dir_all(&up).unwrap();
         let d = sha256_of(b"x");
         assert!(matches!(
-            s.finish_upload("r", "dir-session", &d).await,
+            s.finish_upload("r", "dir-session", &d, u64::MAX).await,
             Err(StorageError::BadPath(_))
         ));
     }
@@ -1994,6 +2245,93 @@ mod tests {
         assert_eq!(s.read_blob("dst", &d).await.unwrap(), data);
     }
 
+    // A same-repo mount (src == dest) short-circuits: the blob is already
+    // present and must not be copied onto itself (which would truncate it).
+    #[tokio::test]
+    async fn mount_blob_same_repo_is_idempotent_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let data = b"self-mount";
+        let d = sha256_of(data);
+        s.put_blob("r", &d, data).await.unwrap();
+        assert!(s.mount_blob("r", "r", &d).await.unwrap());
+        // Content is intact (not truncated by a copy-onto-self).
+        assert_eq!(s.read_blob("r", &d).await.unwrap(), data);
+    }
+
+    // A planted symlink under the CAS name is not a valid blob: blob_exists and
+    // blob_size report it absent (no-follow), so it can never satisfy a
+    // manifest's referenced-blob check nor be served as a repo's content.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planted_cas_symlink_is_not_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let secret = dir.path().join("outside-secret");
+        std::fs::write(&secret, b"outside").unwrap();
+        let d = sha256_of(b"outside");
+        // Force the presence filter to say "maybe" so the stat path runs.
+        s.presence.insert("r", &d.as_string());
+        let cas = s.blob_path("r", &d).unwrap();
+        std::fs::create_dir_all(cas.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&secret, &cas).unwrap();
+        assert!(!s.blob_exists("r", &d).await.unwrap());
+        assert!(matches!(
+            s.blob_size("r", &d).await,
+            Err(StorageError::NotFound)
+        ));
+        // A mount whose destination is the planted symlink is rejected, not a
+        // false 201.
+        s.put_blob("src", &d, b"outside").await.unwrap();
+        assert!(matches!(
+            s.mount_blob("src", "r", &d).await,
+            Err(StorageError::BadPath(_))
+        ));
+    }
+
+    // A PATCH append opens the staging file O_NOFOLLOW: a symlink planted at
+    // `uploads/<id>` cannot redirect the append to an arbitrary target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn append_refuses_symlinked_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let target = dir.path().join("append-target");
+        std::fs::write(&target, b"").unwrap();
+        let uploads = s.repo_dir("r").unwrap().join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        std::os::unix::fs::symlink(&target, uploads.join("evil")).unwrap();
+        // Appending to the symlinked session fails (O_NOFOLLOW → ELOOP), and the
+        // redirect target is left untouched.
+        assert!(s.append_upload("r", "evil", b"x", None).await.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
+    }
+
+    // finish_upload re-checks the per-session cap under the lock: a staging file
+    // that grew past the cap is rejected (413/SIZE_INVALID → TooLarge) and
+    // dropped, so a racing empty-body PUT cannot promote an oversized blob.
+    #[tokio::test]
+    async fn finish_upload_rejects_over_cap_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let data = b"0123456789";
+        let d = sha256_of(data);
+        let id = s.begin_upload("r").await.unwrap();
+        s.append_upload("r", &id, data, None).await.unwrap();
+        // Cap below the staged size → finalize rejects and drops the session.
+        assert!(matches!(
+            s.finish_upload("r", &id, &d, 4).await,
+            Err(StorageError::TooLarge {
+                limit: 4,
+                actual: 10
+            })
+        ));
+        assert!(matches!(
+            s.upload_size("r", &id).await,
+            Err(StorageError::NotFound)
+        ));
+    }
+
     #[tokio::test]
     async fn finish_upload_promotes_staging_without_leftover() {
         let dir = tempfile::tempdir().unwrap();
@@ -2008,7 +2346,7 @@ mod tests {
         s.append_upload("r", &id, &data[512 * 1024..], None)
             .await
             .unwrap();
-        s.finish_upload("r", &id, &d).await.unwrap();
+        s.finish_upload("r", &id, &d, u64::MAX).await.unwrap();
         // Content is retrievable byte-identical, the staging file is gone, and
         // the CAS file exists (promotion happened in place, no buffering leak).
         assert_eq!(s.read_blob("r", &d).await.unwrap(), data);
@@ -2023,7 +2361,7 @@ mod tests {
         let id2 = s.begin_upload("r").await.unwrap();
         s.append_upload("r", &id2, b"mismatch", None).await.unwrap();
         assert!(matches!(
-            s.finish_upload("r", &id2, &d).await,
+            s.finish_upload("r", &id2, &d, u64::MAX).await,
             Err(StorageError::DigestMismatch { .. })
         ));
         assert!(!tokio::fs::try_exists(s.upload_path("r", &id2).unwrap())
@@ -2106,7 +2444,7 @@ mod tests {
         assert_eq!(d.algorithm(), "sha512");
         let id = s.begin_upload("r").await.unwrap();
         s.append_upload("r", &id, data, None).await.unwrap();
-        s.finish_upload("r", &id, &d).await.unwrap();
+        s.finish_upload("r", &id, &d, u64::MAX).await.unwrap();
         assert_eq!(s.read_blob("r", &d).await.unwrap(), data);
         // A sha512 mismatch is rejected by the streamed verify.
         let id2 = s.begin_upload("r").await.unwrap();
@@ -2114,7 +2452,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            s.finish_upload("r", &id2, &d).await,
+            s.finish_upload("r", &id2, &d, u64::MAX).await,
             Err(StorageError::DigestMismatch { .. })
         ));
     }
@@ -2151,7 +2489,7 @@ mod tests {
         ));
         let d = sha256_of(b"x");
         assert!(matches!(
-            s.finish_upload("r", "../evil", &d).await,
+            s.finish_upload("r", "../evil", &d, u64::MAX).await,
             Err(StorageError::BadPath(_))
         ));
         assert!(matches!(
@@ -2229,7 +2567,7 @@ mod tests {
         symlink(&target, uploads.join("linksess")).unwrap();
         let d = sha256_of(b"secret");
         assert!(matches!(
-            s.finish_upload("r", "linksess", &d).await,
+            s.finish_upload("r", "linksess", &d, u64::MAX).await,
             Err(StorageError::BadPath(_))
         ));
     }

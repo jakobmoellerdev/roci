@@ -184,6 +184,9 @@ impl From<StorageError> for ApiError {
                 ErrorCode::BlobUploadInvalid,
                 "content range does not match offset",
             ),
+            StorageError::TooLarge { limit, actual } => ApiError::payload_too_large(format!(
+                "upload size {actual} exceeds maximum blob size {limit}"
+            )),
             StorageError::Io(_) => ApiError::Internal("internal error".to_string()),
         }
     }

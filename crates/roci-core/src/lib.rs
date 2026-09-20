@@ -1046,7 +1046,7 @@ async fn finish_upload<S: Storage>(
             return ApiError::payload_too_large("upload exceeds maximum blob size").into_response();
         }
     }
-    match st.storage.finish_upload(repo, id, &d).await {
+    match st.storage.finish_upload(repo, id, &d, st.max_upload).await {
         Ok(()) => {
             let mut headers = HeaderMap::new();
             headers.insert(
