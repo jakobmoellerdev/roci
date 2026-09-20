@@ -838,7 +838,8 @@ static FORCE_STAT_ERROR: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// real reflink/hard-link behavior, so a stray forced fallback cannot make a
 /// parallel test flaky. Held for the duration of each such test.
 #[cfg(all(test, target_os = "linux"))]
-static FAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static FAULT_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[cfg(target_os = "linux")]
 fn try_reflink(output: &mut std::fs::File, input: &mut std::fs::File) -> bool {
@@ -2450,7 +2451,7 @@ mod tests {
         // Serialize against the fault-injection test so a forced fallback cannot
         // turn this test's hard link into a copy (different inode) and flake it.
         #[cfg(target_os = "linux")]
-        let _serialize = FAULT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialize = FAULT_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let s = FsStorage::new(dir.path()).unwrap();
         let data = b"shared-layer";
@@ -2832,7 +2833,7 @@ mod tests {
     #[tokio::test]
     async fn copy_fallback_paths_when_reflink_and_hardlink_unavailable() {
         use std::sync::atomic::Ordering;
-        let _serialize = FAULT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialize = FAULT_TEST_LOCK.lock().await;
         FORCE_COPY_FALLBACK.store(true, Ordering::Relaxed);
         // copy_file_atomic streams (reflink forced off) — bytes still land.
         let dir = tempfile::tempdir().unwrap();
@@ -2887,7 +2888,7 @@ mod tests {
     #[tokio::test]
     async fn stat_beneath_propagates_io_error() {
         use std::sync::atomic::Ordering;
-        let _serialize = FAULT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialize = FAULT_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let s = FsStorage::new(dir.path()).unwrap();
         let data = b"present-blob";
