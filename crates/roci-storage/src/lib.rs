@@ -831,6 +831,8 @@ static FORCE_REFLINK_OK: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 #[cfg(all(test, target_os = "linux"))]
 static FORCE_TMPFILE_UNSUPPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(test, target_os = "linux"))]
+static FORCE_STAT_ERROR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Serializes the fault-injection tests (which flip the process-global
 /// `FORCE_*` switches) against each other and against tests that assert on the
 /// real reflink/hard-link behavior, so a stray forced fallback cannot make a
@@ -973,11 +975,10 @@ async fn publish_bytes(alg_dir: &Path, dest: &Path, data: &[u8]) -> io::Result<(
             Mode::from_raw_mode(0o644),
         ) {
             Ok(fd) => fd,
-            // Filesystem does not support O_TMPFILE → signal the rename fallback.
-            Err(Errno::OPNOTSUPP | Errno::NOTSUP | Errno::ISDIR | Errno::INVAL) => {
-                return Ok(false);
-            }
-            Err(e) => return Err(io::Error::from(e)),
+            // O_TMPFILE unavailable (unsupported fs like NFS/overlay, or any
+            // other open failure) → take the portable temp+rename fallback,
+            // which re-attempts the write and surfaces a genuine IO error itself.
+            Err(_) => return Ok(false),
         };
         let mut f = std::fs::File::from(fd);
         f.write_all(&data_vec)?;
@@ -1162,11 +1163,29 @@ async fn stat_beneath(root: &Path, rel: &Path) -> io::Result<Option<(bool, u64)>
                 Err(e) => return Err(io::Error::from(e)),
             }
         }
-        match rustix::fs::statat(&dir, *last, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(st) => {
-                let is_file = FileType::from_raw_mode(st.st_mode).is_file();
-                Ok(Some((is_file, st.st_size as u64)))
+        // Stat the leaf no-follow. A missing/symlinked leaf is absent; a genuine
+        // IO error propagates. In test, `FORCE_STAT_ERROR` injects a synthetic
+        // errno so this error arm is covered deterministically (a real leaf stat
+        // failure needs a fault a single-fs test cannot otherwise produce).
+        let statted = {
+            #[cfg(all(test, target_os = "linux"))]
+            {
+                if FORCE_STAT_ERROR.load(std::sync::atomic::Ordering::Relaxed) {
+                    Err(rustix::io::Errno::IO)
+                } else {
+                    rustix::fs::statat(&dir, *last, AtFlags::SYMLINK_NOFOLLOW)
+                }
             }
+            #[cfg(not(all(test, target_os = "linux")))]
+            {
+                rustix::fs::statat(&dir, *last, AtFlags::SYMLINK_NOFOLLOW)
+            }
+        };
+        match statted {
+            Ok(st) => Ok(Some((
+                FileType::from_raw_mode(st.st_mode).is_file(),
+                st.st_size as u64,
+            ))),
             Err(rustix::io::Errno::NOENT) => Ok(None),
             Err(e) => Err(io::Error::from(e)),
         }
@@ -2856,6 +2875,24 @@ mod tests {
         ts.put_blob("r", &td, b"no-tmpfile-here").await.unwrap();
         assert_eq!(ts.read_blob("r", &td).await.unwrap(), b"no-tmpfile-here");
         FORCE_TMPFILE_UNSUPPORTED.store(false, Ordering::Relaxed);
+    }
+
+    // stat_beneath propagates a genuine leaf-stat IO error (not NOENT) as an
+    // error, exercised deterministically via the FORCE_STAT_ERROR seam.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stat_beneath_propagates_io_error() {
+        use std::sync::atomic::Ordering;
+        let _serialize = FAULT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let data = b"present-blob";
+        let d = sha256_of(data);
+        s.put_blob("r", &d, data).await.unwrap();
+        FORCE_STAT_ERROR.store(true, Ordering::Relaxed);
+        let res = s.blob_exists("r", &d).await;
+        FORCE_STAT_ERROR.store(false, Ordering::Relaxed);
+        assert!(matches!(res, Err(StorageError::Io(_))));
     }
 
     // put_blob's O_TMPFILE+linkat hits EEXIST when the digest name already
