@@ -291,20 +291,14 @@ impl FsStorage {
         }
     }
 
-    /// Validate a single untrusted path component and **return it** so callers
-    /// build paths from the validated value (a barrier the taint analysis and
-    /// a human both see). Rejects empty, `.`/`..`, and any embedded separator
-    /// (`/`, `\`) or NUL. Defense-in-depth backstop so the CAS is safe
-    /// regardless of the caller (SECURITY.md inv. 8).
-    fn safe_component(s: &str) -> Result<&str, StorageError> {
-        if s.is_empty()
-            || s == "."
-            || s == ".."
-            || s.bytes().any(|b| b == b'/' || b == b'\\' || b == 0)
-        {
-            return Err(StorageError::BadPath(s.to_string()));
-        }
-        Ok(s)
+    /// Validate a single untrusted path component, returning a [`SafeComponent`]
+    /// — a wrapper whose only constructor is this validation, so a filesystem
+    /// path built from it is provably free of traversal input (a barrier the
+    /// taint analysis and a human both see). Rejects empty, `.`/`..`, and any
+    /// embedded separator (`/`, `\`) or NUL. Defense-in-depth backstop so the
+    /// CAS is safe regardless of the caller (SECURITY.md inv. 8).
+    fn safe_component(s: &str) -> Result<SafeComponent<'_>, StorageError> {
+        SafeComponent::new(s)
     }
 
     fn repo_dir(&self, repo: &str) -> Result<PathBuf, StorageError> {
@@ -417,6 +411,34 @@ fn map_not_found(e: io::Error) -> StorageError {
         StorageError::NotFound
     } else {
         StorageError::Io(e)
+    }
+}
+
+/// A single path component that has passed traversal validation. Its only
+/// constructor is [`SafeComponent::new`], so any [`Path`] built by joining a
+/// `SafeComponent` is provably free of `.`/`..`/separator/NUL injection — the
+/// validation is a visible barrier between untrusted input and the filesystem
+/// (SECURITY.md inv. 8), and a taint analysis sees the sanitizer boundary.
+struct SafeComponent<'a>(&'a str);
+
+impl<'a> SafeComponent<'a> {
+    /// Validate `s` as a single safe path component, rejecting empty, `.`,
+    /// `..`, and any embedded separator (`/`, `\`) or NUL.
+    fn new(s: &'a str) -> Result<Self, StorageError> {
+        if s.is_empty()
+            || s == "."
+            || s == ".."
+            || s.bytes().any(|b| b == b'/' || b == b'\\' || b == 0)
+        {
+            return Err(StorageError::BadPath(s.to_string()));
+        }
+        Ok(Self(s))
+    }
+}
+
+impl AsRef<Path> for SafeComponent<'_> {
+    fn as_ref(&self) -> &Path {
+        Path::new(self.0)
     }
 }
 
