@@ -142,6 +142,29 @@ codeql-local:
       test "$n" = "0"
     '
 
+# Run the roci-storage test suite on real ext4 / btrfs / XFS filesystems
+# (macOS/CI run only on a single overlay/ext4, so the per-FS reflink / hard-link
+# / O_TMPFILE / copy branches are otherwise only simulated via FORCE_* seams).
+# Builds Containerfile.filesystems, then in a PRIVILEGED container makes a
+# loopback image of each filesystem, mounts it, and runs the suite with TMPDIR
+# on the mount so FsStorage exercises that filesystem's real syscall behavior.
+# Requires Docker with privileged/loop support.
+test-filesystems:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="$(git rev-parse --show-toplevel)"
+    docker build -t roci-filesystems:local -f Containerfile.filesystems .
+    name="roci-fs-$$"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    # Privileged + loop control so the harness can losetup/mount loopback images.
+    docker create --privileged --name "$name" -w /roci roci-filesystems:local sleep infinity >/dev/null
+    trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+    docker start "$name" >/dev/null
+    COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata \
+      --exclude=./target --exclude='._*' --exclude='*/fsmonitor--daemon.ipc' \
+      -C "$root" -cf - . | docker cp - "$name:/roci"
+    docker exec "$name" bash /roci/scripts/test-filesystems.sh
+
 # Full local gate — run before pushing (the required CI checks).
 ci: lint-workflows fmt clippy test build deps-guard coverage conformance
 

@@ -1,0 +1,34 @@
+# Real-filesystem test harness (toolchain image; the repo is copied in at run).
+#
+# roci's storage fast paths behave differently per filesystem — reflink
+# (`FICLONE`) succeeds on btrfs/XFS but returns `EOPNOTSUPP` on ext4, hard links
+# and `O_TMPFILE` vary, and the copy fallback only runs when the fast path
+# genuinely fails. CI (`ubuntu-latest` / the coverage container) runs on a
+# single overlay/ext4 filesystem, so those per-FS branches are otherwise only
+# exercised via the `#[cfg(test)] FORCE_*` fault seams (simulation).
+#
+# `just test-filesystems` builds this image, then (privileged, so it can
+# `losetup`/`mount`) creates a loopback ext4, btrfs, and XFS image, mounts each,
+# and runs the roci-storage test suite with `TMPDIR` pointed at the mount — so
+# every `tempfile::tempdir()`-rooted `FsStorage` (and thus every reflink /
+# hard-link / O_TMPFILE / copy path) runs on the *real* target filesystem, no
+# simulation. This proves the fast paths on the filesystems that actually
+# support them and the fallbacks on the ones that do not.
+#
+# It is NOT the production image (that is `Containerfile`, a hardened scratch
+# image). This is a throwaway build/test container only.
+
+# Match rust-toolchain.toml (channel = "1.98.1"). Bump both in one change.
+FROM docker.io/library/rust:1.98.1-bookworm
+
+# mkfs.btrfs / mkfs.xfs + loop/mount utilities for the per-filesystem harness;
+# cargo-nextest to run the suite the same way the coverage job does.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        btrfs-progs xfsprogs mount util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install cargo-nextest --locked
+
+# Build artifacts go here (a container-local dir), never into the copied repo.
+ENV CARGO_TARGET_DIR=/target CARGO_TERM_COLOR=never
+WORKDIR /roci

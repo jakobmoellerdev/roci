@@ -2447,9 +2447,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mount_blob_hard_links_and_reports_absence() {
+    async fn mount_blob_promotes_and_reports_absence() {
         // Serialize against the fault-injection test so a forced fallback cannot
-        // turn this test's hard link into a copy (different inode) and flake it.
+        // change the promotion mechanism mid-assertion and flake it.
         #[cfg(target_os = "linux")]
         let _serialize = FAULT_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
@@ -2457,30 +2457,32 @@ mod tests {
         let data = b"shared-layer";
         let d = sha256_of(data);
         s.put_blob("src", &d, data).await.unwrap();
-        // Present source → first mount hard-links: byte-identical and sharing
-        // one inode (a link, not a copy).
+        // Present source → mount promotes it into `dst` (reflink on
+        // btrfs/XFS/APFS, else a hard link, else a streaming copy — all share
+        // storage or copy the exact bytes). Assert the observable contract, not
+        // the mechanism (which is filesystem-dependent): the mount succeeds and
+        // the blob is byte-identical in the destination repo.
         assert!(s.mount_blob("src", "dst", &d).await.unwrap());
         assert_eq!(s.read_blob("dst", &d).await.unwrap(), data);
+        // Both repos hold a real, independently-openable regular file for the
+        // digest (reflink gives distinct inodes; a hard link shares one — either
+        // way both paths resolve to a regular CAS blob with the right bytes).
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
-            let src_ino = std::fs::metadata(s.blob_path("src", &d).unwrap())
-                .unwrap()
-                .ino();
-            let dst_ino = std::fs::metadata(s.blob_path("dst", &d).unwrap())
-                .unwrap()
-                .ino();
-            assert_eq!(src_ino, dst_ino);
+            for repo in ["src", "dst"] {
+                let meta = std::fs::symlink_metadata(s.blob_path(repo, &d).unwrap()).unwrap();
+                assert!(meta.is_file());
+                assert_eq!(meta.len(), data.len() as u64);
+            }
         }
-        // Re-mounting a destination that already exists exercises the copy
-        // fallback (the hard link fails on the existing path) and stays correct.
+        // Re-mounting an already-present destination is idempotent success (the
+        // existing regular-file blob is validated no-follow, never re-copied).
         assert!(s.mount_blob("src", "dst", &d).await.unwrap());
         assert_eq!(s.read_blob("dst", &d).await.unwrap(), data);
         // Absent source → Ok(false) (caller falls back to a session).
         let absent = sha256_of(b"never-stored");
         assert!(!s.mount_blob("src", "dst", &absent).await.unwrap());
-        // Re-mounting a destination that already exists exercises the copy
-        // fallback (the hard link fails on the existing path) and stays correct.
+        // Idempotent re-mount stays correct.
         assert!(s.mount_blob("src", "dst", &d).await.unwrap());
         assert_eq!(s.read_blob("dst", &d).await.unwrap(), data);
     }
