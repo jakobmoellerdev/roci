@@ -41,6 +41,17 @@ jobs:
       contents: read
       # Upload analysis results to the code-scanning dashboard.
       security-events: write
+    env:
+      # Apply roci's in-repo path-injection barrier model pack at analysis time.
+      # Model packs load via `database run-queries --model-packs` (NOT the
+      # config `packs:`, which resolves query packs from GHCR at init and fails
+      # for a local unpublished pack; and NOT `database init`, which rejects
+      # `--additional-packs`). `--additional-packs` adds the local checkout to
+      # the pack search path so `roci/path-sanitizers` resolves without GHCR.
+      # The value is parsed as YAML/JSON; its `database.run-queries` array is
+      # appended to that CLI invocation (codeql-action getExtraOptionsFromEnv).
+      CODEQL_ACTION_EXTRA_OPTIONS: >-
+        {"database":{"run-queries":["--additional-packs=${{ github.workspace }}/.github/codeql/extensions","--model-packs=roci/path-sanitizers"]}}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
