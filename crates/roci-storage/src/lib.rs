@@ -828,6 +828,9 @@ static FORCE_COPY_FALLBACK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(all(test, target_os = "linux"))]
 static FORCE_REFLINK_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(test, target_os = "linux"))]
+static FORCE_TMPFILE_UNSUPPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// Serializes the fault-injection tests (which flip the process-global
 /// `FORCE_*` switches) against each other and against tests that assert on the
 /// real reflink/hard-link behavior, so a stray forced fallback cannot make a
@@ -959,6 +962,11 @@ async fn publish_bytes(alg_dir: &Path, dest: &Path, data: &[u8]) -> io::Result<(
     let data_vec = data.to_vec();
     let outcome = tokio::task::spawn_blocking(move || -> io::Result<bool> {
         // Anonymous inode in the target directory: it has no name until linkat.
+        #[cfg(test)]
+        if FORCE_TMPFILE_UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed) {
+            // Simulate a filesystem without O_TMPFILE → take the rename fallback.
+            return Ok(false);
+        }
         let fd = match rustix::fs::open(
             &alg_dir_buf,
             OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
@@ -2828,7 +2836,71 @@ mod tests {
         let rdst = dir.path().join("reflink-dst");
         copy_file_atomic(&rsrc, &rdst).await.unwrap();
         assert_eq!(tokio::fs::read(&rdst).await.unwrap(), payload);
+        // Reflink succeeds in mount_blob's primary path (FORCE_REFLINK_OK moves
+        // the bytes), exercising the `reflink_atomic Ok` arm.
+        let rstore = tempfile::tempdir().unwrap();
+        let rs = FsStorage::new(rstore.path()).unwrap();
+        let rd = sha256_of(b"reflink-mount");
+        rs.put_blob("srcrepo", &rd, b"reflink-mount").await.unwrap();
+        assert!(rs.mount_blob("srcrepo", "dstrepo", &rd).await.unwrap());
+        assert_eq!(
+            rs.read_blob("dstrepo", &rd).await.unwrap(),
+            b"reflink-mount"
+        );
         FORCE_REFLINK_OK.store(false, Ordering::Relaxed);
+        // O_TMPFILE unsupported → put_blob takes the temp+rename fallback.
+        FORCE_TMPFILE_UNSUPPORTED.store(true, Ordering::Relaxed);
+        let tstore = tempfile::tempdir().unwrap();
+        let ts = FsStorage::new(tstore.path()).unwrap();
+        let td = sha256_of(b"no-tmpfile-here");
+        ts.put_blob("r", &td, b"no-tmpfile-here").await.unwrap();
+        assert_eq!(ts.read_blob("r", &td).await.unwrap(), b"no-tmpfile-here");
+        FORCE_TMPFILE_UNSUPPORTED.store(false, Ordering::Relaxed);
+    }
+
+    // put_blob's O_TMPFILE+linkat hits EEXIST when the digest name already
+    // exists, but if that entry is NOT a regular file (a planted symlink) it is
+    // rejected, never reported as dedup success.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn put_blob_rejects_non_regular_eexist_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let data = b"collide";
+        let d = sha256_of(data);
+        // Pre-plant a symlink at the exact CAS destination so linkat → EEXIST.
+        let dest = s.blob_path("r", &d).unwrap();
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"x").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &dest).unwrap();
+        let err = s.put_blob("r", &d, data).await.unwrap_err();
+        assert!(matches!(err, StorageError::Io(_)));
+    }
+
+    // finish_upload on an id that was never begun (no staging file) resolves to
+    // absent beneath the root → NotFound, and drops the session lock.
+    #[tokio::test]
+    async fn finish_upload_missing_session_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let d = sha256_of(b"never-staged");
+        assert!(matches!(
+            s.finish_upload("r", "ghost", &d, u64::MAX, b"").await,
+            Err(StorageError::NotFound)
+        ));
+    }
+
+    // stat_beneath on an empty relative path is a no-op absent (defensive guard
+    // for a path with no components).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stat_beneath_empty_rel_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(stat_beneath(dir.path(), Path::new(""))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // publish_bytes surfaces a genuine linkat failure (not EEXIST): linking the
