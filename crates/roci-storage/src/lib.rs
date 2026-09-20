@@ -641,34 +641,28 @@ async fn hash_file(path: &Path, algorithm: &str) -> io::Result<Digest> {
 /// not possible.
 #[cfg(target_os = "linux")]
 async fn copy_file(src: &Path, dest: &Path) -> io::Result<()> {
-    let src = src.to_path_buf();
-    let dest = dest.to_path_buf();
-    tokio::task::spawn_blocking(move || -> io::Result<()> {
-        let input = std::fs::File::open(&src)?;
-        let output = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&dest)?;
-        // copy_file_range may transfer fewer bytes than requested and returns 0
-        // at EOF; loop until the source is exhausted. A `len` request that the
-        // kernel satisfies in one shot still passes through the loop once.
-        let mut remaining = input.metadata()?.len() as usize;
-        loop {
-            let n = rustix::fs::copy_file_range(&input, None, &output, None, remaining)
-                .map_err(io::Error::from)?;
-            if n == 0 {
-                break;
-            }
-            remaining -= n;
-            if remaining == 0 {
-                break;
-            }
+    let input = std::fs::File::open(src)?;
+    let output = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dest)?;
+    // copy_file_range may transfer fewer bytes than requested and returns 0 at
+    // EOF; loop until the source is exhausted. A request the kernel satisfies in
+    // one shot still passes through the loop once.
+    let mut remaining = input.metadata()?.len() as usize;
+    loop {
+        let n = rustix::fs::copy_file_range(&input, None, &output, None, remaining)
+            .map_err(io::Error::from)?;
+        if n == 0 {
+            break;
         }
-        Ok(())
-    })
-    .await
-    .map_err(io::Error::other)?
+        remaining -= n;
+        if remaining == 0 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Copy `src` to `dest` with a plain streaming copy (non-Linux fallback).

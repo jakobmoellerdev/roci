@@ -302,9 +302,12 @@ impl LogMetadataStore {
         // Snapshot the append seq *before* syncing so we only claim durability
         // for records already flushed to the kernel.
         let covered = self.appended.load(Ordering::Acquire);
-        if let Some(handle) = sync.handle.as_ref() {
-            handle.sync_data()?;
-        }
+        // The handle is set on the first append (before any seq is returned), so
+        // it is always present by the time a commit runs.
+        sync.handle
+            .as_ref()
+            .expect("log handle set on first append")
+            .sync_data()?;
         sync.synced = sync.synced.max(covered);
         Ok(())
     }
