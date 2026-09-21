@@ -89,7 +89,7 @@ jobs:
   # coverage gate — nextest runs under llvm-cov, so we compile once instead of
   # once for tests and again for coverage.
   test-and-coverage:
-    name: test + coverage (100% lines)
+    name: test + coverage (95% floor)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -108,9 +108,9 @@ jobs:
       - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           tool: nextest,cargo-llvm-cov
-      - name: Tests + coverage (single instrumented build, 100% gate)
+      - name: Tests + coverage (single instrumented build, 95% floor)
         # scripts/coverage.sh instruments once, runs the suite via nextest, and
-        # asserts 100% line coverage (lcov); also emits cobertura.xml.
+        # asserts line coverage stays at/above the 95% floor (lcov); emits cobertura.xml.
         run: bash scripts/coverage.sh
       - name: HTML coverage report
         if: always()

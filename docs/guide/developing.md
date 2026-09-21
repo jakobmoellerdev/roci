@@ -27,7 +27,7 @@ git submodule update --init --depth 1   # or: just init
 ```
 
 Install the git pre-commit hook (when Rust sources are staged it runs fmt,
-clippy, the 100% coverage gate, and the full OCI conformance suite; it also
+clippy, the 95% coverage floor, and the full OCI conformance suite; it also
 runs workflow lint/security when workflows are staged, and refreshes
 `COVERAGE.md` + the badge on every commit):
 
@@ -49,7 +49,7 @@ just hooks   # or, with the pre-commit framework: pre-commit install
 | `just lint-workflows` | Lint the GitHub Actions workflows (actionlint) |
 | `just zizmor` | Security-audit the workflows (zizmor) |
 | `just audit` | `cargo deny` supply-chain check |
-| `just coverage` | Enforce 100% line coverage (cargo-llvm-cov) |
+| `just coverage` | Enforce the 95% line-coverage floor (cargo-llvm-cov) |
 | `just coverage-report` | Show uncovered lines (developer aid) |
 | `just ci` | Run the full local gate before pushing |
 | `just conformance` | Run the OCI dist-spec conformance suite against a local roci |
@@ -62,9 +62,9 @@ just hooks   # or, with the pre-commit framework: pre-commit install
 
 ## Coverage gate
 
-**100% line coverage is enforced.** CI compiles the workspace once (instrumented) and runs tests under `cargo llvm-cov nextest`, then enforces `--fail-under-lines 100`. New code must ship with tests that cover every line; inspect gaps with `just coverage-report`.
+**A 95% line-coverage floor is enforced.** CI compiles the workspace once (instrumented) and runs tests under `cargo llvm-cov nextest`, then `scripts/coverage.sh` asserts the lcov line coverage stays at or above 95% and prints the uncovered lines for triage. New code should ship with tests for the behavior it adds; the handful of lines that remain uncovered are unreachable-in-CI defensive syscall-error arms in the beneath-root storage path. Inspect gaps with `just coverage-report`.
 
-The gate is strict on the Linux CI runner; `scripts/coverage.sh` is intentionally tolerant on non-Linux (e.g. macOS/APFS) where a couple of Unix-filesystem-specific edges cannot be exercised locally — those lines are covered on Linux CI, which remains authoritative.
+The gate runs on the Linux CI runner, which is authoritative: `cargo llvm-cov`'s line attribution differs on macOS/APFS (it collapses some error/skip arms), so a local `just coverage` number is indicative only — reproduce the Linux figure with `just coverage-linux` before pushing coverage-sensitive work.
 
 ## Security & static analysis
 

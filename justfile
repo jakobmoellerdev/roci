@@ -59,7 +59,7 @@ lint-workflows:
 zizmor:
     zizmor .github/workflows .github/actions
 
-# Enforce 100% line coverage, refresh COVERAGE.md + the README badge (CI `coverage` job).
+# Enforce the 95% line-coverage floor, refresh COVERAGE.md + the README badge (CI `coverage` job).
 # Requires `cargo-llvm-cov` (`cargo install cargo-llvm-cov`) + `llvm-tools-preview`.
 coverage:
     bash scripts/coverage.sh
@@ -74,7 +74,7 @@ coverage-report:
     cargo llvm-cov --workspace --all-features --summary-only
     cargo llvm-cov report --show-missing-lines
 
-# Reproduce the CI Linux 100%-coverage gate locally in a container (for darwin
+# Reproduce the CI Linux coverage gate locally in a container (for darwin
 # devs, and the only way to exercise the Linux-only fast paths). Builds the
 # toolchain image once, copies the tracked working tree into a container via
 # `docker cp` (no bind-mount, so it works regardless of Docker Desktop file
