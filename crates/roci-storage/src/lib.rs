@@ -474,25 +474,26 @@ impl FsStorage {
         // The blob was just promoted, so it is present and regular. Read it back
         // (no-follow, beneath-root) and cache it only if small; any IO hiccup on
         // this optional warm is simply skipped (the loose CAS file is truth).
-        let Ok(mut f) = open_beneath(&self.root, rel).await else {
+        let Ok(f) = open_beneath(&self.root, rel).await else {
             return;
         };
+        // The small-blob cache only ever holds blobs up to its configured
+        // threshold, and the cache itself enforces an absolute ceiling. Bound the
+        // warm read by a compile-time constant (never by the operator threshold
+        // alone) so this buffer's size is a fixed constant, not derived from
+        // config/user-influenced state: read at most CAP+1 bytes through a capped
+        // reader; if the blob exceeds the effective limit it is simply not cached.
+        const WARM_CAP: usize = 8 * 1024 * 1024; // absolute ceiling for a warm-cache read
         let threshold = self.cache.threshold();
-        // Read up to the cache threshold + 1: if the blob is larger it is not
-        // cacheable, so stop early rather than buffer a multi-GiB layer.
-        let mut bytes = Vec::with_capacity(threshold.min(64 * 1024));
-        let mut chunk = [0u8; 64 * 1024];
-        loop {
-            match f.read(&mut chunk).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    bytes.extend_from_slice(&chunk[..n]);
-                    if bytes.len() > threshold {
-                        return; // too large to cache
-                    }
-                }
-                Err(_) => return,
-            }
+        // Effective limit is the smaller of the operator threshold and the
+        // constant ceiling — so the allocation can never exceed WARM_CAP.
+        let limit = threshold.min(WARM_CAP);
+        // `take(limit as u64 + 1)`: read one past the limit to detect an
+        // over-limit blob without ever buffering more than limit+1 bytes.
+        let mut bytes = Vec::new();
+        let read = f.take(limit as u64 + 1).read_to_end(&mut bytes).await;
+        if read.is_err() || bytes.len() > limit {
+            return; // IO hiccup, or too large to cache — skip the optional warm
         }
         self.cache.put(repo, digest_str, &bytes);
     }
@@ -828,6 +829,21 @@ async fn mount_promote_beneath(
         )
         .map_err(io::Error::from)?;
         let mut src_file = std::fs::File::from(src);
+        // Prove the opened source is a *regular file* on the fd we hold — not the
+        // path. `O_NOFOLLOW` refuses a symlink leaf, but a FIFO/socket/device
+        // planted at the source name is still openable (`O_NONBLOCK` keeps the
+        // open from blocking) and would otherwise be reflink/copy-read or, worse,
+        // hard-linked into the CAS as a non-regular inode. Bind the check to the
+        // inode we will actually promote by fstat'ing the descriptor.
+        {
+            let st = rustix::fs::fstat(&src_file).map_err(io::Error::from)?;
+            if !FileType::from_raw_mode(st.st_mode).is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "mount source is not a regular file",
+                ));
+            }
+        }
         // Treat a pre-existing regular-file destination as idempotent success; a
         // symlink/dir/other there is rejected (re-checked here, not only in the
         // caller's earlier stat, to close the check→promote race). A missing dest
@@ -883,8 +899,24 @@ async fn mount_promote_beneath(
                 rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
                 Ok(())
             }
-            // Destination raced in as a valid blob between our stat and link.
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            // Destination raced in between our earlier stat and this link. Accept
+            // it as idempotent success ONLY if it is now a regular file, re-checked
+            // no-follow — `EEXIST` alone also fires for a symlink/dir/other planted
+            // in the race, which must not count as a valid CAS blob (would 201 a
+            // bogus entry). Mirrors the pre-link destination check above.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                match rustix::fs::statat(&to_dir, leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => {
+                        rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
+                        Ok(())
+                    }
+                    Ok(_) => Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "mount destination exists and is not a regular file",
+                    )),
+                    Err(e) => Err(io::Error::from(e)),
+                }
+            }
             // Cross-device / no-hardlink: stream-copy into a fresh temp + rename.
             Err(_) => {
                 let mut out = promote_via_temp(OFlags::empty())?;
@@ -1124,8 +1156,13 @@ async fn publish_bytes(root: &Path, alg_rel: &Path, leaf: &str, data: &[u8]) -> 
     Ok(())
 }
 
-/// Non-Linux publish: portable dirfd-anchored temp+rename.
-#[cfg(not(target_os = "linux"))]
+/// Non-Linux **Unix** publish (macOS/BSD): portable dirfd-anchored temp+rename.
+/// Gated `all(unix, not(linux))` to match `publish_bytes_rename`/`try_reflink`
+/// and the rest of the dirfd machinery — the whole `FsStorage` storage path is
+/// Unix-only (no Windows target; see the Unix-gated `resolve_beneath`/dirfd
+/// helpers), so this must not claim to cover a non-Unix `not(linux)` platform
+/// where its `#[cfg(unix)]` callee `publish_bytes_rename` does not exist.
+#[cfg(all(unix, not(target_os = "linux")))]
 async fn publish_bytes(root: &Path, alg_rel: &Path, leaf: &str, data: &[u8]) -> io::Result<()> {
     publish_bytes_rename(root, alg_rel, leaf, data).await
 }
@@ -1246,8 +1283,19 @@ fn dir_beneath(root: &Path, rel: &Path, create: bool) -> io::Result<std::os::fd:
                     Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                     Err(e) => return Err(io::Error::from(e)),
                 }
-                dir = rustix::fs::openat(&dir, comp, dir_flags, Mode::empty())
-                    .map_err(io::Error::from)?;
+                // Re-open no-follow. A racer that replaced the just-created dir
+                // with a symlink/non-dir (or removed it) yields LOOP/NOTDIR/NOENT
+                // — normalize to NotFound (404), matching the walk arm below,
+                // rather than surfacing a raw 500.
+                dir = match rustix::fs::openat(&dir, comp, dir_flags, Mode::empty()) {
+                    Ok(next) => next,
+                    Err(
+                        rustix::io::Errno::LOOP
+                        | rustix::io::Errno::NOTDIR
+                        | rustix::io::Errno::NOENT,
+                    ) => return Err(io::Error::from(io::ErrorKind::NotFound)),
+                    Err(e) => return Err(io::Error::from(e)),
+                };
             }
             // A symlinked / non-directory / missing component: not a valid CAS
             // directory. `NotFound` so a read returns 404; a write with
@@ -1266,6 +1314,15 @@ fn dir_beneath(root: &Path, rel: &Path, create: bool) -> io::Result<std::os::fd:
 /// no-follow beneath `root` (the destination dir is created). A symlinked parent
 /// on either side cannot redirect the rename outside the store. Then fsyncs the
 /// destination directory so the new entry is durable.
+///
+/// `expected_ino` is the `(st_dev, st_ino)` of the inode the caller already
+/// hashed+verified. Because `renameat` is name-based, a hostile local
+/// filesystem actor could swap `from_leaf` for a different inode between the
+/// hash and this call, promoting unverified bytes under the verified digest
+/// name. We `statat` the source leaf no-follow and require the same inode
+/// before renaming — binding the promotion to the hashed inode. A mismatch
+/// (the leaf was swapped) is rejected as `NotFound` so the upload is not
+/// finalized against foreign content.
 #[cfg(unix)]
 async fn rename_beneath(
     root: &Path,
@@ -1273,7 +1330,9 @@ async fn rename_beneath(
     from_leaf: &str,
     to_dir_rel: &Path,
     to_leaf: &str,
+    expected_ino: (u64, u64),
 ) -> io::Result<()> {
+    use rustix::fs::AtFlags;
     let root = root.to_path_buf();
     let from_dir_rel = from_dir_rel.to_path_buf();
     let from_leaf = from_leaf.to_string();
@@ -1282,6 +1341,13 @@ async fn rename_beneath(
     tokio::task::spawn_blocking(move || -> io::Result<()> {
         let from_fd = dir_beneath(&root, &from_dir_rel, false)?;
         let to_fd = dir_beneath(&root, &to_dir_rel, true)?;
+        // Prove the source leaf is still the exact inode we hashed (no-follow):
+        // reject a raced swap rather than promote foreign bytes under the digest.
+        let st = rustix::fs::statat(&from_fd, from_leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(io::Error::from)?;
+        if (st.st_dev as u64, st.st_ino as u64) != expected_ino {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
         rustix::fs::renameat(&from_fd, from_leaf.as_str(), &to_fd, to_leaf.as_str())
             .map_err(io::Error::from)?;
         rustix::fs::fsync(&to_fd).map_err(io::Error::from)?;
@@ -1607,6 +1673,19 @@ impl Storage for FsStorage {
         let staging_fd = open_beneath(&self.root, &staging_rel)
             .await
             .map_err(map_not_found)?;
+        // Durability: fsync the staging file's *data* before it is promoted. The
+        // trailing append above only `flush`ed to the kernel, and PATCH bodies
+        // may sit in page cache; a crash after `rename_beneath` would otherwise
+        // leave a named CAS blob with torn/unwritten contents, breaking the
+        // atomic-finalize guarantee. Sync on the same fd we hash+promote.
+        staging_fd.sync_all().await.map_err(map_not_found)?;
+        // Capture the hashed inode's identity so the later name-based
+        // `renameat` can prove it is promoting *this* verified inode, not a leaf
+        // a hostile local filesystem actor swapped in after the hash.
+        let staging_ino = {
+            let st = rustix::fs::fstat(&staging_fd).map_err(|e| map_not_found(e.into()))?;
+            (st.st_dev as u64, st.st_ino as u64)
+        };
         let actual = hash_reader(staging_fd, expected.algorithm())
             .await
             .map_err(map_not_found)?;
@@ -1628,7 +1707,7 @@ impl Storage for FsStorage {
         self.ensure_layout(repo).await?;
         let (up_dir, up_leaf) = self.upload_dir_rel(repo, id)?;
         let (alg_rel, hex) = self.blob_dir_rel(repo, expected)?;
-        rename_beneath(&self.root, &up_dir, &up_leaf, &alg_rel, &hex).await?;
+        rename_beneath(&self.root, &up_dir, &up_leaf, &alg_rel, &hex, staging_ino).await?;
         self.drop_session_lock(repo, id);
         // Record presence so future reads skip the stat on a definite miss.
         let digest_str = expected.as_string();
@@ -3026,7 +3105,8 @@ mod tests {
 
         // (1) Reflink + hard link forced off → mount takes the streaming copy.
         FORCE_COPY_FALLBACK.store(true, Ordering::Relaxed);
-        let s1 = FsStorage::new(tempfile::tempdir().unwrap().path()).unwrap();
+        let d1 = tempfile::tempdir().unwrap();
+        let s1 = FsStorage::new(d1.path()).unwrap();
         s1.put_blob("srcrepo", &d, data).await.unwrap();
         assert!(s1.mount_blob("srcrepo", "dstrepo", &d).await.unwrap());
         assert_eq!(s1.read_blob("dstrepo", &d).await.unwrap(), data);
@@ -3034,7 +3114,8 @@ mod tests {
 
         // (2) Reflink forced to succeed → mount takes the reflink primary.
         FORCE_REFLINK_OK.store(true, Ordering::Relaxed);
-        let s2 = FsStorage::new(tempfile::tempdir().unwrap().path()).unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let s2 = FsStorage::new(d2.path()).unwrap();
         s2.put_blob("srcrepo", &d, data).await.unwrap();
         assert!(s2.mount_blob("srcrepo", "dstrepo", &d).await.unwrap());
         assert_eq!(s2.read_blob("dstrepo", &d).await.unwrap(), data);
@@ -3042,7 +3123,8 @@ mod tests {
 
         // (3) O_TMPFILE unsupported → put_blob takes the temp+rename fallback.
         FORCE_TMPFILE_UNSUPPORTED.store(true, Ordering::Relaxed);
-        let s3 = FsStorage::new(tempfile::tempdir().unwrap().path()).unwrap();
+        let d3 = tempfile::tempdir().unwrap();
+        let s3 = FsStorage::new(d3.path()).unwrap();
         let td = sha256_of(b"no-tmpfile-here");
         s3.put_blob("r", &td, b"no-tmpfile-here").await.unwrap();
         assert_eq!(s3.read_blob("r", &td).await.unwrap(), b"no-tmpfile-here");
