@@ -97,9 +97,9 @@ Every recipe mirrors a CI gate, so passing locally means passing the required CI
 | `just` | List all recipes |
 | `just init` | Fetch pinned spec submodules |
 | `just fmt` / `just fmt-fix` | Check / apply formatting |
-| `just clippy` | Lint both build flavors, warnings = errors |
+| `just clippy` | Lint both flavors, warnings = errors — the sole gate compiling the minimal flavor |
 | `just test` | Run tests (nextest) + doctests |
-| `just build` | Build minimal and full flavors |
+| `just build` | Build minimal and full flavors (dev convenience; the minimal-flavor CI compile is the clippy job) |
 | `just deps-guard` | Assert no extension crate leaks into the minimal build |
 | `just lint-workflows` | Lint the GitHub Actions workflows (actionlint) |
 | `just zizmor` | Security-audit the workflows (zizmor) |

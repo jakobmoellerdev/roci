@@ -33,7 +33,10 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: conformance
+          # Shares the `ci-full` cache populated by the clippy job's full-flavor
+          # `--profile ci` compile, so conformance restores the compiled
+          # dependency tree instead of building it from cold.
+          cache-key: ci-full
       # The conformance suite is a Go binary (requires Go 1.17+).
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
