@@ -72,7 +72,9 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: ci-full
+          # shared-key (not the job-scoped `cache-key`) so the conformance job,
+          # which has a different job id, restores these same compiled deps.
+          shared-key: ci-full
           components: clippy
       # Full flavor: lint everything, extensions included. This is also the
       # workspace's sole full-flavor `--profile ci` compile — its compiled deps

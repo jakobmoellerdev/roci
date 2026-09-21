@@ -10,9 +10,23 @@ description: Install the pinned Rust toolchain and restore the build cache.
 inputs:
   cache-key:
     description: >-
-      Suffix distinguishing this job's cache from other jobs' (e.g. test,
-      clippy, flavor-full). Distinct feature sets must not clobber each other.
-    required: true
+      An ADDITIONAL, job-scoped cache suffix (rust-cache `key`). rust-cache
+      always folds the GitHub job id into the key, so two differently-named
+      jobs with the same `cache-key` still get SEPARATE caches. Use this for a
+      job whose artifacts must not be shared with any other job (e.g. the
+      llvm-cov-instrumented test build, or a package-scoped storage build).
+    required: false
+    default: ""
+  shared-key:
+    description: >-
+      A cache key used INSTEAD of the automatic job-id key (rust-cache
+      `shared-key`), stable across differently-named jobs. Jobs that pass the
+      same `shared-key` share one cache entry — use this to let a later job
+      restore the compiled dependency tree an earlier job already built (e.g.
+      clippy and conformance both compile the full flavor at `--profile ci`).
+      Set exactly one of `cache-key` / `shared-key`.
+    required: false
+    default: ""
   components:
     description: Space/comma-separated extra rustup components (e.g. "clippy, rustfmt").
     required: false
@@ -29,7 +43,10 @@ runs:
     - name: Cache cargo registry and build artifacts
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
+        # `key` is job-scoped (job id always folded in); `shared-key` replaces
+        # the job-id component so same-`shared-key` jobs share one entry.
         key: ${{ inputs.cache-key }}
+        shared-key: ${{ inputs.shared-key }}
         cache-on-failure: true
         # Only main writes cache entries; PR jobs restore from main's cache but
         # never save, so a PR can't poison the shared cache.
