@@ -72,6 +72,7 @@ impl Digest {
         diff == 0
     }
 
+    #[cfg(test)]
     fn relative_path(&self) -> PathBuf {
         PathBuf::from(&self.algorithm).join(&self.hex)
     }
@@ -409,6 +410,7 @@ impl FsStorage {
         }
         Ok(path)
     }
+    #[cfg(test)]
     fn blob_path(&self, repo: &str, d: &Digest) -> Result<PathBuf, StorageError> {
         Ok(self.repo_dir(repo)?.join("blobs").join(d.relative_path()))
     }
