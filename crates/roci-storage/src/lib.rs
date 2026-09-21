@@ -466,6 +466,16 @@ impl FsStorage {
         Self::safe_component(id)?;
         Ok((dir, id.to_string()))
     }
+    /// The repository directory itself, relative to the store root
+    /// (`<repo…>`), validated component-wise — for dirfd-anchored layout/upload
+    /// operations that must not follow a symlink planted at a repo component.
+    fn repo_rel(&self, repo: &str) -> Result<PathBuf, StorageError> {
+        let mut rel = PathBuf::new();
+        for component in repo.split('/') {
+            rel.push(Self::safe_component(component)?);
+        }
+        Ok(rel)
+    }
 
     /// Best-effort: if the just-promoted blob is small enough, read it back
     /// (no-follow, beneath-root) and warm the small-blob cache. Any IO hiccup
@@ -497,42 +507,22 @@ impl FsStorage {
         }
         self.cache.put(repo, digest_str, &bytes);
     }
-    fn layout_path(&self, repo: &str) -> Result<PathBuf, StorageError> {
-        Ok(self.repo_dir(repo)?.join("oci-layout"))
+    async fn ensure_layout(&self, repo: &str) -> Result<(), StorageError> {
+        // Anchor the repo dir + `oci-layout` marker to a dirfd walked no-follow
+        // beneath the store root: a symlink planted at a repo path component
+        // cannot redirect the marker write outside the store (a path-based
+        // `create_dir_all`+`write` would follow it). Idempotent.
+        let repo_rel = self.repo_rel(repo)?;
+        ensure_layout_beneath(&self.root, &repo_rel, OCI_LAYOUT_MARKER).await?;
+        // Persist the repo path entry itself (its parent dir) so a blob-only
+        // repository is discoverable after a crash. The repo dir is `<root>/…/
+        // <name>`, so it has a parent under the root.
+        let repo_dir = self.repo_dir(repo)?;
+        sync_dir(repo_dir.parent().unwrap_or(&repo_dir)).await?;
+        Ok(())
     }
     fn index_path(&self, repo: &str) -> Result<PathBuf, StorageError> {
         Ok(self.repo_dir(repo)?.join("index.json"))
-    }
-    /// Ensure `<repo>/` exists and carries a valid `oci-layout` marker so the
-    /// directory is a well-formed OCI image layout even if only blobs (no
-    /// manifest) have been pushed. Idempotent.
-    async fn ensure_layout(&self, repo: &str) -> Result<(), StorageError> {
-        let repo_dir = self.repo_dir(repo)?;
-        tokio::fs::create_dir_all(&repo_dir).await?;
-        let marker = self.layout_path(repo)?;
-        // Write the marker only if absent (idempotent). A pre-existing marker is
-        // the steady state after the first push.
-        if tokio::fs::try_exists(&marker).await? {
-            return Ok(());
-        }
-        // fsync the marker and the repo directory so a blob-only repository (only
-        // `oci-layout` + `blobs/`) is discoverable after a crash — otherwise a
-        // restart's CAS walk misses it and a valid referenced blob is reported
-        // absent (MANIFEST_BLOB_UNKNOWN). The parent (`root/<repo-parents>`)
-        // entry is persisted too so the repo path itself survives.
-        tokio::fs::write(&marker, OCI_LAYOUT_MARKER).await?;
-        {
-            let f = tokio::fs::OpenOptions::new()
-                .read(true)
-                .open(&marker)
-                .await?;
-            f.sync_all().await?;
-        }
-        sync_dir(&repo_dir).await?;
-        // A repo dir is always `<root>/…/<name>`, so it has a parent; sync it so
-        // the repo path entry itself is durable.
-        sync_dir(repo_dir.parent().unwrap_or(&repo_dir)).await?;
-        Ok(())
     }
     /// Read `<repo>/index.json` as an image index. A missing index yields the
     /// canonical empty image index. A malformed on-disk index is an internal
@@ -557,6 +547,7 @@ impl FsStorage {
         tokio::fs::rename(&tmp, &dest).await?;
         Ok(())
     }
+    #[cfg(test)]
     fn upload_path(&self, repo: &str, id: &str) -> Result<PathBuf, StorageError> {
         Ok(self
             .repo_dir(repo)?
@@ -886,10 +877,8 @@ async fn mount_promote_beneath(
         let mut out = promote_via_temp(OFlags::empty())?;
         if try_reflink(&mut out, &mut src_file) {
             out.sync_all()?;
-            rustix::fs::renameat(&to_dir, tmp.as_str(), &to_dir, leaf.as_str())
-                .map_err(io::Error::from)?;
-            rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
-            return Ok(());
+            drop(out);
+            return promote_temp_noreplace(&to_dir, tmp.as_str(), leaf.as_str());
         }
         // Reflink unavailable: drop the temp and try a direct hard link.
         drop(out);
@@ -922,15 +911,53 @@ async fn mount_promote_beneath(
                 let mut out = promote_via_temp(OFlags::empty())?;
                 stream_copy(&mut src_file, &mut out)?;
                 out.sync_all()?;
-                rustix::fs::renameat(&to_dir, tmp.as_str(), &to_dir, leaf.as_str())
-                    .map_err(io::Error::from)?;
-                rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
-                Ok(())
+                drop(out);
+                promote_temp_noreplace(&to_dir, tmp.as_str(), leaf.as_str())
             }
         }
     })
     .await
     .map_err(io::Error::other)?
+}
+
+/// Atomically move the temp `tmp` onto `leaf` in `to_dir` with **no-replace**
+/// semantics (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)`
+/// on Apple), then fsync the dir. Plain `renameat` has replace semantics: a
+/// racer that installs a symlink or a different file at `leaf` between the
+/// caller's no-follow check and the rename would be silently overwritten (or the
+/// symlink followed on a later replace). NOREPLACE closes that window — the
+/// rename fails `EEXIST` if anything is at `leaf`, which is accepted as an
+/// idempotent dedup hit ONLY when the existing entry is a regular file
+/// (re-validated no-follow); a symlink/dir/other is rejected. The leftover temp
+/// is removed on the idempotent path so no orphan survives.
+#[cfg(unix)]
+fn promote_temp_noreplace(to_dir: &std::os::fd::OwnedFd, tmp: &str, leaf: &str) -> io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, RenameFlags};
+    match rustix::fs::renameat_with(to_dir, tmp, to_dir, leaf, RenameFlags::NOREPLACE) {
+        Ok(()) => {
+            rustix::fs::fsync(to_dir).map_err(io::Error::from)?;
+            Ok(())
+        }
+        // Something is already at `leaf`. Accept only a regular file (idempotent
+        // dedup — content-addressed, so identical bytes); reject a raced
+        // symlink/dir/other. Drop our now-unneeded temp either way.
+        Err(rustix::io::Errno::EXIST) => {
+            let st = rustix::fs::statat(to_dir, leaf, AtFlags::SYMLINK_NOFOLLOW);
+            let _ = rustix::fs::unlinkat(to_dir, tmp, AtFlags::empty());
+            match st {
+                Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => Ok(()),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "CAS destination exists and is not a regular file",
+                )),
+                Err(e) => Err(io::Error::from(e)),
+            }
+        }
+        Err(e) => {
+            let _ = rustix::fs::unlinkat(to_dir, tmp, AtFlags::empty());
+            Err(io::Error::from(e))
+        }
+    }
 }
 
 /// `linkat` between two dirfds, with a test-only fault seam: when
@@ -1064,11 +1091,10 @@ async fn publish_bytes_rename(
         f.write_all(&data)?;
         f.sync_all()?;
         drop(f);
-        rustix::fs::renameat(&dirfd, tmp_name.as_str(), &dirfd, leaf.as_str())
-            .map_err(io::Error::from)?;
-        // Persist the new directory entry (fsync the dirfd).
-        rustix::fs::fsync(&dirfd).map_err(io::Error::from)?;
-        Ok(())
+        // No-replace promotion: a raced symlink/file at `leaf` is not silently
+        // overwritten; an `EEXIST` is a dedup hit only if the existing entry is a
+        // regular file (matches the Linux O_TMPFILE+linkat path's contract).
+        promote_temp_noreplace(&dirfd, tmp_name.as_str(), leaf.as_str())
     })
     .await
     .map_err(io::Error::other)?
@@ -1348,10 +1374,37 @@ async fn rename_beneath(
         if (st.st_dev as u64, st.st_ino as u64) != expected_ino {
             return Err(io::Error::from(io::ErrorKind::NotFound));
         }
-        rustix::fs::renameat(&from_fd, from_leaf.as_str(), &to_fd, to_leaf.as_str())
-            .map_err(io::Error::from)?;
-        rustix::fs::fsync(&to_fd).map_err(io::Error::from)?;
-        Ok(())
+        // No-replace rename onto the CAS leaf: a racer that installs a
+        // symlink/file at `to_leaf` is not overwritten. `EEXIST` means the digest
+        // already exists — idempotent success only if it is a regular file
+        // (content-addressed, identical bytes), else rejected; our verified
+        // staging inode is discarded on the dedup path.
+        use rustix::fs::{FileType, RenameFlags};
+        match rustix::fs::renameat_with(
+            &from_fd,
+            from_leaf.as_str(),
+            &to_fd,
+            to_leaf.as_str(),
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {
+                rustix::fs::fsync(&to_fd).map_err(io::Error::from)?;
+                Ok(())
+            }
+            Err(rustix::io::Errno::EXIST) => {
+                let dst = rustix::fs::statat(&to_fd, to_leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(io::Error::from)?;
+                if FileType::from_raw_mode(dst.st_mode).is_file() {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "CAS destination exists and is not a regular file",
+                    ))
+                }
+            }
+            Err(e) => Err(io::Error::from(e)),
+        }
     })
     .await
     .map_err(io::Error::other)?
@@ -1369,6 +1422,87 @@ async fn unlink_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io::Result<(
         let dirfd = dir_beneath(&root, &dir_rel, false)?;
         rustix::fs::unlinkat(&dirfd, leaf.as_str(), rustix::fs::AtFlags::empty())
             .map_err(io::Error::from)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+/// Create an empty file `leaf` inside `dir_rel` (relative to `root`), creating
+/// the directory tree, via a dirfd walked no-follow beneath `root` and an
+/// `O_CREAT|O_EXCL|O_NOFOLLOW` open. A symlink planted at any parent component
+/// (or at `leaf` itself) cannot redirect the creation outside the store. Used to
+/// stage an upload session (`<repo…>/uploads/<id>`) without following a planted
+/// `uploads` symlink the way a path-based `File::create` would.
+#[cfg(unix)]
+async fn create_empty_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io::Result<()> {
+    use rustix::fs::{Mode, OFlags};
+    let root = root.to_path_buf();
+    let dir_rel = dir_rel.to_path_buf();
+    let leaf = leaf.to_string();
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
+        let dirfd = dir_beneath(&root, &dir_rel, true)?;
+        let fd = rustix::fs::openat(
+            &dirfd,
+            leaf.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )
+        .map_err(io::Error::from)?;
+        drop(std::fs::File::from(fd));
+        Ok(())
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+/// Ensure `<repo…>` exists with a valid `oci-layout` marker, anchored to a dirfd
+/// walked no-follow beneath `root` so a symlink planted at a repo path component
+/// cannot redirect the marker write outside the store (the path-based
+/// `create_dir_all`+`write` would follow it). Idempotent: an existing regular
+/// marker is left as-is; the repo dir and its parent are fsynced so a blob-only
+/// repository survives a crash. Returns whether the marker was newly written.
+#[cfg(unix)]
+async fn ensure_layout_beneath(root: &Path, repo_rel: &Path, marker: &str) -> io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+    let root = root.to_path_buf();
+    let repo_rel = repo_rel.to_path_buf();
+    let marker = marker.to_string();
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
+        use std::io::Write as _;
+        let dirfd = dir_beneath(&root, &repo_rel, true)?;
+        // Idempotent: a pre-existing regular `oci-layout` is the steady state.
+        match rustix::fs::statat(&dirfd, "oci-layout", AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => return Ok(()),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "oci-layout exists and is not a regular file",
+                ))
+            }
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => return Err(io::Error::from(e)),
+        }
+        // Write the marker to a temp in the repo dirfd, fsync, then no-replace
+        // rename into place (a racer creating it first is an idempotent win).
+        let mut rnd = [0u8; 8];
+        getrandom::fill(&mut rnd).map_err(io::Error::other)?;
+        let tmp = format!(".oci-layout.{}.tmp", hex::encode(rnd));
+        let fd = rustix::fs::openat(
+            &dirfd,
+            tmp.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )
+        .map_err(io::Error::from)?;
+        let mut f = std::fs::File::from(fd);
+        f.write_all(marker.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        match promote_temp_noreplace(&dirfd, tmp.as_str(), "oci-layout") {
+            // A concurrent creator won the race: still success (idempotent).
+            Ok(()) => Ok(()),
+            Err(e) => Err(e),
+        }
     })
     .await
     .map_err(io::Error::other)?
@@ -1554,10 +1688,12 @@ impl Storage for FsStorage {
         let mut buf = [0u8; 16];
         getrandom::fill(&mut buf).map_err(|e| StorageError::Io(io::Error::other(e)))?;
         let id = hex::encode(buf);
-        let path = self.upload_path(repo, &id)?;
-        let uploads_dir = self.repo_dir(repo)?.join("uploads");
-        tokio::fs::create_dir_all(&uploads_dir).await?;
-        tokio::fs::File::create(&path).await?;
+        // Create the staging file anchored to a dirfd walked no-follow beneath
+        // the store root (creating `<repo…>/uploads`), so a symlink planted at a
+        // repo/`uploads` component cannot redirect the create outside the store
+        // the way a path-based `create_dir_all`+`File::create` would.
+        let (up_dir, up_leaf) = self.upload_dir_rel(repo, &id)?;
+        create_empty_beneath(&self.root, &up_dir, &up_leaf).await?;
         Ok(id)
     }
 
@@ -1601,10 +1737,17 @@ impl Storage for FsStorage {
     }
 
     async fn upload_size(&self, repo: &str, id: &str) -> Result<u64, StorageError> {
-        let meta = tokio::fs::metadata(self.upload_path(repo, id)?)
+        // Stat the staging file no-follow beneath the store root: a symlinked
+        // `uploads`/`<id>` component cannot redirect the size read outside the
+        // store. A missing or non-regular entry is NotFound (no such session).
+        let rel = self.upload_rel(repo, id)?;
+        match stat_beneath(&self.root, &rel)
             .await
-            .map_err(map_not_found)?;
-        Ok(meta.len())
+            .map_err(map_not_found)?
+        {
+            Some((true, size)) => Ok(size),
+            _ => Err(StorageError::NotFound),
+        }
     }
 
     async fn finish_upload(
@@ -1621,7 +1764,6 @@ impl Storage for FsStorage {
         // valid completion).
         let lock = self.session_lock(repo, id)?;
         let _guard = lock.lock().await;
-        let staging = self.upload_path(repo, id)?;
         let staging_rel = self.upload_rel(repo, id)?;
         // Append the monolithic PUT's trailing body (if any) to the staging file
         // under the same lock, no-follow, before hashing.
@@ -1648,7 +1790,8 @@ impl Storage for FsStorage {
             }
         };
         if !is_file {
-            let _ = tokio::fs::remove_file(&staging).await;
+            let (up_dir, up_leaf) = self.upload_dir_rel(repo, id)?;
+            let _ = unlink_beneath(&self.root, &up_dir, &up_leaf).await;
             self.drop_session_lock(repo, id);
             return Err(StorageError::BadPath(format!(
                 "upload {id} is not a regular file"
@@ -1659,7 +1802,8 @@ impl Storage for FsStorage {
         // racing empty-body PUT, because finalize itself rejects an oversized
         // staging file (and drops it) here.
         if staged_size > max_size {
-            let _ = tokio::fs::remove_file(&staging).await;
+            let (up_dir, up_leaf) = self.upload_dir_rel(repo, id)?;
+            let _ = unlink_beneath(&self.root, &up_dir, &up_leaf).await;
             self.drop_session_lock(repo, id);
             return Err(StorageError::TooLarge {
                 limit: max_size,
@@ -1707,7 +1851,9 @@ impl Storage for FsStorage {
         self.ensure_layout(repo).await?;
         let (up_dir, up_leaf) = self.upload_dir_rel(repo, id)?;
         let (alg_rel, hex) = self.blob_dir_rel(repo, expected)?;
-        rename_beneath(&self.root, &up_dir, &up_leaf, &alg_rel, &hex, staging_ino).await?;
+        rename_beneath(&self.root, &up_dir, &up_leaf, &alg_rel, &hex, staging_ino)
+            .await
+            .map_err(map_not_found)?;
         self.drop_session_lock(repo, id);
         // Record presence so future reads skip the stat on a definite miss.
         let digest_str = expected.as_string();
@@ -1725,8 +1871,12 @@ impl Storage for FsStorage {
         // Serialize with any concurrent append/finish, then drop the session.
         let lock = self.session_lock(repo, id)?;
         let guard = lock.lock().await;
-        // Idempotent: a missing session is `Ok(false)` (nothing removed).
-        let removed = match tokio::fs::remove_file(self.upload_path(repo, id)?).await {
+        // Idempotent: a missing session is `Ok(false)` (nothing removed). Remove
+        // via a dirfd walked no-follow beneath the store root so a symlinked
+        // `uploads`/`<id>` component cannot redirect the deletion outside the
+        // store; a missing entry / symlinked parent maps to NotFound → false.
+        let (up_dir, up_leaf) = self.upload_dir_rel(repo, id)?;
+        let removed = match unlink_beneath(&self.root, &up_dir, &up_leaf).await {
             Ok(()) => true,
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(StorageError::Io(e)),
@@ -2053,6 +2203,9 @@ impl Storage for FsStorage {
                     digest.as_string()
                 )));
             }
+            // A symlinked/non-directory destination parent is refused beneath the
+            // root as `NotFound` → 404 (documented), not a raw 500.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(StorageError::NotFound),
             Err(e) => return Err(StorageError::Io(e)),
         }
         self.presence.insert(to_repo, &digest.as_string());

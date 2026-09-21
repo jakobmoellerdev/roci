@@ -38,7 +38,7 @@ repos:
         pass_filenames: false
 
       - id: coverage
-        name: coverage (100% lines) + report refresh
+        name: coverage (95% floor) + report refresh
         entry: bash scripts/coverage.sh
         language: system
         types: [rust]

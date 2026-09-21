@@ -7,7 +7,7 @@ shim over the fully-covered library). Any uncovered lines are listed at gate
 time for triage; the few that remain are unreachable-in-CI defensive
 syscall-error arms in the beneath-root storage path.
 
-Current line coverage: **99.69%** (5836/5854 lines).
+Current line coverage: **99.24%** (5883/5928 lines).
 
 Regenerate with `just coverage` (or on every commit via the pre-commit hook).
 Inspect region-level gaps with `just coverage-report`.
@@ -29,9 +29,9 @@ roci-ext-sync/src/lib.rs               3                 0   100.00%           1
 roci-storage-s3/src/lib.rs             3                 0   100.00%           1                 0   100.00%           3                 0   100.00%           0                 0         -
 roci-storage/src/cache.rs            304                 0   100.00%          15                 0   100.00%         112                 0   100.00%           0                 0         -
 roci-storage/src/filter.rs           169                 0   100.00%          12                 0   100.00%          83                 0   100.00%           0                 0         -
-roci-storage/src/lib.rs             5075               252    95.03%         273                12    95.60%        2275                38    98.33%           0                 0         -
+roci-storage/src/lib.rs             5209               290    94.43%         280                12    95.71%        2353                65    97.24%           0                 0         -
 roci-storage/src/metadata.rs         962                17    98.23%          43                 0   100.00%         451                 0   100.00%           0                 0         -
 roci-telemetry/src/lib.rs             33                 0   100.00%           5                 0   100.00%          22                 0   100.00%           0                 0         -
 --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-TOTAL                              12039               282    97.66%         641                13    97.97%        6464                39    99.40%           0                 0         -
+TOTAL                              12173               320    97.37%         648                13    97.99%        6542                66    98.99%           0                 0         -
 ```

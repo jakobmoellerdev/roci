@@ -22,9 +22,10 @@ if echo "$staged" | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$'; then
   cargo clippy --workspace --all-targets --all-features -- -D warnings
   cargo clippy --workspace --no-default-features -- -D warnings
 
-  echo "[pre-commit] coverage (100% lines) + report refresh"
-  # scripts/coverage.sh enforces 100% on Linux and is tolerant on other
-  # platforms (a few Unix-filesystem-specific lines are covered on Linux CI).
+  echo "[pre-commit] coverage (95% floor) + report refresh"
+  # scripts/coverage.sh enforces a >=95% line floor on Linux and prints the
+  # uncovered lines for triage (a few Unix-filesystem-specific defensive arms
+  # are unreachable in CI); it is authoritative on Linux CI.
   bash scripts/coverage.sh
   # Re-stage the regenerated report and badge so they land in this commit.
   git add COVERAGE.md README.md
