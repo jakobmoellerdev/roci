@@ -42,12 +42,14 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: filesystems
-      - name: Install filesystem tools + nextest
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        with:
+          tool: nextest
+      - name: Install filesystem tools
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends btrfs-progs xfsprogs
-          cargo install cargo-nextest --locked
 
       - name: Create, mount, and run the suite on ${{ matrix.fs }}
         shell: bash
@@ -86,5 +88,5 @@ jobs:
             ext4)      [ "$reflink" = unsupported ] || echo "note: ext4 reports reflink (kernel-dependent); fallback still valid" ;;
           esac
           # Run the storage suite rooted on the mounted filesystem.
-          TMPDIR="$mnt" cargo nextest run -p roci-storage --all-features
+          TMPDIR="$mnt" cargo nextest run -p roci-storage --all-features --cargo-profile ci
           sudo umount "$mnt"

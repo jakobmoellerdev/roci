@@ -17,20 +17,24 @@ fmt:
 fmt-fix:
     cargo fmt --all
 
-# Lint both build flavors, warnings = errors (CI `clippy` job).
+# Lint both build flavors, warnings = errors (CI `clippy` job). Clippy is the
+# sole gate that compiles the minimal flavor (ARCHITECTURE.md invariant 1).
 clippy:
     cargo clippy --workspace --all-targets --all-features --profile ci -- -D warnings
-    cargo clippy --workspace --no-default-features -- -D warnings
+    cargo clippy --workspace --no-default-features --profile ci -- -D warnings
 
-# Tests via nextest + doctests (CI `test` job).
+# Tests via nextest + doctests (CI `test + coverage` job). `--cargo-profile ci`
+# builds under the shared `ci` profile (nextest's own `--profile` selects a
+# nextest test profile, of which only `default` exists).
 test:
-    cargo nextest run --workspace --all-features --profile ci
-    cargo test --workspace --all-features --doc
+    cargo nextest run --workspace --all-features --cargo-profile ci
+    cargo test --workspace --all-features --doc --profile ci
 
-# Build both flavors (CI `build-flavors` job).
+# Build both flavors (dev convenience). The minimal flavor's CI compile gate is
+# now the clippy job; `just build` still compiles both locally as a sanity check.
 build:
-    cargo build --workspace --no-default-features
-    cargo build --workspace --all-features
+    cargo build --workspace --no-default-features --profile ci
+    cargo build --workspace --all-features --profile ci
 
 # Assert no extension crate leaks into the minimal build (CI `minimal-deps-guard` job).
 deps-guard:

@@ -72,11 +72,17 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: clippy
+          # shared-key (not the job-scoped `cache-key`) so the conformance job,
+          # which has a different job id, restores these same compiled deps.
+          shared-key: ci-full
           components: clippy
-      # Full flavor: lint everything, extensions included.
+      # Full flavor: lint everything, extensions included. This is also the
+      # workspace's sole full-flavor `--profile ci` compile — its compiled deps
+      # are cached under `ci-full` and reused by the conformance job.
       - run: cargo clippy --workspace --all-targets --all-features --profile ci -- -D warnings
-      # Minimal flavor must also compile clean (ARCHITECTURE.md invariant 1).
+      # Minimal flavor: clippy is the ONLY gate that compiles the minimal flavor
+      # (ARCHITECTURE.md invariant 1). `--all-targets --no-default-features`
+      # type-checks every target, a strict superset of a bare minimal `build`.
       - run: cargo clippy --workspace --no-default-features --profile ci -- -D warnings
 
   # One instrumented all-features build serves BOTH the test run and the
@@ -133,22 +139,6 @@ jobs:
             coverage-html
             COVERAGE.md
           if-no-files-found: ignore
-
-  # Minimal flavor is a distinct feature set (cannot reuse the all-features
-  # artifacts), so it gets its own compile — the only extra build besides the
-  # instrumented one. The `full` flavor is already compiled by test-and-coverage.
-  build-minimal:
-    name: build (minimal flavor)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup-rust
-        with:
-          cache-key: flavor-minimal
-      # Core builds with every extension disabled (ARCHITECTURE invariant 1).
-      - run: cargo build --workspace --no-default-features --profile ci
 
   minimal-deps-guard:
     name: minimal-deps-guard
