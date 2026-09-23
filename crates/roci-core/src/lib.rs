@@ -17,6 +17,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
+use roci_config::Config;
 use roci_storage::{digest_of, sha256_of, Digest, Storage, StorageError};
 
 mod error;
@@ -32,27 +33,36 @@ pub struct AppState<S: Storage> {
     max_body: usize,
     /// Maximum cumulative size of one upload session; exceeding it is 413.
     max_upload: u64,
+    /// Effective runtime configuration.
+    config: Config,
 }
 
-// Manual Clone: `Arc<S>` is always cloneable regardless of whether `S` is.
+// Manual Clone: `Arc<S>` + `Config` are both cloneable regardless of whether
+// `S` is.
 impl<S: Storage> Clone for AppState<S> {
     fn clone(&self) -> Self {
         Self {
             storage: Arc::clone(&self.storage),
             max_body: self.max_body,
             max_upload: self.max_upload,
+            config: self.config.clone(),
         }
     }
 }
 
 impl<S: Storage> AppState<S> {
-    /// Wrap a storage backend, accepting bodies up to [`MAX_BODY`] (256 MiB)
-    /// and upload sessions up to [`MAX_UPLOAD`] (5 GiB).
+    /// Wrap a storage backend with default size limits and a default config.
     pub fn new(storage: S) -> Self {
+        Self::new_with(storage, Config::default())
+    }
+
+    /// Wrap a storage backend with an explicit config.
+    pub fn new_with(storage: S, config: Config) -> Self {
         Self {
             storage: Arc::new(storage),
             max_body: MAX_BODY,
             max_upload: MAX_UPLOAD,
+            config,
         }
     }
 
@@ -66,6 +76,11 @@ impl<S: Storage> AppState<S> {
     pub fn with_max_upload(mut self, max_upload: u64) -> Self {
         self.max_upload = max_upload;
         self
+    }
+
+    /// Whether deletion is enabled in the effective configuration.
+    pub fn can_delete(&self) -> bool {
+        self.config.delete.enabled
     }
 }
 
@@ -216,6 +231,8 @@ struct TagsQuery {
 struct ReferrersQuery {
     #[serde(rename = "artifactType")]
     artifact_type: Option<String>,
+    n: Option<usize>,
+    last: Option<String>,
 }
 
 // ---- end-1: base ---------------------------------------------------------
@@ -550,6 +567,9 @@ fn blob_not_modified(digest_str: &str) -> Response {
 }
 
 async fn delete_blob<S: Storage>(st: &AppState<S>, repo: &str, d: &Digest) -> Response {
+    if !st.can_delete() {
+        return ApiError::unsupported().into_response();
+    }
     match st.storage.delete_blob(repo, d).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(StorageError::NotFound) => ApiError::blob_unknown().into_response(),
@@ -852,6 +872,9 @@ async fn put_manifest<S: Storage>(
 }
 
 async fn delete_manifest<S: Storage>(st: &AppState<S>, repo: &str, reference: &str) -> Response {
+    if !st.can_delete() {
+        return ApiError::unsupported().into_response();
+    }
     // Resolve tag → digest first so tag deletions work too. A `:`-form
     // reference is a digest (grammar checked by Digest::parse → 400 on a
     // malformed digest); otherwise it is a tag resolved via storage.
@@ -1092,14 +1115,38 @@ async fn list_tags<S: Storage>(st: &AppState<S>, repo: &str, q: TagsQuery) -> Re
     }
     // Clamp the requested page size to the server-side cap (SECURITY inv. 14).
     let limit = q.n.map(|n| n.min(MAX_PAGE)).unwrap_or(MAX_PAGE);
+    let total_len = tags.len();
     tags.truncate(limit);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    // Pagination (dist-spec end-8): when tags remain past this page, advertise
+    // the next page with an RFC 5988 `Link` whose cursor is the last tag served.
+    if total_len > tags.len() && limit > 0 {
+        let cursor = tags.last().map(String::as_str).unwrap_or_default();
+        insert_next_link(
+            &mut headers,
+            &format!("/v2/{repo}/tags/list"),
+            &[("n", &limit.to_string()), ("last", cursor)],
+        );
+    }
     let body = serde_json::json!({ "name": repo, "tags": tags });
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response()
+    (StatusCode::OK, headers, body.to_string()).into_response()
+}
+
+/// Insert an RFC 5988 `Link: <path?query>; rel="next"` header. Query values are
+/// form-urlencoded so cursor/filter values containing `&`, `#`, `%`, `+` or
+/// spaces round-trip through the next request; a value that still cannot form
+/// a header (control bytes) omits the link rather than panicking.
+fn insert_next_link(headers: &mut HeaderMap, path: &str, query: &[(&str, &str)]) {
+    let Ok(qs) = serde_urlencoded::to_string(query) else {
+        return;
+    };
+    if let Ok(v) = HeaderValue::from_str(&format!("<{path}?{qs}>; rel=\"next\"")) {
+        headers.insert(header::LINK, v);
+    }
 }
 
 // ---- end-12: referrers ---------------------------------------------------
@@ -1117,31 +1164,68 @@ async fn referrers<S: Storage>(
         .list_referrers(repo, subject)
         .await
         .unwrap_or_default();
-    // Bound work *before* parsing: take at most MAX_PAGE raw descriptors so a
-    // large referrer index cannot exhaust memory/CPU in the parse below
-    // (GHSA-259w-8hf6-59bj amplification class).
-    let mut manifests: Vec<serde_json::Value> = raw
-        .into_iter()
-        .take(MAX_PAGE)
-        .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .collect();
+    let limit = q.n.map(|n| n.min(MAX_PAGE)).unwrap_or(MAX_PAGE);
+    let filter = q.artifact_type.as_deref();
+    // Stream the (stable, insertion-ordered) referrer list: skip through the
+    // `last` cursor, apply the artifactType filter, and stop after `limit + 1`
+    // matches — so parse work is bounded by the page, never by the whole
+    // referrer set (GHSA-259w-8hf6-59bj amplification class), and every page
+    // stays reachable via the cursor.
+    let mut past_cursor = q.last.is_none();
+    let mut manifests: Vec<serde_json::Value> = Vec::with_capacity(limit.min(64) + 1);
+    for bytes in raw {
+        let Ok(m) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let digest = m.get("digest").and_then(|v| v.as_str());
+        if !past_cursor {
+            past_cursor = digest == q.last.as_deref();
+            continue;
+        }
+        if let Some(f) = filter {
+            if m.get("artifactType").and_then(|v| v.as_str()) != Some(f) {
+                continue;
+            }
+        }
+        manifests.push(m);
+        if manifests.len() > limit {
+            break;
+        }
+    }
+    let had_more = manifests.len() > limit;
+    manifests.truncate(limit);
 
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/vnd.oci.image.index.v1+json"),
     );
-    // end-12b: filter by artifactType and advertise the applied filter.
-    if let Some(filter) = q.artifact_type.as_ref() {
-        manifests
-            .retain(|m| m.get("artifactType").and_then(|v| v.as_str()) == Some(filter.as_str()));
+    // end-12b: advertise the applied filter; the response varies by query.
+    if filter.is_some() {
         headers.insert(
             "oci-filters-applied",
             HeaderValue::from_static("artifactType"),
         );
+        headers.insert(header::VARY, HeaderValue::from_static("Accept"));
+    }
+    // RFC 5988 `Link` to the next page when this one is truncated.
+    if had_more && limit > 0 {
+        let last_digest = manifests
+            .last()
+            .and_then(|m| m.get("digest").and_then(|v| v.as_str()))
+            .unwrap_or_default();
+        let n = limit.to_string();
+        let mut query: Vec<(&str, &str)> = vec![("n", &n), ("last", last_digest)];
+        if let Some(f) = filter {
+            query.push(("artifactType", f));
+        }
+        insert_next_link(
+            &mut headers,
+            &format!("/v2/{repo}/referrers/{}", subject.as_string()),
+            &query,
+        );
     }
 
-    // (list already bounded to MAX_PAGE before parsing above)
     let body = serde_json::json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.index.v1+json",
@@ -2331,6 +2415,202 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(v["tags"], serde_json::json!(["c", "d"]));
+    }
+
+    #[tokio::test]
+    async fn delete_disabled_returns_405() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path()).unwrap();
+        let m = br#"{"schemaVersion":2}"#;
+        let md = sha256_of(m);
+        storage
+            .put_manifest("r", Some("v1"), &md, "application/json", m)
+            .await
+            .unwrap();
+        let mut config = Config::default();
+        config.delete.enabled = false;
+        let app = build_router(AppState::new_with(storage.clone(), config));
+        for path in [
+            format!("/v2/r/manifests/{}", md.as_string()),
+            "/v2/r/manifests/v1".to_string(),
+            format!("/v2/r/blobs/{}", md.as_string()),
+        ] {
+            let v = body_json_of(
+                &app,
+                HttpRequest::delete(&path).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(v["errors"][0]["code"], "UNSUPPORTED", "{path}");
+            assert_eq!(
+                status_of(
+                    &app,
+                    HttpRequest::delete(&path).body(Body::empty()).unwrap()
+                )
+                .await,
+                StatusCode::METHOD_NOT_ALLOWED
+            );
+        }
+        // Nothing was deleted.
+        assert!(storage.get_manifest("r", "v1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn tags_list_link_header_walks_all_pages() {
+        let (app, storage, _d) = app_with_storage();
+        let m = br#"{"schemaVersion":2}"#;
+        let md = sha256_of(m);
+        for t in ["a", "b", "c", "d", "e"] {
+            storage
+                .put_manifest("r", Some(t), &md, "application/json", m)
+                .await
+                .unwrap();
+        }
+        let mut url = "/v2/r/tags/list?n=2".to_string();
+        let mut seen = Vec::new();
+        loop {
+            let resp = app
+                .clone()
+                .oneshot(HttpRequest::get(&url).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let link = resp
+                .headers()
+                .get(header::LINK)
+                .map(|v| v.to_str().unwrap().to_string());
+            let v: serde_json::Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            for t in v["tags"].as_array().unwrap() {
+                seen.push(t.as_str().unwrap().to_string());
+            }
+            match link {
+                Some(l) => {
+                    assert!(l.ends_with("; rel=\"next\""), "{l}");
+                    url = l[1..l.find('>').unwrap()].to_string();
+                }
+                None => break,
+            }
+        }
+        assert_eq!(seen, ["a", "b", "c", "d", "e"]);
+    }
+
+    #[tokio::test]
+    async fn referrers_pagination_filter_link_and_vary() {
+        let (app, storage, _d) = app_with_storage();
+        let subject = sha256_of(b"subject");
+        let mut sigs = Vec::new();
+        for i in 0..5u8 {
+            let r = sha256_of(&[i]);
+            let at = if i % 2 == 0 {
+                "application/sig"
+            } else {
+                "application/sbom"
+            };
+            if at == "application/sig" {
+                sigs.push(r.as_string());
+            }
+            let desc = serde_json::json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": r.as_string(),
+                "size": 1,
+                "artifactType": at,
+            });
+            storage
+                .add_referrer("r", &subject, &r, desc.to_string().as_bytes())
+                .await
+                .unwrap();
+        }
+        // Unfiltered: no Vary, no filter header, full list.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(format!("/v2/r/referrers/{}", subject.as_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().get(header::VARY).is_none());
+        assert!(resp.headers().get(header::LINK).is_none());
+        // Filtered + paged: walk every page via Link; collect only sigs.
+        let mut url = format!(
+            "/v2/r/referrers/{}?artifactType=application/sig&n=2",
+            subject.as_string()
+        );
+        let mut seen = Vec::new();
+        loop {
+            let resp = app
+                .clone()
+                .oneshot(HttpRequest::get(&url).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.headers().get(header::VARY).unwrap(), "Accept");
+            assert_eq!(
+                resp.headers().get("oci-filters-applied").unwrap(),
+                "artifactType"
+            );
+            let link = resp
+                .headers()
+                .get(header::LINK)
+                .map(|v| v.to_str().unwrap().to_string());
+            let v: serde_json::Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            let page = v["manifests"].as_array().unwrap();
+            assert!(page.len() <= 2);
+            for m in page {
+                seen.push(m["digest"].as_str().unwrap().to_string());
+            }
+            match link {
+                Some(l) => url = l[1..l.find('>').unwrap()].to_string(),
+                None => break,
+            }
+        }
+        assert_eq!(seen, sigs);
+    }
+
+    #[tokio::test]
+    async fn next_link_encodes_query_values_and_round_trips() {
+        let (app, storage, _d) = app_with_storage();
+        let subject = sha256_of(b"subject");
+        let at = "application/vnd.x+json; a=b&c#d%";
+        for i in 0..3u8 {
+            let r = sha256_of(&[i, 9]);
+            let desc = serde_json::json!({"digest": r.as_string(), "artifactType": at});
+            storage
+                .add_referrer("r", &subject, &r, desc.to_string().as_bytes())
+                .await
+                .unwrap();
+        }
+        let first = format!(
+            "/v2/r/referrers/{}?n=1&{}",
+            subject.as_string(),
+            serde_urlencoded::to_string([("artifactType", at)]).unwrap()
+        );
+        let mut url = first;
+        let mut pages = 0;
+        loop {
+            let resp = app
+                .clone()
+                .oneshot(HttpRequest::get(&url).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let link = resp
+                .headers()
+                .get(header::LINK)
+                .map(|v| v.to_str().unwrap().to_string());
+            let v: serde_json::Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            // The filter survives every hop: each page still has its one match.
+            assert_eq!(v["manifests"].as_array().unwrap().len(), 1);
+            pages += 1;
+            match link {
+                Some(l) => url = l[1..l.find('>').unwrap()].to_string(),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 3);
     }
 
     #[tokio::test]

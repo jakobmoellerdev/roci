@@ -45,7 +45,12 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let storage = FsStorage::new(&config.storage_root)?;
-    let app = build_router(AppState::new(storage));
+    let app = build_router(AppState::new_with(storage.clone(), config.clone()));
+    // Startup recovery before accepting requests: register pre-existing
+    // `subject` links (referrers upgrade) and reconcile `index.json` with the
+    // replayed metadata log (write-behind crash recovery, foreign-tag import).
+    storage.warm_referrers_from_layout().await;
+    storage.reconcile_index_json().await;
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let local = listener.local_addr()?;
     tracing::info!(addr = %local, root = %config.storage_root.display(), "roci listening");
@@ -91,6 +96,7 @@ mod tests {
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             storage_root: dir.path().to_path_buf(),
+            ..Default::default()
         };
         let (bind_tx, bind_rx) = tokio::sync::oneshot::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
@@ -120,6 +126,7 @@ mod tests {
         let config = Config {
             listen: taken,
             storage_root: dir.path().to_path_buf(),
+            ..Default::default()
         };
         let result = serve(config, |_| {}, std::future::pending()).await;
         assert!(result.is_err());

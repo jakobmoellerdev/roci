@@ -7,7 +7,7 @@
 
 # roci
 
-![coverage](https://img.shields.io/badge/coverage-99.24%25-brightgreen)
+![coverage](https://img.shields.io/badge/coverage-98.87%25-brightgreen)
 
 **roci** is a Rust implementation of the [OCI Distribution Specification](spec/distribution-spec/spec.md) — an OCI container registry.
 
@@ -160,7 +160,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 
 ### Core distribution
 
-- [~] Conforms to OCI Distribution Spec APIs (v1.1.1)
+- [x] Conforms to OCI Distribution Spec APIs (v1.1.1)
 - [x] Uses OCI image layout for image storage
 - [x] Can serve any OCI image layout as a registry
 - [~] Single binary for all features
@@ -168,7 +168,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [~] Clear separation between core dist-spec and roci-specific extensions
 - [ ] Behavior controlled entirely via configuration
 - [ ] Binaries released for multiple operating systems and architectures
-- [ ] Image deletion by tag
+- [x] Image deletion by tag
 - [ ] Compatible with ecosystem tools (skopeo, cri-o)
 - [ ] Suitable for on-premises deployments (e.g. colocated with Kubernetes)
 - [ ] HTTP/2 multiplexing + keep-alive; TLS 1.3 with optional kTLS zero-copy

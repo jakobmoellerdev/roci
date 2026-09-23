@@ -67,6 +67,7 @@ fi
   OCI_ROOT_URL="http://127.0.0.1:${port}" \
     OCI_NAMESPACE=roci-conformance/test \
     OCI_CROSSMOUNT_NAMESPACE=roci-conformance/other \
+    OCI_AUTOMATIC_CROSSMOUNT=false \
     OCI_TEST_PULL=1 OCI_TEST_PUSH=1 OCI_TEST_CONTENT_DISCOVERY=1 OCI_TEST_CONTENT_MANAGEMENT=1 \
     OCI_HIDE_SKIPPED_WORKFLOWS=1 \
     ./conformance.test

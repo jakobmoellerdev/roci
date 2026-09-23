@@ -96,17 +96,17 @@ Rules:
 
 **Goal:** listing, deletion, and the referrers API. **Discovery + Management conformance pass.** Completes core dist-spec conformance.
 
-- [ ] `GET /v2/<name>/tags/list` (end-8a) + paginated `?n=&last=` (end-8b) — lexical order, stable cursor, **server-side `n` cap** (SECURITY inv. 14; CVE-2023-2253 class), O(log n) `last` seek.
-- [ ] `DELETE /v2/<name>/manifests/<reference>` (end-9) — `202`; deletion by tag and by digest. **All delete paths (blob/tag/referrer) pass one `can_delete()` guard** so `delete.enabled=false` can't be bypassed (CVE-2026-41888).
-- [ ] `DELETE /v2/<name>/blobs/<digest>` (end-10) — `202`; `405`/`400` when deletion disabled (via the shared guard).
-- [ ] **`index.json` write-behind** — tag/delete mutations update in-RAM maps + WAL immediately; the spec-visible `index.json` is rewritten by a coalescing background task (atomic `O_TMPFILE`+`linkat`), never per-op.
-- [ ] **Referrers API** `GET /v2/<name>/referrers/<digest>` (end-12a) + `?artifactType=` (end-12b):
-  - [ ] Maintain a **subject → referrers reverse index** (in the MetadataStore) updated on every manifest put/delete → O(1) read, not a repo scan. **This index is also the lazy-pull metadata backbone** (SOCI index / Nydus zran meta stored as referrers).
-  - [ ] Return image index of referrers; `artifactType` filter sets `OCI-Filters-Applied`; **paginate + cap referrers-list size** (GHSA-259w-8hf6-59bj amplification); `Vary` on filtered responses.
-  - [ ] Referrers-tag-schema fallback (`<alg>-<ref>` tag).
-- [ ] Enable-referrers upgrade semantics (include preexisting subject manifests).
+- [x] `GET /v2/<name>/tags/list` (end-8a) + paginated `?n=&last=` (end-8b) — lexical order, stable cursor, **server-side `n` cap** (SECURITY inv. 14; CVE-2023-2253 class), RFC 5988 `Link: <…?n=&last=<last served>>; rel="next"` when truncated. *(Follow-up: push the page into storage — `list_tags`/`list_referrers` still materialize the full set in RAM before the handler applies `n`/`last`; needs a paged `Storage` API with an O(log n) seek over a sorted map so per-request work is bounded by the page, not the repo.)*
+- [x] `DELETE /v2/<name>/manifests/<reference>` (end-9) — `202`; deletion by tag and by digest. **All delete paths (blob/manifest-by-tag/manifest-by-digest) pass one `AppState::can_delete()` guard** so `delete.enabled=false` (config `delete.enabled`, default `true`) can't be bypassed (CVE-2026-41888) → `405 UNSUPPORTED`.
+- [x] `DELETE /v2/<name>/blobs/<digest>` (end-10) — `202`; `405` when deletion disabled (via the shared guard).
+- [x] **`index.json` write-behind** — manifest put/delete and referrer mutations update in-RAM maps + WAL immediately and bump a per-repo dirty generation; a coalescing background task rebuilds `index.json` from the metadata store merged over the on-disk index (foreign descriptors preserved) and replaces it atomically (unique tmp + `rename` + dir `fsync`), clearing the entry only if no newer mutation raced it. Reads through roci of a dirty repo derive the current index in memory; external tools see an eventually-current, always-valid layout. *(`O_TMPFILE`+`linkat` for the index file deferred; the tmp+rename sequence is equally crash-safe.)*
+- [x] **Referrers API** `GET /v2/<name>/referrers/<digest>` (end-12a) + `?artifactType=` (end-12b):
+  - [x] **subject → referrers reverse index** in the MetadataStore, updated on manifest put/delete → O(1) read, not a repo scan. **Also the lazy-pull metadata backbone** (SOCI index / Nydus zran meta stored as referrers).
+  - [x] Image index of referrers; `artifactType` filter sets `OCI-Filters-Applied` + `Vary: Accept`; **cursor pagination** `?n=&last=` with `Link` (filter carried into the next link), page capped at `MAX_PAGE` and parse work bounded by the page (GHSA-259w-8hf6-59bj amplification).
+  - [x] Referrers-tag-schema fallback (`<alg>-<ref>` tag → its image index's `manifests`, de-duplicated; malformed → empty).
+- [x] Enable-referrers upgrade semantics: `FsStorage::warm_referrers_from_layout` (run by `serve` before accepting requests) registers every pre-existing `index.json` descriptor carrying `subject` in the metadata store; idempotent. `FsStorage::reconcile_index_json` (also run by `serve`) rebuilds any repo whose `index.json` lags the replayed WAL (crash between WAL append and background rename) and imports tags from externally written layouts so rebuilds never drop them. `FsStorage::new` needs no Tokio runtime (the writer starts only when one is present).
 
-**Correctness gate:** **all four** conformance categories pass. roci is now a conformant OCI registry. Smoke: `oras` push/discover artifacts; `crane` referrers.
+**Correctness gate:** **all four** conformance categories pass (`just conformance`: 75 passed, 0 failed; the 4 skips are the suite's mutually exclusive branches — pre-seeded-registry setup, 202-mount fallback, auto-crossmount enabled). roci is now a conformant OCI registry. Smoke: `oras` push/discover artifacts; `crane` referrers.
 
 ---
 

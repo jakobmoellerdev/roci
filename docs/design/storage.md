@@ -22,6 +22,8 @@ Online, O(garbage) garbage collection — never offline — using a grace period
 
 An embedded metadata index designed for a footprint budget: append-log + in-RAM maps by default, upgradeable to a B-tree KV store, with mmap-offloadable metadata so the index can run on a Raspberry Pi.
 
+The spec-visible `index.json` is maintained by **coalescing write-behind**: a mutation is authoritative in the metadata log immediately, and a background task rewrites `index.json` atomically (no-follow beneath the storage root), preserving descriptors written by other tools. At startup roci reconciles `index.json` against the replayed log, so a crash between the two never leaves the layout behind. See the canonical [Architecture](https://github.com/jakobmoellerdev/roci/blob/main/ARCHITECTURE.md) invariant 12.
+
 ## Multi-store & quotas
 
 Serve multiple storage paths (and backends, e.g. S3 via `roci-storage-s3`) from a single server, with per-repo and per-total storage quotas, an in-memory small-blob content cache, and a 2-level fanout at scale.
