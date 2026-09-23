@@ -1125,15 +1125,28 @@ async fn list_tags<S: Storage>(st: &AppState<S>, repo: &str, q: TagsQuery) -> Re
     // Pagination (dist-spec end-8): when tags remain past this page, advertise
     // the next page with an RFC 5988 `Link` whose cursor is the last tag served.
     if total_len > tags.len() && limit > 0 {
-        let cursor = tags.last().cloned().unwrap_or_default();
-        let link = format!(
-            "</v2/{}/tags/list?n={}&last={}>; rel=\"next\"",
-            repo, limit, cursor
+        let cursor = tags.last().map(String::as_str).unwrap_or_default();
+        insert_next_link(
+            &mut headers,
+            &format!("/v2/{repo}/tags/list"),
+            &[("n", &limit.to_string()), ("last", cursor)],
         );
-        headers.insert(header::LINK, HeaderValue::from_str(&link).unwrap());
     }
     let body = serde_json::json!({ "name": repo, "tags": tags });
     (StatusCode::OK, headers, body.to_string()).into_response()
+}
+
+/// Insert an RFC 5988 `Link: <path?query>; rel="next"` header. Query values are
+/// form-urlencoded so cursor/filter values containing `&`, `#`, `%`, `+` or
+/// spaces round-trip through the next request; a value that still cannot form
+/// a header (control bytes) omits the link rather than panicking.
+fn insert_next_link(headers: &mut HeaderMap, path: &str, query: &[(&str, &str)]) {
+    let Ok(qs) = serde_urlencoded::to_string(query) else {
+        return;
+    };
+    if let Ok(v) = HeaderValue::from_str(&format!("<{path}?{qs}>; rel=\"next\"")) {
+        headers.insert(header::LINK, v);
+    }
 }
 
 // ---- end-12: referrers ---------------------------------------------------
@@ -1201,21 +1214,16 @@ async fn referrers<S: Storage>(
             .last()
             .and_then(|m| m.get("digest").and_then(|v| v.as_str()))
             .unwrap_or_default();
-        let mut link = format!(
-            "</v2/{}/referrers/{}?n={}&last={}",
-            repo,
-            subject.as_string(),
-            limit,
-            last_digest
-        );
+        let n = limit.to_string();
+        let mut query: Vec<(&str, &str)> = vec![("n", &n), ("last", last_digest)];
         if let Some(f) = filter {
-            link.push_str("&artifactType=");
-            link.push_str(&f.replace('+', "%2B"));
+            query.push(("artifactType", f));
         }
-        link.push_str(">; rel=\"next\"");
-        if let Ok(v) = HeaderValue::from_str(&link) {
-            headers.insert(header::LINK, v);
-        }
+        insert_next_link(
+            &mut headers,
+            &format!("/v2/{repo}/referrers/{}", subject.as_string()),
+            &query,
+        );
     }
 
     let body = serde_json::json!({
@@ -2559,6 +2567,50 @@ mod tests {
             }
         }
         assert_eq!(seen, sigs);
+    }
+
+    #[tokio::test]
+    async fn next_link_encodes_query_values_and_round_trips() {
+        let (app, storage, _d) = app_with_storage();
+        let subject = sha256_of(b"subject");
+        let at = "application/vnd.x+json; a=b&c#d%";
+        for i in 0..3u8 {
+            let r = sha256_of(&[i, 9]);
+            let desc = serde_json::json!({"digest": r.as_string(), "artifactType": at});
+            storage
+                .add_referrer("r", &subject, &r, desc.to_string().as_bytes())
+                .await
+                .unwrap();
+        }
+        let first = format!(
+            "/v2/r/referrers/{}?n=1&{}",
+            subject.as_string(),
+            serde_urlencoded::to_string([("artifactType", at)]).unwrap()
+        );
+        let mut url = first;
+        let mut pages = 0;
+        loop {
+            let resp = app
+                .clone()
+                .oneshot(HttpRequest::get(&url).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let link = resp
+                .headers()
+                .get(header::LINK)
+                .map(|v| v.to_str().unwrap().to_string());
+            let v: serde_json::Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            // The filter survives every hop: each page still has its one match.
+            assert_eq!(v["manifests"].as_array().unwrap().len(), 1);
+            pages += 1;
+            match link {
+                Some(l) => url = l[1..l.find('>').unwrap()].to_string(),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 3);
     }
 
     #[tokio::test]

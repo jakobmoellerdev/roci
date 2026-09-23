@@ -29,7 +29,7 @@ The workspace separates the stable dist-spec core from cleanly isolated extensio
 
 ## Storage subsystem
 
-Storage is a plain [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md) on disk. Highlights (see the canonical doc for the full design): content-addressable dedup, online O(garbage) garbage collection, an embedded metadata index (append-log + in-RAM maps by default, B-tree KV upgrade), and zero-copy blob serving.
+Storage is a plain [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md) on disk. Highlights (see the canonical doc for the full design): content-addressable dedup, online O(garbage) garbage collection, an embedded metadata index (append-log + in-RAM maps by default, B-tree KV upgrade) with coalescing write-behind of the spec-visible `index.json` (reconciled at startup), and zero-copy blob serving.
 
 ## Scaling
 

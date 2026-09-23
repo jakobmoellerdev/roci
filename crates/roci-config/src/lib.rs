@@ -77,17 +77,18 @@ mod tests {
     }
 
     #[test]
-    fn delete_enabled_can_be_disabled() {
-        let mut c = Config::default();
-        c.delete.enabled = false;
-        assert!(!c.delete.enabled);
+    fn omitted_delete_section_or_field_defaults_to_enabled() {
+        // Pre-Phase-3 configs have no `delete` section at all.
+        let c: Config = serde_json::from_str(r#"{"listen":"127.0.0.1:1"}"#).unwrap();
+        assert!(c.delete.enabled);
+        // An empty `delete` object keeps the per-field default.
+        let c: Config = serde_json::from_str(r#"{"delete":{}}"#).unwrap();
+        assert!(c.delete.enabled);
     }
 
     #[test]
-    fn serde_round_trip() {
-        let c = Config::default();
-        let encoded = serde_json::to_string(&c).unwrap();
-        let decoded: Config = serde_json::from_str(&encoded).unwrap();
-        assert!(decoded.delete.enabled);
+    fn delete_can_be_disabled_via_config() {
+        let c: Config = serde_json::from_str(r#"{"delete":{"enabled":false}}"#).unwrap();
+        assert!(!c.delete.enabled);
     }
 }
