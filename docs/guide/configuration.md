@@ -21,6 +21,18 @@ With no configuration, roci:
 | `--listen` | Address to bind (default `127.0.0.1:5000`). |
 | `--storage-root` | Directory for the on-disk OCI image layout. |
 
+## Configuration schema
+
+The configuration schema (`roci-config`) currently has these fields. All are optional; omitted fields take the defaults above.
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `listen` | `127.0.0.1:5000` | Address to bind. |
+| `storage_root` | `./roci-data` | Directory for the on-disk OCI image layout. |
+| `delete.enabled` | `true` | Allow manifest/blob deletion. When `false`, every delete endpoint returns `405 UNSUPPORTED` through a single shared guard (CVE-2026-41888 class). |
+
+Loading a config file lands in Phase 4 (see [`PLAN.md`](https://github.com/jakobmoellerdev/roci/blob/main/PLAN.md)). Until then, the fields are set programmatically.
+
 ## Build flavors
 
 roci compiles in two flavors (see [Architecture](/design/architecture)):

@@ -95,7 +95,7 @@ struct SyncCoord {
 /// A repo-scoped map key: `(repo, name)` so repositories stay isolated.
 type RepoKey = (String, String);
 /// One referrer: `(referrer_digest, descriptor_bytes)`; the digest de-dups.
-type Referrer = (String, Vec<u8>);
+pub type Referrer = (String, Vec<u8>);
 
 /// The mutable in-RAM state. Keyed by `(repo, key)` so repos stay isolated.
 #[derive(Default)]
@@ -317,6 +317,40 @@ impl LogMetadataStore {
             .sync_data()?;
         sync.synced = sync.synced.max(covered);
         Ok(())
+    }
+
+    /// Snapshot all manifest digests recorded in `repo` (populated by
+    /// [`MetaOp::PutManifest`]).
+    pub fn manifests(&self, repo: &str) -> Vec<String> {
+        let state = self.inner.lock().expect("metadata lock poisoned");
+        state
+            .media_types
+            .keys()
+            .filter(|(r, _)| r == repo)
+            .map(|(_, d)| d.clone())
+            .collect()
+    }
+
+    /// Snapshot the tags for `repo` as `(tag, digest, media_type)`.
+    pub fn tags_snapshot(&self, repo: &str) -> Vec<(String, String, String)> {
+        let state = self.inner.lock().expect("metadata lock poisoned");
+        state
+            .tags
+            .iter()
+            .filter(|((r, _), _)| r == repo)
+            .map(|((_, tag), (digest, media))| (tag.clone(), digest.clone(), media.clone()))
+            .collect()
+    }
+
+    /// Snapshot referrers for `repo` as `(subject_digest, [(referrer_digest, descriptor_bytes)])`.
+    pub fn referrers_snapshot(&self, repo: &str) -> Vec<(String, Vec<Referrer>)> {
+        let state = self.inner.lock().expect("metadata lock poisoned");
+        state
+            .referrers
+            .iter()
+            .filter(|((r, _), _)| r == repo)
+            .map(|((_, subject), refs)| (subject.clone(), refs.clone()))
+            .collect()
     }
 }
 

@@ -4,14 +4,16 @@
 //! blob in memory (ARCHITECTURE.md invariant 4).
 #![forbid(unsafe_code)]
 
+use futures::channel::oneshot;
 use sha2::{Digest as _, Sha256, Sha512};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Notify;
 
 mod cache;
 mod filter;
@@ -302,6 +304,17 @@ pub struct FsStorage {
     /// or bypass the size cap). Keyed by `(repo, id)`; entries are dropped when
     /// a session finishes or aborts.
     upload_locks: UploadLocks,
+    /// Background index write-behind: repos whose `index.json` lags the
+    /// metadata store, with a per-repo mutation generation. Mutations bump the
+    /// generation and wake the writer; the writer clears an entry only if its
+    /// generation is unchanged after a successful write, so a reader never
+    /// sees a repo as clean while its on-disk index is stale.
+    index_dirty: Arc<StdMutex<HashMap<String, u64>>>,
+    /// Wake channel for the background index writer.
+    index_notify: Arc<Notify>,
+    /// Held only to be dropped: when the last `FsStorage` clone goes away the
+    /// receiver in the writer task resolves and the task exits.
+    _index_cancel: Arc<oneshot::Sender<()>>,
 }
 
 impl FsStorage {
@@ -315,15 +328,73 @@ impl FsStorage {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
         let meta = Arc::new(LogMetadataStore::open(&root)?);
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
         let store = Self {
             root: Arc::new(root),
             meta,
             presence: Arc::new(BlobPresenceFilter::new()),
             cache: Arc::new(SmallBlobCache::new()),
             upload_locks: Arc::new(StdMutex::new(HashMap::new())),
+            index_dirty: Arc::new(StdMutex::new(HashMap::new())),
+            index_notify: Arc::new(Notify::new()),
+            _index_cancel: Arc::new(cancel_tx),
         };
         store.seed_presence_from_cas();
+        store.spawn_index_writer(cancel_rx);
         Ok(store)
+    }
+
+    /// One-time referrers enable-upgrade pass: walk every repo's `index.json`,
+    /// and for any descriptor carrying `subject` register it in the metadata
+    /// store so `list_referrers` sees pre-existing links. Call at startup when
+    /// the runtime (Tokio) is available.
+    pub async fn warm_referrers_from_layout(&self) {
+        for repo in discover_repos(&self.root) {
+            let Ok(path) = self.index_path(&repo) else {
+                continue;
+            };
+            let Ok(bytes) = tokio::fs::read(path).await else {
+                continue;
+            };
+            let Ok(index) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            let Some(ms) = index.get("manifests").and_then(|m| m.as_array()) else {
+                continue;
+            };
+            for entry in ms {
+                let (Some(subject), Some(referrer)) = (
+                    entry
+                        .get("subject")
+                        .and_then(|s| s.get("digest"))
+                        .and_then(|v| v.as_str()),
+                    descriptor_digest(entry),
+                ) else {
+                    continue;
+                };
+                // Already known (log replay or live push): nothing to upgrade.
+                if self.meta.referrers(&repo, subject).iter().any(|d| {
+                    serde_json::from_slice::<serde_json::Value>(d)
+                        .ok()
+                        .as_ref()
+                        .and_then(descriptor_digest)
+                        == Some(referrer)
+                }) {
+                    continue;
+                }
+                let Ok(descriptor) = serde_json::to_vec(entry) else {
+                    continue;
+                };
+                if let Err(e) = self.meta.apply(MetaOp::PutReferrer {
+                    repo: repo.clone(),
+                    subject: subject.to_string(),
+                    referrer: referrer.to_string(),
+                    descriptor,
+                }) {
+                    tracing::warn!(repo = %repo, error = %e, "referrers upgrade record failed");
+                }
+            }
+        }
     }
 
     /// The async lock for one upload session, creating it on first use. Held
@@ -389,6 +460,242 @@ impl FsStorage {
                 }
             }
         }
+    }
+
+    /// Mark `repo` dirty (bumping its generation) and wake the background
+    /// writer. Call *after* the metadata mutation is applied so the writer's
+    /// snapshot includes it.
+    fn mark_index_dirty(&self, repo: &str) {
+        *self
+            .index_dirty
+            .lock()
+            .expect("index_dirty poisoned")
+            .entry(repo.to_string())
+            .or_insert(0) += 1;
+        self.index_notify.notify_one();
+    }
+
+    /// Spawn the coalescing background `index.json` writer. Each wake snapshots
+    /// the dirty map, rebuilds every dirty repo's index from the metadata store
+    /// (preserving foreign descriptors on disk), writes it atomically, and
+    /// clears the entry only if no newer mutation arrived meanwhile. A failed
+    /// write stays dirty for the next wake. Exits when the last `FsStorage`
+    /// clone drops (cancel sender dropped → `cancel` resolves).
+    fn spawn_index_writer(&self, mut cancel: oneshot::Receiver<()>) {
+        let dirty = Arc::clone(&self.index_dirty);
+        let notify = Arc::clone(&self.index_notify);
+        let root = Arc::clone(&self.root);
+        let meta = Arc::clone(&self.meta);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = &mut cancel => return,
+                }
+                let snapshot: Vec<(String, u64)> = dirty
+                    .lock()
+                    .expect("index_dirty poisoned")
+                    .iter()
+                    .map(|(r, g)| (r.clone(), *g))
+                    .collect();
+                for (repo, generation) in snapshot {
+                    let dest = root.join(&repo).join("index.json");
+                    let existing = tokio::fs::read(&dest)
+                        .await
+                        .ok()
+                        .and_then(|b| serde_json::from_slice(&b).ok());
+                    let Ok(index) = Self::index_from_meta(&meta, &repo, &root, existing) else {
+                        continue;
+                    };
+                    if let Err(e) = Self::write_index_at_root(&root, &repo, &index).await {
+                        tracing::warn!(repo = %repo, error = %e, "index.json write-behind failed");
+                        continue;
+                    }
+                    let mut map = dirty.lock().expect("index_dirty poisoned");
+                    if map.get(&repo) == Some(&generation) {
+                        map.remove(&repo);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Rebuild a spec-valid `index.json` from the metadata store (authoritative
+    /// for everything roci wrote) merged over the existing on-disk index.
+    ///
+    /// Rules: a manifest the store knows emits one descriptor per tag (or one
+    /// untagged descriptor), enriched with its referrer fields (`subject`,
+    /// `artifactType`, annotations) and any extra fields already on disk. An
+    /// on-disk entry the store does not know is kept only if it is *foreign*
+    /// — no `ref.name` tag and no `subject` (roci would have recorded either);
+    /// otherwise it is a deleted manifest and is dropped.
+    fn index_from_meta(
+        meta: &LogMetadataStore,
+        repo: &str,
+        root: &Path,
+        existing: Option<serde_json::Value>,
+    ) -> io::Result<serde_json::Value> {
+        type Obj = serde_json::Map<String, serde_json::Value>;
+        let known: HashSet<String> = meta.manifests(repo).into_iter().collect();
+
+        // Per-digest base descriptor (tag stripped) for known manifests, plus
+        // foreign entries passed through verbatim.
+        let mut base: HashMap<String, Obj> = HashMap::new();
+        let mut foreign: Vec<serde_json::Value> = Vec::new();
+        let existing_ms = existing
+            .as_ref()
+            .and_then(|i| i.get("manifests"))
+            .and_then(|m| m.as_array());
+        for e in existing_ms.into_iter().flatten() {
+            let Some(obj) = e.as_object() else {
+                foreign.push(e.clone());
+                continue;
+            };
+            let digest = obj.get("digest").and_then(|v| v.as_str());
+            match digest {
+                Some(d) if known.contains(d) => {
+                    let mut o = obj.clone();
+                    if let Some(ann) = o.get_mut("annotations").and_then(|a| a.as_object_mut()) {
+                        ann.remove(REF_NAME_ANNOTATION);
+                        if ann.is_empty() {
+                            o.remove("annotations");
+                        }
+                    }
+                    base.entry(d.to_string()).or_insert(o);
+                }
+                _ if descriptor_tag(e).is_none() && e.get("subject").is_none() => {
+                    foreign.push(e.clone());
+                }
+                _ => {} // deleted roci-managed manifest
+            }
+        }
+
+        // Every known manifest gets a base (media type from the store; size
+        // from the CAS when not already recorded).
+        for d in &known {
+            let o = base.entry(d.clone()).or_insert_with(|| {
+                let mut o = Obj::new();
+                o.insert("digest".into(), serde_json::Value::String(d.clone()));
+                o
+            });
+            if let Some(mt) = meta.manifest_media_type(repo, d) {
+                o.insert("mediaType".into(), serde_json::Value::String(mt));
+            }
+            if !o.contains_key("size") {
+                if let Some((alg, hex)) = d.split_once(':') {
+                    if let Ok(m) =
+                        std::fs::metadata(root.join(repo).join("blobs").join(alg).join(hex))
+                    {
+                        o.insert("size".into(), serde_json::Value::Number(m.len().into()));
+                    }
+                }
+            }
+        }
+
+        // Merge referrer descriptor fields into the referring manifest's base
+        // (never overwriting its identity; existing annotations win). A live
+        // referrer whose manifest the store does not track (DeleteManifest
+        // already drops referrers) contributes its own descriptor.
+        for (subject, refs) in meta.referrers_snapshot(repo) {
+            for (ref_digest, ref_bytes) in refs {
+                let o = base.entry(ref_digest.clone()).or_insert_with(|| {
+                    let mut o = Obj::new();
+                    o.insert(
+                        "digest".into(),
+                        serde_json::Value::String(ref_digest.clone()),
+                    );
+                    o
+                });
+                let Ok(r) = serde_json::from_slice::<Obj>(&ref_bytes) else {
+                    continue;
+                };
+                for (k, v) in r {
+                    match k.as_str() {
+                        "digest" => {}
+                        "mediaType" | "size" => {
+                            o.entry(k).or_insert(v);
+                        }
+                        "annotations" => {
+                            let (Some(new), Some(cur)) = (
+                                v.as_object(),
+                                o.entry("annotations")
+                                    .or_insert_with(|| serde_json::Value::Object(Obj::new()))
+                                    .as_object_mut(),
+                            ) else {
+                                continue;
+                            };
+                            for (ak, av) in new {
+                                if ak != REF_NAME_ANNOTATION {
+                                    cur.entry(ak.clone()).or_insert_with(|| av.clone());
+                                }
+                            }
+                        }
+                        _ => {
+                            o.insert(k, v);
+                        }
+                    }
+                }
+                o.insert("subject".into(), serde_json::json!({ "digest": subject }));
+            }
+        }
+
+        // Emit: one descriptor per tag, then untagged known manifests, then
+        // foreign entries. Sorted for a deterministic, diff-friendly file.
+        let mut tags = meta.tags_snapshot(repo);
+        tags.sort();
+        let mut tagged: HashSet<&str> = HashSet::new();
+        let mut manifests: Vec<serde_json::Value> = Vec::with_capacity(base.len() + tags.len());
+        for (tag, digest, _) in &tags {
+            let Some(b) = base.get(digest) else { continue };
+            let mut o = b.clone();
+            let ann = o
+                .entry("annotations")
+                .or_insert_with(|| serde_json::Value::Object(Obj::new()));
+            if let Some(ann) = ann.as_object_mut() {
+                ann.insert(
+                    REF_NAME_ANNOTATION.into(),
+                    serde_json::Value::String(tag.clone()),
+                );
+            }
+            tagged.insert(digest.as_str());
+            manifests.push(serde_json::Value::Object(o));
+        }
+        let mut untagged: Vec<(&String, &Obj)> = base
+            .iter()
+            .filter(|(d, _)| !tagged.contains(d.as_str()))
+            .collect();
+        untagged.sort_by(|a, b| a.0.cmp(b.0));
+        manifests.extend(
+            untagged
+                .into_iter()
+                .map(|(_, o)| serde_json::Value::Object(o.clone())),
+        );
+        manifests.extend(foreign);
+        Ok(serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": manifests,
+        }))
+    }
+
+    /// Atomic `index.json` write ensuring the layout marker is present.
+    async fn write_index_at_root(
+        root: &Path,
+        repo: &str,
+        index: &serde_json::Value,
+    ) -> io::Result<()> {
+        let repo_dir = root.join(repo);
+        std::fs::create_dir_all(&repo_dir)?;
+        let dest = repo_dir.join("index.json");
+        let mut rand_bytes = [0u8; 8];
+        getrandom::fill(&mut rand_bytes).map_err(io::Error::other)?;
+        let tmp = repo_dir.join(format!("index.json.tmp.{}", hex::encode(rand_bytes)));
+        let bytes =
+            serde_json::to_vec(index).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        tokio::fs::write(&tmp, &bytes).await?;
+        tokio::fs::rename(&tmp, &dest).await?;
+        sync_dir(&repo_dir).await?;
+        Ok(())
     }
 
     /// Validate a single untrusted path component, returning a [`SafeComponent`]
@@ -528,24 +835,28 @@ impl FsStorage {
     /// canonical empty image index. A malformed on-disk index is an internal
     /// error (mapped to [`StorageError::Io`]).
     async fn read_index(&self, repo: &str) -> Result<serde_json::Value, StorageError> {
+        // A dirty repo's on-disk index.json lags the metadata store (write-behind);
+        // derive the current view in memory. The background writer persists it.
+        let is_dirty = self
+            .index_dirty
+            .lock()
+            .expect("index_dirty poisoned")
+            .contains_key(repo);
+        if is_dirty {
+            let existing = match tokio::fs::read(self.index_path(repo)?).await {
+                Ok(b) => serde_json::from_slice(&b).ok(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(StorageError::Io(e)),
+            };
+            return Self::index_from_meta(&self.meta, repo, &self.root, existing)
+                .map_err(StorageError::Io);
+        }
         match tokio::fs::read(self.index_path(repo)?).await {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|e| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, e))),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(empty_index()),
             Err(e) => Err(StorageError::Io(e)),
         }
-    }
-    /// Write `<repo>/index.json` atomically (tmp + rename), first ensuring the
-    /// layout marker exists.
-    async fn write_index(&self, repo: &str, index: &serde_json::Value) -> Result<(), StorageError> {
-        self.ensure_layout(repo).await?;
-        let dest = self.index_path(repo)?;
-        let tmp = dest.with_extension("json.tmp");
-        let bytes = serde_json::to_vec(index)
-            .map_err(|e| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
-        tokio::fs::write(&tmp, &bytes).await?;
-        tokio::fs::rename(&tmp, &dest).await?;
-        Ok(())
     }
     #[cfg(test)]
     fn upload_path(&self, repo: &str, id: &str) -> Result<PathBuf, StorageError> {
@@ -690,6 +1001,7 @@ fn empty_index() -> serde_json::Value {
 
 /// Borrow the `manifests` array of an image index, replacing a missing or
 /// non-array `manifests` field with an empty array first.
+#[cfg(test)]
 fn index_manifests_mut(index: &mut serde_json::Value) -> &mut Vec<serde_json::Value> {
     let obj = match index {
         serde_json::Value::Object(o) => o,
@@ -1945,38 +2257,8 @@ impl Storage for FsStorage {
         // (put_blob verifies the digest and ensures the layout marker).
         self.put_blob(repo, digest, data).await?;
 
-        // Record/refresh the manifest's descriptor in index.json.
-        let mut index = self.read_index(repo).await?;
-        let digest_str = digest.as_string();
-        let manifests = index_manifests_mut(&mut index);
-        // Drop any prior entry that would collide: the same tag (a tag move) or,
-        // for this exact (digest, tag) pair, an exact duplicate (idempotent
-        // re-push). Foreign descriptors and other tags are preserved.
-        manifests.retain(|entry| {
-            let same_tag = tag.is_some() && descriptor_tag(entry) == tag;
-            let same_untagged = tag.is_none()
-                && descriptor_tag(entry).is_none()
-                && descriptor_digest(entry) == Some(digest_str.as_str());
-            !(same_tag || same_untagged)
-        });
-        let mut descriptor = serde_json::Map::new();
-        descriptor.insert(
-            "mediaType".into(),
-            serde_json::Value::String(media_type.to_string()),
-        );
-        descriptor.insert("digest".into(), serde_json::Value::String(digest_str));
-        descriptor.insert("size".into(), serde_json::Value::Number(data.len().into()));
-        if let Some(tag) = tag {
-            let mut ann = serde_json::Map::new();
-            ann.insert(
-                REF_NAME_ANNOTATION.into(),
-                serde_json::Value::String(tag.to_string()),
-            );
-            descriptor.insert("annotations".into(), serde_json::Value::Object(ann));
-        }
-        manifests.push(serde_json::Value::Object(descriptor));
-        self.write_index(repo, &index).await?;
-        // Mirror the mutation into the derived metadata index + durable log.
+        // Record the mutation in the metadata index + durable log (authoritative
+        // immediately), then schedule the coalesced index.json rewrite.
         self.meta
             .apply(MetaOp::PutManifest {
                 repo: repo.to_string(),
@@ -1984,7 +2266,9 @@ impl Storage for FsStorage {
                 media_type: media_type.to_string(),
                 tag: tag.map(str::to_string),
             })
-            .map_err(StorageError::Io)
+            .map_err(StorageError::Io)?;
+        self.mark_index_dirty(repo);
+        Ok(())
     }
 
     async fn get_manifest(&self, repo: &str, reference: &str) -> Result<ManifestRef, StorageError> {
@@ -2044,19 +2328,14 @@ impl Storage for FsStorage {
         // Drop the manifest from the presence filter + small-blob cache.
         self.presence.remove(repo, &digest.as_string());
         self.cache.invalidate(repo, &digest.as_string());
-        // Drop every index entry (including tags) pointing at this digest.
-        let mut index = self.read_index(repo).await?;
-        let target = digest.as_string();
-        let manifests = index_manifests_mut(&mut index);
-        manifests.retain(|entry| descriptor_digest(entry) != Some(target.as_str()));
-        self.write_index(repo, &index).await?;
-        // Mirror the deletion into the derived metadata index + durable log.
         self.meta
             .apply(MetaOp::DeleteManifest {
                 repo: repo.to_string(),
-                digest: target,
+                digest: digest.as_string(),
             })
-            .map_err(StorageError::Io)
+            .map_err(StorageError::Io)?;
+        self.mark_index_dirty(repo);
+        Ok(())
     }
 
     async fn list_tags(&self, repo: &str) -> Result<Vec<String>, StorageError> {
@@ -2088,12 +2367,10 @@ impl Storage for FsStorage {
         referrer: &Digest,
         referrer_descriptor: &[u8],
     ) -> Result<(), StorageError> {
-        // The referring manifest is already recorded by put_manifest; merge its
-        // `subject` link (and any richer descriptor fields the core computed:
-        // artifactType, annotations) into that entry so list_referrers can find
-        // it. If for some reason no entry exists yet, append the descriptor.
-        // Parse the referrer descriptor as a JSON object (the core always sends
-        // one); a non-object body is an internal inconsistency → Io.
+        // Record the subject→referrer link (with richer descriptor fields the
+        // core computed: artifactType, annotations) in the metadata store; the
+        // write-behind merges it into the referrer's index.json entry. A
+        // non-object descriptor is an internal inconsistency → Io.
         let mut merged: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(referrer_descriptor)
                 .map_err(|e| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
@@ -2101,44 +2378,18 @@ impl Storage for FsStorage {
             "subject".into(),
             serde_json::json!({ "digest": subject.as_string() }),
         );
-        let referrer_str = referrer.as_string();
-        let mut index = self.read_index(repo).await?;
-        let manifests = index_manifests_mut(&mut index);
-        let merged_value = serde_json::Value::Object(merged.clone());
-        match manifests
-            .iter_mut()
-            .find(|e| descriptor_digest(e) == Some(referrer_str.as_str()))
-            .and_then(|e| e.as_object_mut())
-        {
-            // Existing object entry: merge fields, preserving any tag annotation.
-            Some(existing) => {
-                for (k, v) in &merged {
-                    // Never overwrite the entry's own identity; preserve a tag
-                    // annotation the manifest entry already carries.
-                    if k == "digest" {
-                        continue;
-                    }
-                    if k == "annotations" && existing.contains_key("annotations") {
-                        continue;
-                    }
-                    existing.insert(k.clone(), v.clone());
-                }
-            }
-            // No entry (or a non-object foreign entry): append the descriptor.
-            None => manifests.push(merged_value.clone()),
-        }
-        self.write_index(repo, &index).await?;
-        // Mirror the referrer relation into the derived index + durable log.
         let descriptor = serde_json::to_vec(&merged)
             .map_err(|e| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
         self.meta
             .apply(MetaOp::PutReferrer {
                 repo: repo.to_string(),
                 subject: subject.as_string(),
-                referrer: referrer_str,
+                referrer: referrer.as_string(),
                 descriptor,
             })
-            .map_err(StorageError::Io)
+            .map_err(StorageError::Io)?;
+        self.mark_index_dirty(repo);
+        Ok(())
     }
 
     async fn list_referrers(
@@ -2147,13 +2398,14 @@ impl Storage for FsStorage {
         subject: &Digest,
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         let target = subject.as_string();
-        // Fast path: the in-RAM subject→referrers map; fall back to index.json.
+        // Fast path: the in-RAM subject→referrers map.
         let refs = self.meta.referrers(repo, &target);
         if !refs.is_empty() {
             return Ok(refs);
         }
+        // Fallback: scan index.json for any descriptor carrying `subject`.
         let index = self.read_index(repo).await?;
-        let out = index
+        let out: Vec<Vec<u8>> = index
             .get("manifests")
             .and_then(|m| m.as_array())
             .map(|ms| {
@@ -2168,7 +2420,49 @@ impl Storage for FsStorage {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(out)
+        if !out.is_empty() {
+            return Ok(out);
+        }
+        // Tag-schema fallback (dist-spec §Referrers tag schema): a client that
+        // pushed to a registry without the referrers API maintains an image
+        // index under the tag `<alg>-<ref>` (ref = hex, truncated to 64). Serve
+        // its `manifests`, de-duplicated by digest; anything malformed → empty.
+        let hex_up_to_64 = &subject.hex[..subject.hex.len().min(64)];
+        let tag_schema_tag = format!("{}-{}", subject.algorithm, hex_up_to_64);
+        let resolved = match self.meta.resolve_tag(repo, &tag_schema_tag) {
+            Some((digest, _media_type)) => Digest::parse(&digest).ok(),
+            None => self
+                .index_resolve_tag(repo, &tag_schema_tag)
+                .await
+                .ok()
+                .map(|(d, _)| d),
+        };
+        let Some(tag_blob_digest) = resolved else {
+            return Ok(Vec::new());
+        };
+        let bytes: Vec<u8> = match self.read_blob(repo, &tag_blob_digest).await {
+            Ok(b) => b,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let parsed: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let Some(arr) = parsed.get("manifests").and_then(|m| m.as_array()) else {
+            return Ok(Vec::new());
+        };
+        let mut dedup: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for entry in arr {
+            if let Some(d) = entry.get("digest").and_then(|v| v.as_str()) {
+                if dedup.insert(d.to_string()) {
+                    if let Ok(b) = serde_json::to_vec(entry) {
+                        result.push(b);
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
 
     async fn mount_blob(
@@ -2495,16 +2789,15 @@ mod tests {
         ));
 
         // In a clean repo where the blob write succeeds, a pre-existing
-        // `index.json` *directory* makes the atomic index rename fail, covering
-        // write_index's error path.
+        // `index.json` directory makes writing index.json fail; put_manifest
+        // succeeds (write-behind), but reading the dirty index surfaces the IO error.
         let body = br#"{"schemaVersion":2}"#;
         let bd = sha256_of(body);
         std::fs::create_dir_all(dir.path().join("r2").join("index.json")).unwrap();
-        assert!(matches!(
-            s.put_manifest("r2", Some("v1"), &bd, "application/json", body)
-                .await,
-            Err(StorageError::Io(_))
-        ));
+        s.put_manifest("r2", Some("v1"), &bd, "application/json", body)
+            .await
+            .unwrap();
+        assert!(matches!(s.read_index("r2").await, Err(StorageError::Io(_))));
     }
 
     #[tokio::test]
@@ -2598,7 +2891,9 @@ mod tests {
                 {"mediaType": "application/xml", "digest": "sha256:dead", "size": 3}
             ]
         });
-        s.write_index("r", &seeded).await.unwrap();
+        FsStorage::write_index_at_root(&s.root, "r", &seeded)
+            .await
+            .unwrap();
         // The foreign entry contributes no tag and is not a referrer.
         assert!(s.list_tags("r").await.unwrap().is_empty());
         assert!(s.list_referrers("r", &subject).await.unwrap().is_empty());
@@ -2625,6 +2920,147 @@ mod tests {
         // The foreign descriptor is still present after the append.
         let idx = s.read_index("r").await.unwrap();
         assert_eq!(idx["manifests"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn referrers_tag_schema_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let subject = sha256_of(b"subject-without-api-referrers");
+        let referrer = sha256_of(b"legacy-sig");
+        // A client on a non-referrers registry pushed an index under the
+        // `<alg>-<hex>` tag listing the referrer (dist-spec tag-schema fallback).
+        let fallback = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                 "digest": referrer.as_string(), "size": 10, "artifactType": "a/sig"},
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                 "digest": referrer.as_string(), "size": 10, "artifactType": "a/sig"}
+            ]
+        })
+        .to_string();
+        let fd = sha256_of(fallback.as_bytes());
+        let tag = format!("sha256-{}", &subject.as_string()[7..]);
+        s.put_manifest(
+            "r",
+            Some(&tag),
+            &fd,
+            "application/vnd.oci.image.index.v1+json",
+            fallback.as_bytes(),
+        )
+        .await
+        .unwrap();
+        let listed = s.list_referrers("r", &subject).await.unwrap();
+        assert_eq!(listed.len(), 1, "de-duplicated by digest");
+        let d: serde_json::Value = serde_json::from_slice(&listed[0]).unwrap();
+        assert_eq!(d["digest"], referrer.as_string());
+        // A malformed body under the fallback tag yields no referrers.
+        let other = sha256_of(b"other-subject");
+        let junk = b"not json";
+        let jd = sha256_of(junk);
+        let tag2 = format!("sha256-{}", &other.as_string()[7..]);
+        s.put_manifest("r", Some(&tag2), &jd, "application/json", junk)
+            .await
+            .unwrap();
+        assert!(s.list_referrers("r", &other).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upgrade_semantics_preexisting_subjects() {
+        let dir = tempfile::tempdir().unwrap();
+        let subject = sha256_of(b"subject");
+        let referrer = sha256_of(b"preexisting-referrer");
+        // A layout written by another tool: index.json already carries a
+        // descriptor with `subject`, but roci's metadata log has never seen it.
+        let repo = dir.path().join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("oci-layout"),
+            br#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("index.json"),
+            serde_json::json!({
+                "schemaVersion": 2,
+                "manifests": [{
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": referrer.as_string(), "size": 5,
+                    "artifactType": "a/sig",
+                    "subject": {"digest": subject.as_string()}
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        s.warm_referrers_from_layout().await;
+        // Served from the metadata store (fast path), not the index.json scan.
+        let from_meta = s.meta.referrers("r", &subject.as_string());
+        assert_eq!(from_meta.len(), 1);
+        // Idempotent: a second pass records nothing new.
+        s.warm_referrers_from_layout().await;
+        assert_eq!(s.meta.referrers("r", &subject.as_string()).len(), 1);
+        let d: serde_json::Value = serde_json::from_slice(&from_meta[0]).unwrap();
+        assert_eq!(d["digest"], referrer.as_string());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_write_behind_eventual() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let body = br#"{"schemaVersion":2}"#;
+        let d = sha256_of(body);
+        s.put_manifest("r", Some("v1"), &d, "application/json", body)
+            .await
+            .unwrap();
+        // The in-RAM index is authoritative immediately.
+        assert_eq!(s.list_tags("r").await.unwrap(), ["v1"]);
+        // The on-disk index.json converges without any read through roci.
+        let path = dir.path().join("r").join("index.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+        loop {
+            if let Ok(b) = std::fs::read(&path) {
+                let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+                if v["manifests"]
+                    .as_array()
+                    .is_some_and(|m| m.iter().any(|e| descriptor_tag(e) == Some("v1")))
+                {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "index.json never written"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Converged: the repo is no longer dirty and no temp files linger.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!s.index_dirty.lock().unwrap().contains_key("r"));
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("r"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+        // Delete converges too: the entry disappears from disk.
+        s.delete_manifest("r", &d).await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+        loop {
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            if v["manifests"].as_array().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "delete never persisted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     #[test]

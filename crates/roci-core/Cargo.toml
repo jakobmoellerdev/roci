@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+roci-config.workspace = true
 roci-storage.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

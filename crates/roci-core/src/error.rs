@@ -119,6 +119,9 @@ impl ApiError {
     pub fn blob_unknown() -> Self {
         ApiError::new(ErrorCode::BlobUnknown, "blob unknown to registry")
     }
+    pub fn unsupported() -> Self {
+        ApiError::new(ErrorCode::Unsupported, "the operation is unsupported")
+    }
     /// A body exceeding the accepted size: `413` with the `SIZE_INVALID` code.
     pub fn payload_too_large(message: impl Into<String>) -> Self {
         ApiError::PayloadTooLarge(message.into())

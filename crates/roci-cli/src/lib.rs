@@ -45,7 +45,10 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let storage = FsStorage::new(&config.storage_root)?;
-    let app = build_router(AppState::new(storage));
+    let app = build_router(AppState::new_with(storage.clone(), config.clone()));
+    // Referrers enable-upgrade: seed metadata from index.json before accepting
+    // requests so `list_referrers` is complete even for pre-existing layouts.
+    storage.warm_referrers_from_layout().await;
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let local = listener.local_addr()?;
     tracing::info!(addr = %local, root = %config.storage_root.display(), "roci listening");
@@ -91,6 +94,7 @@ mod tests {
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             storage_root: dir.path().to_path_buf(),
+            ..Default::default()
         };
         let (bind_tx, bind_rx) = tokio::sync::oneshot::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
@@ -120,6 +124,7 @@ mod tests {
         let config = Config {
             listen: taken,
             storage_root: dir.path().to_path_buf(),
+            ..Default::default()
         };
         let result = serve(config, |_| {}, std::future::pending()).await;
         assert!(result.is_err());
