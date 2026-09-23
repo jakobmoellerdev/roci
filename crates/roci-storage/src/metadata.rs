@@ -331,6 +331,20 @@ impl LogMetadataStore {
             .collect()
     }
 
+    /// Every repo with at least one manifest or referrer recorded.
+    pub fn repos(&self) -> Vec<String> {
+        let state = self.inner.lock().expect("metadata lock poisoned");
+        let mut repos: Vec<String> = state
+            .media_types
+            .keys()
+            .chain(state.referrers.keys())
+            .map(|(r, _)| r.clone())
+            .collect();
+        repos.sort();
+        repos.dedup();
+        repos
+    }
+
     /// Snapshot the tags for `repo` as `(tag, digest, media_type)`.
     pub fn tags_snapshot(&self, repo: &str) -> Vec<(String, String, String)> {
         let state = self.inner.lock().expect("metadata lock poisoned");

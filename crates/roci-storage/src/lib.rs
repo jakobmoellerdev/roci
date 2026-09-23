@@ -481,43 +481,134 @@ impl FsStorage {
     /// clears the entry only if no newer mutation arrived meanwhile. A failed
     /// write stays dirty for the next wake. Exits when the last `FsStorage`
     /// clone drops (cancel sender dropped → `cancel` resolves).
+    ///
+    /// Constructed outside a Tokio runtime there is nowhere to run the task;
+    /// the repos simply stay dirty (reads through roci derive the index in
+    /// memory) and [`FsStorage::reconcile_index_json`] persists them later.
     fn spawn_index_writer(&self, mut cancel: oneshot::Receiver<()>) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
         let dirty = Arc::clone(&self.index_dirty);
         let notify = Arc::clone(&self.index_notify);
         let root = Arc::clone(&self.root);
         let meta = Arc::clone(&self.meta);
-        tokio::spawn(async move {
+        rt.spawn(async move {
             loop {
                 tokio::select! {
                     _ = notify.notified() => {}
                     _ = &mut cancel => return,
                 }
-                let snapshot: Vec<(String, u64)> = dirty
-                    .lock()
-                    .expect("index_dirty poisoned")
-                    .iter()
-                    .map(|(r, g)| (r.clone(), *g))
-                    .collect();
-                for (repo, generation) in snapshot {
-                    let dest = root.join(&repo).join("index.json");
-                    let existing = tokio::fs::read(&dest)
-                        .await
-                        .ok()
-                        .and_then(|b| serde_json::from_slice(&b).ok());
-                    let Ok(index) = Self::index_from_meta(&meta, &repo, &root, existing) else {
-                        continue;
-                    };
-                    if let Err(e) = Self::write_index_at_root(&root, &repo, &index).await {
-                        tracing::warn!(repo = %repo, error = %e, "index.json write-behind failed");
-                        continue;
-                    }
-                    let mut map = dirty.lock().expect("index_dirty poisoned");
-                    if map.get(&repo) == Some(&generation) {
-                        map.remove(&repo);
-                    }
-                }
+                Self::flush_dirty(&root, &meta, &dirty).await;
             }
         });
+    }
+
+    /// Persist every currently dirty repo's `index.json` (one pass).
+    async fn flush_dirty(
+        root: &Path,
+        meta: &LogMetadataStore,
+        dirty: &StdMutex<HashMap<String, u64>>,
+    ) {
+        let snapshot: Vec<(String, u64)> = dirty
+            .lock()
+            .expect("index_dirty poisoned")
+            .iter()
+            .map(|(r, g)| (r.clone(), *g))
+            .collect();
+        for (repo, generation) in snapshot {
+            let existing = Self::read_index_beneath(root, &repo).await.ok().flatten();
+            let Ok(index) = Self::index_from_meta(meta, &repo, root, existing) else {
+                continue;
+            };
+            if let Err(e) = Self::write_index_at_root(root, &repo, &index).await {
+                tracing::warn!(repo = %repo, error = %e, "index.json write-behind failed");
+                continue;
+            }
+            let mut map = dirty.lock().expect("index_dirty poisoned");
+            if map.get(&repo) == Some(&generation) {
+                map.remove(&repo);
+            }
+        }
+    }
+
+    /// Read and parse `<repo>/index.json` beneath the root, no-follow. `Ok(None)`
+    /// when absent or unparseable (the rebuild then starts from the store).
+    async fn read_index_beneath(root: &Path, repo: &str) -> io::Result<Option<serde_json::Value>> {
+        let rel = Self::repo_rel_of(repo)
+            .map_err(|e| io::Error::other(e.to_string()))?
+            .join("index.json");
+        let mut f = match open_beneath(root, &rel).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut b = Vec::new();
+        f.read_to_end(&mut b).await?;
+        Ok(serde_json::from_slice(&b).ok())
+    }
+
+    /// Startup reconciliation (crash recovery for the write-behind): for every
+    /// repo the metadata store knows, rebuild `index.json` and persist it if it
+    /// differs from disk. Closes the window where a WAL record was durable but
+    /// the process died before the background rename. Also imports tags from
+    /// any pre-existing (externally written) `index.json` the log has not seen,
+    /// so the first rebuild never drops them. Run once before serving.
+    pub async fn reconcile_index_json(&self) {
+        for repo in discover_repos(&self.root) {
+            let Ok(Some(existing)) = Self::read_index_beneath(&self.root, &repo).await else {
+                continue;
+            };
+            self.import_foreign_tags(&repo, &existing);
+            let Ok(rebuilt) =
+                Self::index_from_meta(&self.meta, &repo, &self.root, Some(existing.clone()))
+            else {
+                continue;
+            };
+            if !same_manifest_set(&existing, &rebuilt) {
+                self.mark_index_dirty(&repo);
+            }
+        }
+        for repo in self.meta.repos() {
+            if Self::read_index_beneath(&self.root, &repo)
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                self.mark_index_dirty(&repo);
+            }
+        }
+        Self::flush_dirty(&self.root, &self.meta, &self.index_dirty).await;
+    }
+
+    /// Record tagged descriptors from an on-disk index that the metadata store
+    /// does not yet know (a layout written by another tool) so the write-behind
+    /// treats them as live, not as deleted roci manifests.
+    fn import_foreign_tags(&self, repo: &str, existing: &serde_json::Value) {
+        let Some(ms) = existing.get("manifests").and_then(|m| m.as_array()) else {
+            return;
+        };
+        for e in ms {
+            let (Some(tag), Some(digest)) = (descriptor_tag(e), descriptor_digest(e)) else {
+                continue;
+            };
+            if Digest::parse(digest).is_err() || self.meta.resolve_tag(repo, tag).is_some() {
+                continue;
+            }
+            let media_type = e
+                .get("mediaType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("application/vnd.oci.image.manifest.v1+json");
+            if let Err(err) = self.meta.apply(MetaOp::PutManifest {
+                repo: repo.to_string(),
+                digest: digest.to_string(),
+                media_type: media_type.to_string(),
+                tag: Some(tag.to_string()),
+            }) {
+                tracing::warn!(repo = %repo, error = %err, "import of existing tag failed");
+            }
+        }
     }
 
     /// Rebuild a spec-valid `index.json` from the metadata store (authoritative
@@ -678,24 +769,59 @@ impl FsStorage {
         }))
     }
 
-    /// Atomic `index.json` write ensuring the layout marker is present.
+    /// Atomically replace `<repo>/index.json`, anchored to a dirfd walked
+    /// no-follow beneath the store root (a symlink planted at any repo
+    /// component cannot redirect the write), ensuring the `oci-layout` marker
+    /// first. Unique temp → `fsync` → `rename` → dir `fsync`, so every on-disk
+    /// state is a complete index.
     async fn write_index_at_root(
         root: &Path,
         repo: &str,
         index: &serde_json::Value,
     ) -> io::Result<()> {
-        let repo_dir = root.join(repo);
-        std::fs::create_dir_all(&repo_dir)?;
-        let dest = repo_dir.join("index.json");
-        let mut rand_bytes = [0u8; 8];
-        getrandom::fill(&mut rand_bytes).map_err(io::Error::other)?;
-        let tmp = repo_dir.join(format!("index.json.tmp.{}", hex::encode(rand_bytes)));
+        let repo_rel = Self::repo_rel_of(repo).map_err(|e| io::Error::other(e.to_string()))?;
+        ensure_layout_beneath(root, &repo_rel, OCI_LAYOUT_MARKER).await?;
         let bytes =
             serde_json::to_vec(index).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        tokio::fs::write(&tmp, &bytes).await?;
-        tokio::fs::rename(&tmp, &dest).await?;
-        sync_dir(&repo_dir).await?;
-        Ok(())
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            use rustix::fs::{Mode, OFlags};
+            use std::io::Write as _;
+            let dirfd = dir_beneath(&root, &repo_rel, false)?;
+            let mut rnd = [0u8; 8];
+            getrandom::fill(&mut rnd).map_err(io::Error::other)?;
+            let tmp = format!(".index.json.{}.tmp", hex::encode(rnd));
+            let fd = rustix::fs::openat(
+                &dirfd,
+                tmp.as_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o644),
+            )
+            .map_err(io::Error::from)?;
+            let mut f = std::fs::File::from(fd);
+            let written = f.write_all(&bytes).and_then(|()| f.sync_all());
+            drop(f);
+            let renamed = written.and_then(|()| {
+                rustix::fs::renameat(&dirfd, tmp.as_str(), &dirfd, "index.json")
+                    .map_err(io::Error::from)
+            });
+            if renamed.is_err() {
+                let _ = rustix::fs::unlinkat(&dirfd, tmp.as_str(), rustix::fs::AtFlags::empty());
+            }
+            renamed?;
+            rustix::fs::fsync(&dirfd).map_err(io::Error::from)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    /// Validated repo path relative to the root (static form of [`Self::repo_rel`]).
+    fn repo_rel_of(repo: &str) -> Result<PathBuf, StorageError> {
+        let mut rel = PathBuf::new();
+        for component in repo.split('/') {
+            rel.push(Self::safe_component(component)?);
+        }
+        Ok(rel)
     }
 
     /// Validate a single untrusted path component, returning a [`SafeComponent`]
@@ -1031,6 +1157,20 @@ fn descriptor_tag(descriptor: &serde_json::Value) -> Option<&str> {
 /// The `digest` field of a descriptor, if present and a string.
 fn descriptor_digest(descriptor: &serde_json::Value) -> Option<&str> {
     descriptor.get("digest").and_then(|v| v.as_str())
+}
+
+/// Whether two image indexes carry the same descriptor set (order-insensitive).
+fn same_manifest_set(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    let set = |v: &serde_json::Value| -> Vec<String> {
+        let mut s: Vec<String> = v
+            .get("manifests")
+            .and_then(|m| m.as_array())
+            .map(|ms| ms.iter().map(|e| e.to_string()).collect())
+            .unwrap_or_default();
+        s.sort();
+        s
+    };
+    set(a) == set(b)
 }
 
 /// Compute the sha256 digest of `data`.
@@ -2371,6 +2511,9 @@ impl Storage for FsStorage {
         // core computed: artifactType, annotations) in the metadata store; the
         // write-behind merges it into the referrer's index.json entry. A
         // non-object descriptor is an internal inconsistency → Io.
+        // Traversal backstop before any state is recorded (SECURITY inv. 8):
+        // the write-behind later builds paths from `repo`.
+        Self::repo_rel_of(repo)?;
         let mut merged: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(referrer_descriptor)
                 .map_err(|e| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
@@ -3061,6 +3204,126 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+    }
+
+    #[test]
+    fn new_outside_runtime_does_not_panic_and_reconcile_persists() {
+        // Construction needs no Tokio runtime; mutations made later stay
+        // readable through roci and are persisted by reconcile.
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let body = br#"{"schemaVersion":2}"#;
+            let d = sha256_of(body);
+            s.put_manifest("r", Some("v1"), &d, "application/json", body)
+                .await
+                .unwrap();
+            assert_eq!(s.list_tags("r").await.unwrap(), ["v1"]);
+            s.reconcile_index_json().await;
+        });
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("r/index.json")).unwrap())
+                .unwrap();
+        assert!(v["manifests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| descriptor_tag(e) == Some("v1")));
+    }
+
+    #[tokio::test]
+    async fn reconcile_recovers_wal_ahead_of_index() {
+        // Simulate a crash after the WAL append but before the background
+        // rename: record via the metadata log only, then reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let body = br#"{"schemaVersion":2}"#;
+        let d = sha256_of(body);
+        {
+            let s = FsStorage::new(dir.path()).unwrap();
+            s.put_blob("r", &d, body).await.unwrap();
+            s.meta
+                .apply(MetaOp::PutManifest {
+                    repo: "r".into(),
+                    digest: d.as_string(),
+                    media_type: "application/json".into(),
+                    tag: Some("v1".into()),
+                })
+                .unwrap();
+        }
+        assert!(!dir.path().join("r/index.json").exists());
+        let s = FsStorage::new(dir.path()).unwrap();
+        s.reconcile_index_json().await;
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("r/index.json")).unwrap())
+                .unwrap();
+        let e = &v["manifests"][0];
+        assert_eq!(descriptor_tag(e), Some("v1"));
+        assert_eq!(e["size"], body.len());
+    }
+
+    #[tokio::test]
+    async fn rebuild_preserves_preexisting_foreign_tags() {
+        // A layout another tool wrote: a tagged descriptor roci's log never saw.
+        let dir = tempfile::tempdir().unwrap();
+        let foreign_body = br#"{"schemaVersion":2,"x":1}"#;
+        let fd = sha256_of(foreign_body);
+        {
+            let s = FsStorage::new(dir.path()).unwrap();
+            s.put_blob("r", &fd, foreign_body).await.unwrap();
+        }
+        std::fs::remove_file(dir.path().join("roci-meta.log")).ok();
+        std::fs::write(
+            dir.path().join("r/index.json"),
+            serde_json::json!({"schemaVersion": 2, "manifests": [{
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": fd.as_string(), "size": foreign_body.len(),
+                "annotations": {REF_NAME_ANNOTATION: "legacy"}
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        s.reconcile_index_json().await;
+        // A new push triggers a rebuild; the legacy tag must survive it.
+        let body = br#"{"schemaVersion":2}"#;
+        let d = sha256_of(body);
+        s.put_manifest("r", Some("new"), &d, "application/json", body)
+            .await
+            .unwrap();
+        let idx = s.read_index("r").await.unwrap();
+        let tags: Vec<_> = idx["manifests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(descriptor_tag)
+            .collect();
+        assert!(
+            tags.contains(&"legacy") && tags.contains(&"new"),
+            "{tags:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn index_write_refuses_symlinked_repo_and_bad_repo_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("evil")).unwrap();
+        let idx = serde_json::json!({"schemaVersion": 2, "manifests": []});
+        assert!(FsStorage::write_index_at_root(dir.path(), "evil", &idx)
+            .await
+            .is_err());
+        assert!(!outside.path().join("index.json").exists());
+        let s = FsStorage::new(dir.path()).unwrap();
+        let sub = sha256_of(b"s");
+        assert!(matches!(
+            s.add_referrer("../x", &sub, &sub, b"{}").await,
+            Err(StorageError::BadPath(_))
+        ));
     }
 
     #[test]

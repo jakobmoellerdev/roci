@@ -46,9 +46,11 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let storage = FsStorage::new(&config.storage_root)?;
     let app = build_router(AppState::new_with(storage.clone(), config.clone()));
-    // Referrers enable-upgrade: seed metadata from index.json before accepting
-    // requests so `list_referrers` is complete even for pre-existing layouts.
+    // Startup recovery before accepting requests: register pre-existing
+    // `subject` links (referrers upgrade) and reconcile `index.json` with the
+    // replayed metadata log (write-behind crash recovery, foreign-tag import).
     storage.warm_referrers_from_layout().await;
+    storage.reconcile_index_json().await;
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let local = listener.local_addr()?;
     tracing::info!(addr = %local, root = %config.storage_root.display(), "roci listening");
