@@ -2,7 +2,7 @@
 //! local filesystem, plus the [`Storage`] trait the registry core is written
 //! against. Blob I/O is streamed with hash-on-write; nothing buffers a whole
 //! blob in memory (ARCHITECTURE.md invariant 4).
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 #[macro_use]
 mod fault;
@@ -25,7 +25,10 @@ mod storage;
 pub use dedupe::DedupeIndex;
 pub use digest::{digest_of, sha256_of, Digest};
 pub use error::{QuotaScope, StorageError};
-pub use layout::{manifest_references, MEDIA_TYPE_IMAGE_INDEX, MEDIA_TYPE_IMAGE_MANIFEST};
+pub use layout::{
+    import_foreign_tags, index_from_meta, manifest_references, MEDIA_TYPE_IMAGE_INDEX,
+    MEDIA_TYPE_IMAGE_MANIFEST,
+};
 pub use metadata::{
     open_metadata, BlobChecksum, LogMetadataStore, MetaOp, MetadataStore, Page, Referrer,
 };

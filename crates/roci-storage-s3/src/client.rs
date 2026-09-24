@@ -25,10 +25,7 @@ pub(crate) struct S3Client {
     pub redirect_ttl: Duration,
     /// Multipart part size in bytes.
     pub multipart_part_size: u64,
-    /// Parts transferred in parallel per multipart upload/copy. Preserved
-    /// for future ranged-read→multipart-write server-side copy paths; the
-    /// `object_store` crate handles upload concurrency internally.
-    #[allow(dead_code)]
+    /// Maximum parts in flight per multipart upload/copy.
     pub multipart_concurrency: usize,
 }
 

@@ -10,6 +10,8 @@
 //! replaying the log or, failing that, walking the layout.
 
 mod log;
+mod snapshot;
+mod wal_hmac;
 
 #[cfg(feature = "redb")]
 mod redb;

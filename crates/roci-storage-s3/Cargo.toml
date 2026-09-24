@@ -31,3 +31,4 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 roci-core = { workspace = true }
 http-body-util = "0.1"
 tower = { workspace = true, features = ["util"] }
+axum = { workspace = true }

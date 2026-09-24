@@ -73,8 +73,8 @@ macro_rules! delegate_storage {
         async fn $method(&self $(, $arg: $ty)*) -> $ret {
             match self {
                 AnyBackend::Fs(inner) => inner.$method($($arg),*).await,
-                // #[cfg(feature = "s3")]
-                // AnyBackend::S3(inner) => inner.$method($($arg),*).await,
+                #[cfg(feature = "s3")]
+                AnyBackend::S3(inner) => inner.$method($($arg),*).await,
             }
         }
     };
@@ -88,14 +88,17 @@ macro_rules! delegate_storage {
 pub enum AnyBackend {
     /// Local-filesystem CAS backend.
     Fs(FsStorage),
-    // #[cfg(feature = "s3")]
-    // S3(roci_storage_s3::S3Storage),
+    #[cfg(feature = "s3")]
+    /// S3-compatible object-store backend.
+    S3(roci_storage_s3::S3Storage),
 }
 
 impl std::fmt::Debug for AnyBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AnyBackend::Fs(_) => f.write_str("AnyBackend::Fs(..)"),
+            #[cfg(feature = "s3")]
+            AnyBackend::S3(_) => f.write_str("AnyBackend::S3(..)"),
         }
     }
 }
@@ -124,16 +127,16 @@ impl StorageBackend for AnyBackend {
     async fn recover(&self) {
         match self {
             AnyBackend::Fs(inner) => inner.recover().await,
-            // #[cfg(feature = "s3")]
-            // AnyBackend::S3(inner) => inner.recover().await,
+            #[cfg(feature = "s3")]
+            AnyBackend::S3(inner) => inner.recover().await,
         }
     }
 
     fn start_maintenance(&self, shutdown: tokio::sync::watch::Receiver<bool>) {
         match self {
             AnyBackend::Fs(inner) => inner.start_maintenance(shutdown),
-            // #[cfg(feature = "s3")]
-            // AnyBackend::S3(inner) => inner.start_maintenance(shutdown),
+            #[cfg(feature = "s3")]
+            AnyBackend::S3(inner) => inner.start_maintenance(shutdown),
         }
     }
 }
@@ -155,16 +158,13 @@ pub fn build_storage(config: &Config) -> anyhow::Result<Routed<AnyBackend>> {
         max_upload_sessions: config.storage.quota.max_upload_sessions,
     }));
 
-    // Reject S3 on the default backend until wired.
-    if config.storage.s3.is_some() {
-        anyhow::bail!("storage.s3: S3 backend requires the s3 feature and is not yet wired");
-    }
-
-    let default = AnyBackend::Fs(FsStorage::with_config(
+    let default = build_one_backend(
         &config.storage.root,
+        config.storage.s3.as_ref(),
         &config.storage,
         Arc::clone(&quota),
-    )?);
+        "storage.s3",
+    )?;
     tracing::info!(
         root = %config.storage.root.display(),
         prefix = "<default>",
@@ -173,16 +173,13 @@ pub fn build_storage(config: &Config) -> anyhow::Result<Routed<AnyBackend>> {
 
     let mut routes = Vec::new();
     for (prefix, sub) in &config.storage.subpaths {
-        if sub.s3.is_some() {
-            anyhow::bail!(
-                "storage.subpaths.{prefix}.s3: S3 backend requires the s3 feature and is not yet wired"
-            );
-        }
-        let backend = AnyBackend::Fs(FsStorage::with_config(
+        let backend = build_one_backend(
             &sub.root,
+            sub.s3.as_ref(),
             &config.storage,
             Arc::clone(&quota),
-        )?);
+            &format!("storage.subpaths.{prefix}.s3"),
+        )?;
         tracing::info!(
             root = %sub.root.display(),
             prefix = %prefix,
@@ -192,6 +189,36 @@ pub fn build_storage(config: &Config) -> anyhow::Result<Routed<AnyBackend>> {
     }
 
     Ok(Routed::new(default, routes))
+}
+
+/// Build a single [`AnyBackend`]. When `s3` is `Some`, uses the S3 backend
+/// (behind the `s3` feature); otherwise the local filesystem backend.
+fn build_one_backend(
+    root: &std::path::Path,
+    s3: Option<&roci_config::S3Config>,
+    storage: &roci_config::StorageConfig,
+    quota: Arc<QuotaTracker>,
+    field_name: &str,
+) -> anyhow::Result<AnyBackend> {
+    // Only the build without the `s3` backend needs the field name (to reject
+    // the section by its exact path).
+    #[cfg(feature = "s3")]
+    let _ = field_name;
+    match s3 {
+        #[cfg(feature = "s3")]
+        Some(s3_cfg) => {
+            let backend = roci_storage_s3::S3Storage::open(root, s3_cfg, storage, quota)?;
+            Ok(AnyBackend::S3(backend))
+        }
+        #[cfg(not(feature = "s3"))]
+        Some(_) => {
+            anyhow::bail!("{field_name}: S3 backend requires a build with the `s3` feature");
+        }
+        None => {
+            let backend = FsStorage::with_config(root, storage, quota)?;
+            Ok(AnyBackend::Fs(backend))
+        }
+    }
 }
 
 /// Bind and serve the registry until `shutdown` resolves. Reports the bound
@@ -356,10 +383,17 @@ fn build_tls_acceptor(tls: &roci_config::TlsConfig) -> anyhow::Result<tokio_rust
     let key = PrivateKeyDer::from_pem_slice(&key_pem)
         .map_err(|e| anyhow::anyhow!("parsing TLS key {}: {e}", tls.key.display()))?;
 
-    let mut sc = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| anyhow::anyhow!("building TLS config: {e}"))?;
+    // Pin the `ring` provider explicitly (SECURITY: ring is the audited
+    // crypto backend): the `s3` backend's HTTP client pulls in rustls'
+    // `aws-lc-rs` feature, and with both enabled rustls cannot pick a
+    // process default on its own.
+    let mut sc =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| anyhow::anyhow!("building TLS config: {e}"))?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| anyhow::anyhow!("building TLS config: {e}"))?;
 
     // ALPN: h2 preferred, then http/1.1.
     sc.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
@@ -702,9 +736,13 @@ max_body = 0
 
         // ---- TLS + HTTP/1.1 ----
         {
-            let mut cc = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store.clone())
-                .with_no_client_auth();
+            let mut cc = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(root_store.clone())
+            .with_no_client_auth();
             cc.alpn_protocols = vec![b"http/1.1".to_vec()];
             let connector = tokio_rustls::TlsConnector::from(Arc::new(cc));
             let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -723,9 +761,13 @@ max_body = 0
 
         // ---- TLS + HTTP/2 ----
         {
-            let mut cc = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
+            let mut cc = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
             cc.alpn_protocols = vec![b"h2".to_vec()];
             let connector = tokio_rustls::TlsConnector::from(Arc::new(cc));
             let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -881,9 +923,13 @@ max_body = 0
         for c in &cert_der {
             root_store.add(c.clone()).unwrap();
         }
-        let cc = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let cc = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(cc));
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap();
@@ -1287,6 +1333,7 @@ max_body = 0
         handle.await.unwrap().unwrap();
     }
 
+    #[cfg(not(feature = "s3"))]
     #[test]
     fn s3_config_fails_with_field_qualified_error() {
         // S3 on the default backend
@@ -1314,6 +1361,7 @@ max_body = 0
         );
     }
 
+    #[cfg(not(feature = "s3"))]
     #[test]
     fn s3_subpath_config_fails_with_field_qualified_error() {
         // S3 on a subpath
@@ -1387,5 +1435,92 @@ max_body = 0
         let toml_str = toml::to_string(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(config, parsed);
+    }
+
+    /// `storage.metadata.engine = "redb"` opens the embedded KV in a `redb`
+    /// build and aborts startup, naming the field, in any other build.
+    #[test]
+    fn redb_engine_is_selected_by_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = dir.path().to_path_buf();
+        config.storage.metadata.engine = roci_config::MetadataEngine::Redb;
+        let built = build_storage(&config);
+        #[cfg(feature = "redb")]
+        {
+            built.unwrap();
+            assert!(dir.path().join("roci-meta.redb").exists());
+        }
+        #[cfg(not(feature = "redb"))]
+        {
+            let err = built
+                .err()
+                .expect("redb needs its build feature")
+                .to_string();
+            assert!(err.contains("storage.metadata.engine"), "{err}");
+        }
+    }
+
+    // -- S3 backend tests ------------------------------------------------
+
+    fn test_s3_config() -> roci_config::S3Config {
+        roci_config::S3Config {
+            bucket: "test-bucket".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            prefix: String::new(),
+            access_key_id: None,
+            secret_access_key_file: None,
+            allow_http: false,
+            redirect_min_size: 1024 * 1024,
+            redirect_ttl_secs: 60,
+            multipart_part_size: 16 * 1024 * 1024,
+            multipart_concurrency: 4,
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn build_storage_s3_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = dir.path().to_path_buf();
+        config.storage.s3 = Some(test_s3_config());
+        // S3Storage::open must not touch the network.
+        let storage = build_storage(&config).unwrap();
+        drop(storage);
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn build_storage_s3_subpath() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = dir.path().join("default");
+        config.storage.subpaths.insert(
+            "team".into(),
+            roci_config::SubpathConfig {
+                root: dir.path().join("team"),
+                s3: Some(test_s3_config()),
+            },
+        );
+        let storage = build_storage(&config).unwrap();
+        drop(storage);
+    }
+
+    #[cfg(not(feature = "s3"))]
+    #[test]
+    fn s3_section_without_feature_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = dir.path().to_path_buf();
+        config.storage.s3 = Some(test_s3_config());
+        let err = build_storage(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("s3"), "error should name the s3 field: {msg}");
+        assert!(
+            msg.contains("feature"),
+            "error should mention the feature: {msg}"
+        );
     }
 }

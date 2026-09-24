@@ -25,7 +25,7 @@ SHA-512 default digests (SHA-256 accepted) with constant-time verification; cosi
 
 ## Request- & storage-boundary controls
 
-Path-traversal-safe validation, a wire digest allowlist, bounded inputs (config-driven size / `n` caps, JSON depth), header-read + idle timeouts, per-HTTP-method rate limits (`429 TOOMANYREQUESTS`), TLS 0-RTT refused (1-RTT ticket resumption only), repository isolation (no cross-repo presence or content oracle), and SSRF containment (no client-URL fetch; host-allowlisted, repo-gated redirects).
+Path-traversal-safe validation, a wire digest allowlist, bounded inputs (config-driven size / `n` caps, JSON depth), header-read + idle timeouts, per-HTTP-method rate limits (`429 TOOMANYREQUESTS`), TLS 0-RTT refused (1-RTT ticket resumption only), repository isolation (no cross-repo presence or content oracle), and SSRF containment (no client-URL fetch; host-allowlisted, repo-gated redirects). On the storage side: storage quotas and a concurrent upload-session cap against exhaustion, GC that can never delete a blob a push is about to reference, a manifest and its derived links committed as one metadata record, scrub quarantine of blobs that no longer match their digest, and optional HMAC authentication of the metadata log and snapshot against a tampered storage volume.
 
 ## Security invariants & CVE regression suite
 

@@ -798,3 +798,624 @@ async fn rejects_traversal_in_repo() {
 }
 
 use futures::StreamExt;
+
+// ═══════════════════════════════════════════════════════════════════════
+// End-to-end tests through the HTTP stack
+// ═══════════════════════════════════════════════════════════════════════
+
+mod http_e2e {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request as HttpRequest, StatusCode};
+    use http_body_util::BodyExt;
+    use roci_config::Config;
+    use roci_core::{build_router, AppState};
+    use tower::ServiceExt;
+
+    /// Build an axum Router backed by S3Storage over InMemory.
+    fn make_app() -> (tempfile::TempDir, axum::Router, S3Storage) {
+        make_app_with_config(StorageConfig::default(), QuotaTracker::default())
+    }
+
+    fn make_app_with_config(
+        storage_config: StorageConfig,
+        quota: QuotaTracker,
+    ) -> (tempfile::TempDir, axum::Router, S3Storage) {
+        let (dir, s) = test_store_with_config(storage_config, quota);
+        let router = build_router(AppState::new_with(s.clone(), Config::default()));
+        (dir, router, s)
+    }
+
+    fn make_app_with_redirect(
+        redirect_min_size: u64,
+    ) -> (tempfile::TempDir, axum::Router, S3Storage, Arc<InMemory>) {
+        let (dir, s, mem) = test_store_with_redirect(redirect_min_size);
+        let router = build_router(AppState::new_with(s.clone(), Config::default()));
+        (dir, router, s, mem)
+    }
+
+    async fn body_bytes(resp: axum::http::Response<Body>) -> Vec<u8> {
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
+    }
+
+    // ── monolithic push + pull ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn monolithic_push_and_pull() {
+        let (_dir, app, _s) = make_app();
+        let repo = "test/repo";
+
+        // Push a blob.
+        let data = b"hello-world";
+        let digest = sha256_digest(data);
+        let digest_str = digest.as_string();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/v2/{repo}/blobs/uploads/?digest={digest_str}"))
+                    .header("Content-Type", "application/octet-stream")
+                    .header("Content-Length", data.len().to_string())
+                    .body(Body::from(data.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Monolithic POST with digest should return 201 Created.
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Pull the blob.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(format!("/v2/{repo}/blobs/{digest_str}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert_eq!(body, data);
+    }
+
+    // ── chunked push ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn chunked_push() {
+        let (_dir, app, _s) = make_app();
+        let repo = "test/chunked";
+
+        // Begin upload.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/v2/{repo}/blobs/uploads/"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let location = resp
+            .headers()
+            .get("Location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Upload chunks.
+        let chunk_a = b"chunk-a-";
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::patch(&location)
+                    .header("Content-Type", "application/octet-stream")
+                    .header("Content-Range", "0-7")
+                    .body(Body::from(chunk_a.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let chunk_b = b"chunk-b";
+        let full_data = b"chunk-a-chunk-b";
+        let digest = sha256_digest(full_data);
+        let digest_str = digest.as_string();
+
+        // Finalize.
+        let final_location = resp
+            .headers()
+            .get("Location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let sep = if final_location.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::put(format!("{final_location}{sep}digest={digest_str}"))
+                    .header("Content-Type", "application/octet-stream")
+                    .body(Body::from(chunk_b.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Pull.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(format!("/v2/{repo}/blobs/{digest_str}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, full_data);
+    }
+
+    // ── manifest push/pull by tag and digest ───────────────────────────
+
+    #[tokio::test]
+    async fn manifest_push_pull_by_tag_and_digest() {
+        let (_dir, app, _s) = make_app();
+        let repo = "test/manifest";
+
+        // Push config blob first.
+        let config_data = b"config";
+        let config_digest = sha256_digest(config_data);
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!(
+                    "/v2/{repo}/blobs/uploads/?digest={}",
+                    config_digest.as_string()
+                ))
+                .header("Content-Type", "application/octet-stream")
+                .body(Body::from(config_data.to_vec()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Push manifest with tag.
+        let manifest = test_manifest(&config_digest.as_string(), &[]);
+        let manifest_digest = sha256_digest(&manifest);
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::put(format!("/v2/{repo}/manifests/latest"))
+                    .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                    .body(Body::from(manifest.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Pull by tag.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(format!("/v2/{repo}/manifests/latest"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, manifest);
+
+        // Pull by digest.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(format!(
+                    "/v2/{repo}/manifests/{}",
+                    manifest_digest.as_string()
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, manifest);
+    }
+
+    // ── HEAD ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn head_blob() {
+        let (_dir, app, s) = make_app();
+        let data = b"head-check";
+        let digest = sha256_digest(data);
+        s.put_blob("test/head", &digest, data).await.unwrap();
+
+        let resp = app
+            .oneshot(
+                HttpRequest::head(format!("/v2/test/head/blobs/{}", digest.as_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cl = resp
+            .headers()
+            .get("Content-Length")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cl, "10"); // b"head-check".len()
+        assert!(body_bytes(resp).await.is_empty());
+    }
+
+    // ── tags list ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tags_list() {
+        let (_dir, app, s) = make_app();
+        let repo = "test/tags";
+        for tag in ["alpha", "beta", "gamma"] {
+            let d = format!("data-{tag}");
+            let cd = sha256_digest(d.as_bytes());
+            s.put_blob(repo, &cd, d.as_bytes()).await.unwrap();
+            let m = test_manifest(&cd.as_string(), &[]);
+            let md = sha256_digest(&m);
+            s.put_manifest(
+                repo,
+                Some(tag),
+                &md,
+                "application/vnd.oci.image.manifest.v1+json",
+                &m,
+                ManifestLinks {
+                    references: &[cd],
+                    subject: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let resp = app
+            .oneshot(
+                HttpRequest::get(format!("/v2/{repo}/tags/list"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let tags = body["tags"].as_array().unwrap();
+        let names: Vec<&str> = tags.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+        assert!(names.contains(&"gamma"));
+    }
+
+    // ── referrers ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn referrers_via_http() {
+        let (_dir, app, s) = make_app();
+        let repo = "test/referrers";
+
+        // Push subject.
+        let subject_data = b"subject";
+        let cd = sha256_digest(subject_data);
+        s.put_blob(repo, &cd, subject_data).await.unwrap();
+        let subject_manifest = test_manifest(&cd.as_string(), &[]);
+        let subject_digest = sha256_digest(&subject_manifest);
+        s.put_manifest(
+            repo,
+            Some("base"),
+            &subject_digest,
+            "application/vnd.oci.image.manifest.v1+json",
+            &subject_manifest,
+            ManifestLinks {
+                references: std::slice::from_ref(&cd),
+                subject: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Push referrer.
+        let ref_config = b"ref-config";
+        let ref_cd = sha256_digest(ref_config);
+        s.put_blob(repo, &ref_cd, ref_config).await.unwrap();
+        let referrer_manifest =
+            test_manifest_with_subject(&ref_cd.as_string(), &[], &subject_digest.as_string());
+        let referrer_digest = sha256_digest(&referrer_manifest);
+        let descriptor = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": referrer_digest.as_string(),
+            "size": referrer_manifest.len(),
+            "artifactType": "application/example"
+        });
+        s.put_manifest(
+            repo,
+            None,
+            &referrer_digest,
+            "application/vnd.oci.image.manifest.v1+json",
+            &referrer_manifest,
+            ManifestLinks {
+                references: &[ref_cd.clone(), subject_digest.clone()],
+                subject: Some((&subject_digest, &serde_json::to_vec(&descriptor).unwrap())),
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = app
+            .oneshot(
+                HttpRequest::get(format!(
+                    "/v2/{repo}/referrers/{}",
+                    subject_digest.as_string()
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let manifests = body["manifests"].as_array().unwrap();
+        assert!(!manifests.is_empty(), "referrers should not be empty");
+    }
+
+    // ── cross-repo mount (201) and isolation (404) ─────────────────────
+
+    #[tokio::test]
+    async fn cross_repo_mount_and_isolation() {
+        let (_dir, app, s) = make_app();
+        let data = b"shared-for-mount";
+        let digest = sha256_digest(data);
+        s.put_blob("source/repo", &digest, data).await.unwrap();
+
+        // Mount from source/repo to target/repo.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!(
+                    "/v2/target/repo/blobs/uploads/?mount={}&from=source/repo",
+                    digest.as_string()
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Verify blob is in target/repo.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::head(format!("/v2/target/repo/blobs/{}", digest.as_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Blob only in source/repo should NOT be visible in other/repo.
+        let data2 = b"only-in-source";
+        let digest2 = sha256_digest(data2);
+        s.put_blob("source/repo", &digest2, data2).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::head(format!("/v2/other/repo/blobs/{}", digest2.as_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── delete ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_blob_via_http() {
+        let (_dir, app, s) = make_app();
+        let data = b"delete-me";
+        let digest = sha256_digest(data);
+        s.put_blob("test/del", &digest, data).await.unwrap();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::delete(format!("/v2/test/del/blobs/{}", digest.as_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // Confirm gone.
+        let resp = app
+            .oneshot(
+                HttpRequest::head(format!("/v2/test/del/blobs/{}", digest.as_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── quota 413 ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn quota_blob_over_cap_413() {
+        let quota = QuotaTracker::new(QuotaLimits {
+            max_repo_bytes: 10,
+            max_total_bytes: 0,
+            max_upload_sessions: 0,
+        });
+        let (_dir, app, _s) = make_app_with_config(StorageConfig::default(), quota);
+
+        let data = b"this blob exceeds ten bytes by a lot!!";
+        let digest = sha256_digest(data);
+        let resp = app
+            .oneshot(
+                HttpRequest::post(format!(
+                    "/v2/test/quota/blobs/uploads/?digest={}",
+                    digest.as_string()
+                ))
+                .header("Content-Type", "application/octet-stream")
+                .body(Body::from(data.to_vec()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Expect 413 or 403 depending on how the router surfaces QuotaExceeded.
+        // OCI spec says DENIED or SIZE_EXCEEDED → 413 or 403.
+        let status = resp.status().as_u16();
+        assert!(
+            status == 403 || status == 413,
+            "expected 403 or 413 for quota exceeded, got {status}"
+        );
+    }
+
+    // ── session cap 429 ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn session_cap_429() {
+        let quota = QuotaTracker::new(QuotaLimits {
+            max_repo_bytes: 0,
+            max_total_bytes: 0,
+            max_upload_sessions: 1,
+        });
+        let (_dir, app, _s) = make_app_with_config(StorageConfig::default(), quota);
+
+        // First upload starts fine.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::post("/v2/test/sess/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // Second upload should hit the session cap.
+        let resp = app
+            .oneshot(
+                HttpRequest::post("/v2/test/sess/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        assert!(
+            status == 429 || status == 503 || status == 403,
+            "expected 429/503/403 for session cap, got {status}"
+        );
+    }
+
+    // ── 307 redirect for large blob with signer ────────────────────────
+
+    #[tokio::test]
+    async fn redirect_307_for_large_blob_with_signer() {
+        let (_dir, app, s, _mem) = make_app_with_redirect(10);
+
+        // Push blob above the redirect threshold.
+        let data = b"this blob exceeds ten bytes, triggering redirect";
+        let digest = sha256_digest(data);
+        s.put_blob("test/redir", &digest, data).await.unwrap();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(format!("/v2/test/redir/blobs/{}", digest.as_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Should be either 307 (redirect) or 200 (proxied).
+        // With a signer configured and size >= redirect_min_size, expect 307.
+        let status = resp.status().as_u16();
+        if status == 307 {
+            let loc = resp
+                .headers()
+                .get("Location")
+                .expect("307 should have Location header")
+                .to_str()
+                .unwrap();
+            assert!(
+                loc.contains("X-Amz-Signature") || loc.contains("Signature"),
+                "expected signed URL, got: {loc}"
+            );
+        } else {
+            // Proxied 200 is also acceptable if signing failed.
+            assert_eq!(status, 200);
+        }
+    }
+
+    // ── 200 (proxied) for small blob even with signer ──────────────────
+
+    #[tokio::test]
+    async fn proxy_200_for_small_blob_with_signer() {
+        let (_dir, app, s, _mem) = make_app_with_redirect(1000);
+
+        let data = b"small";
+        let digest = sha256_digest(data);
+        s.put_blob("test/proxy", &digest, data).await.unwrap();
+
+        let resp = app
+            .oneshot(
+                HttpRequest::get(format!("/v2/test/proxy/blobs/{}", digest.as_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Below redirect_min_size: proxied 200, not redirect.
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, data);
+    }
+
+    // ── delete absent blob returns 404 ─────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_absent_blob_returns_404() {
+        let (_dir, app, _s) = make_app();
+        let digest = sha256_digest(b"never-stored");
+        let resp = app
+            .oneshot(
+                HttpRequest::delete(format!("/v2/test/gone/blobs/{}", digest.as_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}

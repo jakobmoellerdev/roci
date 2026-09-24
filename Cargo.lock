@@ -2145,6 +2145,7 @@ dependencies = [
 name = "roci-storage-s3"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bytes",
  "crc32c",
  "futures",

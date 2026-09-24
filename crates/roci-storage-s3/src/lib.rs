@@ -19,7 +19,7 @@ use roci_config::{S3Config, StorageConfig};
 use roci_storage::gc::GcTracker;
 use roci_storage::quota::QuotaTracker;
 use roci_storage::{DedupeIndex, MetadataStore};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -56,6 +56,13 @@ pub struct S3Storage {
     index_notify: Arc<Notify>,
     /// Config snapshot.
     config: Arc<StorageConfig>,
+    /// Per-repo oci-layout marker presence cache (avoids a HEAD on every push).
+    layout_cache: Arc<StdMutex<HashSet<String>>>,
+    /// Recorded manifest sizes for index.json rebuilds (no per-entry HEAD).
+    /// Key: `(repo, digest)`, value: byte size.
+    manifest_sizes: Arc<StdMutex<HashMap<(String, String), u64>>>,
+    /// Cached remote index.json for synchronous media-type lookups.
+    cached_remote_index: Arc<StdMutex<HashMap<String, serde_json::Value>>>,
 }
 
 impl S3Storage {
@@ -95,6 +102,9 @@ impl S3Storage {
             index_dirty: Arc::new(StdMutex::new(HashMap::new())),
             index_notify: Arc::new(Notify::new()),
             config: Arc::new(storage.clone()),
+            layout_cache: Arc::new(StdMutex::new(HashSet::new())),
+            manifest_sizes: Arc::new(StdMutex::new(HashMap::new())),
+            cached_remote_index: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 

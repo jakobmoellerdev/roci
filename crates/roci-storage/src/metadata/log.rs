@@ -1,6 +1,32 @@
 //! The default metadata engine: in-RAM maps mirrored to an append-only,
 //! CRC32C-framed `roci-meta.log`, replayed in one sequential pass on start.
+//!
+//! ## Compaction (Phase 5)
+//!
+//! When `roci-meta.log` exceeds `compact_threshold_bytes`, `maintain()` writes
+//! a fresh log containing the minimal record set reproducing the current state,
+//! atomically swaps it in, and re-opens the append + group-commit handles. The
+//! state lock is held for the rewrite (brief pause — typically < 50 ms for
+//! multi-MB logs) so concurrent appends are not lost or reordered. A crash at
+//! any point leaves either the old or the new complete log.
+//!
+//! ## rkyv mmap snapshot (Phase 5, `snapshot = true`)
+//!
+//! When snapshots are enabled, `maintain()` also writes an rkyv archive of the
+//! complete state (`roci-meta.snapshot`) with an integrity header (CRC32C or
+//! HMAC-SHA256 when a key is configured). On open, the snapshot is mmap'd and
+//! verified, then reads are served from the archived base + an in-RAM delta
+//! overlay. Cold start is O(1) — mmap + demand-paging, no per-record replay.
+//!
+//! ## WAL HMAC (Phase 5, `hmac_key_file` set)
+//!
+//! Every log record carries an HMAC-SHA256 tag (in addition to its CRC32C for
+//! torn-tail detection). The first record is a header declaring the framing
+//! mode. Opening an existing log with a mismatched framing/key moves it aside
+//! and starts fresh — the layout rebuild recovers the state.
 
+use super::snapshot::{self, SnapshotState};
+use super::wal_hmac::{self, decode_header, FramingMode, HmacKey};
 use super::{after, take_page, BlobChecksum, MetaOp, MetadataStore, Page, Referrer};
 use roci_config::MetadataConfig;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -10,51 +36,47 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// In-RAM metadata maps mirrored to an append-only CRC32C-framed log.
-///
-/// Writes are **group-committed**: the append (buffered `write` + `flush` into
-/// the kernel) happens under the fast `inner` lock and bumps `appended`; the
-/// durability barrier (`fdatasync`) is coalesced behind a separate `sync` lock,
-/// so N appends that pile up while one `fdatasync` is in flight are made
-/// durable by that single sync — a caller whose record is already covered
-/// (`synced >= my_seq`) returns without its own sync (RESEARCH §8.8, PLAN
-/// Phase 2 group-commit).
 pub struct LogMetadataStore {
     inner: Mutex<State>,
-    /// Records appended to the kernel so far (monotonic; the append seq).
     appended: AtomicU64,
-    /// Coalesced durability barrier: the highest `appended` made durable, plus
-    /// a `fdatasync`-capable clone of the log handle.
     sync: Mutex<SyncCoord>,
     log_path: PathBuf,
+    snapshot_path: PathBuf,
+    compact_threshold: u64,
+    snapshot_enabled: bool,
+    hmac_key: Option<HmacKey>,
+    /// The snapshot base. When present, queries merge base + delta.
+    snap_base: Mutex<Option<snapshot::VerifiedSnapshot>>,
+    generation: Mutex<u64>,
+    /// Length of the log image written by the last compaction/snapshot (or
+    /// the offset a loaded snapshot covers): upkeep triggers on growth past
+    /// it, so a state larger than the threshold is not rewritten every tick.
+    image_len: AtomicU64,
 }
 
-/// Durability-barrier state, guarded independently of `inner` so a `fdatasync`
-/// never holds the append lock.
+impl std::fmt::Debug for LogMetadataStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogMetadataStore")
+            .field("log_path", &self.log_path)
+            .finish()
+    }
+}
+
 #[derive(Default)]
 struct SyncCoord {
-    /// Highest `appended` seq made durable by a completed `fdatasync`.
     synced: u64,
-    /// A clone of the log file used only for `sync_data`; set on first append.
     handle: Option<std::fs::File>,
 }
 
-/// A repo-scoped map key: `(repo, name)` so repositories stay isolated.
 type RepoKey = (String, String);
 
-/// The referrers of one subject, ordered by referrer digest so a page is an
-/// O(log n) seek past the cursor. `by_type` indexes the same digests by their
-/// descriptor's `artifactType`, so a filtered page is an equally bounded seek.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct SubjectReferrers {
-    /// `referrer_digest → (artifactType, descriptor_bytes)`.
     by_digest: BTreeMap<String, (Option<String>, Vec<u8>)>,
-    /// `artifactType → {referrer_digest}`; holds exactly the typed entries of
-    /// `by_digest`, and a type whose set empties is removed.
     by_type: HashMap<String, BTreeSet<String>>,
 }
 
 impl SubjectReferrers {
-    /// Record (or replace, de-duplicating by digest) one referrer descriptor.
     fn insert(&mut self, referrer: &str, descriptor: &[u8]) {
         let artifact_type = serde_json::from_slice::<serde_json::Value>(descriptor)
             .ok()
@@ -70,7 +92,6 @@ impl SubjectReferrers {
             .insert(referrer.to_string(), (artifact_type, descriptor.to_vec()));
     }
 
-    /// Drop `referrer` from both indexes.
     fn remove(&mut self, referrer: &str) {
         let Some((Some(t), _)) = self.by_digest.remove(referrer) else {
             return;
@@ -108,30 +129,23 @@ impl SubjectReferrers {
     }
 }
 
-/// The mutable in-RAM state. Repo-scoped so repositories stay isolated.
+/// The mutable in-RAM state (acts as delta overlay when a snapshot base is
+/// present).
 #[derive(Default)]
 struct State {
-    /// `repo → tag → (digest, media_type)` — lexically ordered per repo so a
-    /// tag page is a seek; a repo whose last tag goes is removed. The media
-    /// type is stored alongside so a tag resolution needs no second lookup.
     tags: HashMap<String, BTreeMap<String, (String, String)>>,
-    /// `(repo, digest) → media_type`.
     media_types: HashMap<RepoKey, String>,
-    /// `(repo, subject) → referrers`; a subject whose last referrer goes is
-    /// removed.
     referrers: HashMap<RepoKey, SubjectReferrers>,
-    /// `(repo, blob_digest) → [manifest_digest]`: reverse edges from a blob to
-    /// every manifest that references it — GC's liveness index. Maintained on
-    /// manifest put/delete; manifest digests de-dup within a set.
     backrefs: HashMap<RepoKey, Vec<String>>,
-    /// `(repo, blob_digest) → checksum` recorded at write, for the scrub.
     checksums: HashMap<RepoKey, BlobChecksum>,
-    /// Buffered log writer (`None` until a mutation opens/creates the log).
     log: Option<std::fs::File>,
+    /// Digests deleted from the base per repo (for DeleteManifest tombstoning).
+    deleted_digests: HashMap<String, BTreeSet<String>>,
+    /// Individual blob-checksum keys deleted from the base.
+    deleted_checksums: BTreeSet<RepoKey>,
 }
 
 impl State {
-    /// Add `manifest` to the backref set of every blob in `blobs`.
     fn add_backrefs(&mut self, repo: &str, manifest: &str, blobs: &[String]) {
         for blob in blobs {
             let set = self
@@ -144,42 +158,283 @@ impl State {
         }
     }
 
-    /// Record `referrer` (descriptor bytes) against `subject`.
     fn add_referrer(&mut self, repo: &str, subject: &str, referrer: &str, descriptor: &[u8]) {
         self.referrers
             .entry((repo.to_string(), subject.to_string()))
             .or_default()
             .insert(referrer, descriptor);
     }
-}
 
-impl LogMetadataStore {
-    /// Open with the `[storage.metadata]` policy (compaction threshold,
-    /// snapshot, HMAC key).
-    pub fn open_with(root: &Path, _config: &MetadataConfig) -> io::Result<Self> {
-        Self::open(root)
+    /// Is `digest` tombstoned in `repo`?
+    fn is_digest_deleted(&self, repo: &str, digest: &str) -> bool {
+        self.deleted_digests
+            .get(repo)
+            .is_some_and(|s| s.contains(digest))
     }
 
-    /// Open (replaying) or create the metadata store at `<root>/roci-meta.log`.
-    /// A corrupt trailing record (torn write from a crash) is truncated away;
-    /// records that fail their CRC are skipped, and the layout can always
-    /// rebuild what a damaged log loses.
-    pub fn open(root: &Path) -> io::Result<Self> {
-        let log_path = root.join("roci-meta.log");
-        let mut state = State::default();
-        if let Ok(bytes) = std::fs::read(&log_path) {
-            replay(&bytes, &mut state);
+    /// Materialize the full in-RAM state from `self` (delta) + snapshot base
+    /// into a standalone `State` suitable for compaction/snapshot serialization.
+    fn materialize(&self, base: Option<&snapshot::VerifiedSnapshot>) -> State {
+        if base.is_none() {
+            return State {
+                tags: self.tags.clone(),
+                media_types: self.media_types.clone(),
+                referrers: self.referrers.clone(),
+                backrefs: self.backrefs.clone(),
+                checksums: self.checksums.clone(),
+                log: None,
+                deleted_digests: self.deleted_digests.clone(),
+                deleted_checksums: self.deleted_checksums.clone(),
+            };
         }
+        let archived = base.unwrap().archived();
+        let mut out = State::default();
+
+        // Tags: base filtered by tombstones, then delta overrides.
+        for entry in archived.tags.iter() {
+            let repo: String = entry.repo.as_str().into();
+            let deleted = self.deleted_digests.get(&repo);
+            for tag_entry in entry.tags.iter() {
+                let tag: String = tag_entry.tag.as_str().into();
+                let digest: String = tag_entry.digest.as_str().into();
+                let media: String = tag_entry.media_type.as_str().into();
+                if deleted.is_some_and(|s| s.contains(&digest)) {
+                    continue;
+                }
+                out.tags
+                    .entry(repo.clone())
+                    .or_default()
+                    .insert(tag, (digest, media));
+            }
+        }
+        for (repo, delta_tags) in &self.tags {
+            let out_tags = out.tags.entry(repo.clone()).or_default();
+            for (tag, val) in delta_tags {
+                out_tags.insert(tag.clone(), val.clone());
+            }
+        }
+
+        // Media types: base minus tombstones, then delta.
+        for entry in archived.media_types.iter() {
+            let repo: String = entry.repo.as_str().into();
+            let digest: String = entry.digest.as_str().into();
+            let media: String = entry.media_type.as_str().into();
+            let key = (repo, digest);
+            if self
+                .deleted_digests
+                .get(&key.0)
+                .is_some_and(|s| s.contains(&key.1))
+            {
+                continue;
+            }
+            out.media_types.insert(key, media);
+        }
+        for (k, v) in &self.media_types {
+            out.media_types.insert(k.clone(), v.clone());
+        }
+
+        // Referrers: base minus tombstones, then delta.
+        for entry in archived.referrers.iter() {
+            let repo: String = entry.repo.as_str().into();
+            let subject: String = entry.subject.as_str().into();
+            let key = (repo.clone(), subject);
+            let deleted = self.deleted_digests.get(&repo);
+            let out_refs = out.referrers.entry(key).or_default();
+            for ref_entry in entry.referrers.iter() {
+                let referrer: String = ref_entry.referrer_digest.as_str().into();
+                if deleted.is_some_and(|s| s.contains(&referrer)) {
+                    continue;
+                }
+                let descriptor: Vec<u8> = ref_entry.descriptor.as_slice().to_vec();
+                out_refs.insert(&referrer, &descriptor);
+            }
+        }
+        for (k, v) in &self.referrers {
+            let out_refs = out.referrers.entry(k.clone()).or_default();
+            for (d, (_, bytes)) in &v.by_digest {
+                out_refs.insert(d, bytes);
+            }
+        }
+        out.referrers.retain(|_, v| !v.by_digest.is_empty());
+
+        // Backrefs: base minus tombstones, then delta.
+        for entry in archived.backrefs.iter() {
+            let repo: String = entry.repo.as_str().into();
+            let blob: String = entry.blob.as_str().into();
+            let key = (repo.clone(), blob);
+            let deleted = self.deleted_digests.get(&repo);
+            let mut manifests: Vec<String> = entry
+                .manifests
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .filter(|m| !deleted.is_some_and(|s| s.contains(m)))
+                .collect();
+            if let Some(delta) = self.backrefs.get(&key) {
+                for m in delta {
+                    if !manifests.contains(m) {
+                        manifests.push(m.clone());
+                    }
+                }
+            }
+            if !manifests.is_empty() {
+                out.backrefs.insert(key, manifests);
+            }
+        }
+        // Delta-only backrefs.
+        for (k, v) in &self.backrefs {
+            if !out.backrefs.contains_key(k) {
+                out.backrefs.insert(k.clone(), v.clone());
+            }
+        }
+
+        // Checksums: base minus tombstones, then delta.
+        for entry in archived.checksums.iter() {
+            let repo: String = entry.repo.as_str().into();
+            let digest: String = entry.digest.as_str().into();
+            let key = (repo, digest);
+            if self.deleted_checksums.contains(&key) {
+                continue;
+            }
+            if self
+                .deleted_digests
+                .get(&key.0)
+                .is_some_and(|s| s.contains(&key.1))
+            {
+                continue;
+            }
+            out.checksums.insert(
+                key,
+                BlobChecksum {
+                    crc32c: entry.crc32c.into(),
+                    size: entry.size.into(),
+                },
+            );
+        }
+        for (k, v) in &self.checksums {
+            out.checksums.insert(k.clone(), *v);
+        }
+
+        out
+    }
+}
+
+// ============================================================================
+// LogMetadataStore: open, apply_in_ram
+// ============================================================================
+
+impl LogMetadataStore {
+    /// Open with the `[storage.metadata]` policy.
+    pub fn open_with(root: &Path, config: &MetadataConfig) -> io::Result<Self> {
+        let hmac_key = config
+            .hmac_key_file
+            .as_ref()
+            .map(|p| HmacKey::load(p))
+            .transpose()?;
+        Self::open_inner(
+            root,
+            config.compact_threshold_bytes,
+            config.snapshot,
+            hmac_key,
+        )
+    }
+
+    /// Open (replaying) or create the metadata store.
+    pub fn open(root: &Path) -> io::Result<Self> {
+        Self::open_inner(root, 0, false, None)
+    }
+
+    fn open_inner(
+        root: &Path,
+        compact_threshold: u64,
+        snapshot_enabled: bool,
+        hmac_key: Option<HmacKey>,
+    ) -> io::Result<Self> {
+        let log_path = root.join("roci-meta.log");
+        let snapshot_path = root.join("roci-meta.snapshot");
+        let mut state = State::default();
+        let mut generation = 0u64;
+        // `(generation, covered log offset)` of a verified snapshot.
+        let mut covered: Option<(u64, u64)> = None;
+        let mut snap_base: Option<snapshot::VerifiedSnapshot> = None;
+
+        // Phase 1: Try to load and verify a snapshot.
+        if snapshot_enabled {
+            match snapshot::VerifiedSnapshot::open(&snapshot_path, hmac_key.as_ref()) {
+                Ok(Some(verified)) => {
+                    let archived = verified.archived();
+                    generation = archived.generation.into();
+                    covered = Some((generation, archived.log_offset.into()));
+                    snap_base = Some(verified);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "discarding invalid snapshot; falling back to log replay"
+                    );
+                    let _ = std::fs::remove_file(&snapshot_path);
+                }
+            }
+        }
+
+        // Phase 2: Replay the log.
+        if let Ok(bytes) = std::fs::read(&log_path) {
+            if !bytes.is_empty() {
+                let expected_mode = if hmac_key.is_some() {
+                    FramingMode::HmacSha256
+                } else {
+                    FramingMode::Plain
+                };
+                match check_log_framing(&bytes, expected_mode, hmac_key.as_ref()) {
+                    LogFramingCheck::Compatible => {
+                        replay_log(&bytes, &mut state, hmac_key.as_ref(), covered);
+                    }
+                    LogFramingCheck::Incompatible => {
+                        tracing::warn!(
+                            "WAL framing/key mismatch; moving log aside and starting fresh"
+                        );
+                        let _ = wal_hmac::move_aside(&log_path);
+                        if snap_base.is_some() {
+                            snap_base = None;
+                            let _ = std::fs::remove_file(&snapshot_path);
+                        }
+                    }
+                    LogFramingCheck::NoHeader => {
+                        // Legacy log without a header — only compatible when
+                        // no HMAC key is configured.
+                        if hmac_key.is_some() {
+                            tracing::warn!(
+                                "unauthenticated log found with HMAC key configured; \
+                                 moving log aside"
+                            );
+                            let _ = wal_hmac::move_aside(&log_path);
+                            if snap_base.is_some() {
+                                snap_base = None;
+                                let _ = std::fs::remove_file(&snapshot_path);
+                            }
+                        } else {
+                            replay_legacy(&bytes, &mut state);
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             inner: Mutex::new(state),
             appended: AtomicU64::new(0),
             sync: Mutex::new(SyncCoord::default()),
             log_path,
+            snapshot_path,
+            compact_threshold,
+            snapshot_enabled,
+            hmac_key,
+            snap_base: Mutex::new(snap_base),
+            generation: Mutex::new(generation),
+            image_len: AtomicU64::new(covered.map_or(0, |(_, offset)| offset)),
         })
     }
 
-    /// Apply a mutation to the in-RAM maps only (used by both `apply`, after it
-    /// has framed the record to the log, and by log replay).
     fn apply_in_ram(state: &mut State, op: &MetaOp) {
         match op {
             MetaOp::PutManifest {
@@ -206,26 +461,32 @@ impl LogMetadataStore {
                 }
             }
             MetaOp::DeleteManifest { repo, digest } => {
-                // The manifest blob leaves the CAS with it.
                 state.checksums.remove(&(repo.clone(), digest.clone()));
+                state
+                    .deleted_checksums
+                    .insert((repo.clone(), digest.clone()));
                 state.media_types.remove(&(repo.clone(), digest.clone()));
-                // Drop every tag pointing at this digest.
+                // Tombstone this digest in the base.
+                state
+                    .deleted_digests
+                    .entry(repo.clone())
+                    .or_default()
+                    .insert(digest.clone());
+                // Drop tags pointing at this digest from the delta.
                 if let Some(tags) = state.tags.get_mut(repo) {
                     tags.retain(|_, (d, _)| d != digest);
                     if tags.is_empty() {
                         state.tags.remove(repo);
                     }
                 }
-                // Drop the deleted manifest as a referrer of any subject in
-                // this repo; a subject left without referrers is removed.
+                // Drop from delta referrers.
                 state.referrers.retain(|(r, _), refs| {
                     if r == repo {
                         refs.remove(digest);
                     }
                     !refs.by_digest.is_empty()
                 });
-                // Drop the deleted manifest from every blob's backref set in
-                // this repo; a set that empties is removed entirely.
+                // Drop from delta backrefs.
                 state.backrefs.retain(|(r, _), manifests| {
                     if r == repo {
                         manifests.retain(|m| m != digest);
@@ -250,8 +511,10 @@ impl LogMetadataStore {
                 crc32c,
                 size,
             } => {
+                let key = (repo.clone(), digest.clone());
+                state.deleted_checksums.remove(&key);
                 state.checksums.insert(
-                    (repo.clone(), digest.clone()),
+                    key,
                     BlobChecksum {
                         crc32c: *crc32c,
                         size: *size,
@@ -259,31 +522,118 @@ impl LogMetadataStore {
                 );
             }
             MetaOp::DeleteBlob { repo, digest } => {
-                state.checksums.remove(&(repo.clone(), digest.clone()));
+                let key = (repo.clone(), digest.clone());
+                state.checksums.remove(&key);
+                state.deleted_checksums.insert(key);
             }
         }
     }
 }
 
+// ============================================================================
+// MetadataStore trait implementation
+// ============================================================================
+
 impl MetadataStore for LogMetadataStore {
     fn resolve_tag(&self, repo: &str, tag: &str) -> Option<(String, String)> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        state.tags.get(repo)?.get(tag).cloned()
+        // Check delta first.
+        if let Some(tags) = state.tags.get(repo) {
+            if let Some(v) = tags.get(tag) {
+                return Some(v.clone());
+            }
+        }
+        // Check base.
+        let base = self.snap_base.lock().expect("snap lock poisoned");
+        if let Some(snap) = base.as_ref() {
+            let a = snap.archived();
+            if let Ok(idx) = a.tags.binary_search_by(|e| e.repo.as_str().cmp(repo)) {
+                for entry in a.tags[idx].tags.iter() {
+                    if entry.tag.as_str() == tag {
+                        let digest: String = entry.digest.as_str().into();
+                        if state.is_digest_deleted(repo, &digest) {
+                            return None;
+                        }
+                        return Some((digest, entry.media_type.as_str().into()));
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn manifest_media_type(&self, repo: &str, digest: &str) -> Option<String> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        state
+        if let Some(v) = state
             .media_types
             .get(&(repo.to_string(), digest.to_string()))
-            .cloned()
+        {
+            return Some(v.clone());
+        }
+        if state.is_digest_deleted(repo, digest) {
+            return None;
+        }
+        let base = self.snap_base.lock().expect("snap lock poisoned");
+        if let Some(snap) = base.as_ref() {
+            let a = snap.archived();
+            if let Ok(idx) = a
+                .media_types
+                .binary_search_by(|e| (e.repo.as_str(), e.digest.as_str()).cmp(&(repo, digest)))
+            {
+                return Some(a.media_types[idx].media_type.as_str().into());
+            }
+        }
+        None
     }
 
     fn tags_page(&self, repo: &str, last: Option<&str>, limit: usize) -> Option<Page<String>> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        let tags = state.tags.get(repo)?;
+        let base = self.snap_base.lock().expect("snap lock poisoned");
+
+        if base.is_none() {
+            // Fast path: no snapshot, pure delta.
+            let tags = state.tags.get(repo)?;
+            return Some(take_page(
+                tags.range::<str, _>(after(last)).map(|(t, _)| t.clone()),
+                limit,
+            ));
+        }
+
+        // Merge base + delta, filtering tombstones.
+        let a = base.as_ref().unwrap().archived();
+        let delta_tags = state.tags.get(repo);
+        let base_repo = a
+            .tags
+            .binary_search_by(|e| e.repo.as_str().cmp(repo))
+            .ok()
+            .map(|i| &a.tags[i].tags);
+
+        if delta_tags.is_none() && base_repo.is_none() {
+            return None;
+        }
+
+        let mut merged = BTreeMap::new();
+        if let Some(base_tags) = base_repo {
+            for entry in base_tags.iter() {
+                let tag: String = entry.tag.as_str().into();
+                let digest: String = entry.digest.as_str().into();
+                if !state.is_digest_deleted(repo, &digest) {
+                    merged.insert(tag, ());
+                }
+            }
+        }
+        if let Some(dt) = delta_tags {
+            for t in dt.keys() {
+                merged.insert(t.clone(), ());
+            }
+        }
+
+        if merged.is_empty() {
+            return None;
+        }
+
         Some(take_page(
-            tags.range::<str, _>(after(last)).map(|(t, _)| t.clone()),
+            merged.range::<str, _>(after(last)).map(|(t, _)| t.clone()),
             limit,
         ))
     }
@@ -297,122 +647,289 @@ impl MetadataStore for LogMetadataStore {
         limit: usize,
     ) -> Option<Page<Referrer>> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        let refs = state
+        let base = self.snap_base.lock().expect("snap lock poisoned");
+        let key = (repo.to_string(), subject.to_string());
+
+        if base.is_none() {
+            let refs = state.referrers.get(&key)?;
+            return Some(refs.page(artifact_type, last, limit));
+        }
+
+        // Merge base + delta referrers into a temporary SubjectReferrers.
+        let a = base.as_ref().unwrap().archived();
+        let base_refs = a
             .referrers
-            .get(&(repo.to_string(), subject.to_string()))?;
-        Some(refs.page(artifact_type, last, limit))
+            .binary_search_by(|e| (e.repo.as_str(), e.subject.as_str()).cmp(&(repo, subject)))
+            .ok()
+            .map(|i| &a.referrers[i].referrers);
+        let delta_refs = state.referrers.get(&key);
+
+        if base_refs.is_none() && delta_refs.is_none() {
+            return None;
+        }
+
+        let mut merged = SubjectReferrers::default();
+        if let Some(br) = base_refs {
+            for entry in br.iter() {
+                let referrer: String = entry.referrer_digest.as_str().into();
+                if state.is_digest_deleted(repo, &referrer) {
+                    continue;
+                }
+                let descriptor: Vec<u8> = entry.descriptor.as_slice().to_vec();
+                merged.insert(&referrer, &descriptor);
+            }
+        }
+        if let Some(dr) = delta_refs {
+            for (d, (_, bytes)) in &dr.by_digest {
+                merged.insert(d, bytes);
+            }
+        }
+
+        if merged.by_digest.is_empty() {
+            return None;
+        }
+
+        Some(merged.page(artifact_type, last, limit))
     }
 
     fn has_referrer(&self, repo: &str, subject: &str, referrer: &str) -> bool {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        state
-            .referrers
-            .get(&(repo.to_string(), subject.to_string()))
-            .is_some_and(|refs| refs.by_digest.contains_key(referrer))
+        let key = (repo.to_string(), subject.to_string());
+        if let Some(refs) = state.referrers.get(&key) {
+            if refs.by_digest.contains_key(referrer) {
+                return true;
+            }
+        }
+        if state.is_digest_deleted(repo, referrer) {
+            return false;
+        }
+        let base = self.snap_base.lock().expect("snap lock poisoned");
+        if let Some(snap) = base.as_ref() {
+            let a = snap.archived();
+            if let Ok(idx) = a
+                .referrers
+                .binary_search_by(|e| (e.repo.as_str(), e.subject.as_str()).cmp(&(repo, subject)))
+            {
+                return a.referrers[idx]
+                    .referrers
+                    .binary_search_by(|e| e.referrer_digest.as_str().cmp(referrer))
+                    .is_ok();
+            }
+        }
+        false
     }
 
     fn backrefs(&self, repo: &str, blob: &str) -> Vec<String> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        state
-            .backrefs
-            .get(&(repo.to_string(), blob.to_string()))
-            .cloned()
-            .unwrap_or_default()
+        let key = (repo.to_string(), blob.to_string());
+        let base = self.snap_base.lock().expect("snap lock poisoned");
+
+        let mut result: Vec<String> = Vec::new();
+
+        // Base backrefs for this blob.
+        if let Some(snap) = base.as_ref() {
+            let a = snap.archived();
+            if let Ok(idx) = a
+                .backrefs
+                .binary_search_by(|e| (e.repo.as_str(), e.blob.as_str()).cmp(&(repo, blob)))
+            {
+                for m in a.backrefs[idx].manifests.iter() {
+                    let ms: String = m.as_str().into();
+                    if !state.is_digest_deleted(repo, &ms) {
+                        result.push(ms);
+                    }
+                }
+            }
+        }
+
+        // Delta backrefs.
+        if let Some(delta) = state.backrefs.get(&key) {
+            for m in delta {
+                if !result.contains(m) {
+                    result.push(m.clone());
+                }
+            }
+        }
+
+        result
     }
 
     fn checksum(&self, repo: &str, digest: &str) -> Option<BlobChecksum> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        state
-            .checksums
-            .get(&(repo.to_string(), digest.to_string()))
-            .copied()
+        let key = (repo.to_string(), digest.to_string());
+        if let Some(v) = state.checksums.get(&key) {
+            return Some(*v);
+        }
+        if state.deleted_checksums.contains(&key) || state.is_digest_deleted(repo, digest) {
+            return None;
+        }
+        let base = self.snap_base.lock().expect("snap lock poisoned");
+        if let Some(snap) = base.as_ref() {
+            let a = snap.archived();
+            if let Ok(idx) = a
+                .checksums
+                .binary_search_by(|e| (e.repo.as_str(), e.digest.as_str()).cmp(&(repo, digest)))
+            {
+                return Some(BlobChecksum {
+                    crc32c: a.checksums[idx].crc32c.into(),
+                    size: a.checksums[idx].size.into(),
+                });
+            }
+        }
+        None
     }
 
     fn apply(&self, op: MetaOp) -> io::Result<()> {
-        // Append the record and reflect it in RAM under one lock (so the
-        // in-memory maps always match log-replay order even under concurrent
-        // appends), then coalesce the durability barrier. The in-RAM maps are a
-        // rebuildable cache and the log is the source of truth: if the barrier
-        // fails, the record is already in the log (replayed on restart) and the
-        // in-RAM state already matches that replay — the caller gets the error.
         let my_seq = self.append_record(&op)?;
         self.group_commit_through(my_seq)
     }
 
     fn apply_relaxed(&self, op: MetaOp) -> io::Result<()> {
-        // Appended to the kernel (and applied in RAM) exactly like `apply`,
-        // but the caller does not wait for the durability barrier: the next
-        // group commit (or a clean shutdown) makes it durable.
         self.append_record(&op).map(drop)
     }
 
     fn repos(&self) -> Vec<String> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        let mut repos: Vec<String> = state
+        let base = self.snap_base.lock().expect("snap lock poisoned");
+        let mut repos: BTreeSet<String> = state
             .media_types
             .keys()
             .chain(state.referrers.keys())
             .map(|(r, _)| r.clone())
             .collect();
-        repos.sort();
-        repos.dedup();
-        repos
+        if let Some(snap) = base.as_ref() {
+            let a = snap.archived();
+            for entry in a.media_types.iter() {
+                let repo: String = entry.repo.as_str().into();
+                let digest: String = entry.digest.as_str().into();
+                if !state.is_digest_deleted(&repo, &digest) {
+                    repos.insert(repo);
+                }
+            }
+            for entry in a.referrers.iter() {
+                let repo: String = entry.repo.as_str().into();
+                let has_live = entry
+                    .referrers
+                    .iter()
+                    .any(|r| !state.is_digest_deleted(&repo, r.referrer_digest.as_str()));
+                if has_live {
+                    repos.insert(repo);
+                }
+            }
+        }
+        repos.into_iter().collect()
     }
 
     fn manifests(&self, repo: &str) -> Vec<String> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        state
+        let base = self.snap_base.lock().expect("snap lock poisoned");
+        let mut result: Vec<String> = state
             .media_types
             .keys()
             .filter(|(r, _)| r == repo)
             .map(|(_, d)| d.clone())
-            .collect()
+            .collect();
+        if let Some(snap) = base.as_ref() {
+            let a = snap.archived();
+            for entry in a.media_types.iter() {
+                if entry.repo.as_str() == repo {
+                    let digest: String = entry.digest.as_str().into();
+                    if !state.is_digest_deleted(repo, &digest) && !result.contains(&digest) {
+                        result.push(digest);
+                    }
+                }
+            }
+        }
+        result
     }
 
     fn tags_snapshot(&self, repo: &str) -> Vec<(String, String, String)> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        state
-            .tags
-            .get(repo)
-            .map(|tags| {
-                tags.iter()
-                    .map(|(tag, (digest, media))| (tag.clone(), digest.clone(), media.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let base = self.snap_base.lock().expect("snap lock poisoned");
+
+        let mut merged: BTreeMap<String, (String, String)> = BTreeMap::new();
+        if let Some(snap) = base.as_ref() {
+            let a = snap.archived();
+            if let Ok(idx) = a.tags.binary_search_by(|e| e.repo.as_str().cmp(repo)) {
+                for entry in a.tags[idx].tags.iter() {
+                    let digest: String = entry.digest.as_str().into();
+                    if !state.is_digest_deleted(repo, &digest) {
+                        merged.insert(
+                            entry.tag.as_str().into(),
+                            (digest, entry.media_type.as_str().into()),
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(dt) = state.tags.get(repo) {
+            for (t, v) in dt {
+                merged.insert(t.clone(), v.clone());
+            }
+        }
+        merged.into_iter().map(|(t, (d, m))| (t, d, m)).collect()
     }
 
     fn referrers_snapshot(&self, repo: &str) -> Vec<(String, Vec<Referrer>)> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        state
-            .referrers
-            .iter()
-            .filter(|((r, _), _)| r == repo)
-            .map(|((_, subject), refs)| {
-                let refs = refs
+        let base = self.snap_base.lock().expect("snap lock poisoned");
+
+        let mut by_subject: HashMap<String, SubjectReferrers> = HashMap::new();
+
+        if let Some(snap) = base.as_ref() {
+            let a = snap.archived();
+            for entry in a.referrers.iter() {
+                if entry.repo.as_str() != repo {
+                    continue;
+                }
+                let subject: String = entry.subject.as_str().into();
+                let sr = by_subject.entry(subject).or_default();
+                for ref_entry in entry.referrers.iter() {
+                    let referrer: String = ref_entry.referrer_digest.as_str().into();
+                    if !state.is_digest_deleted(repo, &referrer) {
+                        let descriptor: Vec<u8> = ref_entry.descriptor.as_slice().to_vec();
+                        sr.insert(&referrer, &descriptor);
+                    }
+                }
+            }
+        }
+
+        for ((r, subject), refs) in &state.referrers {
+            if r != repo {
+                continue;
+            }
+            let sr = by_subject.entry(subject.clone()).or_default();
+            for (d, (_, bytes)) in &refs.by_digest {
+                sr.insert(d, bytes);
+            }
+        }
+
+        by_subject
+            .into_iter()
+            .filter(|(_, sr)| !sr.by_digest.is_empty())
+            .map(|(subject, sr)| {
+                let refs = sr
                     .by_digest
-                    .iter()
-                    .map(|(d, (_, bytes))| (d.clone(), bytes.clone()))
+                    .into_iter()
+                    .map(|(d, (_, bytes))| (d, bytes))
                     .collect();
-                (subject.clone(), refs)
+                (subject, refs)
             })
             .collect()
     }
 
     fn maintain(&self) -> io::Result<()> {
-        Ok(())
+        self.do_maintain()
     }
 }
 
+// ============================================================================
+// Private implementation: append, group-commit, compaction, snapshot
+// ============================================================================
+
 impl LogMetadataStore {
-    /// Phase 1 of a group-committed apply: under the fast `inner` lock, buffer
-    /// the record into the kernel (write + flush, no fsync), apply it to the
-    /// in-RAM maps **in append order** (same lock → no reordering across
-    /// concurrent callers), and return this write's monotonic sequence number.
-    /// On the first mutation, open the log and hand a `sync_data`-capable clone
-    /// to the durability coordinator.
     fn append_record(&self, op: &MetaOp) -> io::Result<u64> {
-        let record = encode(op);
+        let record = encode(op, self.hmac_key.as_ref());
         let mut state = self.inner.lock().expect("metadata lock poisoned");
         if state.log.is_none() {
             let f = std::fs::OpenOptions::new()
@@ -420,8 +937,31 @@ impl LogMetadataStore {
                 .append(true)
                 .open(&self.log_path)?;
             let clone = f.try_clone()?;
+            // Write header if the file is empty (new log).
+            let meta = f.metadata()?;
+            if meta.len() == 0 {
+                let mode = if self.hmac_key.is_some() {
+                    FramingMode::HmacSha256
+                } else {
+                    FramingMode::Plain
+                };
+                let header_payload = wal_hmac::encode_header(mode);
+                let header_record = encode_raw(&header_payload, self.hmac_key.as_ref());
+                // We write header + first record together before setting the
+                // file handle, so the header is always the first record.
+                let mut combined = header_record;
+                combined.extend_from_slice(&record);
+                (&f).write_all(&combined)?;
+                (&f).flush()?;
+            } else {
+                (&f).write_all(&record)?;
+                (&f).flush()?;
+            }
             state.log = Some(f);
             self.sync.lock().expect("sync lock poisoned").handle = Some(clone);
+            let seq = self.appended.fetch_add(1, Ordering::AcqRel) + 1;
+            Self::apply_in_ram(&mut state, op);
+            return Ok(seq);
         }
         let log = state.log.as_mut().expect("log opened above");
         log.write_all(&record)?;
@@ -431,21 +971,12 @@ impl LogMetadataStore {
         Ok(seq)
     }
 
-    /// Phase 2 of a group-committed apply: the coalesced durability barrier.
-    /// If a prior `fdatasync` already covered `my_seq` this returns without a
-    /// syscall; otherwise one `fdatasync` makes every append up to now durable
-    /// (the group-commit win — concurrent appends piled up during an in-flight
-    /// sync share it). N appends between two syncs cost one fsync.
     fn group_commit_through(&self, my_seq: u64) -> io::Result<()> {
         let mut sync = self.sync.lock().expect("sync lock poisoned");
         if sync.synced >= my_seq {
             return Ok(());
         }
-        // Snapshot the append seq *before* syncing so we only claim durability
-        // for records already flushed to the kernel.
         let covered = self.appended.load(Ordering::Acquire);
-        // The handle is set on the first append (before any seq is returned), so
-        // it is always present by the time a commit runs.
         sync.handle
             .as_ref()
             .expect("log handle set on first append")
@@ -453,27 +984,421 @@ impl LogMetadataStore {
         sync.synced = sync.synced.max(covered);
         Ok(())
     }
+
+    /// The maintenance entry point. Nothing happens until the WAL outgrows
+    /// `compact_threshold`; then the log is rewritten as the minimal record
+    /// image of the current state and — with `snapshot` on — an rkyv snapshot
+    /// covering that image is cut, so a cold start maps the snapshot and
+    /// replays only the records appended after it.
+    ///
+    /// The state lock is held for the whole rewrite: appends pause for its
+    /// duration (O(state) serialization + two fsyncs) but can never interleave
+    /// with, or be lost by, the swap.
+    fn do_maintain(&self) -> io::Result<()> {
+        let log_size = std::fs::metadata(&self.log_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let grown = log_size.saturating_sub(self.image_len.load(Ordering::Acquire));
+        if self.compact_threshold == 0 || grown <= self.compact_threshold {
+            return Ok(());
+        }
+        let mut state = self.inner.lock().expect("metadata lock poisoned");
+        let mut base = self.snap_base.lock().expect("snap lock poisoned");
+        let full = state.materialize(base.as_ref());
+        if self.snapshot_enabled {
+            let mut gen = self.generation.lock().expect("gen lock poisoned");
+            let next = *gen + 1;
+            let (tmp, covered) = self.write_log_image(&full, Some(next))?;
+            let snap_state = state_to_snapshot(&full, next, covered);
+            let body = rkyv::to_bytes::<rkyv::rancor::Error>(&snap_state)
+                .map_err(|e| io::Error::other(format!("rkyv: {e}")))?;
+            let hdr = snapshot::encode_header(&body, self.hmac_key.as_ref());
+            // Snapshot first: a crash before the log swap leaves the new
+            // snapshot next to the previous-generation log, which open()
+            // ignores — the snapshot already covers every record in it.
+            snapshot::write_atomic(&self.snapshot_path, &hdr, &body)?;
+            self.install_log(&mut state, &tmp)?;
+            self.image_len.store(covered, Ordering::Release);
+            *base = snapshot::VerifiedSnapshot::open(&self.snapshot_path, self.hmac_key.as_ref())?;
+            *gen = next;
+            // The snapshot is the new base; the in-RAM delta starts empty.
+            state.tags.clear();
+            state.media_types.clear();
+            state.referrers.clear();
+            state.backrefs.clear();
+            state.checksums.clear();
+            state.deleted_digests.clear();
+            state.deleted_checksums.clear();
+        } else {
+            let (tmp, len) = self.write_log_image(&full, None)?;
+            self.install_log(&mut state, &tmp)?;
+            self.image_len.store(len, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Write the minimal record image reproducing `full` — WAL header, an
+    /// optional generation marker binding it to a snapshot, then one record
+    /// per tag / untagged manifest / backref edge / referrer / checksum — to a
+    /// temp beside the log, fsynced. Returns the temp path and its length
+    /// (the offset a snapshot of the same state covers through).
+    fn write_log_image(&self, full: &State, gen: Option<u64>) -> io::Result<(PathBuf, u64)> {
+        let key = self.hmac_key.as_ref();
+        let tmp = self.log_path.with_extension("log.compact.tmp");
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        let mode = if key.is_some() {
+            FramingMode::HmacSha256
+        } else {
+            FramingMode::Plain
+        };
+        f.write_all(&encode_raw(&wal_hmac::encode_header(mode), key))?;
+        if let Some(gen) = gen {
+            let marker = format!("{{\"op\":\"gen\",\"gen\":{gen}}}");
+            f.write_all(&encode_raw(marker.as_bytes(), key))?;
+        }
+        let mut tagged: BTreeSet<(&str, &str)> = BTreeSet::new();
+        for (repo, tags) in &full.tags {
+            for (tag, (digest, media_type)) in tags {
+                f.write_all(&encode(
+                    &MetaOp::PutManifest {
+                        repo: repo.clone(),
+                        digest: digest.clone(),
+                        media_type: media_type.clone(),
+                        tag: Some(tag.clone()),
+                        references: Vec::new(),
+                        referrer: None,
+                    },
+                    key,
+                ))?;
+                tagged.insert((repo, digest));
+            }
+        }
+        for ((repo, digest), media_type) in &full.media_types {
+            if !tagged.contains(&(repo.as_str(), digest.as_str())) {
+                f.write_all(&encode(
+                    &MetaOp::PutManifest {
+                        repo: repo.clone(),
+                        digest: digest.clone(),
+                        media_type: media_type.clone(),
+                        tag: None,
+                        references: Vec::new(),
+                        referrer: None,
+                    },
+                    key,
+                ))?;
+            }
+        }
+        for ((repo, blob), manifests) in &full.backrefs {
+            for m in manifests {
+                f.write_all(&encode(
+                    &MetaOp::PutBackrefs {
+                        repo: repo.clone(),
+                        manifest: m.clone(),
+                        blobs: vec![blob.clone()],
+                    },
+                    key,
+                ))?;
+            }
+        }
+        for ((repo, subject), refs) in &full.referrers {
+            for (referrer, (_, descriptor)) in &refs.by_digest {
+                f.write_all(&encode(
+                    &MetaOp::PutReferrer {
+                        repo: repo.clone(),
+                        subject: subject.clone(),
+                        referrer: referrer.clone(),
+                        descriptor: descriptor.clone(),
+                    },
+                    key,
+                ))?;
+            }
+        }
+        for ((repo, digest), ck) in &full.checksums {
+            f.write_all(&encode(
+                &MetaOp::PutChecksum {
+                    repo: repo.clone(),
+                    digest: digest.clone(),
+                    crc32c: ck.crc32c,
+                    size: ck.size,
+                },
+                key,
+            ))?;
+        }
+        let f = f.into_inner().map_err(io::IntoInnerError::into_error)?;
+        f.sync_all()?;
+        let len = f.metadata()?.len();
+        Ok((tmp, len))
+    }
+
+    /// Atomically install `tmp` as the WAL (rename + dir fsync) and point the
+    /// append and group-commit handles at it. Every record appended so far is
+    /// in the image, so the durability watermark moves to the current seq.
+    fn install_log(&self, state: &mut State, tmp: &Path) -> io::Result<()> {
+        std::fs::rename(tmp, &self.log_path)?;
+        if let Some(dir) = self.log_path.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.log_path)?;
+        let clone = f.try_clone()?;
+        state.log = Some(f);
+        let mut sync = self.sync.lock().expect("sync lock poisoned");
+        sync.handle = Some(clone);
+        sync.synced = self.appended.load(Ordering::Acquire);
+        Ok(())
+    }
 }
 
-// ---- Log framing -----------------------------------------------------------
-//
-// Each record is `<u32 LE length><u32 LE crc32c><JSON payload>`. The length lets
-// replay find the next record; the CRC lets it reject a torn tail. The payload
-// is the `MetaOp` serialized as a small self-describing JSON object.
+/// Convert a materialized State into a SnapshotState for rkyv serialization.
+fn state_to_snapshot(state: &State, generation: u64, log_offset: u64) -> SnapshotState {
+    use snapshot::*;
 
-fn encode(op: &MetaOp) -> Vec<u8> {
+    let mut tags: Vec<RepoTags> = state
+        .tags
+        .iter()
+        .map(|(repo, btree)| RepoTags {
+            repo: repo.clone(),
+            tags: btree
+                .iter()
+                .map(|(tag, (digest, media))| TagEntry {
+                    tag: tag.clone(),
+                    digest: digest.clone(),
+                    media_type: media.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+    tags.sort_by(|a, b| a.repo.cmp(&b.repo));
+
+    let mut media_types: Vec<MediaTypeEntry> = state
+        .media_types
+        .iter()
+        .map(|((r, d), m)| MediaTypeEntry {
+            repo: r.clone(),
+            digest: d.clone(),
+            media_type: m.clone(),
+        })
+        .collect();
+    media_types.sort_by(|a, b| (&a.repo, &a.digest).cmp(&(&b.repo, &b.digest)));
+
+    let mut referrers: Vec<SubjectReferrers> = state
+        .referrers
+        .iter()
+        .map(|((repo, subject), sr)| {
+            let mut entries: Vec<ReferrerEntry> = sr
+                .by_digest
+                .iter()
+                .map(|(d, (at, bytes))| ReferrerEntry {
+                    referrer_digest: d.clone(),
+                    artifact_type: at.clone().unwrap_or_default(),
+                    descriptor: bytes.clone(),
+                })
+                .collect();
+            entries.sort_by(|a, b| a.referrer_digest.cmp(&b.referrer_digest));
+            snapshot::SubjectReferrers {
+                repo: repo.clone(),
+                subject: subject.clone(),
+                referrers: entries,
+            }
+        })
+        .collect();
+    referrers.sort_by(|a, b| (&a.repo, &a.subject).cmp(&(&b.repo, &b.subject)));
+
+    let mut backrefs: Vec<BackrefEntry> = state
+        .backrefs
+        .iter()
+        .map(|((r, b), ms)| BackrefEntry {
+            repo: r.clone(),
+            blob: b.clone(),
+            manifests: ms.clone(),
+        })
+        .collect();
+    backrefs.sort_by(|a, b| (&a.repo, &a.blob).cmp(&(&b.repo, &b.blob)));
+
+    let mut checksums: Vec<ChecksumEntry> = state
+        .checksums
+        .iter()
+        .map(|((r, d), ck)| ChecksumEntry {
+            repo: r.clone(),
+            digest: d.clone(),
+            crc32c: ck.crc32c,
+            size: ck.size,
+        })
+        .collect();
+    checksums.sort_by(|a, b| (&a.repo, &a.digest).cmp(&(&b.repo, &b.digest)));
+
+    SnapshotState {
+        tags,
+        media_types,
+        referrers,
+        backrefs,
+        checksums,
+        generation,
+        log_offset,
+    }
+}
+
+// ============================================================================
+// Log framing: encode, replay, compatibility checking
+// ============================================================================
+
+/// Encode a MetaOp as a framed record.
+fn encode(op: &MetaOp, hmac_key: Option<&HmacKey>) -> Vec<u8> {
     let payload = serialize_op(op);
-    let crc = crc32c::crc32c(&payload);
-    let mut out = Vec::with_capacity(8 + payload.len());
+    encode_raw(&payload, hmac_key)
+}
+
+/// Encode raw payload bytes as a framed record.
+fn encode_raw(payload: &[u8], hmac_key: Option<&HmacKey>) -> Vec<u8> {
+    let crc = crc32c::crc32c(payload);
+    let hmac_tag = hmac_key.map(|k| k.tag(payload));
+    let total = 8 + payload.len() + if hmac_tag.is_some() { 32 } else { 0 };
+    let mut out = Vec::with_capacity(total);
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(payload);
+    if let Some(tag) = hmac_tag {
+        out.extend_from_slice(&tag);
+    }
     out
 }
 
-/// Replay a log buffer into `state`, stopping at the first truncated or
-/// CRC-failed record (a crash-torn tail).
-fn replay(bytes: &[u8], state: &mut State) {
+/// Result of checking the first record of a log for framing compatibility.
+enum LogFramingCheck {
+    /// The log has a header matching the expected mode.
+    Compatible,
+    /// The log has a header with a different mode.
+    Incompatible,
+    /// The log has no WAL header (legacy format).
+    NoHeader,
+}
+
+/// Check if the log's first record is a WAL header matching `expected`.
+fn check_log_framing(
+    bytes: &[u8],
+    expected: FramingMode,
+    hmac_key: Option<&HmacKey>,
+) -> LogFramingCheck {
+    if bytes.len() < 8 {
+        return LogFramingCheck::NoHeader;
+    }
+    let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let crc = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let payload_end = 8 + len;
+    if payload_end > bytes.len() {
+        return LogFramingCheck::NoHeader;
+    }
+    let payload = &bytes[8..payload_end];
+    if crc32c::crc32c(payload) != crc {
+        return LogFramingCheck::NoHeader;
+    }
+    match decode_header(payload) {
+        Some(mode) if mode == expected => {
+            // If an HMAC key is configured and the mode is HMAC, verify
+            // the HMAC tag on the header record to detect a wrong key.
+            if let Some(key) = hmac_key {
+                let hmac_start = payload_end;
+                let hmac_end = hmac_start + 32;
+                if hmac_end > bytes.len() {
+                    return LogFramingCheck::Incompatible;
+                }
+                let tag: [u8; 32] = bytes[hmac_start..hmac_end].try_into().expect("32 bytes");
+                if !key.verify(payload, &tag) {
+                    return LogFramingCheck::Incompatible;
+                }
+            }
+            LogFramingCheck::Compatible
+        }
+        Some(_) => LogFramingCheck::Incompatible,
+        None => LogFramingCheck::NoHeader,
+    }
+}
+
+/// The generation a `{"op":"gen","gen":N}` marker record binds its log to.
+fn generation_marker(payload: &[u8]) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    if v.get("op")?.as_str()? != "gen" {
+        return None;
+    }
+    v.get("gen")?.as_u64()
+}
+
+/// Replay a log (with WAL header) into `state`.
+/// With a verified snapshot, `covered = Some((generation, offset))`: a log of
+/// another generation is ignored entirely (the snapshot covers it), and in the
+/// matching log only records starting at or after `offset` — the tail appended
+/// since the snapshot — are replayed. Without one, every record is replayed.
+fn replay_log(
+    bytes: &[u8],
+    state: &mut State,
+    hmac_key: Option<&HmacKey>,
+    covered: Option<(u64, u64)>,
+) {
+    let mut pos = 0usize;
+    let hmac_extra = if hmac_key.is_some() { 32 } else { 0 };
+    // Records 0 and 1 may be the WAL header and a generation marker.
+    let mut index = 0usize;
+    let mut log_generation = 0u64;
+
+    while pos + 8 <= bytes.len() {
+        let record_start = pos;
+        let len = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+            as usize;
+        let crc = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]);
+        let payload_start = pos + 8;
+        let payload_end = payload_start + len;
+        let record_end = payload_end + hmac_extra;
+        if record_end > bytes.len() {
+            break; // truncated tail
+        }
+        let payload = &bytes[payload_start..payload_end];
+        if crc32c::crc32c(payload) != crc {
+            break; // corrupt record
+        }
+        // Verify HMAC if configured.
+        if let Some(key) = hmac_key {
+            let tag: [u8; 32] = bytes[payload_end..record_end].try_into().expect("32 bytes");
+            if !key.verify(payload, &tag) {
+                break; // HMAC verification failed
+            }
+        }
+        pos = record_end;
+        index += 1;
+
+        if index == 1 && decode_header(payload).is_some() {
+            continue;
+        }
+        if index <= 2 {
+            if let Some(g) = generation_marker(payload) {
+                log_generation = g;
+                continue;
+            }
+        }
+        if let Some((snap_generation, offset)) = covered {
+            // A log of another generation is fully covered by the snapshot;
+            // in the matching one, skip the image the snapshot was cut from.
+            if log_generation != snap_generation {
+                return;
+            }
+            if (record_start as u64) < offset {
+                continue;
+            }
+        }
+
+        if let Some(op) = deserialize_op(payload) {
+            LogMetadataStore::apply_in_ram(state, &op);
+        }
+    }
+}
+
+/// Replay a legacy log (no WAL header) into `state`.
+fn replay_legacy(bytes: &[u8], state: &mut State) {
     let mut pos = 0usize;
     while pos + 8 <= bytes.len() {
         let len = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
@@ -487,11 +1412,11 @@ fn replay(bytes: &[u8], state: &mut State) {
         let start = pos + 8;
         let end = start + len;
         if end > bytes.len() {
-            break; // truncated tail
+            break;
         }
         let payload = &bytes[start..end];
         if crc32c::crc32c(payload) != crc {
-            break; // corrupt record; layout rebuild is the recovery path
+            break;
         }
         if let Some(op) = deserialize_op(payload) {
             LogMetadataStore::apply_in_ram(state, &op);
@@ -519,8 +1444,6 @@ fn serialize_op(op: &MetaOp) -> Vec<u8> {
                 "media_type": media_type,
                 "tag": tag,
             });
-            // Derived links are omitted when empty so a plain manifest record
-            // stays as small as before (and old logs replay unchanged).
             if !references.is_empty() {
                 v["references"] = serde_json::json!(references);
             }
@@ -545,8 +1468,6 @@ fn serialize_op(op: &MetaOp) -> Vec<u8> {
             "repo": repo,
             "subject": subject,
             "referrer": referrer,
-            // Descriptor bytes are already JSON; embed as a string to keep the
-            // record a single flat object and survive any byte content.
             "descriptor": String::from_utf8_lossy(descriptor),
         }),
         MetaOp::PutBackrefs {
@@ -646,13 +1567,18 @@ mod tests {
         }
     }
 
+    fn make_key(dir: &Path) -> PathBuf {
+        let p = dir.join("hmac.key");
+        std::fs::write(&p, [0xABu8; 64]).unwrap();
+        p
+    }
+
     #[test]
     fn apply_resolve_and_list() {
         let dir = tempfile::tempdir().unwrap();
         let s = LogMetadataStore::open(dir.path()).unwrap();
         s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
         s.apply(put("r", "sha256:bb", Some("v2"))).unwrap();
-        // Untagged manifest records only its media type.
         s.apply(put("r", "sha256:cc", None)).unwrap();
         assert_eq!(
             s.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
@@ -677,7 +1603,6 @@ mod tests {
         let s = LogMetadataStore::open(dir.path()).unwrap();
         s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
         s.apply(put("r", "sha256:aa", Some("v1b"))).unwrap();
-        // A referrer manifest pointing at subject sha256:aa.
         s.apply(MetaOp::PutReferrer {
             repo: "r".into(),
             subject: "sha256:aa".into(),
@@ -692,7 +1617,6 @@ mod tests {
                 .len(),
             1
         );
-        // Deleting the referrer manifest drops it from the subject's set.
         s.apply(MetaOp::DeleteManifest {
             repo: "r".into(),
             digest: "sha256:rr".into(),
@@ -701,7 +1625,6 @@ mod tests {
         assert!(s
             .referrers_page("r", "sha256:aa", None, None, usize::MAX)
             .is_none());
-        // Deleting the subject manifest drops both its tags and media type.
         s.apply(MetaOp::DeleteManifest {
             repo: "r".into(),
             digest: "sha256:aa".into(),
@@ -748,8 +1671,7 @@ mod tests {
         };
         let v = |ts: &[&str]| ts.iter().map(|t| t.to_string()).collect::<Vec<_>>();
         assert_eq!(page(None, 2), (v(&["v1", "v2"]), true));
-        assert_eq!(page(Some("v2"), 2), (v(&["v3", "v4"]), false), "exact fit");
-        // A cursor that is not (or no longer) a tag resumes lexically after it.
+        assert_eq!(page(Some("v2"), 2), (v(&["v3", "v4"]), false));
         assert_eq!(page(Some("v25"), 1), (v(&["v3"]), true));
         assert_eq!(page(Some("v9"), 5), (v(&[]), false));
         assert_eq!(page(None, 0), (v(&[]), true));
@@ -783,7 +1705,6 @@ mod tests {
             )
         };
         let v = |ds: &[&str]| ds.iter().map(|d| d.to_string()).collect::<Vec<_>>();
-        // Digest order, independent of insertion order.
         assert_eq!(
             page(None, None, 9),
             (v(&["sha256:a", "sha256:b", "sha256:c", "sha256:d"]), false)
@@ -794,14 +1715,12 @@ mod tests {
             (v(&["sha256:c"]), false)
         );
         assert_eq!(page(Some("nope"), None, 9), (v(&[]), false));
-        // Re-typing a referrer moves it between type indexes.
         add("r", "sha256:c", r#"{"artifactType":"sbom"}"#);
         assert_eq!(page(Some("sig"), None, 9), (v(&["sha256:a"]), false));
         assert_eq!(
             page(Some("sbom"), None, 9),
             (v(&["sha256:b", "sha256:c"]), false)
         );
-        // Deleting a manifest drops it from this repo's indexes only.
         s.apply(MetaOp::DeleteManifest {
             repo: "r".into(),
             digest: "sha256:a".into(),
@@ -823,7 +1742,6 @@ mod tests {
                 blobs: vec!["sha256:b1".into(), "sha256:b2".into()],
             })
             .unwrap();
-            // Idempotent: re-recording the same edge does not duplicate it.
             s.apply(MetaOp::PutBackrefs {
                 repo: "r".into(),
                 manifest: "sha256:m".into(),
@@ -833,10 +1751,8 @@ mod tests {
             assert_eq!(s.backrefs("r", "sha256:b1"), vec!["sha256:m".to_string()]);
             assert!(s.backrefs("r", "sha256:absent").is_empty());
         }
-        // A fresh store replays the log (serialize → deserialize round-trip).
         let s2 = LogMetadataStore::open(dir.path()).unwrap();
         assert_eq!(s2.backrefs("r", "sha256:b2"), vec!["sha256:m".to_string()]);
-        // Deleting the manifest clears its backref edges on replay too.
         s2.apply(MetaOp::DeleteManifest {
             repo: "r".into(),
             digest: "sha256:m".into(),
@@ -858,8 +1774,6 @@ mod tests {
                 descriptor: br#"{"digest":"sha256:rr"}"#.to_vec(),
             })
             .unwrap();
-            // A second tagged manifest that we then delete, so replay exercises
-            // the DeleteManifest record decode + apply.
             s.apply(put("r", "sha256:bb", Some("v2"))).unwrap();
             s.apply(MetaOp::DeleteManifest {
                 repo: "r".into(),
@@ -867,7 +1781,6 @@ mod tests {
             })
             .unwrap();
         }
-        // A fresh store over the same dir replays the log.
         let s2 = LogMetadataStore::open(dir.path()).unwrap();
         assert_eq!(
             s2.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
@@ -880,7 +1793,6 @@ mod tests {
                 .len(),
             1
         );
-        // The deleted manifest's tag did not survive replay.
         assert_eq!(s2.resolve_tag("r", "v2"), None);
     }
 
@@ -893,9 +1805,9 @@ mod tests {
         let log = dir.path().join("roci-meta.log");
         let good = std::fs::read(&log).unwrap();
 
-        // Case 1: a truncated trailing record is ignored; the good record stays.
+        // Case 1: truncated trailing record.
         let mut torn = good.clone();
-        torn.extend_from_slice(&(999u32).to_le_bytes()); // length far past EOF
+        torn.extend_from_slice(&(999u32).to_le_bytes());
         torn.extend_from_slice(&(0u32).to_le_bytes());
         torn.extend_from_slice(b"partial");
         std::fs::write(&log, &torn).unwrap();
@@ -906,28 +1818,26 @@ mod tests {
         );
         drop(s1);
 
-        // Case 2: a record with a corrupted CRC halts replay at that point.
+        // Case 2: bad CRC.
         let mut bad = good.clone();
         let payload = b"{\"op\":\"delete_manifest\",\"repo\":\"r\",\"digest\":\"sha256:aa\"}";
         bad.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        bad.extend_from_slice(&(0xDEAD_BEEFu32).to_le_bytes()); // wrong crc
+        bad.extend_from_slice(&(0xDEAD_BEEFu32).to_le_bytes());
         bad.extend_from_slice(payload);
         std::fs::write(&log, &bad).unwrap();
         let s2 = LogMetadataStore::open(dir.path()).unwrap();
-        // The corrupt delete was skipped, so the tag survives.
         assert_eq!(
             s2.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
             Some("sha256:aa")
         );
 
-        // Case 3: a valid-CRC but unknown-op record is skipped, replay continues.
+        // Case 3: unknown op is skipped, replay continues.
         let mut unknown = good.clone();
         let up = b"{\"op\":\"nope\"}";
         unknown.extend_from_slice(&(up.len() as u32).to_le_bytes());
         unknown.extend_from_slice(&crc32c::crc32c(up).to_le_bytes());
         unknown.extend_from_slice(up);
-        // Append a real record after the unknown one to prove replay continued.
-        unknown.extend_from_slice(&encode(&put("r", "sha256:bb", Some("v2"))));
+        unknown.extend_from_slice(&encode(&put("r", "sha256:bb", Some("v2")), None));
         std::fs::write(&log, &unknown).unwrap();
         let s3 = LogMetadataStore::open(dir.path()).unwrap();
         assert_eq!(
@@ -946,16 +1856,11 @@ mod tests {
     fn group_commit_coalesces_syncs() {
         let dir = tempfile::tempdir().unwrap();
         let s = LogMetadataStore::open(dir.path()).unwrap();
-        // Append two records without syncing between them (phase 1 only).
         let seq1 = s.append_record(&put("r", "sha256:aa", Some("v1"))).unwrap();
         let seq2 = s.append_record(&put("r", "sha256:bb", Some("v2"))).unwrap();
         assert_eq!((seq1, seq2), (1, 2));
-        // One durability barrier covering seq 2 makes both records durable.
         s.group_commit_through(seq2).unwrap();
-        // A later barrier for an already-covered seq is a no-op (the coalesced
-        // fast path: `synced >= my_seq`, no second fsync).
         s.group_commit_through(seq1).unwrap();
-        // Both records survive a reopen (they were flushed + synced).
         drop(s);
         let s2 = LogMetadataStore::open(dir.path()).unwrap();
         assert_eq!(
@@ -966,11 +1871,529 @@ mod tests {
             s2.resolve_tag("r", "v2").map(|(d, _)| d).as_deref(),
             Some("sha256:bb")
         );
-        // The public `apply` still works end-to-end (append + immediate sync).
         s2.apply(put("r", "sha256:cc", Some("v3"))).unwrap();
         assert_eq!(
             s2.resolve_tag("r", "v3").map(|(d, _)| d).as_deref(),
             Some("sha256:cc")
         );
+    }
+
+    // ---- Compaction tests ------------------------------------------------
+
+    #[test]
+    fn compaction_preserves_all_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            compact_threshold_bytes: 1, // compact on every maintain
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+
+        // Build up state: tags, referrers, backrefs, checksums, media types.
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.apply(put("r", "sha256:bb", Some("v2"))).unwrap();
+        s.apply(put("r", "sha256:cc", None)).unwrap();
+        s.apply(MetaOp::PutReferrer {
+            repo: "r".into(),
+            subject: "sha256:aa".into(),
+            referrer: "sha256:ref1".into(),
+            descriptor: br#"{"artifactType":"sig","digest":"sha256:ref1"}"#.to_vec(),
+        })
+        .unwrap();
+        s.apply(MetaOp::PutBackrefs {
+            repo: "r".into(),
+            manifest: "sha256:aa".into(),
+            blobs: vec!["sha256:b1".into(), "sha256:b2".into()],
+        })
+        .unwrap();
+        s.apply(MetaOp::PutChecksum {
+            repo: "r".into(),
+            digest: "sha256:b1".into(),
+            crc32c: 0x12345678,
+            size: 1024,
+        })
+        .unwrap();
+
+        // Snapshot state before compaction.
+        let tags_before = s.tags_snapshot("r");
+        let refs_before = s.referrers_snapshot("r");
+        let backrefs_before = s.backrefs("r", "sha256:b1");
+        let ck_before = s.checksum("r", "sha256:b1");
+        let mt_before = s.manifest_media_type("r", "sha256:cc");
+        let repos_before = s.repos();
+        let manifests_before = s.manifests("r");
+
+        // Compact.
+        s.maintain().unwrap();
+
+        // All queries must be identical.
+        assert_eq!(s.tags_snapshot("r"), tags_before);
+        assert_eq!(s.referrers_snapshot("r"), refs_before);
+        assert_eq!(s.backrefs("r", "sha256:b1"), backrefs_before);
+        assert_eq!(s.checksum("r", "sha256:b1"), ck_before);
+        assert_eq!(s.manifest_media_type("r", "sha256:cc"), mt_before);
+        assert_eq!(s.repos(), repos_before);
+        assert_eq!(s.manifests("r"), manifests_before);
+
+        // Appends after compaction still work.
+        s.apply(put("r", "sha256:dd", Some("v3"))).unwrap();
+        assert_eq!(
+            s.resolve_tag("r", "v3").map(|(d, _)| d).as_deref(),
+            Some("sha256:dd")
+        );
+
+        // Reopen and verify.
+        drop(s);
+        let s2 = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        assert_eq!(s2.tags_snapshot("r"), {
+            let mut t = tags_before.clone();
+            t.push((
+                "v3".into(),
+                "sha256:dd".into(),
+                "application/vnd.oci.image.manifest.v1+json".into(),
+            ));
+            t.sort();
+            t
+        });
+    }
+
+    #[test]
+    fn compaction_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.maintain().unwrap();
+        drop(s);
+
+        let s2 = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        assert_eq!(
+            s2.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
+    }
+
+    #[test]
+    fn torn_tail_after_compaction_handled() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.maintain().unwrap();
+        s.apply(put("r", "sha256:bb", Some("v2"))).unwrap();
+        drop(s);
+
+        // Append garbage to simulate a torn tail.
+        let log = dir.path().join("roci-meta.log");
+        let mut data = std::fs::read(&log).unwrap();
+        data.extend_from_slice(&(999u32).to_le_bytes());
+        data.extend_from_slice(b"garbage");
+        std::fs::write(&log, &data).unwrap();
+
+        let s2 = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        assert_eq!(
+            s2.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
+        assert_eq!(
+            s2.resolve_tag("r", "v2").map(|(d, _)| d).as_deref(),
+            Some("sha256:bb")
+        );
+    }
+
+    // ---- HMAC tests -------------------------------------------------------
+
+    #[test]
+    fn hmac_tampered_payload_stops_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = make_key(dir.path());
+        let cfg = MetadataConfig {
+            hmac_key_file: Some(key_path.clone()),
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.apply(put("r", "sha256:bb", Some("v2"))).unwrap();
+        drop(s);
+
+        // Tamper with a byte in the second record's payload.
+        let log = dir.path().join("roci-meta.log");
+        let mut data = std::fs::read(&log).unwrap();
+        // The log has: header_record, rec1, rec2. Flip a byte in the middle.
+        let mid = data.len() / 2;
+        data[mid] ^= 0xFF;
+        std::fs::write(&log, &data).unwrap();
+
+        let s2 = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        // The first record (v1) may or may not survive depending on where
+        // the flip landed. The tampered record and everything after must stop.
+        // We just verify that v2 is gone (replay stopped).
+        assert_eq!(s2.resolve_tag("r", "v2"), None);
+    }
+
+    #[test]
+    fn hmac_wrong_key_moves_log_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = make_key(dir.path());
+        let cfg1 = MetadataConfig {
+            hmac_key_file: Some(key_path),
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg1).unwrap();
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        drop(s);
+
+        // Open with a different key.
+        let key2_path = dir.path().join("hmac2.key");
+        std::fs::write(&key2_path, [0xCDu8; 64]).unwrap();
+        let cfg2 = MetadataConfig {
+            hmac_key_file: Some(key2_path),
+            ..Default::default()
+        };
+        let s2 = LogMetadataStore::open_with(dir.path(), &cfg2).unwrap();
+        assert_eq!(s2.resolve_tag("r", "v1"), None);
+
+        // Original log was moved aside.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("untrusted"))
+            .collect();
+        assert!(!entries.is_empty(), "log should be moved aside");
+    }
+
+    #[test]
+    fn hmac_unauthenticated_with_key_moves_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write a plain log.
+        let s = LogMetadataStore::open(dir.path()).unwrap();
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        drop(s);
+
+        // Open with an HMAC key.
+        let key_path = make_key(dir.path());
+        let cfg = MetadataConfig {
+            hmac_key_file: Some(key_path),
+            ..Default::default()
+        };
+        let s2 = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        assert_eq!(s2.resolve_tag("r", "v1"), None);
+    }
+
+    #[test]
+    fn hmac_key_too_short_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("short.key");
+        std::fs::write(&key_path, [0u8; 31]).unwrap();
+        let cfg = MetadataConfig {
+            hmac_key_file: Some(key_path),
+            ..Default::default()
+        };
+        let err = LogMetadataStore::open_with(dir.path(), &cfg).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    // ---- Snapshot tests ---------------------------------------------------
+
+    #[test]
+    fn snapshot_reopen_identical_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.apply(put("r", "sha256:bb", Some("v2"))).unwrap();
+        s.apply(MetaOp::PutChecksum {
+            repo: "r".into(),
+            digest: "sha256:b1".into(),
+            crc32c: 0xABCD,
+            size: 512,
+        })
+        .unwrap();
+        s.apply(MetaOp::PutReferrer {
+            repo: "r".into(),
+            subject: "sha256:aa".into(),
+            referrer: "sha256:ref1".into(),
+            descriptor: br#"{"artifactType":"sig","digest":"sha256:ref1"}"#.to_vec(),
+        })
+        .unwrap();
+        s.apply(MetaOp::PutBackrefs {
+            repo: "r".into(),
+            manifest: "sha256:aa".into(),
+            blobs: vec!["sha256:b1".into()],
+        })
+        .unwrap();
+
+        let tags_before = s.tags_snapshot("r");
+        let refs_before = s.referrers_page("r", "sha256:aa", None, None, usize::MAX);
+        let ck_before = s.checksum("r", "sha256:b1");
+        let br_before = s.backrefs("r", "sha256:b1");
+
+        s.maintain().unwrap();
+        drop(s);
+
+        // Reopen from snapshot.
+        let s2 = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        assert_eq!(s2.tags_snapshot("r"), tags_before);
+        assert_eq!(
+            s2.referrers_page("r", "sha256:aa", None, None, usize::MAX),
+            refs_before
+        );
+        assert_eq!(s2.checksum("r", "sha256:b1"), ck_before);
+        assert_eq!(s2.backrefs("r", "sha256:b1"), br_before);
+    }
+
+    #[test]
+    fn snapshot_delta_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.apply(put("r", "sha256:bb", Some("v2"))).unwrap();
+        s.maintain().unwrap();
+
+        // Add more after snapshot.
+        s.apply(put("r", "sha256:cc", Some("v3"))).unwrap();
+        // Delete one from the snapshot base.
+        s.apply(MetaOp::DeleteManifest {
+            repo: "r".into(),
+            digest: "sha256:aa".into(),
+        })
+        .unwrap();
+
+        assert_eq!(s.resolve_tag("r", "v1"), None);
+        assert_eq!(
+            s.resolve_tag("r", "v3").map(|(d, _)| d).as_deref(),
+            Some("sha256:cc")
+        );
+        assert_eq!(s.manifest_media_type("r", "sha256:aa"), None);
+
+        // Re-add the same digest.
+        s.apply(put("r", "sha256:aa", Some("v1-new"))).unwrap();
+        assert_eq!(
+            s.resolve_tag("r", "v1-new").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
+
+        // Snapshot again and reopen.
+        s.maintain().unwrap();
+        drop(s);
+        let s2 = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        assert_eq!(s2.resolve_tag("r", "v1"), None);
+        assert_eq!(
+            s2.resolve_tag("r", "v1-new").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
+        assert_eq!(
+            s2.resolve_tag("r", "v3").map(|(d, _)| d).as_deref(),
+            Some("sha256:cc")
+        );
+    }
+
+    #[test]
+    fn snapshot_page_merge_across_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        // Put tags v1, v3 in the snapshot base.
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.apply(put("r", "sha256:cc", Some("v3"))).unwrap();
+        s.maintain().unwrap();
+
+        // Add v2 and v4 in the delta.
+        s.apply(put("r", "sha256:bb", Some("v2"))).unwrap();
+        s.apply(put("r", "sha256:dd", Some("v4"))).unwrap();
+
+        // Page across boundaries.
+        let page = |last, limit| {
+            let p = s.tags_page("r", last, limit).unwrap();
+            (p.items, p.more)
+        };
+        let v = |ts: &[&str]| ts.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        assert_eq!(page(None, 2), (v(&["v1", "v2"]), true));
+        assert_eq!(page(Some("v2"), 2), (v(&["v3", "v4"]), false));
+        assert_eq!(page(None, 4), (v(&["v1", "v2", "v3", "v4"]), false));
+    }
+
+    #[test]
+    fn snapshot_corrupted_byte_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.maintain().unwrap();
+        drop(s);
+
+        // Corrupt the snapshot.
+        let snap_path = dir.path().join("roci-meta.snapshot");
+        let mut data = std::fs::read(&snap_path).unwrap();
+        let mid = data.len() / 2;
+        data[mid] ^= 0xFF;
+        std::fs::write(&snap_path, &data).unwrap();
+
+        // Reopen: should fall back to log replay.
+        let s2 = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        assert_eq!(
+            s2.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
+    }
+
+    #[test]
+    fn snapshot_wrong_hmac_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = make_key(dir.path());
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            hmac_key_file: Some(key_path),
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.maintain().unwrap();
+        drop(s);
+
+        // Open with a different key.
+        let key2_path = dir.path().join("hmac2.key");
+        std::fs::write(&key2_path, [0xCDu8; 64]).unwrap();
+        let cfg2 = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            hmac_key_file: Some(key2_path),
+            ..Default::default()
+        };
+        // The snapshot has wrong HMAC, log has wrong HMAC framing too.
+        let s2 = LogMetadataStore::open_with(dir.path(), &cfg2).unwrap();
+        // Both snapshot and log are discarded.
+        assert_eq!(s2.resolve_tag("r", "v1"), None);
+    }
+
+    #[test]
+    fn snapshot_stale_log_tail_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.maintain().unwrap();
+        // The maintain cut a snapshot (gen 1) and wrote a fresh log (gen 1).
+        // Now add more.
+        s.apply(put("r", "sha256:bb", Some("v2"))).unwrap();
+        drop(s);
+
+        // Save the current log (gen 1, with v2).
+        let log_path = dir.path().join("roci-meta.log");
+        let saved_log = std::fs::read(&log_path).unwrap();
+
+        // Re-open and maintain again to get gen 2.
+        let s2 = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        s2.maintain().unwrap();
+        drop(s2);
+
+        // Replace the log with the saved gen-1 log (stale).
+        std::fs::write(&log_path, &saved_log).unwrap();
+
+        // Reopen: the stale log tail (gen 1) should be ignored because
+        // the snapshot is now gen 2.
+        let s3 = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        assert_eq!(
+            s3.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
+        assert_eq!(
+            s3.resolve_tag("r", "v2").map(|(d, _)| d).as_deref(),
+            Some("sha256:bb")
+        );
+        // v2 is in the snapshot (gen 2), not from the stale log.
+    }
+
+    #[test]
+    fn snapshot_is_cut_only_past_the_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = |threshold| MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: threshold,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg(1 << 20)).unwrap();
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.maintain().unwrap();
+        assert!(!dir.path().join("roci-meta.snapshot").exists());
+        drop(s);
+        let s = LogMetadataStore::open_with(dir.path(), &cfg(1)).unwrap();
+        s.maintain().unwrap();
+        let first = std::fs::metadata(dir.path().join("roci-meta.snapshot")).unwrap();
+        // Upkeep triggers on growth past the last image, not on the image's
+        // own size: with nothing appended since, a tick rewrites nothing.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        s.maintain().unwrap();
+        let again = std::fs::metadata(dir.path().join("roci-meta.snapshot")).unwrap();
+        assert_eq!(first.modified().unwrap(), again.modified().unwrap());
+        // Reopening from the snapshot replays nothing into the heap delta.
+        drop(s);
+        let s = LogMetadataStore::open_with(dir.path(), &cfg(1)).unwrap();
+        assert!(s.inner.lock().unwrap().tags.is_empty());
+        assert_eq!(
+            s.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
+    }
+
+    #[test]
+    fn snapshot_reopen_replays_only_the_tail_but_falls_back_to_the_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        for i in 0..20 {
+            s.apply(put(
+                "r",
+                &format!("sha256:{i:02}"),
+                Some(&format!("t{i:02}")),
+            ))
+            .unwrap();
+        }
+        s.maintain().unwrap();
+        s.apply(put("r", "sha256:ff", Some("tail"))).unwrap();
+        drop(s);
+        // Cold start: the snapshot is the base; only the one tail record is
+        // replayed into the heap delta.
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        assert_eq!(s.inner.lock().unwrap().tags["r"].len(), 1);
+        assert_eq!(s.tags_page("r", None, 100).unwrap().items.len(), 21);
+        drop(s);
+        // A rejected snapshot falls back to the full log: the image the
+        // snapshot was cut from plus the tail.
+        std::fs::write(dir.path().join("roci-meta.snapshot"), b"garbage").unwrap();
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        assert_eq!(s.tags_page("r", None, 100).unwrap().items.len(), 21);
     }
 }

@@ -1,5 +1,9 @@
-//! Local upload staging: resumable chunked sessions staged under `root/uploads/`
-//! with random 128-bit hex ids, per-session lock, Content-Range precondition.
+//! Local upload staging: resumable chunked sessions staged under
+//! `root/uploads/<repo components>/<id>` with random 128-bit hex ids,
+//! per-session lock, Content-Range precondition.
+//!
+//! Staging is repo-scoped: a session id is only usable within its originating
+//! repo, matching FsStorage's isolation semantics.
 
 use crate::S3Storage;
 use roci_storage::StorageError;
@@ -8,19 +12,33 @@ use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 impl S3Storage {
-    /// Staging file path for an upload session.
-    pub(crate) fn staging_path(&self, id: &str) -> Result<PathBuf, StorageError> {
+    /// Staging directory for a repo: `root/uploads/<repo>`.
+    fn repo_staging_dir(&self, repo: &str) -> Result<PathBuf, StorageError> {
+        validate_repo_for_staging(repo)?;
+        Ok(self.root.join("uploads").join(repo))
+    }
+
+    /// Staging file path for an upload session: `root/uploads/<repo>/<id>`.
+    pub(crate) fn staging_path(&self, repo: &str, id: &str) -> Result<PathBuf, StorageError> {
         validate_session_id(id)?;
-        Ok(self.root.join("uploads").join(id))
+        Ok(self.repo_staging_dir(repo)?.join(id))
     }
 
     /// Begin a new upload session. Returns the session id.
-    pub(crate) async fn begin_upload_session(&self, _repo: &str) -> Result<String, StorageError> {
+    pub(crate) async fn begin_upload_session(&self, repo: &str) -> Result<String, StorageError> {
         let mut buf = [0u8; 16];
         getrandom::fill(&mut buf).map_err(|e| StorageError::Io(io::Error::other(e)))?;
         let id = hex::encode(buf);
+        // Validate the id before creating the lock entry.
+        validate_session_id(&id)?;
         self.quota.begin_session()?;
-        let path = self.staging_path(&id)?;
+        // Ensure repo staging dir exists.
+        let dir = self.repo_staging_dir(repo)?;
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            self.quota.end_session();
+            return Err(StorageError::Io(e));
+        }
+        let path = self.staging_path(repo, &id)?;
         if let Err(e) = tokio::fs::File::create(&path).await {
             self.quota.end_session();
             return Err(StorageError::Io(e));
@@ -31,11 +49,12 @@ impl S3Storage {
     /// Append bytes to a staging file under the session lock.
     pub(crate) async fn append_to_staging(
         &self,
+        repo: &str,
         id: &str,
         chunk: &[u8],
         expected_offset: Option<u64>,
     ) -> Result<u64, StorageError> {
-        let path = self.staging_path(id)?;
+        let path = self.staging_path(repo, id)?;
         let mut f = tokio::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -56,15 +75,15 @@ impl S3Storage {
     }
 
     /// Get the current size of a staging file.
-    pub(crate) async fn staging_size(&self, id: &str) -> Result<u64, StorageError> {
-        let path = self.staging_path(id)?;
+    pub(crate) async fn staging_size(&self, repo: &str, id: &str) -> Result<u64, StorageError> {
+        let path = self.staging_path(repo, id)?;
         let meta = tokio::fs::metadata(&path).await.map_err(map_not_found)?;
         Ok(meta.len())
     }
 
     /// Remove a staging file and release the session.
-    pub(crate) async fn remove_staging(&self, id: &str) {
-        if let Ok(path) = self.staging_path(id) {
+    pub(crate) async fn remove_staging(&self, repo: &str, id: &str) {
+        if let Ok(path) = self.staging_path(repo, id) {
             let _ = tokio::fs::remove_file(&path).await;
         }
         self.quota.end_session();
@@ -73,10 +92,11 @@ impl S3Storage {
     /// Stream-hash a staging file: returns (digest, crc32c, size).
     pub(crate) async fn hash_staging(
         &self,
+        repo: &str,
         id: &str,
         algorithm: &str,
     ) -> Result<(roci_storage::Digest, u32, u64), StorageError> {
-        let path = self.staging_path(id)?;
+        let path = self.staging_path(repo, id)?;
         let mut f = tokio::fs::File::open(&path).await.map_err(map_not_found)?;
         let size = f.metadata().await?.len();
 
@@ -90,6 +110,30 @@ impl S3Storage {
             }
         };
         Ok((digest, crc, size))
+    }
+
+    /// Seed the open-session count from existing staging files at startup.
+    pub(crate) fn seed_sessions_from_staging(&self) {
+        let uploads_dir = self.root.join("uploads");
+        let count = count_staging_files(&uploads_dir);
+        if count > 0 {
+            self.quota.seed_sessions(count);
+            tracing::info!(
+                sessions = count,
+                "seeded upload sessions from staging files"
+            );
+        }
+    }
+
+    /// Enumerate all staging files under `root/uploads/` recursively.
+    /// Returns `(repo, id, size, modified)` for each file.
+    pub(crate) fn enumerate_staging_files(
+        &self,
+    ) -> Vec<(String, String, u64, std::time::SystemTime)> {
+        let uploads_dir = self.root.join("uploads");
+        let mut result = Vec::new();
+        walk_staging_files(&uploads_dir, &uploads_dir, &mut result);
+        result
     }
 }
 
@@ -116,15 +160,27 @@ async fn hash_file<H: sha2::Digest>(
     Ok((digest, crc))
 }
 
-/// Validate a session id (hex, 32 chars).
+/// Validate a session id: 32 hex chars (128-bit), no path separators.
 fn validate_session_id(id: &str) -> Result<(), StorageError> {
     if id.is_empty()
         || id == "."
         || id == ".."
         || id.len() > 64
         || id.bytes().any(|b| b == b'/' || b == b'\\' || b == 0)
+        || !id.bytes().all(|b| b.is_ascii_hexdigit())
     {
         return Err(StorageError::BadPath(id.to_string()));
+    }
+    Ok(())
+}
+
+/// Validate a repo name for staging path construction: each component is
+/// non-empty, not `.`/`..`, no backslash or NUL.
+fn validate_repo_for_staging(repo: &str) -> Result<(), StorageError> {
+    for c in repo.split('/') {
+        if c.is_empty() || c == "." || c == ".." || c.bytes().any(|b| b == b'\\' || b == 0) {
+            return Err(StorageError::BadPath(repo.to_string()));
+        }
     }
     Ok(())
 }
@@ -134,5 +190,56 @@ fn map_not_found(e: io::Error) -> StorageError {
         StorageError::NotFound
     } else {
         StorageError::Io(e)
+    }
+}
+
+/// Count all regular files under a staging directory recursively.
+fn count_staging_files(dir: &std::path::Path) -> usize {
+    let mut count = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                count += count_staging_files(&entry.path());
+            } else if ft.is_file() {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Walk the staging directory recursively, collecting file metadata.
+fn walk_staging_files(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<(String, String, u64, std::time::SystemTime)>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            walk_staging_files(base, &entry.path(), out);
+        } else if ft.is_file() {
+            let Ok(meta) = entry.metadata() else { continue };
+            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            // Extract repo and id from path: base/<repo components>/<id>
+            let path = entry.path();
+            let Ok(rel) = path.strip_prefix(base) else {
+                continue;
+            };
+            let components: Vec<&str> = rel
+                .components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect();
+            if components.len() < 2 {
+                continue;
+            }
+            let id = components[components.len() - 1].to_string();
+            let repo = components[..components.len() - 1].join("/");
+            out.push((repo, id, meta.len(), modified));
+        }
     }
 }
