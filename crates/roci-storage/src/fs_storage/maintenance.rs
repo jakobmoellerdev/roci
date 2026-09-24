@@ -55,6 +55,9 @@ impl FsStorage {
                 }
             },
         );
+        if self.config.scrub.enabled {
+            self.start_scrub(shutdown.clone());
+        }
     }
 
     /// Run `task` every `period` (first run one period after start) until
