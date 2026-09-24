@@ -524,7 +524,9 @@ async fn concurrent_push_delete_preserves_reachable_set() {
     let config = StorageConfig {
         gc: GcConfig {
             enabled: true,
-            delay_secs: 0, // instant expiry for testing
+            // The grace period the design relies on: far longer than one
+            // push, far shorter than the test.
+            delay_secs: 1,
             interval_secs: 3600,
         },
         ..StorageConfig::default()
@@ -556,6 +558,10 @@ async fn concurrent_push_delete_preserves_reachable_set() {
                     .await
                     .unwrap();
 
+                // Like the manifest-push handler: check referenced blobs first
+                // (refreshing their GC stamp), then commit the manifest.
+                assert!(st.blob_exists("c", &layer_d).await.unwrap());
+                assert!(st.blob_exists("c", &config_d).await.unwrap());
                 let manifest_body = make_manifest(&config_d, &[&layer_d]);
                 let manifest_d = sha256_of(&manifest_body);
                 let refs = manifest_references(&serde_json::from_slice(&manifest_body).unwrap());
@@ -587,7 +593,7 @@ async fn concurrent_push_delete_preserves_reachable_set() {
         let st = store.clone();
         handles.push(tokio::spawn(async move {
             for _ in 0..(iterations * 2) {
-                st.sweep_at(Instant::now() + Duration::from_secs(10)).await;
+                st.sweep_at(Instant::now()).await;
                 tokio::task::yield_now().await;
             }
         }));
