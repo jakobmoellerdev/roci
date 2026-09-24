@@ -55,6 +55,9 @@ impl FsStorage {
                 }
             },
         );
+        if self.gc.enabled() {
+            self.start_gc(shutdown.clone());
+        }
         if self.config.scrub.enabled {
             self.start_scrub(shutdown.clone());
         }

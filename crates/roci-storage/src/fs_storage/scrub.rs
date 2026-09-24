@@ -6,7 +6,7 @@ use super::paths::blob_rel;
 use crate::beneath::{dir_beneath, open_beneath, run_blocking};
 use crate::digest::hash_reader;
 use crate::layout::for_each_cas_blob;
-use crate::metadata::{BlobChecksum, MetaOp};
+use crate::metadata::MetaOp;
 use crate::Digest;
 use std::io;
 use std::path::{Path, PathBuf};

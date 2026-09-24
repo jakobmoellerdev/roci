@@ -1240,11 +1240,9 @@ max_body = 0
         let blob3 = vec![0xCC; 40];
         let digest3 = roci_storage::sha256_of(&blob3);
         let digest_str3 = digest3.as_string();
-        let post = format!(
-            "POST /v2/team/extra/blobs/uploads/ HTTP/1.1\r\n\
-             Host: localhost\r\nConnection: close\r\n\r\n"
-        );
-        let (status, headers, _) = http_raw(addr, &post).await;
+        let post = "POST /v2/team/extra/blobs/uploads/ HTTP/1.1\r\n\
+             Host: localhost\r\nConnection: close\r\n\r\n";
+        let (status, headers, _) = http_raw(addr, post).await;
         assert_eq!(status, 202);
         let location = headers
             .lines()

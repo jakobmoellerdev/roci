@@ -19,7 +19,7 @@
 //! deletion class): the refreshed stamp keeps it out of the sweep for another
 //! full `delay`, far longer than any push takes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -39,6 +39,13 @@ pub struct GcTracker {
     /// Set once the startup consistency check (backref rebuild + candidate
     /// seeding) completed; sweeps are refused until then.
     ready: AtomicBool,
+    /// Root manifest digests that are GC-immune: manifests known from the
+    /// layout (`index.json` descriptors / image-index children) are roots
+    /// regardless of whether the metadata store recorded them.
+    roots: Mutex<HashSet<BlobKey>>,
+    /// Repos whose root manifests are unreadable or unparseable: sweeps skip
+    /// these entirely (a missing edge must never read as "unreferenced").
+    unsafe_repos: Mutex<HashSet<String>>,
 }
 
 impl GcTracker {
@@ -49,6 +56,8 @@ impl GcTracker {
             candidates: Mutex::default(),
             fence: RwLock::new(()),
             ready: AtomicBool::new(false),
+            roots: Mutex::default(),
+            unsafe_repos: Mutex::default(),
         }
     }
 
@@ -83,9 +92,15 @@ impl GcTracker {
 
     /// `(repo, digest)` is unreferenced as of now: (re)stamp it a candidate.
     pub fn mark(&self, repo: &str, digest: &str) {
+        self.mark_at(repo, digest, Instant::now());
+    }
+
+    /// `(repo, digest)` is unreferenced as of `at`: stamp it a candidate.
+    /// Allows the startup seed to use a deterministic timestamp.
+    pub fn mark_at(&self, repo: &str, digest: &str, at: Instant) {
         if self.enabled {
             self.lock()
-                .insert((repo.to_string(), digest.to_string()), Instant::now());
+                .insert((repo.to_string(), digest.to_string()), at);
         }
     }
 
@@ -144,6 +159,48 @@ impl GcTracker {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<BlobKey, Instant>> {
         self.candidates.lock().expect("gc lock poisoned")
     }
+
+    /// Record `(repo, digest)` as a GC root: a manifest known from the layout
+    /// that the sweeper must never collect.
+    pub fn add_root(&self, repo: &str, digest: &str) {
+        if self.enabled {
+            self.roots
+                .lock()
+                .expect("gc roots lock poisoned")
+                .insert((repo.to_string(), digest.to_string()));
+        }
+    }
+
+    /// Whether `(repo, digest)` is a root manifest.
+    pub fn is_root(&self, repo: &str, digest: &str) -> bool {
+        self.roots
+            .lock()
+            .expect("gc roots lock poisoned")
+            .contains(&(repo.to_string(), digest.to_string()))
+    }
+
+    /// Mark `repo` as GC-unsafe: sweeps skip it entirely.
+    pub fn mark_unsafe(&self, repo: &str) {
+        if self.enabled {
+            self.unsafe_repos
+                .lock()
+                .expect("gc unsafe lock poisoned")
+                .insert(repo.to_string());
+        }
+    }
+
+    /// Whether `repo` is GC-unsafe.
+    pub fn is_unsafe(&self, repo: &str) -> bool {
+        self.unsafe_repos
+            .lock()
+            .expect("gc unsafe lock poisoned")
+            .contains(repo)
+    }
+
+    /// Number of root manifests tracked.
+    pub fn roots_len(&self) -> usize {
+        self.roots.lock().expect("gc roots lock poisoned").len()
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +235,11 @@ mod tests {
         assert!(gc.pin().await.is_none());
         gc.set_ready();
         assert!(!gc.is_ready());
+        // Roots and unsafe repos are still trackable (disabled only means no sweeps).
+        gc.add_root("r", "d");
+        assert_eq!(gc.roots_len(), 0); // disabled → no-op
+        gc.mark_unsafe("r");
+        assert!(!gc.is_unsafe("r")); // disabled → no-op
     }
 
     #[tokio::test]
@@ -195,5 +257,31 @@ mod tests {
         assert!(!sweeper.is_finished(), "sweep must wait for the pin");
         drop(pin);
         sweeper.await.unwrap();
+    }
+
+    #[test]
+    fn mark_at_allows_deterministic_timestamps() {
+        let gc = GcTracker::new(true, Duration::from_secs(10));
+        let base = Instant::now();
+        gc.mark_at("r", "sha256:a", base);
+        // Not due before delay elapses relative to the stamped instant.
+        assert!(!gc.is_due("r", "sha256:a", base + Duration::from_secs(5)));
+        // Due after the delay from the stamped instant.
+        assert!(gc.is_due("r", "sha256:a", base + Duration::from_secs(11)));
+    }
+
+    #[test]
+    fn roots_and_unsafe_repos() {
+        let gc = GcTracker::new(true, Duration::from_secs(60));
+        assert!(!gc.is_root("r", "sha256:a"));
+        gc.add_root("r", "sha256:a");
+        assert!(gc.is_root("r", "sha256:a"));
+        assert!(!gc.is_root("r", "sha256:b"));
+        assert_eq!(gc.roots_len(), 1);
+
+        assert!(!gc.is_unsafe("r"));
+        gc.mark_unsafe("r");
+        assert!(gc.is_unsafe("r"));
+        assert!(!gc.is_unsafe("other"));
     }
 }

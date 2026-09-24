@@ -38,7 +38,7 @@ impl<B: StorageBackend + Clone> Routed<B> {
     /// component sequences (validated upstream in `roci-config`); empty entries
     /// are silently ignored.  Routes are sorted longest-first.
     pub fn new(default: B, mut routes: Vec<(String, B)>) -> Self {
-        routes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        routes.sort_by_key(|r| std::cmp::Reverse(r.0.len()));
         Self { default, routes }
     }
 
