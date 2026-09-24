@@ -5,6 +5,7 @@
 mod faults;
 mod hardening;
 mod index;
+mod policies;
 mod sessions;
 
 pub(crate) use crate::beneath::*;
