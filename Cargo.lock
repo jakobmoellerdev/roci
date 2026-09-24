@@ -1638,6 +1638,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "toml",
  "tower",
  "tracing",
 ]

@@ -17,7 +17,11 @@ use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use roci_config::{Config, ConfigError};
 use roci_core::{build_router, AppState};
 use roci_storage::quota::{QuotaLimits, QuotaTracker};
-use roci_storage::{FsStorage, StorageBackend};
+use roci_storage::routing::Routed;
+use roci_storage::{
+    BlobRead, Digest, FsStorage, ManifestLinks, ManifestRef, Page, Referrer, Storage,
+    StorageBackend, StorageError,
+};
 use tokio::net::TcpListener;
 use tower::Service;
 
@@ -56,6 +60,140 @@ pub fn resolve_config(args: &Args) -> Result<Config, ConfigError> {
     Ok(config)
 }
 
+// ---------------------------------------------------------------------------
+// AnyBackend: extensible storage backend enum
+// ---------------------------------------------------------------------------
+
+/// Delegates every method in one trait through a match on each enum variant.
+/// Each arm destructures `Self::Variant(inner)` and calls `inner.$method(…)`.
+/// The integrator adds a variant (e.g. `S3(S3Storage)`) by adding one arm per
+/// method list in each macro invocation — only the variant name changes.
+macro_rules! delegate_storage {
+    ($method:ident(&self $(, $arg:ident : $ty:ty)*) -> $ret:ty) => {
+        async fn $method(&self $(, $arg: $ty)*) -> $ret {
+            match self {
+                AnyBackend::Fs(inner) => inner.$method($($arg),*).await,
+                // #[cfg(feature = "s3")]
+                // AnyBackend::S3(inner) => inner.$method($($arg),*).await,
+            }
+        }
+    };
+}
+
+/// A concrete backend variant: one per build-time backend, selected at startup
+/// from the config's `s3` field.  The `Fs` variant wraps [`FsStorage`]; an S3
+/// variant can be added behind `#[cfg(feature = "s3")]` by extending every
+/// `delegate_storage!` call with one arm.
+#[derive(Clone)]
+pub enum AnyBackend {
+    /// Local-filesystem CAS backend.
+    Fs(FsStorage),
+    // #[cfg(feature = "s3")]
+    // S3(roci_storage_s3::S3Storage),
+}
+
+impl std::fmt::Debug for AnyBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnyBackend::Fs(_) => f.write_str("AnyBackend::Fs(..)"),
+        }
+    }
+}
+
+impl Storage for AnyBackend {
+    delegate_storage!(blob_size(&self, repo: &str, digest: &Digest) -> Result<u64, StorageError>);
+    delegate_storage!(blob_exists(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError>);
+    delegate_storage!(read_blob(&self, repo: &str, digest: &Digest) -> Result<Vec<u8>, StorageError>);
+    delegate_storage!(open_blob(&self, repo: &str, digest: &Digest) -> Result<BlobRead, StorageError>);
+    delegate_storage!(begin_upload(&self, repo: &str) -> Result<String, StorageError>);
+    delegate_storage!(append_upload(&self, repo: &str, id: &str, chunk: &[u8], expected_offset: Option<u64>) -> Result<u64, StorageError>);
+    delegate_storage!(upload_size(&self, repo: &str, id: &str) -> Result<u64, StorageError>);
+    delegate_storage!(abort_upload(&self, repo: &str, id: &str) -> Result<bool, StorageError>);
+    delegate_storage!(mount_blob(&self, from_repo: &str, to_repo: &str, digest: &Digest) -> Result<bool, StorageError>);
+    delegate_storage!(finish_upload(&self, repo: &str, id: &str, expected: &Digest, max_size: u64, trailing: &[u8]) -> Result<(), StorageError>);
+    delegate_storage!(put_blob(&self, repo: &str, digest: &Digest, data: &[u8]) -> Result<(), StorageError>);
+    delegate_storage!(delete_blob(&self, repo: &str, digest: &Digest) -> Result<(), StorageError>);
+    delegate_storage!(put_manifest(&self, repo: &str, tag: Option<&str>, digest: &Digest, media_type: &str, data: &[u8], links: ManifestLinks<'_>) -> Result<(), StorageError>);
+    delegate_storage!(get_manifest(&self, repo: &str, reference: &str) -> Result<ManifestRef, StorageError>);
+    delegate_storage!(delete_manifest(&self, repo: &str, digest: &Digest) -> Result<(), StorageError>);
+    delegate_storage!(list_tags(&self, repo: &str, last: Option<&str>, limit: usize) -> Result<Page<String>, StorageError>);
+    delegate_storage!(list_referrers(&self, repo: &str, subject: &Digest, artifact_type: Option<&str>, last: Option<&str>, limit: usize) -> Result<Page<Referrer>, StorageError>);
+}
+
+impl StorageBackend for AnyBackend {
+    async fn recover(&self) {
+        match self {
+            AnyBackend::Fs(inner) => inner.recover().await,
+            // #[cfg(feature = "s3")]
+            // AnyBackend::S3(inner) => inner.recover().await,
+        }
+    }
+
+    fn start_maintenance(&self, shutdown: tokio::sync::watch::Receiver<bool>) {
+        match self {
+            AnyBackend::Fs(inner) => inner.start_maintenance(shutdown),
+            // #[cfg(feature = "s3")]
+            // AnyBackend::S3(inner) => inner.start_maintenance(shutdown),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// build_storage: multi-backend routing from config
+// ---------------------------------------------------------------------------
+
+/// Build the multi-backend routed storage from the config.  One shared
+/// [`QuotaTracker`] spans the default and every subpath backend (the
+/// registry-wide quota cap), and each backend is an [`AnyBackend`].
+///
+/// Any `s3` section (on the default backend or a subpath) is a startup error
+/// until the S3 backend is wired in.
+pub fn build_storage(config: &Config) -> anyhow::Result<Routed<AnyBackend>> {
+    let quota = Arc::new(QuotaTracker::new(QuotaLimits {
+        max_repo_bytes: config.storage.quota.max_repo_bytes,
+        max_total_bytes: config.storage.quota.max_total_bytes,
+        max_upload_sessions: config.storage.quota.max_upload_sessions,
+    }));
+
+    // Reject S3 on the default backend until wired.
+    if config.storage.s3.is_some() {
+        anyhow::bail!("storage.s3: S3 backend requires the s3 feature and is not yet wired");
+    }
+
+    let default = AnyBackend::Fs(FsStorage::with_config(
+        &config.storage.root,
+        &config.storage,
+        Arc::clone(&quota),
+    )?);
+    tracing::info!(
+        root = %config.storage.root.display(),
+        prefix = "<default>",
+        "storage backend"
+    );
+
+    let mut routes = Vec::new();
+    for (prefix, sub) in &config.storage.subpaths {
+        if sub.s3.is_some() {
+            anyhow::bail!(
+                "storage.subpaths.{prefix}.s3: S3 backend requires the s3 feature and is not yet wired"
+            );
+        }
+        let backend = AnyBackend::Fs(FsStorage::with_config(
+            &sub.root,
+            &config.storage,
+            Arc::clone(&quota),
+        )?);
+        tracing::info!(
+            root = %sub.root.display(),
+            prefix = %prefix,
+            "storage backend"
+        );
+        routes.push((prefix.clone(), backend));
+    }
+
+    Ok(Routed::new(default, routes))
+}
+
 /// Bind and serve the registry until `shutdown` resolves. Reports the bound
 /// address via `on_bind` (so tests can drive a request against an ephemeral
 /// port) before entering the serve loop.
@@ -64,14 +202,8 @@ pub async fn serve(
     on_bind: impl FnOnce(SocketAddr),
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let quota = Arc::new(QuotaTracker::new(QuotaLimits {
-        max_repo_bytes: config.storage.quota.max_repo_bytes,
-        max_total_bytes: config.storage.quota.max_total_bytes,
-        max_upload_sessions: config.storage.quota.max_upload_sessions,
-    }));
-    let storage = FsStorage::with_config(&config.storage.root, &config.storage, quota)?;
-    let app = build_router(AppState::new_with(storage.clone(), config.clone()))
-        .merge(roci_telemetry::metrics_router(&config));
+    let storage = build_storage(&config)?;
+
     // Startup recovery before accepting requests: register pre-existing
     // `subject` links (referrers upgrade) and reconcile `index.json` with the
     // replayed metadata log (write-behind crash recovery, foreign-tag import).
@@ -79,7 +211,10 @@ pub async fn serve(
 
     // Graceful-shutdown signal shared by the listener and background tasks.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    StorageBackend::start_maintenance(&storage, shutdown_rx.clone());
+    storage.start_maintenance(shutdown_rx.clone());
+
+    let app = build_router(AppState::new_with(storage, config.clone()))
+        .merge(roci_telemetry::metrics_router(&config));
 
     let listener = TcpListener::bind(config.http.listen).await?;
     let local = listener.local_addr()?;
@@ -899,5 +1034,360 @@ max_body = 0
 
         let _ = stop_tx.send(());
         handle.await.unwrap().unwrap();
+    }
+
+    // ---------------------------------------------------------------------------
+    // Routing / subpath tests
+    // ---------------------------------------------------------------------------
+
+    /// Issue a raw HTTP request and return `(status_code, headers, body)`.
+    async fn http_raw(addr: SocketAddr, req: &str) -> (u16, String, Vec<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf);
+        // Parse status line
+        let status_line = response.lines().next().unwrap_or("");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+        // Split headers from body at \r\n\r\n
+        let sep = b"\r\n\r\n";
+        let hdr_end = buf.windows(4).position(|w| w == sep).unwrap_or(buf.len());
+        let headers = String::from_utf8_lossy(&buf[..hdr_end]).to_string();
+        let body = if hdr_end + 4 <= buf.len() {
+            buf[hdr_end + 4..].to_vec()
+        } else {
+            Vec::new()
+        };
+        (status, headers, body)
+    }
+
+    /// Push a monolithic blob via the dist-spec two-step: POST + PUT.
+    /// Returns the digest string.
+    async fn push_blob(addr: SocketAddr, repo: &str, data: &[u8]) -> String {
+        let digest = roci_storage::sha256_of(data);
+        let digest_str = digest.as_string();
+
+        // POST to begin the upload session
+        let post = format!(
+            "POST /v2/{repo}/blobs/uploads/ HTTP/1.1\r\n\
+             Host: localhost\r\nConnection: close\r\n\r\n"
+        );
+        let (status, headers, _) = http_raw(addr, &post).await;
+        assert_eq!(status, 202, "begin upload returned {status}");
+        // Extract Location header
+        let location = headers
+            .lines()
+            .find(|l| l.to_lowercase().starts_with("location:"))
+            .unwrap()
+            .split_once(": ")
+            .unwrap()
+            .1
+            .trim();
+        // PUT to finalize with the data inline
+        let put = format!(
+            "PUT {location}?digest={digest_str} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Length: {len}\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Connection: close\r\n\r\n",
+            len = data.len(),
+        );
+        let mut req_bytes = put.into_bytes();
+        req_bytes.extend_from_slice(data);
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            stream.write_all(&req_bytes).await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            let resp = String::from_utf8_lossy(&buf);
+            let st: u16 = resp
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            assert_eq!(st, 201, "finalize upload returned {st}, resp: {resp}");
+        }
+        digest_str
+    }
+
+    #[tokio::test]
+    async fn subpath_routes_push_to_correct_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_root = dir.path().join("default");
+        let team_root = dir.path().join("team");
+        std::fs::create_dir_all(&default_root).unwrap();
+        std::fs::create_dir_all(&team_root).unwrap();
+
+        let mut config = Config::default();
+        config.http.listen = "127.0.0.1:0".parse().unwrap();
+        config.storage.root = default_root.clone();
+        config.storage.subpaths.insert(
+            "team".into(),
+            roci_config::SubpathConfig {
+                root: team_root.clone(),
+                s3: None,
+            },
+        );
+
+        let (bind_tx, bind_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            serve(
+                config,
+                move |addr| {
+                    let _ = bind_tx.send(addr);
+                },
+                async move {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+        });
+        let addr = bind_rx.await.unwrap();
+        assert_eq!(http_get(&format!("http://{addr}/v2/")).await, "{}");
+
+        // Push a blob under "team/app" → must land in team_root
+        let blob_data = b"subpath-routing-test-blob";
+        let digest_str = push_blob(addr, "team/app", blob_data).await;
+        let hex = digest_str.strip_prefix("sha256:").unwrap();
+        assert!(
+            team_root
+                .join(format!("team/app/blobs/sha256/{hex}"))
+                .exists(),
+            "blob should exist in team root"
+        );
+        assert!(
+            !default_root
+                .join(format!("team/app/blobs/sha256/{hex}"))
+                .exists(),
+            "blob should NOT exist in default root"
+        );
+
+        // Push a blob under "other/app" → must land in default_root
+        let blob_data2 = b"default-routing-test-blob";
+        let digest_str2 = push_blob(addr, "other/app", blob_data2).await;
+        let hex2 = digest_str2.strip_prefix("sha256:").unwrap();
+        assert!(
+            default_root
+                .join(format!("other/app/blobs/sha256/{hex2}"))
+                .exists(),
+            "blob should exist in default root"
+        );
+
+        let _ = stop_tx.send(());
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn quota_spans_both_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_root = dir.path().join("default");
+        let team_root = dir.path().join("team");
+        std::fs::create_dir_all(&default_root).unwrap();
+        std::fs::create_dir_all(&team_root).unwrap();
+
+        let mut config = Config::default();
+        config.http.listen = "127.0.0.1:0".parse().unwrap();
+        config.storage.root = default_root.clone();
+        // Very tight total quota: 100 bytes (barely enough for one blob)
+        config.storage.quota.max_total_bytes = 100;
+        config.storage.subpaths.insert(
+            "team".into(),
+            roci_config::SubpathConfig {
+                root: team_root.clone(),
+                s3: None,
+            },
+        );
+
+        let (bind_tx, bind_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            serve(
+                config,
+                move |addr| {
+                    let _ = bind_tx.send(addr);
+                },
+                async move {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+        });
+        let addr = bind_rx.await.unwrap();
+
+        // First push into default root: 40 bytes — should succeed
+        let blob1 = vec![0xAA; 40];
+        push_blob(addr, "lib/base", &blob1).await;
+
+        // Second push into team root: 40 bytes — should succeed (total 80)
+        let blob2 = vec![0xBB; 40];
+        push_blob(addr, "team/app", &blob2).await;
+
+        // Third push: 40 more bytes would exceed 100 byte total quota.
+        // The upload should fail (the finalize returns 413 or 400).
+        let blob3 = vec![0xCC; 40];
+        let digest3 = roci_storage::sha256_of(&blob3);
+        let digest_str3 = digest3.as_string();
+        let post = format!(
+            "POST /v2/team/extra/blobs/uploads/ HTTP/1.1\r\n\
+             Host: localhost\r\nConnection: close\r\n\r\n"
+        );
+        let (status, headers, _) = http_raw(addr, &post).await;
+        assert_eq!(status, 202);
+        let location = headers
+            .lines()
+            .find(|l| l.to_lowercase().starts_with("location:"))
+            .unwrap()
+            .split_once(": ")
+            .unwrap()
+            .1
+            .trim();
+        let put = format!(
+            "PUT {location}?digest={digest_str3} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Length: {len}\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Connection: close\r\n\r\n",
+            len = blob3.len(),
+        );
+        let mut req_bytes = put.into_bytes();
+        req_bytes.extend_from_slice(&blob3);
+        let (st, _, _) = {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            stream.write_all(&req_bytes).await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            let resp = String::from_utf8_lossy(&buf);
+            let st: u16 = resp
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            (st, String::new(), Vec::<u8>::new())
+        };
+        // Quota exceeded: expect a 4xx error (roci returns 413 or a DENIED error)
+        assert!(st >= 400, "expected quota rejection (4xx), got {st}");
+
+        let _ = stop_tx.send(());
+        handle.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn s3_config_fails_with_field_qualified_error() {
+        // S3 on the default backend
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = dir.path().join("default");
+        config.storage.s3 = Some(roci_config::S3Config {
+            bucket: "test".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            prefix: String::new(),
+            access_key_id: None,
+            secret_access_key_file: None,
+            allow_http: false,
+            redirect_min_size: 1024 * 1024,
+            redirect_ttl_secs: 60,
+            multipart_part_size: 16 * 1024 * 1024,
+            multipart_concurrency: 8,
+        });
+        let err = build_storage(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("storage.s3"),
+            "expected field-qualified error mentioning storage.s3, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn s3_subpath_config_fails_with_field_qualified_error() {
+        // S3 on a subpath
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = dir.path().join("default");
+        config.storage.subpaths.insert(
+            "team".into(),
+            roci_config::SubpathConfig {
+                root: dir.path().join("team"),
+                s3: Some(roci_config::S3Config {
+                    bucket: "test".into(),
+                    region: "us-east-1".into(),
+                    endpoint: None,
+                    prefix: String::new(),
+                    access_key_id: None,
+                    secret_access_key_file: None,
+                    allow_http: false,
+                    redirect_min_size: 1024 * 1024,
+                    redirect_ttl_secs: 60,
+                    multipart_part_size: 16 * 1024 * 1024,
+                    multipart_concurrency: 8,
+                }),
+            },
+        );
+        let err = build_storage(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("storage.subpaths.team.s3"),
+            "expected field-qualified error mentioning storage.subpaths.team.s3, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_storage_default_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = dir.path().to_path_buf();
+        let storage = build_storage(&config).unwrap();
+        // It should be a valid routed storage with no routes (default only).
+        drop(storage);
+    }
+
+    #[test]
+    fn build_storage_with_subpath() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = dir.path().join("default");
+        config.storage.subpaths.insert(
+            "team".into(),
+            roci_config::SubpathConfig {
+                root: dir.path().join("team"),
+                s3: None,
+            },
+        );
+        let storage = build_storage(&config).unwrap();
+        drop(storage);
+    }
+
+    #[test]
+    fn config_round_trip_with_subpaths() {
+        // Verify that a config with subpaths can be serialized and deserialized.
+        let mut config = Config::default();
+        config.storage.subpaths.insert(
+            "team".into(),
+            roci_config::SubpathConfig {
+                root: PathBuf::from("/data/team"),
+                s3: None,
+            },
+        );
+        let toml_str = toml::to_string(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config, parsed);
     }
 }

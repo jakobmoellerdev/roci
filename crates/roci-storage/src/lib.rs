@@ -19,6 +19,7 @@ mod layout;
 mod metadata;
 mod publish;
 pub mod quota;
+pub mod routing;
 mod storage;
 
 pub use dedupe::DedupeIndex;
