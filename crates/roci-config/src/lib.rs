@@ -802,6 +802,21 @@ mod tests {
     }
 
     #[test]
+    fn subsystem_checks_apply_only_when_relevant() {
+        // Periods are only checked for an enabled subsystem, snapshot/HMAC
+        // only restrict the redb engine when set, and an https endpoint needs
+        // no `allow_http`.
+        for ok in [
+            "[storage.gc]\nenabled = false\ndelay_secs = 0\ninterval_secs = 0",
+            "[storage.scrub]\nenabled = false\ninterval_secs = 0",
+            "[storage.metadata]\nengine = \"redb\"",
+            "[storage.s3]\nbucket = \"b\"\nendpoint = \"https://s3.example\"",
+        ] {
+            parse(ok).unwrap_or_else(|e| panic!("{ok:?} → {e}"));
+        }
+    }
+
+    #[test]
     fn repo_prefix_grammar() {
         for ok in ["a", "a/b", "a.b", "a_b", "a__b", "a---b", "x9/y-z/0"] {
             assert!(is_repo_prefix(ok), "{ok}");

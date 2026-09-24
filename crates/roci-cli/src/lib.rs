@@ -149,8 +149,9 @@ impl StorageBackend for AnyBackend {
 /// [`QuotaTracker`] spans the default and every subpath backend (the
 /// registry-wide quota cap), and each backend is an [`AnyBackend`].
 ///
-/// Any `s3` section (on the default backend or a subpath) is a startup error
-/// until the S3 backend is wired in.
+/// An `s3` section (on the default backend or a subpath) selects the S3
+/// backend in builds with the `s3` feature and is a field-qualified startup
+/// error otherwise.
 pub fn build_storage(config: &Config) -> anyhow::Result<Routed<AnyBackend>> {
     let quota = Arc::new(QuotaTracker::new(QuotaLimits {
         max_repo_bytes: config.storage.quota.max_repo_bytes,
@@ -165,11 +166,7 @@ pub fn build_storage(config: &Config) -> anyhow::Result<Routed<AnyBackend>> {
         Arc::clone(&quota),
         "storage.s3",
     )?;
-    tracing::info!(
-        root = %config.storage.root.display(),
-        prefix = "<default>",
-        "storage backend"
-    );
+    tracing::info!(root = %config.storage.root.display(), "default storage backend");
 
     let mut routes = Vec::new();
     for (prefix, sub) in &config.storage.subpaths {
@@ -180,11 +177,7 @@ pub fn build_storage(config: &Config) -> anyhow::Result<Routed<AnyBackend>> {
             Arc::clone(&quota),
             &format!("storage.subpaths.{prefix}.s3"),
         )?;
-        tracing::info!(
-            root = %sub.root.display(),
-            prefix = %prefix,
-            "storage backend"
-        );
+        tracing::info!(root = %sub.root.display(), %prefix, "subpath storage backend");
         routes.push((prefix.clone(), backend));
     }
 
@@ -1106,11 +1099,10 @@ max_body = 0
         let sep = b"\r\n\r\n";
         let hdr_end = buf.windows(4).position(|w| w == sep).unwrap_or(buf.len());
         let headers = String::from_utf8_lossy(&buf[..hdr_end]).to_string();
-        let body = if hdr_end + 4 <= buf.len() {
-            buf[hdr_end + 4..].to_vec()
-        } else {
-            Vec::new()
-        };
+        let body = buf
+            .get(hdr_end + 4..)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
         (status, headers, body)
     }
 
@@ -1403,6 +1395,25 @@ max_body = 0
         let storage = build_storage(&config).unwrap();
         // It should be a valid routed storage with no routes (default only).
         drop(storage);
+    }
+
+    #[test]
+    fn build_storage_fails_when_a_backend_root_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let mut config = Config::default();
+        config.storage.root = file.clone();
+        assert!(build_storage(&config).is_err());
+        config.storage.root = dir.path().join("default");
+        config.storage.subpaths.insert(
+            "team".into(),
+            roci_config::SubpathConfig {
+                root: file,
+                s3: None,
+            },
+        );
+        assert!(build_storage(&config).is_err());
     }
 
     #[test]
