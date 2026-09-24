@@ -15,10 +15,10 @@ use tokio::io::AsyncReadExt;
 
 // ── Filesystem-type detection ───────────────────────────────────────────
 
-/// Well-known `f_type` / `f_fstypename` magic values for self-checksumming
-/// filesystems that run their own data scrub. The classification is kept in a
-/// pure function over the fs-type value so it can be unit-tested without a
-/// real btrfs/ZFS volume.
+// Well-known `f_type` / `f_fstypename` magic values for self-checksumming
+// filesystems that run their own data scrub. The classification is kept in a
+// pure function over the fs-type value so it can be unit-tested without a
+// real btrfs/ZFS volume.
 
 /// Linux `statfs::f_type` magic numbers.
 #[cfg(target_os = "linux")]
@@ -925,9 +925,8 @@ mod tests {
 
     #[tokio::test]
     async fn scrub_mode_auto_detects_fs() {
-        // On CI/test machines (ext4/APFS), Auto should run the app pass,
-        // not delegate. We verify by pushing a blob, running scrub, and
-        // checking the checksum was recorded (meaning the pass ran).
+        // Auto mode's filesystem detection works on the test root, and a pass
+        // bootstraps the missing checksum (meaning the pass ran).
         let (_dir, s) = test_store();
         let data = b"auto mode test";
         let d = sha256_of(data);
@@ -940,9 +939,9 @@ mod tests {
             })
             .unwrap();
 
-        // Detect: on ext4/APFS this should return false (not self-checksumming).
-        let is_delegated = detect_self_checksumming_fs(_dir.path()).unwrap_or(false);
-        assert!(!is_delegated, "test FS should not be self-checksumming");
+        // Detection must succeed on the test filesystem (the suite also runs
+        // on btrfs, where Auto would delegate); the pass itself runs either way.
+        detect_self_checksumming_fs(_dir.path()).unwrap();
 
         s.scrub_pass().await;
         assert!(s.meta.checksum("r", &d.as_string()).is_some());
