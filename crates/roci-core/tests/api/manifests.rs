@@ -138,6 +138,7 @@ async fn get_manifest_returns_body() {
             &md,
             "application/vnd.oci.image.manifest.v1+json",
             m,
+            ManifestLinks::default(),
         )
         .await
         .unwrap();
@@ -159,6 +160,7 @@ async fn manifest_cache_control_and_conditional() {
             &d,
             "application/vnd.oci.image.manifest.v1+json",
             body,
+            ManifestLinks::default(),
         )
         .await
         .unwrap();
@@ -466,7 +468,14 @@ async fn delete_manifest_by_tag_and_digest_and_errors() {
     let m = br#"{"schemaVersion":2}"#;
     let md = sha256_of(m);
     storage
-        .put_manifest("r", Some("v1"), &md, "application/json", m)
+        .put_manifest(
+            "r",
+            Some("v1"),
+            &md,
+            "application/json",
+            m,
+            ManifestLinks::default(),
+        )
         .await
         .unwrap();
     // Delete by tag.
@@ -476,7 +485,14 @@ async fn delete_manifest_by_tag_and_digest_and_errors() {
     );
     // Re-store and delete by digest.
     storage
-        .put_manifest("r", Some("v1"), &md, "application/json", m)
+        .put_manifest(
+            "r",
+            Some("v1"),
+            &md,
+            "application/json",
+            m,
+            ManifestLinks::default(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -616,11 +632,11 @@ async fn image_index_records_child_and_subject_backrefs() {
     .await;
     // Each child carries a backref to the index manifest.
     assert_eq!(
-        storage.backrefs("r", &child_a).await.unwrap(),
+        storage.backrefs("r", &child_a),
         vec![idx_digest.as_string()]
     );
     assert_eq!(
-        storage.backrefs("r", &child_b).await.unwrap(),
+        storage.backrefs("r", &child_b),
         vec![idx_digest.as_string()]
     );
 }
@@ -645,8 +661,5 @@ async fn manifest_subject_is_recorded_as_backref() {
         &body,
     )
     .await;
-    assert_eq!(
-        storage.backrefs("r", &subject).await.unwrap(),
-        vec![m_digest.as_string()]
-    );
+    assert_eq!(storage.backrefs("r", &subject), vec![m_digest.as_string()]);
 }

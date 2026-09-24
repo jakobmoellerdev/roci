@@ -78,6 +78,7 @@ async fn referrers_pagination_filter_link_and_vary() {
     let mut sigs = Vec::new();
     for i in 0..5u8 {
         let r = sha256_of(&[i]);
+        let bytes = [i];
         let at = if i % 2 == 0 {
             "application/sig"
         } else {
@@ -93,7 +94,17 @@ async fn referrers_pagination_filter_link_and_vary() {
             "artifactType": at,
         });
         storage
-            .add_referrer("r", &subject, &r, desc.to_string().as_bytes())
+            .put_manifest(
+                "r",
+                None,
+                &r,
+                "application/vnd.oci.image.manifest.v1+json",
+                &bytes,
+                ManifestLinks {
+                    references: &[],
+                    subject: Some((&subject, desc.to_string().as_bytes())),
+                },
+            )
             .await
             .unwrap();
     }
@@ -141,9 +152,20 @@ async fn next_link_encodes_query_values_and_round_trips() {
     let at = "application/vnd.x+json; a=b&c#d%";
     for i in 0..3u8 {
         let r = sha256_of(&[i, 9]);
+        let bytes = [i, 9];
         let desc = serde_json::json!({"digest": r.as_string(), "artifactType": at});
         storage
-            .add_referrer("r", &subject, &r, desc.to_string().as_bytes())
+            .put_manifest(
+                "r",
+                None,
+                &r,
+                "application/vnd.oci.image.manifest.v1+json",
+                &bytes,
+                ManifestLinks {
+                    references: &[],
+                    subject: Some((&subject, desc.to_string().as_bytes())),
+                },
+            )
             .await
             .unwrap();
     }

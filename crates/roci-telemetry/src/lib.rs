@@ -20,7 +20,10 @@ use tracing_subscriber::EnvFilter;
 mod metrics;
 
 #[cfg(feature = "otel")]
-pub use metrics::{record_error, record_request};
+pub use metrics::{
+    record_dedupe_link, record_error, record_gc_collected, record_quota_rejection, record_request,
+    record_scrub,
+};
 
 /// Record a completed request (duration histogram + error counter).
 /// No-op in minimal builds.
@@ -38,6 +41,30 @@ pub fn record_request(
 #[cfg(not(feature = "otel"))]
 #[inline(always)]
 pub fn record_error(_error_code: &str) {}
+
+/// Count one object reclaimed by GC (`kind` = `blob`/`upload`) and its bytes.
+/// No-op in minimal builds.
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+pub fn record_gc_collected(_kind: &str, _bytes: u64) {}
+
+/// Count one scrubbed blob by `result` (`ok`/`repaired`/`corrupt`) and the
+/// bytes read. No-op in minimal builds.
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+pub fn record_scrub(_result: &str, _bytes: u64) {}
+
+/// Count one cross-repo promotion by `op` (`mount`/`dedupe`) and `mechanism`
+/// (`reflink`/`hardlink`/`copy`/`existing`). No-op in minimal builds.
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+pub fn record_dedupe_link(_op: &str, _mechanism: &str) {}
+
+/// Count one write rejected by a quota (`repository`/`total`/`sessions`).
+/// No-op in minimal builds.
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+pub fn record_quota_rejection(_scope: &str) {}
 
 // ── Guard ───────────────────────────────────────────────────────────────
 

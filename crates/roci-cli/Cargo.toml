@@ -49,8 +49,20 @@ scan = ["dep:roci-ext-scan"]
 sync = ["dep:roci-ext-sync"]
 cluster = ["dep:roci-cluster"]
 mimalloc = ["dep:mimalloc"]
+# Embedded B-tree KV metadata engine (`storage.metadata.engine = "redb"`).
+redb = ["roci-storage/redb"]
 # Convenience aggregate enabling every extension + the OTel telemetry spine.
-full = ["s3", "search", "sig", "scan", "sync", "cluster", "otel", "mimalloc"]
+full = [
+    "s3",
+    "search",
+    "sig",
+    "scan",
+    "sync",
+    "cluster",
+    "otel",
+    "mimalloc",
+    "redb",
+]
 otel = ["roci-telemetry/otel", "roci-core/otel"]
 
 [dev-dependencies]

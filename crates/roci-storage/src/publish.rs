@@ -6,28 +6,56 @@ use crate::beneath::{dir_beneath, run_blocking};
 use std::io;
 use std::path::Path;
 
+/// How a cross-repo promotion materialized the destination blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Promotion {
+    /// A regular file was already at the destination (idempotent).
+    Existing,
+    /// `FICLONE` copy-on-write clone (the contract primary).
+    Reflink,
+    /// `linkat` hard link (the logged fallback).
+    Hardlink,
+    /// Streaming copy (cross-device / no-hardlink).
+    Copy,
+}
+
+impl Promotion {
+    /// Low-cardinality metric label for this mechanism.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Promotion::Existing => "existing",
+            Promotion::Reflink => "reflink",
+            Promotion::Hardlink => "hardlink",
+            Promotion::Copy => "copy",
+        }
+    }
+}
+
 /// Promote a blob named `leaf` from `from_alg_rel` into `to_alg_rel` (both
-/// directories relative to `root`), for a cross-repo mount. Everything is
-/// anchored to dirfds walked no-follow beneath `root`, so a symlinked `repo`,
-/// `blobs`, or `<alg>` parent on either side cannot redirect the promotion.
-/// Contract order (SECURITY.md:124): **reflink first** (`FICLONE` into a temp
-/// opened in the destination dirfd, then `renameat` — CoW, independent
-/// deletion), then a **hard link** (`linkat` between dirfds, O(1) same-fs), then
-/// a **streaming copy** (cross-device / no-hardlink). A pre-existing destination
-/// is re-validated no-follow as a regular file (idempotent success) or rejected.
+/// directories relative to `root`), for a cross-repo mount or dedupe.
+/// Everything is anchored to dirfds walked no-follow beneath `root`, so a
+/// symlinked `repo`, `blobs`, or `<alg>` parent on either side cannot redirect
+/// the promotion. Contract order (SECURITY.md:124): **reflink first**
+/// (`FICLONE` into a temp opened in the destination dirfd, then `renameat` —
+/// CoW, independent deletion), then a **hard link** (`linkat` between dirfds,
+/// O(1) same-fs), then — only when `allow_copy` — a **streaming copy**
+/// (cross-device / no-hardlink); without it the hard-link error is returned so
+/// a dedupe caller keeps its own copy instead. A pre-existing destination is
+/// re-validated no-follow as a regular file (idempotent success) or rejected.
 #[cfg(unix)]
 pub(crate) async fn mount_promote_beneath(
     root: &Path,
     from_alg_rel: &Path,
     to_alg_rel: &Path,
     leaf: &str,
-) -> io::Result<()> {
+    allow_copy: bool,
+) -> io::Result<Promotion> {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     let root = root.to_path_buf();
     let from_alg_rel = from_alg_rel.to_path_buf();
     let to_alg_rel = to_alg_rel.to_path_buf();
     let leaf = leaf.to_string();
-    run_blocking(move || -> io::Result<()> {
+    run_blocking(move || -> io::Result<Promotion> {
         let from_dir = dir_beneath(&root, &from_alg_rel, false)?;
         let to_dir = dir_beneath(&root, &to_alg_rel, true)?;
         // Open the source no-follow (the caller already verified via blob_exists
@@ -60,7 +88,9 @@ pub(crate) async fn mount_promote_beneath(
         // caller's earlier stat, to close the check→promote race). A missing dest
         // (NOENT) proceeds to promotion; any other stat error propagates.
         match rustix::fs::statat(&to_dir, leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => return Ok(()),
+            Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => {
+                return Ok(Promotion::Existing)
+            }
             Ok(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
@@ -98,7 +128,8 @@ pub(crate) async fn mount_promote_beneath(
         if try_reflink(&mut out, &mut src_file) {
             out.sync_all()?;
             drop(out);
-            return promote_temp_noreplace(&to_dir, tmp.as_str(), leaf.as_str());
+            promote_temp_noreplace(&to_dir, tmp.as_str(), leaf.as_str())?;
+            return Ok(Promotion::Reflink);
         }
         // Reflink unavailable: drop the temp and try a direct hard link.
         drop(out);
@@ -106,7 +137,7 @@ pub(crate) async fn mount_promote_beneath(
         match try_hardlink_at(&from_dir, leaf.as_str(), &to_dir, leaf.as_str()) {
             Ok(()) => {
                 rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
-                Ok(())
+                Ok(Promotion::Hardlink)
             }
             // Destination raced in between our earlier stat and this link. Accept
             // it as idempotent success ONLY if it is now a regular file, re-checked
@@ -117,7 +148,7 @@ pub(crate) async fn mount_promote_beneath(
                 match rustix::fs::statat(&to_dir, leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
                     Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => {
                         rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
-                        Ok(())
+                        Ok(Promotion::Existing)
                     }
                     Ok(_) => Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
@@ -127,13 +158,15 @@ pub(crate) async fn mount_promote_beneath(
                 }
             }
             // Cross-device / no-hardlink: stream-copy into a fresh temp + rename.
-            Err(_) => {
+            Err(_) if allow_copy => {
                 let mut out = promote_via_temp(OFlags::empty())?;
                 stream_copy(&mut src_file, &mut out)?;
                 out.sync_all()?;
                 drop(out);
-                promote_temp_noreplace(&to_dir, tmp.as_str(), leaf.as_str())
+                promote_temp_noreplace(&to_dir, tmp.as_str(), leaf.as_str())?;
+                Ok(Promotion::Copy)
             }
+            Err(e) => Err(e),
         }
     })
     .await

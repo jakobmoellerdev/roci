@@ -78,9 +78,14 @@ fn hash_bytes<H: sha2::Digest>(algorithm: &str, data: &[u8]) -> Digest {
 }
 
 /// Stream `f` through `H` in 64 KiB reads without buffering the whole file,
-/// tagging the result with its wire `algorithm`.
-async fn hash_file<H: sha2::Digest>(algorithm: &str, mut f: tokio::fs::File) -> io::Result<Digest> {
+/// tagging the result with its wire `algorithm`; the same single pass also
+/// folds every byte into a CRC32C (the scrub's fast checksum).
+async fn hash_file<H: sha2::Digest>(
+    algorithm: &str,
+    mut f: tokio::fs::File,
+) -> io::Result<(Digest, u32)> {
     let mut h = H::new();
+    let mut crc = 0u32;
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = f.read(&mut buf).await?;
@@ -88,11 +93,15 @@ async fn hash_file<H: sha2::Digest>(algorithm: &str, mut f: tokio::fs::File) -> 
             break;
         }
         h.update(&buf[..n]);
+        crc = crc32c::crc32c_append(crc, &buf[..n]);
     }
-    Ok(Digest {
-        algorithm: algorithm.to_owned(),
-        hex: hex::encode(h.finalize()),
-    })
+    Ok((
+        Digest {
+            algorithm: algorithm.to_owned(),
+            hex: hex::encode(h.finalize()),
+        },
+        crc,
+    ))
 }
 
 /// Compute the sha256 digest of `data`.
@@ -112,10 +121,11 @@ pub fn digest_of(data: &[u8], algorithm: &str) -> Digest {
 }
 
 /// Stream `f` through the hasher selected by `algorithm` (sha256/sha512),
-/// returning its [`Digest`] without buffering the whole file. `f` is an
-/// already-opened, no-follow-validated regular-file handle (the caller opens it
-/// beneath the store root). Used to verify a staged upload before promoting it.
-pub(crate) async fn hash_reader(f: tokio::fs::File, algorithm: &str) -> io::Result<Digest> {
+/// returning its [`Digest`] and CRC32C without buffering the whole file. `f`
+/// is an already-opened, no-follow-validated regular-file handle (the caller
+/// opens it beneath the store root). Used to verify a staged upload before
+/// promoting it, and by the scrub's full re-hash.
+pub(crate) async fn hash_reader(f: tokio::fs::File, algorithm: &str) -> io::Result<(Digest, u32)> {
     if algorithm == "sha512" {
         hash_file::<Sha512>("sha512", f).await
     } else {

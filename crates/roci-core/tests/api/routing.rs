@@ -86,7 +86,14 @@ async fn delete_disabled_returns_405() {
     let m = br#"{"schemaVersion":2}"#;
     let md = sha256_of(m);
     storage
-        .put_manifest("r", Some("v1"), &md, "application/json", m)
+        .put_manifest(
+            "r",
+            Some("v1"),
+            &md,
+            "application/json",
+            m,
+            ManifestLinks::default(),
+        )
         .await
         .unwrap();
     let mut config = Config::default();

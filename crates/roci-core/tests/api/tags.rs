@@ -10,7 +10,14 @@ async fn tags_list_page_size_is_capped() {
     let d = sha256_of(body);
     for t in ["a", "b", "c", "d"] {
         storage
-            .put_manifest("r", Some(t), &d, "application/json", body)
+            .put_manifest(
+                "r",
+                Some(t),
+                &d,
+                "application/json",
+                body,
+                ManifestLinks::default(),
+            )
             .await
             .unwrap();
     }
@@ -25,7 +32,14 @@ async fn tags_list_pagination() {
     let md = sha256_of(m);
     for t in ["a", "b", "c", "d"] {
         storage
-            .put_manifest("r", Some(t), &md, "application/json", m)
+            .put_manifest(
+                "r",
+                Some(t),
+                &md,
+                "application/json",
+                m,
+                ManifestLinks::default(),
+            )
             .await
             .unwrap();
     }
@@ -46,7 +60,14 @@ async fn tags_list_link_header_walks_all_pages() {
     let md = sha256_of(m);
     for t in ["a", "b", "c", "d", "e"] {
         storage
-            .put_manifest("r", Some(t), &md, "application/json", m)
+            .put_manifest(
+                "r",
+                Some(t),
+                &md,
+                "application/json",
+                m,
+                ManifestLinks::default(),
+            )
             .await
             .unwrap();
     }
@@ -86,7 +107,14 @@ async fn tags_list_last_not_in_list() {
     let md = sha256_of(m);
     for t in ["a", "c"] {
         storage
-            .put_manifest("r", Some(t), &md, "application/json", m)
+            .put_manifest(
+                "r",
+                Some(t),
+                &md,
+                "application/json",
+                m,
+                ManifestLinks::default(),
+            )
             .await
             .unwrap();
     }

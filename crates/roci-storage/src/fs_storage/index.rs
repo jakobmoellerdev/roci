@@ -8,7 +8,7 @@ use crate::beneath::*;
 use crate::digest::Digest;
 use crate::error::StorageError;
 use crate::layout::*;
-use crate::metadata::{LogMetadataStore, MetaOp, MetadataStore};
+use crate::metadata::{MetaOp, MetadataStore};
 use futures::channel::oneshot;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -60,7 +60,7 @@ impl FsStorage {
                     _ = tokio::time::sleep(INDEX_RETRY_BACKOFF), if pending => {}
                     _ = &mut cancel => return,
                 }
-                Self::flush_dirty(&root, &meta, &dirty).await;
+                Self::flush_dirty(&root, &*meta, &dirty).await;
             }
         });
     }
@@ -71,7 +71,7 @@ impl FsStorage {
     /// its foreign descriptors.
     pub(super) async fn flush_dirty(
         root: &Path,
-        meta: &LogMetadataStore,
+        meta: &dyn MetadataStore,
         dirty: &StdMutex<HashMap<String, u64>>,
     ) {
         let snapshot: Vec<(String, u64)> = dirty
@@ -134,7 +134,7 @@ impl FsStorage {
             };
             self.import_foreign_tags(&repo, &existing);
             let Ok(rebuilt) =
-                Self::index_from_meta(&self.meta, &repo, &self.root, Some(existing.clone()))
+                Self::index_from_meta(&*self.meta, &repo, &self.root, Some(existing.clone()))
             else {
                 continue;
             };
@@ -152,7 +152,7 @@ impl FsStorage {
                 self.mark_index_dirty(&repo);
             }
         }
-        Self::flush_dirty(&self.root, &self.meta, &self.index_dirty).await;
+        Self::flush_dirty(&self.root, &*self.meta, &self.index_dirty).await;
     }
 
     /// Record tagged descriptors from an on-disk index that the metadata store
@@ -175,6 +175,8 @@ impl FsStorage {
                 digest: digest.to_string(),
                 media_type: media_type.to_string(),
                 tag: Some(tag.to_string()),
+                references: Vec::new(),
+                referrer: None,
             }) {
                 tracing::warn!(repo = %repo, error = %err, "import of existing tag failed");
             }
@@ -191,7 +193,7 @@ impl FsStorage {
     /// — no `ref.name` tag and no `subject` (roci would have recorded either);
     /// otherwise it is a deleted manifest and is dropped.
     pub(super) fn index_from_meta(
-        meta: &LogMetadataStore,
+        meta: &dyn MetadataStore,
         repo: &str,
         root: &Path,
         existing: Option<serde_json::Value>,
@@ -408,7 +410,7 @@ impl FsStorage {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => None,
                 Err(e) => return Err(StorageError::Io(e)),
             };
-            return Self::index_from_meta(&self.meta, repo, &self.root, existing)
+            return Self::index_from_meta(&*self.meta, repo, &self.root, existing)
                 .map_err(StorageError::Io);
         }
         match tokio::fs::read(self.index_path(repo)?).await {

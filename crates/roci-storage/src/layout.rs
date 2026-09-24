@@ -55,6 +55,28 @@ pub(crate) fn subject_digest(descriptor: &serde_json::Value) -> Option<&str> {
     descriptor.get("subject")?.get("digest")?.as_str()
 }
 
+/// Every object a manifest references — `config`, each `layers` entry, each
+/// image-index `manifests` child, and `subject` — as parsed digests: the GC
+/// liveness edges (backrefs). The single definition shared by the push path
+/// and the GC startup rebuild, so both derive identical edges. Lenient: a
+/// malformed descriptor contributes nothing (the push path validates the
+/// required config/layers separately and rejects a malformed manifest).
+pub fn manifest_references(manifest: &serde_json::Value) -> Vec<crate::Digest> {
+    let descriptors = manifest
+        .get("config")
+        .into_iter()
+        .chain(["layers", "manifests"].into_iter().flat_map(|field| {
+            manifest
+                .get(field)
+                .and_then(serde_json::Value::as_array)
+                .map_or(&[][..], Vec::as_slice)
+        }))
+        .chain(manifest.get("subject"));
+    descriptors
+        .filter_map(|d| crate::Digest::parse(d.as_object()?.get("digest")?.as_str()?).ok())
+        .collect()
+}
+
 /// Page an in-memory list already sorted and de-duplicated by `key`: at most
 /// `limit` items strictly after `last`. Used only by the layout fallbacks,
 /// whose cost is bounded by the document they must read whole anyway.
@@ -129,8 +151,10 @@ pub(crate) fn discover_repos(root: &Path) -> Vec<String> {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            // The CAS/staging subdirs of a repo are never themselves repos.
-            if name == "blobs" || name == "uploads" {
+            // The CAS/staging subdirs of a repo are never themselves repos, and
+            // neither is a dot-directory (the repo grammar forbids a leading
+            // `.`; roci keeps internal state such as a quarantine there).
+            if name == "blobs" || name == "uploads" || name.starts_with('.') {
                 continue;
             }
             let mut child = rel.to_vec();
@@ -141,4 +165,32 @@ pub(crate) fn discover_repos(root: &Path) -> Vec<String> {
     let mut repos = Vec::new();
     walk(root, &[], 16, &mut repos);
     repos
+}
+
+/// Visit every CAS blob under `root` as `(repo, digest, dir entry)`: every
+/// `<repo>/blobs/<alg>/<hex>` of every [`discover_repos`] repository whose
+/// name parses as a wire [`crate::Digest`] (in-progress `.tmp` siblings and
+/// foreign names are skipped). Best-effort — an unreadable directory is
+/// skipped. The shared startup/GC/scrub enumeration.
+pub(crate) fn for_each_cas_blob(
+    root: &Path,
+    mut visit: impl FnMut(&str, &crate::Digest, &std::fs::DirEntry),
+) {
+    for repo in discover_repos(root) {
+        let Ok(algs) = std::fs::read_dir(root.join(&repo).join("blobs")) else {
+            continue;
+        };
+        for alg in algs.flatten() {
+            let alg_name = alg.file_name().to_string_lossy().into_owned();
+            let Ok(hexes) = std::fs::read_dir(alg.path()) else {
+                continue;
+            };
+            for hex in hexes.flatten() {
+                let name = format!("{alg_name}:{}", hex.file_name().to_string_lossy());
+                if let Ok(digest) = crate::Digest::parse(&name) {
+                    visit(&repo, &digest, &hex);
+                }
+            }
+        }
+    }
 }

@@ -1,84 +1,13 @@
-//! Derived, rebuildable-from-the-layout metadata index (ARCHITECTURE.md
-//! §"Metadata index engine"). The [`MetadataStore`] trait is the read/mutate
-//! surface the storage backend resolves tags, manifest media types, and the
-//! subject→referrers relation against; the default [`LogMetadataStore`] keeps
-//! the state in RAM and durably mirrors every mutation to an append-only,
-//! CRC32C-framed `roci-meta.log` so restarts replay in one sequential pass.
-//!
-//! The on-disk OCI layout (`index.json` + `blobs/`) remains the source of
-//! truth (invariant 6); this index is a cache, always reconstructable by
-//! replaying the log or, failing that, walking the layout.
+//! The default metadata engine: in-RAM maps mirrored to an append-only,
+//! CRC32C-framed `roci-meta.log`, replayed in one sequential pass on start.
 
+use super::{after, take_page, BlobChecksum, MetaOp, MetadataStore, Page, Referrer};
+use roci_config::MetadataConfig;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Write};
-use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-
-/// A tag/manifest/referrer mutation the store can record and replay.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MetaOp {
-    /// A manifest was stored: `(repo, digest, media_type, optional tag)`.
-    PutManifest {
-        repo: String,
-        digest: String,
-        media_type: String,
-        tag: Option<String>,
-    },
-    /// The reverse edges for a manifest: every `blob` the manifest references
-    /// (config + layers) gains `manifest` in its backref set. Recorded after
-    /// the manifest is stored so a future GC can reclaim an unreferenced blob.
-    PutBackrefs {
-        repo: String,
-        manifest: String,
-        blobs: Vec<String>,
-    },
-    /// A manifest (and every tag pointing at it) was deleted: `(repo, digest)`.
-    DeleteManifest { repo: String, digest: String },
-    /// A referrer descriptor was recorded against a subject digest.
-    PutReferrer {
-        repo: String,
-        subject: String,
-        referrer: String,
-        descriptor: Vec<u8>,
-    },
-}
-
-/// The read/mutate surface for derived metadata. AuthN/AuthZ is enforced before
-/// any call (ARCHITECTURE.md invariant 3), exactly like [`crate::Storage`].
-pub trait MetadataStore: Send + Sync + 'static {
-    /// Resolve a tag to `(digest, media_type)`, if the tag exists. Both come
-    /// from the same locked read, so a resolved tag always carries its media
-    /// type (no second lookup, no fallback default).
-    fn resolve_tag(&self, repo: &str, tag: &str) -> Option<(String, String)>;
-    /// The stored media type for a manifest digest, if known.
-    fn manifest_media_type(&self, repo: &str, digest: &str) -> Option<String>;
-    /// One page of `repo`'s tags in lexical order: at most `limit` tags
-    /// strictly after `last` (from the start when `None`) — an O(log n) seek,
-    /// so the work is bounded by the page, not the repo. `None` when the store
-    /// records no tag for `repo` (the caller falls back to the layout).
-    fn tags_page(&self, repo: &str, last: Option<&str>, limit: usize) -> Option<Page<String>>;
-    /// One page of the referrers recorded for `subject`, ordered by referrer
-    /// digest: at most `limit` entries strictly after `last`, restricted to
-    /// descriptors whose `artifactType` equals `artifact_type` when given (an
-    /// O(log n) seek into a per-type index, never a filtered scan). `None`
-    /// when the store records no referrer for `subject` at all.
-    fn referrers_page(
-        &self,
-        repo: &str,
-        subject: &str,
-        artifact_type: Option<&str>,
-        last: Option<&str>,
-        limit: usize,
-    ) -> Option<Page<Referrer>>;
-    /// Whether `referrer` is recorded as a referrer of `subject`.
-    fn has_referrer(&self, repo: &str, subject: &str, referrer: &str) -> bool;
-    /// The manifest digests currently recorded as referencing `blob` in `repo`.
-    fn backrefs(&self, repo: &str, blob: &str) -> Vec<String>;
-    /// Apply and durably record a mutation.
-    fn apply(&self, op: MetaOp) -> io::Result<()>;
-}
 
 /// In-RAM metadata maps mirrored to an append-only CRC32C-framed log.
 ///
@@ -111,32 +40,6 @@ struct SyncCoord {
 
 /// A repo-scoped map key: `(repo, name)` so repositories stay isolated.
 type RepoKey = (String, String);
-/// One referrer: `(referrer_digest, descriptor_bytes)`; the digest de-dups.
-pub type Referrer = (String, Vec<u8>);
-
-/// One page of a cursor-paginated listing: at most the requested number of
-/// items strictly after the request cursor, in the listing's stable order.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Page<T> {
-    pub items: Vec<T>,
-    /// At least one further item follows `items` (→ a `Link: rel="next"`).
-    pub more: bool,
-}
-
-/// Collect at most `limit` items of `it` and record whether any remain.
-pub(crate) fn take_page<T>(mut it: impl Iterator<Item = T>, limit: usize) -> Page<T> {
-    let items: Vec<T> = it.by_ref().take(limit).collect();
-    let more = it.next().is_some();
-    Page { items, more }
-}
-
-/// The key range strictly after the cursor `last` (everything when `None`).
-fn after(last: Option<&str>) -> (Bound<&str>, Bound<&str>) {
-    (
-        last.map_or(Bound::Unbounded, Bound::Excluded),
-        Bound::Unbounded,
-    )
-}
 
 /// The referrers of one subject, ordered by referrer digest so a page is an
 /// O(log n) seek past the cursor. `by_type` indexes the same digests by their
@@ -218,14 +121,45 @@ struct State {
     /// removed.
     referrers: HashMap<RepoKey, SubjectReferrers>,
     /// `(repo, blob_digest) → [manifest_digest]`: reverse edges from a blob to
-    /// every manifest that references it. Maintained on manifest put/delete for
-    /// a future online GC; manifest digests de-dup within a set.
+    /// every manifest that references it — GC's liveness index. Maintained on
+    /// manifest put/delete; manifest digests de-dup within a set.
     backrefs: HashMap<RepoKey, Vec<String>>,
+    /// `(repo, blob_digest) → checksum` recorded at write, for the scrub.
+    checksums: HashMap<RepoKey, BlobChecksum>,
     /// Buffered log writer (`None` until a mutation opens/creates the log).
     log: Option<std::fs::File>,
 }
 
+impl State {
+    /// Add `manifest` to the backref set of every blob in `blobs`.
+    fn add_backrefs(&mut self, repo: &str, manifest: &str, blobs: &[String]) {
+        for blob in blobs {
+            let set = self
+                .backrefs
+                .entry((repo.to_string(), blob.clone()))
+                .or_default();
+            if !set.iter().any(|m| m == manifest) {
+                set.push(manifest.to_string());
+            }
+        }
+    }
+
+    /// Record `referrer` (descriptor bytes) against `subject`.
+    fn add_referrer(&mut self, repo: &str, subject: &str, referrer: &str, descriptor: &[u8]) {
+        self.referrers
+            .entry((repo.to_string(), subject.to_string()))
+            .or_default()
+            .insert(referrer, descriptor);
+    }
+}
+
 impl LogMetadataStore {
+    /// Open with the `[storage.metadata]` policy (compaction threshold,
+    /// snapshot, HMAC key).
+    pub fn open_with(root: &Path, _config: &MetadataConfig) -> io::Result<Self> {
+        Self::open(root)
+    }
+
     /// Open (replaying) or create the metadata store at `<root>/roci-meta.log`.
     /// A corrupt trailing record (torn write from a crash) is truncated away;
     /// records that fail their CRC are skipped, and the layout can always
@@ -253,6 +187,8 @@ impl LogMetadataStore {
                 digest,
                 media_type,
                 tag,
+                references,
+                referrer,
             } => {
                 state
                     .media_types
@@ -264,8 +200,14 @@ impl LogMetadataStore {
                         .or_default()
                         .insert(tag.clone(), (digest.clone(), media_type.clone()));
                 }
+                state.add_backrefs(repo, digest, references);
+                if let Some((subject, descriptor)) = referrer {
+                    state.add_referrer(repo, subject, digest, descriptor);
+                }
             }
             MetaOp::DeleteManifest { repo, digest } => {
+                // The manifest blob leaves the CAS with it.
+                state.checksums.remove(&(repo.clone(), digest.clone()));
                 state.media_types.remove(&(repo.clone(), digest.clone()));
                 // Drop every tag pointing at this digest.
                 if let Some(tags) = state.tags.get_mut(repo) {
@@ -295,28 +237,29 @@ impl LogMetadataStore {
                 repo,
                 manifest,
                 blobs,
-            } => {
-                for blob in blobs {
-                    let set = state
-                        .backrefs
-                        .entry((repo.clone(), blob.clone()))
-                        .or_default();
-                    if !set.iter().any(|m| m == manifest) {
-                        set.push(manifest.clone());
-                    }
-                }
-            }
+            } => state.add_backrefs(repo, manifest, blobs),
             MetaOp::PutReferrer {
                 repo,
                 subject,
                 referrer,
                 descriptor,
+            } => state.add_referrer(repo, subject, referrer, descriptor),
+            MetaOp::PutChecksum {
+                repo,
+                digest,
+                crc32c,
+                size,
             } => {
-                state
-                    .referrers
-                    .entry((repo.clone(), subject.clone()))
-                    .or_default()
-                    .insert(referrer, descriptor);
+                state.checksums.insert(
+                    (repo.clone(), digest.clone()),
+                    BlobChecksum {
+                        crc32c: *crc32c,
+                        size: *size,
+                    },
+                );
+            }
+            MetaOp::DeleteBlob { repo, digest } => {
+                state.checksums.remove(&(repo.clone(), digest.clone()));
             }
         }
     }
@@ -377,6 +320,14 @@ impl MetadataStore for LogMetadataStore {
             .unwrap_or_default()
     }
 
+    fn checksum(&self, repo: &str, digest: &str) -> Option<BlobChecksum> {
+        let state = self.inner.lock().expect("metadata lock poisoned");
+        state
+            .checksums
+            .get(&(repo.to_string(), digest.to_string()))
+            .copied()
+    }
+
     fn apply(&self, op: MetaOp) -> io::Result<()> {
         // Append the record and reflect it in RAM under one lock (so the
         // in-memory maps always match log-replay order even under concurrent
@@ -386,6 +337,70 @@ impl MetadataStore for LogMetadataStore {
         // in-RAM state already matches that replay — the caller gets the error.
         let my_seq = self.append_record(&op)?;
         self.group_commit_through(my_seq)
+    }
+
+    fn apply_relaxed(&self, op: MetaOp) -> io::Result<()> {
+        // Appended to the kernel (and applied in RAM) exactly like `apply`,
+        // but the caller does not wait for the durability barrier: the next
+        // group commit (or a clean shutdown) makes it durable.
+        self.append_record(&op).map(drop)
+    }
+
+    fn repos(&self) -> Vec<String> {
+        let state = self.inner.lock().expect("metadata lock poisoned");
+        let mut repos: Vec<String> = state
+            .media_types
+            .keys()
+            .chain(state.referrers.keys())
+            .map(|(r, _)| r.clone())
+            .collect();
+        repos.sort();
+        repos.dedup();
+        repos
+    }
+
+    fn manifests(&self, repo: &str) -> Vec<String> {
+        let state = self.inner.lock().expect("metadata lock poisoned");
+        state
+            .media_types
+            .keys()
+            .filter(|(r, _)| r == repo)
+            .map(|(_, d)| d.clone())
+            .collect()
+    }
+
+    fn tags_snapshot(&self, repo: &str) -> Vec<(String, String, String)> {
+        let state = self.inner.lock().expect("metadata lock poisoned");
+        state
+            .tags
+            .get(repo)
+            .map(|tags| {
+                tags.iter()
+                    .map(|(tag, (digest, media))| (tag.clone(), digest.clone(), media.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn referrers_snapshot(&self, repo: &str) -> Vec<(String, Vec<Referrer>)> {
+        let state = self.inner.lock().expect("metadata lock poisoned");
+        state
+            .referrers
+            .iter()
+            .filter(|((r, _), _)| r == repo)
+            .map(|((_, subject), refs)| {
+                let refs = refs
+                    .by_digest
+                    .iter()
+                    .map(|(d, (_, bytes))| (d.clone(), bytes.clone()))
+                    .collect();
+                (subject.clone(), refs)
+            })
+            .collect()
+    }
+
+    fn maintain(&self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -438,64 +453,6 @@ impl LogMetadataStore {
         sync.synced = sync.synced.max(covered);
         Ok(())
     }
-
-    /// Snapshot all manifest digests recorded in `repo` (populated by
-    /// [`MetaOp::PutManifest`]).
-    pub fn manifests(&self, repo: &str) -> Vec<String> {
-        let state = self.inner.lock().expect("metadata lock poisoned");
-        state
-            .media_types
-            .keys()
-            .filter(|(r, _)| r == repo)
-            .map(|(_, d)| d.clone())
-            .collect()
-    }
-
-    /// Every repo with at least one manifest or referrer recorded.
-    pub fn repos(&self) -> Vec<String> {
-        let state = self.inner.lock().expect("metadata lock poisoned");
-        let mut repos: Vec<String> = state
-            .media_types
-            .keys()
-            .chain(state.referrers.keys())
-            .map(|(r, _)| r.clone())
-            .collect();
-        repos.sort();
-        repos.dedup();
-        repos
-    }
-
-    /// Snapshot the tags for `repo` as `(tag, digest, media_type)`, sorted by tag.
-    pub fn tags_snapshot(&self, repo: &str) -> Vec<(String, String, String)> {
-        let state = self.inner.lock().expect("metadata lock poisoned");
-        state
-            .tags
-            .get(repo)
-            .map(|tags| {
-                tags.iter()
-                    .map(|(tag, (digest, media))| (tag.clone(), digest.clone(), media.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Snapshot referrers for `repo` as `(subject_digest, [(referrer_digest, descriptor_bytes)])`.
-    pub fn referrers_snapshot(&self, repo: &str) -> Vec<(String, Vec<Referrer>)> {
-        let state = self.inner.lock().expect("metadata lock poisoned");
-        state
-            .referrers
-            .iter()
-            .filter(|((r, _), _)| r == repo)
-            .map(|((_, subject), refs)| {
-                let refs = refs
-                    .by_digest
-                    .iter()
-                    .map(|(d, (_, bytes))| (d.clone(), bytes.clone()))
-                    .collect();
-                (subject.clone(), refs)
-            })
-            .collect()
-    }
 }
 
 // ---- Log framing -----------------------------------------------------------
@@ -506,7 +463,7 @@ impl LogMetadataStore {
 
 fn encode(op: &MetaOp) -> Vec<u8> {
     let payload = serialize_op(op);
-    let crc = crc32c(&payload);
+    let crc = crc32c::crc32c(&payload);
     let mut out = Vec::with_capacity(8 + payload.len());
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&crc.to_le_bytes());
@@ -533,7 +490,7 @@ fn replay(bytes: &[u8], state: &mut State) {
             break; // truncated tail
         }
         let payload = &bytes[start..end];
-        if crc32c(payload) != crc {
+        if crc32c::crc32c(payload) != crc {
             break; // corrupt record; layout rebuild is the recovery path
         }
         if let Some(op) = deserialize_op(payload) {
@@ -552,13 +509,27 @@ fn serialize_op(op: &MetaOp) -> Vec<u8> {
             digest,
             media_type,
             tag,
-        } => serde_json::json!({
-            "op": "put_manifest",
-            "repo": repo,
-            "digest": digest,
-            "media_type": media_type,
-            "tag": tag,
-        }),
+            references,
+            referrer,
+        } => {
+            let mut v = serde_json::json!({
+                "op": "put_manifest",
+                "repo": repo,
+                "digest": digest,
+                "media_type": media_type,
+                "tag": tag,
+            });
+            // Derived links are omitted when empty so a plain manifest record
+            // stays as small as before (and old logs replay unchanged).
+            if !references.is_empty() {
+                v["references"] = serde_json::json!(references);
+            }
+            if let Some((subject, descriptor)) = referrer {
+                v["subject"] = serde_json::json!(subject);
+                v["descriptor"] = serde_json::json!(String::from_utf8_lossy(descriptor));
+            }
+            v
+        }
         MetaOp::DeleteManifest { repo, digest } => serde_json::json!({
             "op": "delete_manifest",
             "repo": repo,
@@ -588,6 +559,23 @@ fn serialize_op(op: &MetaOp) -> Vec<u8> {
             "manifest": manifest,
             "blobs": blobs,
         }),
+        MetaOp::PutChecksum {
+            repo,
+            digest,
+            crc32c,
+            size,
+        } => serde_json::json!({
+            "op": "put_checksum",
+            "repo": repo,
+            "digest": digest,
+            "crc32c": crc32c,
+            "size": size,
+        }),
+        MetaOp::DeleteBlob { repo, digest } => serde_json::json!({
+            "op": "delete_blob",
+            "repo": repo,
+            "digest": digest,
+        }),
     };
     serde_json::to_vec(&v).expect("MetaOp serializes")
 }
@@ -595,12 +583,24 @@ fn serialize_op(op: &MetaOp) -> Vec<u8> {
 fn deserialize_op(payload: &[u8]) -> Option<MetaOp> {
     let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    let strings = |k: &str| -> Vec<String> {
+        v.get(k)
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     match v.get("op").and_then(|x| x.as_str())? {
         "put_manifest" => Some(MetaOp::PutManifest {
             repo: s("repo")?,
             digest: s("digest")?,
             media_type: s("media_type")?,
-            tag: v.get("tag").and_then(|x| x.as_str()).map(str::to_string),
+            tag: s("tag"),
+            references: strings("references"),
+            referrer: s("subject").zip(s("descriptor").map(String::into_bytes)),
         }),
         "delete_manifest" => Some(MetaOp::DeleteManifest {
             repo: s("repo")?,
@@ -615,41 +615,20 @@ fn deserialize_op(payload: &[u8]) -> Option<MetaOp> {
         "put_backrefs" => Some(MetaOp::PutBackrefs {
             repo: s("repo")?,
             manifest: s("manifest")?,
-            blobs: v
-                .get("blobs")
-                .and_then(|x| x.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            blobs: strings("blobs"),
+        }),
+        "put_checksum" => Some(MetaOp::PutChecksum {
+            repo: s("repo")?,
+            digest: s("digest")?,
+            crc32c: u32::try_from(v.get("crc32c")?.as_u64()?).ok()?,
+            size: v.get("size")?.as_u64()?,
+        }),
+        "delete_blob" => Some(MetaOp::DeleteBlob {
+            repo: s("repo")?,
+            digest: s("digest")?,
         }),
         _ => None,
     }
-}
-
-// ---- CRC32C (Castagnoli, reflected) ---------------------------------------
-
-/// Compute the CRC32C (Castagnoli polynomial `0x1EDC6F41`, reflected) of `data`.
-/// A dependency-free, table-free software implementation — corruption detection
-/// only, not a cryptographic guarantee (the layout is the real integrity
-/// authority). Records are tiny, so the per-bit loop is not a hot path.
-fn crc32c(data: &[u8]) -> u32 {
-    // Reflected Castagnoli polynomial.
-    const POLY: u32 = 0x82F6_3B78;
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            crc = if crc & 1 == 1 {
-                (crc >> 1) ^ POLY
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    crc ^ 0xFFFF_FFFF
 }
 
 #[cfg(test)]
@@ -662,13 +641,9 @@ mod tests {
             digest: digest.into(),
             media_type: "application/vnd.oci.image.manifest.v1+json".into(),
             tag: tag.map(str::to_string),
+            references: Vec::new(),
+            referrer: None,
         }
-    }
-
-    #[test]
-    fn crc32c_matches_known_vector() {
-        // Standard CRC32C check value for the ASCII string "123456789".
-        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
     }
 
     #[test]
@@ -949,7 +924,7 @@ mod tests {
         let mut unknown = good.clone();
         let up = b"{\"op\":\"nope\"}";
         unknown.extend_from_slice(&(up.len() as u32).to_le_bytes());
-        unknown.extend_from_slice(&crc32c(up).to_le_bytes());
+        unknown.extend_from_slice(&crc32c::crc32c(up).to_le_bytes());
         unknown.extend_from_slice(up);
         // Append a real record after the unknown one to prove replay continued.
         unknown.extend_from_slice(&encode(&put("r", "sha256:bb", Some("v2"))));

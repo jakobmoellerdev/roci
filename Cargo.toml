@@ -70,6 +70,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rcgen = "0.13"
 http-body-util = "0.1"
 mimalloc = { version = "0.1", default-features = false }
+crc32c = "0.6"
+rkyv = "0.8"
+memmap2 = "0.9"
+hmac = "0.12"
+redb = "4"
 
 [profile.ci]
 inherits = "dev"

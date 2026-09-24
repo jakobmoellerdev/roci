@@ -1,8 +1,16 @@
-//! The registry storage contract (`Storage` trait) and its resolved-reference type.
+//! The registry storage contract (`Storage` trait) and its value types: the
+//! resolved-reference [`ManifestRef`], the backend-agnostic [`BlobRead`], and
+//! the atomically-committed [`ManifestLinks`].
 
 use crate::metadata::{Page, Referrer};
 use crate::{Digest, StorageError};
+use bytes::Bytes;
+use futures::future::BoxFuture;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use std::future::Future;
+use std::io;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// A resolved reference target: either a tag pointing at a manifest digest, or
 /// a direct manifest digest.
@@ -11,6 +19,100 @@ pub struct ManifestRef {
     pub digest: Digest,
     pub media_type: String,
     pub bytes: Vec<u8>,
+}
+
+/// A streamed blob body.
+pub type BlobStream = BoxStream<'static, io::Result<Bytes>>;
+
+/// Opens the byte range `[start, start + len)` of a remote blob as a stream.
+pub type RangeOpener =
+    Box<dyn FnOnce(u64, u64) -> BoxFuture<'static, io::Result<BlobStream>> + Send>;
+
+/// A blob opened for a GET: its total size plus how its bytes are delivered —
+/// a local file (streamed, never buffered whole), a backend range reader, or a
+/// short-lived redirect URL the client fetches directly (remote backends above
+/// `redirect_min_size`, ARCHITECTURE §Storage trait & backends).
+pub struct BlobRead {
+    size: u64,
+    source: BlobSource,
+}
+
+enum BlobSource {
+    File(tokio::fs::File),
+    Ranged(RangeOpener),
+    Redirect(String),
+}
+
+impl BlobRead {
+    /// A local file of `size` bytes.
+    pub fn file(file: tokio::fs::File, size: u64) -> Self {
+        Self {
+            size,
+            source: BlobSource::File(file),
+        }
+    }
+
+    /// A remote blob of `size` bytes whose ranges `open` streams on demand.
+    pub fn ranged(size: u64, open: RangeOpener) -> Self {
+        Self {
+            size,
+            source: BlobSource::Ranged(open),
+        }
+    }
+
+    /// A blob the client should fetch from `url` (a `307`).
+    pub fn redirect(size: u64, url: String) -> Self {
+        Self {
+            size,
+            source: BlobSource::Redirect(url),
+        }
+    }
+
+    /// Total blob size in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The redirect target, when the backend asks the client to fetch directly.
+    pub fn redirect_url(&self) -> Option<&str> {
+        match &self.source {
+            BlobSource::Redirect(url) => Some(url),
+            _ => None,
+        }
+    }
+
+    /// Stream `len` bytes starting at `start` (`start + len <= size`). A
+    /// redirect has no local body: [`io::ErrorKind::Unsupported`].
+    pub async fn into_stream(self, start: u64, len: u64) -> io::Result<BlobStream> {
+        match self.source {
+            BlobSource::File(mut f) => {
+                if start > 0 {
+                    f.seek(io::SeekFrom::Start(start)).await?;
+                }
+                Ok(tokio_util::io::ReaderStream::new(f.take(len)).boxed())
+            }
+            BlobSource::Ranged(open) => open(start, len).await,
+            BlobSource::Redirect(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "redirected blob has no local body",
+            )),
+        }
+    }
+}
+
+/// The derived links one manifest push commits **atomically with the manifest
+/// itself** (one WAL record — SECURITY §Storage boundary "GC as an integrity
+/// property"): backref edges and, for a manifest carrying `subject`, its
+/// referrer registration. A crash can never leave a stored manifest whose
+/// blobs look unreferenced to GC.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ManifestLinks<'a> {
+    /// Every object the manifest references — config, layers, image-index
+    /// children, and `subject` — recorded as `object → manifest` backrefs.
+    pub references: &'a [Digest],
+    /// `(subject digest, referrer descriptor JSON)` when the manifest carries a
+    /// `subject`; the descriptor is stored with the subject link merged in.
+    pub subject: Option<(&'a Digest, &'a [u8])>,
 }
 
 /// The registry storage contract. AuthN/AuthZ is enforced *before* any call
@@ -37,12 +139,12 @@ pub trait Storage: Send + Sync + 'static {
         repo: &str,
         digest: &Digest,
     ) -> impl Future<Output = Result<Vec<u8>, StorageError>> + Send;
-    /// Open a blob file for streaming.
+    /// Open a blob for a GET: its size plus a streamable body (or a redirect).
     fn open_blob(
         &self,
         repo: &str,
         digest: &Digest,
-    ) -> impl Future<Output = Result<tokio::fs::File, StorageError>> + Send;
+    ) -> impl Future<Output = Result<BlobRead, StorageError>> + Send;
     /// Begin a chunked upload session, returning its id.
     fn begin_upload(&self, repo: &str)
         -> impl Future<Output = Result<String, StorageError>> + Send;
@@ -75,9 +177,9 @@ pub trait Storage: Send + Sync + 'static {
     /// Mount a blob from `from_repo` into `to_repo` without re-uploading it
     /// (dist-spec end-11 cross-repository blob mount). Returns `Ok(true)` when
     /// the blob was present in `from_repo` and is now linked into `to_repo`;
-    /// `Ok(false)` when the source blob is absent (the caller falls back to a
-    /// normal upload session). Promotion is a filesystem hard-link with a copy
-    /// fallback — no blob bytes pass through memory.
+    /// `Ok(false)` when the source blob is absent or the backends cannot share
+    /// it (the caller falls back to a normal upload session). No blob bytes
+    /// pass through memory: the backend links or copies server-side.
     fn mount_blob(
         &self,
         from_repo: &str,
@@ -111,7 +213,9 @@ pub trait Storage: Send + Sync + 'static {
         repo: &str,
         digest: &Digest,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
-    /// Store a manifest by digest and (optionally) associate a tag.
+    /// Store a manifest by digest, (optionally) associate a tag, and record its
+    /// [`ManifestLinks`] — manifest, tag, backrefs and referrer land in **one**
+    /// metadata record, so a crash never desynchronizes them.
     fn put_manifest(
         &self,
         repo: &str,
@@ -119,6 +223,7 @@ pub trait Storage: Send + Sync + 'static {
         digest: &Digest,
         media_type: &str,
         data: &[u8],
+        links: ManifestLinks<'_>,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
     /// Resolve a manifest by tag or digest reference.
     fn get_manifest(
@@ -142,16 +247,6 @@ pub trait Storage: Send + Sync + 'static {
         last: Option<&str>,
         limit: usize,
     ) -> impl Future<Output = Result<Page<String>, StorageError>> + Send;
-    /// Record a referrer: `subject` is the digest a manifest points at via its
-    /// `subject` field; `referrer_descriptor` is the JSON descriptor of the
-    /// referring manifest to include in the subject's referrers index.
-    fn add_referrer(
-        &self,
-        repo: &str,
-        subject: &Digest,
-        referrer: &Digest,
-        referrer_descriptor: &[u8],
-    ) -> impl Future<Output = Result<(), StorageError>> + Send;
     /// One page of the referrers recorded for `subject` as
     /// `(referrer_digest, descriptor_json)`, ordered by referrer digest: at
     /// most `limit` entries strictly after `last`, restricted to descriptors
@@ -165,21 +260,18 @@ pub trait Storage: Send + Sync + 'static {
         last: Option<&str>,
         limit: usize,
     ) -> impl Future<Output = Result<Page<Referrer>, StorageError>> + Send;
-    /// Record the reverse edges `blob_digest → manifest_digest` for every blob
-    /// a manifest references (its config + layers), so a future GC can reclaim
-    /// a blob the moment its last referencing manifest is deleted. Called by
-    /// the core after a successful [`Storage::put_manifest`]; the delete side
-    /// is handled inside [`Storage::delete_manifest`].
-    fn record_backrefs(
-        &self,
-        repo: &str,
-        manifest: &Digest,
-        blobs: &[Digest],
-    ) -> impl Future<Output = Result<(), StorageError>> + Send;
-    /// The manifest digests currently known to reference `blob` in `repo`.
-    fn backrefs(
-        &self,
-        repo: &str,
-        blob: &Digest,
-    ) -> impl Future<Output = Result<Vec<String>, StorageError>> + Send;
+}
+
+/// The server-driven lifecycle of a concrete backend, on top of the request
+/// surface: startup recovery before any request is served, then background
+/// maintenance until shutdown. The routing layer fans both out to every
+/// backend of a multi-path registry.
+pub trait StorageBackend: Storage {
+    /// Startup recovery (e.g. referrers enable-upgrade, `index.json`
+    /// reconciliation with the replayed metadata log). Run once, before
+    /// serving.
+    fn recover(&self) -> impl Future<Output = ()> + Send;
+    /// Start the enabled background subsystems (GC, scrub, metadata upkeep);
+    /// every task stops when `shutdown` becomes `true`.
+    fn start_maintenance(&self, shutdown: tokio::sync::watch::Receiver<bool>);
 }

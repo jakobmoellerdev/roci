@@ -88,6 +88,7 @@ async fn head_blob_and_manifest() {
             &md,
             "application/vnd.oci.image.manifest.v1+json",
             m,
+            ManifestLinks::default(),
         )
         .await
         .unwrap();

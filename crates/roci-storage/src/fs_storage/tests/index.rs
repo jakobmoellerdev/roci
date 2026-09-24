@@ -18,8 +18,15 @@ async fn put_errors_when_parent_path_is_a_file() {
     // put_manifest first writes the manifest blob (fails here too since
     // `<repo>/blobs` is a file), covering the CAS-write error path.
     assert!(matches!(
-        s.put_manifest("r", None, &d, "application/json", data)
-            .await,
+        s.put_manifest(
+            "r",
+            None,
+            &d,
+            "application/json",
+            data,
+            ManifestLinks::default()
+        )
+        .await,
         Err(StorageError::Io(_))
     ));
 
@@ -29,9 +36,16 @@ async fn put_errors_when_parent_path_is_a_file() {
     let body = br#"{"schemaVersion":2}"#;
     let bd = sha256_of(body);
     std::fs::create_dir_all(dir.path().join("r2").join("index.json")).unwrap();
-    s.put_manifest("r2", Some("v1"), &bd, "application/json", body)
-        .await
-        .unwrap();
+    s.put_manifest(
+        "r2",
+        Some("v1"),
+        &bd,
+        "application/json",
+        body,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
     assert!(matches!(s.read_index("r2").await, Err(StorageError::Io(_))));
 }
 
@@ -93,13 +107,18 @@ async fn index_preserves_foreign_entries_and_referrer_append() {
         .unwrap()
         .items
         .is_empty());
-    // add_referrer with no pre-existing manifest entry appends the merged
+    // A referrer with no pre-existing manifest entry appends the merged
     // descriptor (carrying the subject link) — covers the append branch.
-    s.add_referrer(
+    s.put_manifest(
         "r",
-        &subject,
+        None,
         &referrer,
-        br#"{"digest":"x","artifactType":"a/b"}"#,
+        "application/json",
+        b"referrer",
+        ManifestLinks {
+            references: &[],
+            subject: Some((&subject, br#"{"digest":"x","artifactType":"a/b"}"#)),
+        },
     )
     .await
     .unwrap();
@@ -238,9 +257,16 @@ async fn index_write_behind_eventual() {
     let (dir, s) = store();
     let body = br#"{"schemaVersion":2}"#;
     let d = sha256_of(body);
-    s.put_manifest("r", Some("v1"), &d, "application/json", body)
-        .await
-        .unwrap();
+    s.put_manifest(
+        "r",
+        Some("v1"),
+        &d,
+        "application/json",
+        body,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
     // The in-RAM index is authoritative immediately.
     assert_eq!(
         s.list_tags("r", None, usize::MAX).await.unwrap().items,
@@ -308,9 +334,16 @@ fn new_outside_runtime_does_not_panic_and_reconcile_persists() {
     rt.block_on(async {
         let body = br#"{"schemaVersion":2}"#;
         let d = sha256_of(body);
-        s.put_manifest("r", Some("v1"), &d, "application/json", body)
-            .await
-            .unwrap();
+        s.put_manifest(
+            "r",
+            Some("v1"),
+            &d,
+            "application/json",
+            body,
+            ManifestLinks::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             s.list_tags("r", None, usize::MAX).await.unwrap().items,
             ["v1"]
@@ -342,6 +375,8 @@ async fn reconcile_recovers_wal_ahead_of_index() {
                 digest: d.as_string(),
                 media_type: "application/json".into(),
                 tag: Some("v1".into()),
+                references: Vec::new(),
+                referrer: None,
             })
             .unwrap();
     }
@@ -381,9 +416,16 @@ async fn rebuild_preserves_preexisting_foreign_tags() {
     // A new push triggers a rebuild; the legacy tag must survive it.
     let body = br#"{"schemaVersion":2}"#;
     let d = sha256_of(body);
-    s.put_manifest("r", Some("new"), &d, "application/json", body)
-        .await
-        .unwrap();
+    s.put_manifest(
+        "r",
+        Some("new"),
+        &d,
+        "application/json",
+        body,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
     let idx = s.read_index("r").await.unwrap();
     let tags: Vec<_> = idx["manifests"]
         .as_array()
@@ -411,7 +453,18 @@ async fn index_write_refuses_symlinked_repo_and_bad_repo_name() {
     let s = FsStorage::new(dir.path()).unwrap();
     let sub = sha256_of(b"s");
     assert!(matches!(
-        s.add_referrer("../x", &sub, &sub, b"{}").await,
+        s.put_manifest(
+            "../x",
+            None,
+            &sub,
+            "application/json",
+            b"s",
+            ManifestLinks {
+                references: &[],
+                subject: Some((&sub, b"{}")),
+            },
+        )
+        .await,
         Err(StorageError::BadPath(_))
     ));
 }
@@ -430,16 +483,23 @@ async fn rebuild_keeps_top_level_fields_and_skips_unreadable_index() {
         .unwrap();
     let body = br#"{"schemaVersion":2}"#;
     let d = sha256_of(body);
-    s.put_manifest("r", Some("v1"), &d, "application/json", body)
-        .await
-        .unwrap();
+    s.put_manifest(
+        "r",
+        Some("v1"),
+        &d,
+        "application/json",
+        body,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
     let idx = s.read_index("r").await.unwrap();
     assert_eq!(idx["annotations"]["org.example"], "keep");
     // An existing-but-unreadable index (here: not a regular file) is never
     // overwritten from metadata alone; the repo stays dirty for retry.
     let dirty = StdMutex::new(HashMap::from([("q".to_string(), 1u64)]));
     std::fs::create_dir_all(dir.path().join("q/index.json")).unwrap();
-    FsStorage::flush_dirty(&s.root, &s.meta, &dirty).await;
+    FsStorage::flush_dirty(&s.root, &*s.meta, &dirty).await;
     assert!(dirty.lock().unwrap().contains_key("q"));
     assert!(dir.path().join("q/index.json").is_dir());
 }
@@ -537,28 +597,33 @@ async fn serves_external_oci_layout() {
 }
 
 #[tokio::test]
-async fn add_referrer_merges_into_annotated_entry() {
+async fn referrer_merges_into_annotated_entry() {
     // A tagged manifest already carries an `annotations` entry in the index;
     // add_referrer must preserve it (the k=="annotations" skip branch) while
     // merging the subject/artifactType.
     let (_dir, s) = store();
     let body = br#"{"schemaVersion":2}"#;
     let referrer = sha256_of(body);
-    // put_manifest with a tag records an index entry carrying annotations.
-    s.put_manifest("r", Some("v1"), &referrer, "application/json", body)
-        .await
-        .unwrap();
     let subject = sha256_of(b"subject");
-    // The descriptor the core passes also carries annotations; the existing
-    // entry's annotations must win (skip), other fields merge.
-    s.add_referrer(
-            "r",
-            &subject,
-            &referrer,
-            br#"{"mediaType":"application/json","digest":"x","annotations":{"other":"1"},"artifactType":"a/b"}"#,
-        )
-        .await
-        .unwrap();
+    // put_manifest with a tag records an index entry carrying annotations; the
+    // referrer descriptor the core passes also carries annotations, and the
+    // entry's own annotations must win (skip) while other fields merge.
+    s.put_manifest(
+        "r",
+        Some("v1"),
+        &referrer,
+        "application/json",
+        body,
+        ManifestLinks {
+            references: &[],
+            subject: Some((
+                &subject,
+                br#"{"mediaType":"application/json","digest":"x","annotations":{"other":"1"},"artifactType":"a/b"}"#,
+            )),
+        },
+    )
+    .await
+    .unwrap();
     let listed = s
         .list_referrers("r", &subject, None, None, usize::MAX)
         .await

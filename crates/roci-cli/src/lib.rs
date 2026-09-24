@@ -16,7 +16,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use roci_config::{Config, ConfigError};
 use roci_core::{build_router, AppState};
-use roci_storage::FsStorage;
+use roci_storage::quota::{QuotaLimits, QuotaTracker};
+use roci_storage::{FsStorage, StorageBackend};
 use tokio::net::TcpListener;
 use tower::Service;
 
@@ -63,15 +64,22 @@ pub async fn serve(
     on_bind: impl FnOnce(SocketAddr),
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let storage =
-        FsStorage::with_cache_capacity(&config.storage.root, config.storage.cache_max_bytes)?;
+    let quota = Arc::new(QuotaTracker::new(QuotaLimits {
+        max_repo_bytes: config.storage.quota.max_repo_bytes,
+        max_total_bytes: config.storage.quota.max_total_bytes,
+        max_upload_sessions: config.storage.quota.max_upload_sessions,
+    }));
+    let storage = FsStorage::with_config(&config.storage.root, &config.storage, quota)?;
     let app = build_router(AppState::new_with(storage.clone(), config.clone()))
         .merge(roci_telemetry::metrics_router(&config));
     // Startup recovery before accepting requests: register pre-existing
     // `subject` links (referrers upgrade) and reconcile `index.json` with the
     // replayed metadata log (write-behind crash recovery, foreign-tag import).
-    storage.warm_referrers_from_layout().await;
-    storage.reconcile_index_json().await;
+    storage.recover().await;
+
+    // Graceful-shutdown signal shared by the listener and background tasks.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    StorageBackend::start_maintenance(&storage, shutdown_rx.clone());
 
     let listener = TcpListener::bind(config.http.listen).await?;
     let local = listener.local_addr()?;
@@ -98,9 +106,6 @@ pub async fn serve(
     let builder = Arc::new(builder);
 
     let idle_timeout = Duration::from_secs(config.http.timeouts.idle_secs);
-
-    // Graceful-shutdown tracking.
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Spawn the shutdown watcher.
     tokio::spawn(async move {

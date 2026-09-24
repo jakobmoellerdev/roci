@@ -9,24 +9,35 @@ mod fault;
 
 mod beneath;
 mod cache;
+mod dedupe;
 mod digest;
 mod error;
 mod filter;
 mod fs_storage;
+pub mod gc;
 mod layout;
 mod metadata;
 mod publish;
+pub mod quota;
 mod storage;
 
+pub use dedupe::DedupeIndex;
 pub use digest::{digest_of, sha256_of, Digest};
-pub use error::StorageError;
-pub use layout::{MEDIA_TYPE_IMAGE_INDEX, MEDIA_TYPE_IMAGE_MANIFEST};
-pub use metadata::{LogMetadataStore, MetaOp, MetadataStore, Page, Referrer};
-pub use storage::{ManifestRef, Storage};
+pub use error::{QuotaScope, StorageError};
+pub use layout::{manifest_references, MEDIA_TYPE_IMAGE_INDEX, MEDIA_TYPE_IMAGE_MANIFEST};
+pub use metadata::{
+    open_metadata, BlobChecksum, LogMetadataStore, MetaOp, MetadataStore, Page, Referrer,
+};
+pub use storage::{
+    BlobRead, BlobStream, ManifestLinks, ManifestRef, RangeOpener, Storage, StorageBackend,
+};
 
 use cache::SmallBlobCache;
 use filter::BlobPresenceFilter;
 use futures::channel::oneshot;
+use gc::GcTracker;
+use quota::QuotaTracker;
+use roci_config::StorageConfig;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -45,10 +56,13 @@ type UploadLocks = Arc<StdMutex<HashMap<(String, String), Arc<tokio::sync::Mutex
 #[derive(Clone)]
 pub struct FsStorage {
     root: Arc<PathBuf>,
-    /// Derived, rebuildable metadata index (tags, media types, referrers) kept
-    /// in RAM and mirrored to `roci-meta.log`. Reads resolve against this first
-    /// and fall back to `index.json`; the layout stays the source of truth.
-    meta: Arc<LogMetadataStore>,
+    /// The `[storage]` policy this store runs under (GC, scrub, dedupe, …).
+    config: Arc<StorageConfig>,
+    /// Derived, rebuildable metadata index (tags, media types, referrers,
+    /// backrefs, checksums) behind the engine-agnostic [`MetadataStore`] seam.
+    /// Reads resolve against this first and fall back to `index.json`; the
+    /// layout stays the source of truth.
+    meta: Arc<dyn MetadataStore>,
     /// In-RAM blob-presence filter: a definite-absent answer short-circuits the
     /// filesystem `stat` on the read path (RESEARCH §8.5). Never authoritative
     /// for presence — a "maybe" always verifies on disk (SECURITY inv. 10).
@@ -57,6 +71,12 @@ pub struct FsStorage {
     /// manifests/configs with zero syscalls. A miss falls through to the loose
     /// CAS file, which always exists (never the sole copy).
     cache: Arc<SmallBlobCache>,
+    /// Online-GC candidate set + in-flight fence ([`gc`]).
+    gc: Arc<GcTracker>,
+    /// Byte quotas + upload-session cap, shared across a registry's backends.
+    quota: Arc<QuotaTracker>,
+    /// `digest → repo` dedupe cache for linking re-uploaded blobs.
+    dedupe: Arc<DedupeIndex>,
     /// Per-session async locks serializing `append`/`finish`/`abort` on one
     /// upload id, so a concurrent PATCH cannot inject bytes between a finish's
     /// hash-verify and its promote (a TOCTOU that would commit unverified data

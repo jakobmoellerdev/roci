@@ -12,6 +12,7 @@ async fn manifest_tag_resolution_and_delete() {
         &d,
         "application/vnd.oci.image.manifest.v1+json",
         body,
+        ManifestLinks::default(),
     )
     .await
     .unwrap();
@@ -49,15 +50,36 @@ async fn delete_manifest_removes_pointing_tag() {
     // Tags "a"/"b" point at d; "other" points at a different digest and
     // must survive (covers the retain predicate's keep branch).
     let other = sha256_of(b"different");
-    s.put_manifest("r", Some("a"), &d, "application/json", body)
-        .await
-        .unwrap();
-    s.put_manifest("r", Some("b"), &d, "application/json", body)
-        .await
-        .unwrap();
-    s.put_manifest("r", Some("other"), &other, "application/json", b"different")
-        .await
-        .unwrap();
+    s.put_manifest(
+        "r",
+        Some("a"),
+        &d,
+        "application/json",
+        body,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
+    s.put_manifest(
+        "r",
+        Some("b"),
+        &d,
+        "application/json",
+        body,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
+    s.put_manifest(
+        "r",
+        Some("other"),
+        &other,
+        "application/json",
+        b"different",
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
     s.delete_manifest("r", &d).await.unwrap();
     // "a" and "b" removed; "other" remains.
     assert_eq!(
@@ -65,22 +87,43 @@ async fn delete_manifest_removes_pointing_tag() {
         vec!["other".to_string()]
     );
     // Re-pushing the same (tag, digest) is idempotent (dedup keeps one entry).
-    s.put_manifest("r", Some("other"), &other, "application/json", b"different")
-        .await
-        .unwrap();
+    s.put_manifest(
+        "r",
+        Some("other"),
+        &other,
+        "application/json",
+        b"different",
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         s.list_tags("r", None, usize::MAX).await.unwrap().items,
         vec!["other".to_string()]
     );
     // Deleting an untagged manifest in a fresh repo touches no tags.
     let d2 = sha256_of(b"lonely");
-    s.put_manifest("solo", None, &d2, "application/json", b"lonely")
-        .await
-        .unwrap();
+    s.put_manifest(
+        "solo",
+        None,
+        &d2,
+        "application/json",
+        b"lonely",
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
     // Untagged re-push is a no-op (dedup by digest).
-    s.put_manifest("solo", None, &d2, "application/json", b"lonely")
-        .await
-        .unwrap();
+    s.put_manifest(
+        "solo",
+        None,
+        &d2,
+        "application/json",
+        b"lonely",
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
     s.delete_manifest("solo", &d2).await.unwrap();
     assert!(s
         .list_tags("solo", None, usize::MAX)
@@ -107,6 +150,7 @@ async fn tag_schema_fallback_skips_malformed_digests() {
         &id,
         "application/vnd.oci.image.index.v1+json",
         idx.as_bytes(),
+        ManifestLinks::default(),
     )
     .await
     .unwrap();
@@ -130,16 +174,26 @@ async fn referrers_roundtrip_and_empty() {
         .unwrap()
         .items
         .is_empty());
-    s.add_referrer("r", &subject, &referrer, br#"{"digest":"x"}"#)
-        .await
-        .unwrap();
+    s.put_manifest(
+        "r",
+        None,
+        &referrer,
+        "application/json",
+        b"referrer",
+        ManifestLinks {
+            references: &[],
+            subject: Some((&subject, br#"{"digest":"x"}"#)),
+        },
+    )
+    .await
+    .unwrap();
     let listed = s
         .list_referrers("r", &subject, None, None, usize::MAX)
         .await
         .unwrap()
         .items;
     assert_eq!(listed.len(), 1);
-    // add_referrer merges the subject link into the stored descriptor.
+    // The subject link is merged into the stored descriptor.
     let parsed: serde_json::Value = serde_json::from_slice(&listed[0].1).unwrap();
     assert_eq!(parsed.get("digest").and_then(|v| v.as_str()), Some("x"));
     assert_eq!(
@@ -177,6 +231,7 @@ async fn referrers_tag_schema_fallback() {
         &fd,
         "application/vnd.oci.image.index.v1+json",
         fallback.as_bytes(),
+        ManifestLinks::default(),
     )
     .await
     .unwrap();
@@ -193,9 +248,16 @@ async fn referrers_tag_schema_fallback() {
     let junk = b"not json";
     let jd = sha256_of(junk);
     let tag2 = format!("sha256-{}", &other.as_string()[7..]);
-    s.put_manifest("r", Some(&tag2), &jd, "application/json", junk)
-        .await
-        .unwrap();
+    s.put_manifest(
+        "r",
+        Some(&tag2),
+        &jd,
+        "application/json",
+        junk,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
     assert!(s
         .list_referrers("r", &other, None, None, usize::MAX)
         .await
