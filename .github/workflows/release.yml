@@ -1,0 +1,121 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # Build release binaries on native runners per target. Linux uses static musl
+  # (same as Containerfile); macOS uses the native apple-darwin target.
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            os: linux
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            os: linux
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            os: macos
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            os: macos
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: release-${{ matrix.target }}
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        run: >-
+          cargo build
+          --release
+          --target ${{ matrix.target }}
+          -p roci-cli
+          --features full
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="roci-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp "target/${{ matrix.target }}/release/roci" "$staging/"
+          tar czf "${staging}.tar.gz" "$staging"
+          shasum -a 256 "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: roci-${{ matrix.target }}
+          path: |
+            roci-${{ matrix.target }}.tar.gz
+            roci-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 3
+
+  # Publish: download all build artifacts, attest provenance, upload to GitHub
+  # Release. Only this job holds write permissions.
+  publish:
+    name: publish + attest
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          pattern: roci-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: artifacts/*.tar.gz
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Create the release if it doesn't exist yet (draft, so manual review).
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --draft --generate-notes --title "$TAG"
+          # Upload tarballs + checksums.
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            artifacts/*.tar.gz artifacts/*.tar.gz.sha256

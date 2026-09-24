@@ -44,6 +44,7 @@ fn upload_progress(status: StatusCode, repo: &str, id: &str, received: u64) -> R
     (status, headers).into_response()
 }
 
+#[tracing::instrument(skip_all, name = "upload.session")]
 pub(crate) async fn start<S: Storage>(
     st: &AppState<S>,
     repo: &str,
@@ -67,10 +68,10 @@ pub(crate) async fn start<S: Storage>(
     // directly (put_blob verifies the digest); no session is needed.
     if let Some(digest) = q.digest {
         let d = Digest::parse(&digest)?;
-        let body = read_body_limited(req, st.max_body).await?;
+        let body = read_body_limited(req, st.max_body()).await?;
         // A monolithic body is a complete upload, so the per-session cap applies
         // here too (e.g. when max_upload is configured below max_body).
-        if body.len() as u64 > st.max_upload {
+        if body.len() as u64 > st.max_upload() {
             return Err(ApiError::payload_too_large(
                 "upload exceeds maximum blob size",
             ));
@@ -100,7 +101,7 @@ pub(crate) async fn patch<S: Storage>(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split('-').next())
         .and_then(|s| s.trim().parse::<u64>().ok());
-    let body = read_body_limited(req, st.max_body).await?;
+    let body = read_body_limited(req, st.max_body()).await?;
     let total = match st.storage.append_upload(repo, id, &body, range_start).await {
         Ok(t) => t,
         // The atomic under-lock offset check rejects a concurrent/duplicate
@@ -117,7 +118,7 @@ pub(crate) async fn patch<S: Storage>(
     // Reject a session whose cumulative size exceeds the per-upload cap: drop
     // the staging file and return 413 / SIZE_INVALID so a client cannot exhaust
     // disk with one open upload.
-    if total > st.max_upload {
+    if total > st.max_upload() {
         let _ = st.storage.abort_upload(repo, id).await;
         return Err(ApiError::payload_too_large(
             "upload exceeds maximum blob size",
@@ -126,6 +127,7 @@ pub(crate) async fn patch<S: Storage>(
     Ok(upload_progress(StatusCode::ACCEPTED, repo, id, total))
 }
 
+#[tracing::instrument(skip_all, name = "digest.verify")]
 pub(crate) async fn finish<S: Storage>(
     st: &AppState<S>,
     repo: &str,
@@ -137,12 +139,12 @@ pub(crate) async fn finish<S: Storage>(
         .digest
         .ok_or_else(|| ApiError::digest_invalid("missing digest on upload completion"))?;
     let d = Digest::parse(&digest)?;
-    let body = read_body_limited(req, st.max_body).await?;
+    let body = read_body_limited(req, st.max_body()).await?;
     // Hand the trailing body to finish_upload so the append and the
     // verify+promote happen under one session-lock hold — a concurrent PATCH
     // cannot inject bytes between them. The per-session cap is enforced there.
     st.storage
-        .finish_upload(repo, id, &d, st.max_upload, &body)
+        .finish_upload(repo, id, &d, st.max_upload(), &body)
         .await?;
     Ok(created(&blob_location(repo, &d), &d))
 }

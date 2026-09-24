@@ -12,14 +12,14 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [x] Uses OCI image layout for image storage
 - [x] Can serve any OCI image layout as a registry
 - [~] Single binary for all features
-- [~] Runs without root privileges
+- [x] Runs without root privileges
 - [~] Clear separation between core dist-spec and roci-specific extensions
-- [ ] Behavior controlled entirely via configuration
-- [ ] Binaries released for multiple operating systems and architectures
+- [x] Behavior controlled entirely via configuration
+- [x] Binaries released for multiple operating systems and architectures
 - [x] Image deletion by tag
 - [ ] Compatible with ecosystem tools (skopeo, cri-o)
 - [ ] Suitable for on-premises deployments (e.g. colocated with Kubernetes)
-- [ ] HTTP/2 multiplexing + keep-alive; TLS 1.3 with optional kTLS zero-copy
+- [~] HTTP/2 multiplexing + keep-alive; TLS 1.3 with optional kTLS zero-copy
 - [~] SHA-512 default digests (SHA-256 accepted); constant-time verification
 - [ ] Immutable-by-digest response caching (`ETag`/`If-None-Match` → `304`), correct tag-vs-digest cache-control
 - [ ] Foreign media types & `tar+zstd` layers stored/served as opaque blobs (Nydus, eStargz, SBOM, signatures)
@@ -39,7 +39,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 
 ## Security & access control
 
-- [ ] TLS support (TLS 1.3, 0-RTT resumption)
+- [~] TLS support (TLS 1.3, 0-RTT resumption)
 - [ ] TLS mutual authentication
 - [ ] HTTP Basic authentication — local htpasswd
 - [ ] HTTP Basic authentication — LDAP
@@ -73,9 +73,9 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 
 ## Operability
 
-- [ ] Rate limiting, including per-HTTP-method limits
-- [ ] Prometheus metrics
-- [ ] OpenTelemetry observability (OTLP traces, metrics, and logs)
+- [x] Rate limiting, including per-HTTP-method limits
+- [x] Prometheus metrics
+- [x] OpenTelemetry observability (OTLP traces, metrics, and logs)
 - [ ] Node exporter for minimal builds
 - [ ] Swagger-based API documentation
-- [ ] O(1) cold start (rkyv mmap snapshot / fast-restart) and low-fragmentation allocator
+- [~] O(1) cold start (rkyv mmap snapshot / fast-restart) and low-fragmentation allocator

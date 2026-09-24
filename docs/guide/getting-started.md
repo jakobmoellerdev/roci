@@ -18,6 +18,7 @@ Common flags:
 
 | Flag | Purpose |
 | --- | --- |
+| `--config` | TOML config file (see [Configuration](/guide/configuration)). |
 | `--listen` | Address to bind (default `127.0.0.1:5000`). |
 | `--storage-root` | Directory for the on-disk OCI image layout. |
 

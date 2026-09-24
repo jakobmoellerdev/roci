@@ -31,6 +31,10 @@ The workspace separates the stable dist-spec core from cleanly isolated extensio
 
 Storage is a plain [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md) on disk. Highlights (see the canonical doc for the full design): content-addressable dedup, online O(garbage) garbage collection, an embedded metadata index (append-log + in-RAM maps by default, B-tree KV upgrade) with coalescing write-behind of the spec-visible `index.json` (reconciled at startup), and zero-copy blob serving.
 
+## Configuration & observability
+
+One TOML file (`roci --config`) with `http`, `storage`, `limits`, `delete`, `log`, and `telemetry` sections, validated on load; zero-config defaults need no file. The `otel` build exports traces, metrics, and logs over OTLP and serves a Prometheus scrape view of the same meters; metric labels are bounded by construction, and tail-based sampling is delegated to the OTel Collector.
+
 ## Scaling
 
 - **Vertical** — streaming, zero-copy, bounded memory; RSS scales with reference count, not stored bytes.

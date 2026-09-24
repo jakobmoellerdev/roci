@@ -18,11 +18,25 @@ serde_json.workspace = true
 tracing.workspace = true
 bytes.workspace = true
 serde_urlencoded = "0.7"
+roci-telemetry.workspace = true
+
+# OTel: traceparent propagation; off in minimal build.
+opentelemetry = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tempfile.workspace = true
 tower = { workspace = true, features = ["util"] }
 serde_json.workspace = true
 http-body-util = "0.1"
 roci-storage.workspace = true
+roci-config.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing", "trace"] }
+opentelemetry = { workspace = true }
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+default = []
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]

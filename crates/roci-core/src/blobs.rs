@@ -50,6 +50,7 @@ pub(crate) async fn get<S: Storage>(
 /// Open the blob and produce its GET response — full `200`, ranged `206`, or
 /// `416` — streaming the file. All IO errors propagate to the caller's single
 /// error mapping (a missing blob is `NotFound`).
+#[tracing::instrument(skip_all, name = "blob.open")]
 async fn get_body<S: Storage>(
     st: &AppState<S>,
     repo: &str,

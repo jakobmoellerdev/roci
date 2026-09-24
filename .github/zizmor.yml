@@ -13,3 +13,4 @@ rules:
       - ci.yml
       - conformance.yml
       - filesystems.yml
+      - release.yml

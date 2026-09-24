@@ -156,11 +156,20 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let code = self.code();
+        let status = self.status();
+
+        // Record error on the current span + increment the error counter.
+        let span = tracing::Span::current();
+        span.record("error.type", code);
+        span.record("otel.status_code", "ERROR");
+        roci_telemetry::record_error(code);
+
         let body = serde_json::json!({
-            "errors": [{ "code": self.code(), "message": self.message() }]
+            "errors": [{ "code": code, "message": self.message() }]
         });
         (
-            self.status(),
+            status,
             [(header::CONTENT_TYPE, "application/json")],
             body.to_string(),
         )

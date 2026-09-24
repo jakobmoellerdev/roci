@@ -203,3 +203,7 @@ container:
 # Build the multi-arch image for both Linux platforms (requires buildx + QEMU).
 container-multiarch:
     docker buildx build --platform linux/amd64,linux/arm64 -t roci:multiarch -f Containerfile .
+
+# Build a release binary with all features (allocator, OTel, extensions).
+release-build:
+    cargo build --release -p roci-cli --features full

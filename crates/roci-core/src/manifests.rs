@@ -12,9 +12,6 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use roci_storage::{digest_of, sha256_of, Digest, Storage, MEDIA_TYPE_IMAGE_MANIFEST};
 
-/// Maximum accepted manifest size (4 MiB) — bounded-input guard (PLAN Phase 0).
-pub(crate) const MAX_MANIFEST: usize = 4 * 1024 * 1024;
-
 /// Maximum JSON nesting depth accepted in a manifest body.
 pub(crate) const MAX_JSON_DEPTH: usize = 32;
 
@@ -205,6 +202,7 @@ fn referrer_descriptor(
     serde_json::to_vec(&serde_json::Value::Object(descriptor)).unwrap_or_default()
 }
 
+#[tracing::instrument(skip_all, name = "meta.resolve")]
 pub(crate) async fn get<S: Storage>(
     st: &AppState<S>,
     repo: &str,
@@ -246,6 +244,7 @@ pub(crate) async fn get<S: Storage>(
     }
 }
 
+#[tracing::instrument(skip_all, name = "meta.append")]
 pub(crate) async fn put<S: Storage>(
     st: &AppState<S>,
     repo: &str,
@@ -259,15 +258,16 @@ pub(crate) async fn put<S: Storage>(
         .unwrap_or(MEDIA_TYPE_IMAGE_MANIFEST)
         .to_string();
     // Bound the manifest body by the smaller of the configured request-body
-    // limit and the fixed 4 MiB manifest cap. Exceeding the configured limit is
-    // a 413 (payload too large); exceeding only the fixed cap is MANIFEST_INVALID.
-    let manifest_limit = st.max_body.min(MAX_MANIFEST);
+    // limit and the configured manifest cap. Exceeding the body limit is
+    // a 413 (payload too large); exceeding only the manifest cap is MANIFEST_INVALID.
+    let max_manifest = st.max_manifest();
+    let manifest_limit = st.max_body().min(max_manifest);
     let body = match read_body_limited(req, manifest_limit).await {
         Ok(b) => b,
-        Err(e) if st.max_body <= MAX_MANIFEST => return Err(e),
+        Err(e) if st.max_body() <= max_manifest => return Err(e),
         Err(_) => {
             return Err(ApiError::manifest_invalid(
-                "manifest exceeds 4 MiB size cap",
+                "manifest exceeds manifest size cap",
             ))
         }
     };

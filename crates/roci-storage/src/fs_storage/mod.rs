@@ -50,6 +50,36 @@ impl FsStorage {
         Ok(store)
     }
 
+    /// Create a store rooted at `root` with an explicit cache byte budget.
+    /// A `cache_capacity` of `0` disables the small-blob cache entirely.
+    pub fn with_cache_capacity(root: impl AsRef<Path>, cache_capacity: usize) -> io::Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        std::fs::create_dir_all(&root)?;
+        let meta = Arc::new(LogMetadataStore::open(&root)?);
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let cache = if cache_capacity == 0 {
+            Arc::new(SmallBlobCache::with_limits(0, 0))
+        } else {
+            Arc::new(SmallBlobCache::with_limits(
+                crate::cache::DEFAULT_SMALL_BLOB_THRESHOLD,
+                cache_capacity,
+            ))
+        };
+        let store = Self {
+            root: Arc::new(root),
+            meta,
+            presence: Arc::new(BlobPresenceFilter::new()),
+            cache,
+            upload_locks: Arc::new(StdMutex::new(HashMap::new())),
+            index_dirty: Arc::new(StdMutex::new(HashMap::new())),
+            index_notify: Arc::new(Notify::new()),
+            _index_cancel: Arc::new(cancel_tx),
+        };
+        store.seed_presence_from_cas();
+        store.spawn_index_writer(cancel_rx);
+        Ok(store)
+    }
+
     /// One-time referrers enable-upgrade pass: walk every repo's `index.json`,
     /// and for any descriptor carrying `subject` register it in the metadata
     /// store so `list_referrers` sees pre-existing links. Call at startup when

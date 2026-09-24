@@ -19,7 +19,8 @@
 # --- Build stage: musl-static compile --------------------------------------
 FROM --platform=$BUILDPLATFORM rust:1.98-alpine AS builder
 
-# musl-dev provides the static C runtime bits; no other C deps are used.
+# musl-dev provides the static C runtime; mimalloc (in `full`) compiles C via
+# cc — musl-friendly, no background threads, smaller than jemalloc.
 RUN apk add --no-cache musl-dev
 
 WORKDIR /src
@@ -38,7 +39,7 @@ RUN case "$TARGETARCH" in \
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     target="$(cat /tmp/rust-target)" && \
-    cargo build --release --target "$target" -p roci-cli && \
+    cargo build --release --target "$target" -p roci-cli --features full && \
     cp "target/$target/release/roci" /roci && \
     strip /roci
 
