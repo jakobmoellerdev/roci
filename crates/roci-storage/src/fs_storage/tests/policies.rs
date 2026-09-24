@@ -413,3 +413,49 @@ async fn lifecycle_blob_left_clears_everything() {
     // Checksum should be gone.
     assert!(s.meta.checksum("r", &d.as_string()).is_none());
 }
+
+#[tokio::test]
+async fn manifest_commit_rechecks_required_blobs_under_the_fence() {
+    let (_dir, s) = store_with(QuotaLimits::default(), false);
+    let missing = sha256_of(b"never pushed");
+    let body = br#"{"schemaVersion":2,"y":1}"#;
+    let d = sha256_of(body);
+    let err = s
+        .put_manifest(
+            "r",
+            Some("v1"),
+            &d,
+            "application/json",
+            body,
+            ManifestLinks {
+                references: std::slice::from_ref(&missing),
+                required: std::slice::from_ref(&missing),
+                subject: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::MissingReference(ref m) if *m == missing.as_string()));
+    // Nothing was committed: no tag, no manifest record.
+    assert!(s.meta.resolve_tag("r", "v1").is_none());
+    assert!(s.meta.manifest_media_type("r", &d.as_string()).is_none());
+}
+
+#[tokio::test]
+async fn concurrent_duplicate_uploads_are_charged_once() {
+    let (_dir, s) = store_with(repo_cap(1000), false);
+    let data = b"same bytes, many pushers";
+    let d = sha256_of(data);
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let s = s.clone();
+        let d = d.clone();
+        tasks.push(tokio::spawn(async move { s.put_blob("r", &d, data).await }));
+    }
+    for t in tasks {
+        t.await.unwrap().unwrap();
+    }
+    assert_eq!(s.quota.repo_bytes("r"), data.len() as u64);
+    s.delete_blob("r", &d).await.unwrap();
+    assert_eq!(s.quota.repo_bytes("r"), 0);
+}

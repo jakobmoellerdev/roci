@@ -89,6 +89,11 @@ pub struct FsStorage {
     /// or bypass the size cap). Keyed by `(repo, id)`; entries are dropped when
     /// a session finishes or aborts.
     upload_locks: UploadLocks,
+    /// Per-`(repo, digest)` async locks serializing blob admission + publication,
+    /// so concurrent uploads of the same absent blob cannot both charge quota
+    /// while only one actually lands (quota double-count). Entries are transient:
+    /// created on first admission for a key, dropped after publication.
+    blob_admit_locks: UploadLocks,
     /// Background index write-behind: repos whose `index.json` lags the
     /// metadata store, with a per-repo mutation generation. Mutations bump the
     /// generation and wake the writer; the writer clears an entry only if its

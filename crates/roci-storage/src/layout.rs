@@ -133,6 +133,10 @@ pub(crate) fn same_manifest_set(a: &serde_json::Value, b: &serde_json::Value) ->
 /// `index.json` yet) whose blobs must still seed the presence filter. Named by
 /// its `/`-joined path relative to `root`. Best-effort — an unreadable
 /// directory is skipped. Used only to seed the blob-presence filter at startup.
+///
+/// Symlinks are never followed at any level: `DirEntry::file_type` and
+/// `symlink_metadata` are used throughout so a symlinked repo, `blobs`, or
+/// algorithm directory cannot redirect enumeration outside the store root.
 pub(crate) fn discover_repos(root: &Path) -> Vec<String> {
     fn walk(dir: &Path, rel: &[String], depth: usize, out: &mut Vec<String>) {
         // Bound depth so a pathological tree cannot recurse without limit;
@@ -143,11 +147,23 @@ pub(crate) fn discover_repos(root: &Path) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
-        if !rel.is_empty() && (dir.join("index.json").is_file() || dir.join("oci-layout").is_file())
-        {
-            out.push(rel.join("/"));
+        // Use symlink_metadata so a symlinked index.json/oci-layout cannot
+        // masquerade as a regular file and make us treat an attacker-controlled
+        // directory as a valid repo.
+        if !rel.is_empty() {
+            let has_index = std::fs::symlink_metadata(dir.join("index.json"))
+                .map(|m| m.is_file())
+                .unwrap_or(false);
+            let has_layout = std::fs::symlink_metadata(dir.join("oci-layout"))
+                .map(|m| m.is_file())
+                .unwrap_or(false);
+            if has_index || has_layout {
+                out.push(rel.join("/"));
+            }
         }
         for entry in entries.flatten() {
+            // DirEntry::file_type does not follow symlinks on most platforms;
+            // only real directories are entered.
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
@@ -173,20 +189,39 @@ pub(crate) fn discover_repos(root: &Path) -> Vec<String> {
 /// name parses as a wire [`crate::Digest`] (in-progress `.tmp` siblings and
 /// foreign names are skipped). Best-effort — an unreadable directory is
 /// skipped. The shared startup/GC/scrub enumeration.
+///
+/// Symlinks are never followed: at the `blobs` and `<alg>` levels only real
+/// directories are entered; at the leaf level only regular files (via
+/// `symlink_metadata`) are visited — so a symlinked repo, `blobs`, algorithm
+/// directory or digest leaf cannot redirect enumeration outside the store root.
 pub(crate) fn for_each_cas_blob(
     root: &Path,
     mut visit: impl FnMut(&str, &crate::Digest, &std::fs::DirEntry),
 ) {
     for repo in discover_repos(root) {
-        let Ok(algs) = std::fs::read_dir(root.join(&repo).join("blobs")) else {
+        let blobs_path = root.join(&repo).join("blobs");
+        // Skip if `blobs` is a symlink (no-follow check).
+        match std::fs::symlink_metadata(&blobs_path) {
+            Ok(m) if m.is_dir() => {}
+            _ => continue,
+        }
+        let Ok(algs) = std::fs::read_dir(&blobs_path) else {
             continue;
         };
         for alg in algs.flatten() {
+            // Skip algorithm dirs that are symlinks.
+            if !alg.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
             let alg_name = alg.file_name().to_string_lossy().into_owned();
             let Ok(hexes) = std::fs::read_dir(alg.path()) else {
                 continue;
             };
             for hex in hexes.flatten() {
+                // Leaves must be regular files (not symlinks).
+                if !hex.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
                 let name = format!("{alg_name}:{}", hex.file_name().to_string_lossy());
                 if let Ok(digest) = crate::Digest::parse(&name) {
                     visit(&repo, &digest, &hex);

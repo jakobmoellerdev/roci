@@ -87,19 +87,25 @@ impl QuotaTracker {
     }
 
     /// Return `size` bytes: a blob left `repo`, or an admitted blob was not
-    /// stored after all (failed promote / it was already present).
+    /// stored after all (failed promote / it was already present). An unknown
+    /// repo is a no-op, and at most what the repo currently holds is released
+    /// from both the per-repo and total counters (prevents undercount from
+    /// stale/double cleanup).
     pub fn release(&self, repo: &str, size: u64) {
         if !self.tracks_bytes() {
             return;
         }
         let mut b = self.bytes.lock().expect("quota lock poisoned");
-        b.total = b.total.saturating_sub(size);
-        if let Some(used) = b.per_repo.get_mut(repo) {
-            *used = used.saturating_sub(size);
-            if *used == 0 {
-                b.per_repo.remove(repo);
-            }
+        // Only release what the repo actually holds.
+        let Some(used) = b.per_repo.get_mut(repo) else {
+            return; // unknown repo → no-op
+        };
+        let actual = size.min(*used);
+        *used = used.saturating_sub(actual);
+        if *used == 0 {
+            b.per_repo.remove(repo);
         }
+        b.total = b.total.saturating_sub(actual);
     }
 
     /// Bytes currently accounted to `repo`.
@@ -228,6 +234,37 @@ mod tests {
         assert_eq!(q.total_bytes(), 5);
         q.release("a", 50);
         assert_eq!((q.repo_bytes("a"), q.total_bytes()), (0, 0));
+    }
+
+    #[test]
+    fn release_unknown_repo_is_noop() {
+        let q = limits(100, 200, 0);
+        q.admit("a", 10).unwrap();
+        // Releasing from an unknown repo changes nothing.
+        q.release("unknown", 10);
+        assert_eq!(q.total_bytes(), 10);
+        assert_eq!(q.repo_bytes("a"), 10);
+    }
+
+    #[test]
+    fn release_caps_at_repo_holding() {
+        let q = limits(100, 200, 0);
+        q.admit("a", 10).unwrap();
+        q.admit("b", 20).unwrap();
+        // Release more than repo "a" holds: only 10 released from total.
+        q.release("a", 50);
+        assert_eq!(q.repo_bytes("a"), 0);
+        assert_eq!(q.total_bytes(), 20); // only b's 20 remain
+    }
+
+    #[test]
+    fn double_release_does_not_undercount_total() {
+        let q = limits(100, 200, 0);
+        q.admit("a", 10).unwrap();
+        q.release("a", 10);
+        // Second release: repo "a" is gone → no-op.
+        q.release("a", 10);
+        assert_eq!(q.total_bytes(), 0);
     }
 
     #[test]

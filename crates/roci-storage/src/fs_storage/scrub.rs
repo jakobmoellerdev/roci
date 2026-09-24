@@ -337,11 +337,21 @@ impl FsStorage {
             // Size mismatch or CRC mismatch — fall through to full re-hash.
         }
 
-        // Escalate: full digest re-hash.
+        // Escalate: full digest re-hash.  Capture the opened fd's inode
+        // identity *before* hashing so we can re-verify after acquiring the
+        // exclusive fence (a concurrent delete+re-push could install a valid
+        // replacement; we must not quarantine that).
         let file2 = match open_beneath(&self.root, &rel).await {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return (ScrubResult::Skipped, 0),
             Err(_) => return (ScrubResult::Skipped, 0),
+        };
+        let hashed_ino = {
+            let st = match rustix::fs::fstat(&file2) {
+                Ok(s) => s,
+                Err(_) => return (ScrubResult::Skipped, 0),
+            };
+            (st.st_dev as u64, st.st_ino as u64)
         };
 
         let (computed_digest, computed_crc) = match hash_reader(file2, digest.algorithm()).await {
@@ -368,29 +378,132 @@ impl FsStorage {
             };
             (result, file_size)
         } else {
-            // Corrupt: quarantine the blob.
+            // Corrupt: quarantine the blob under the exclusive GC fence so a
+            // concurrent write path cannot race with the rename.
             tracing::error!(
                 repo = repo,
                 digest = digest_str,
                 "scrub: blob corrupt — digest mismatch, quarantining"
             );
+            let _fence = self.gc.exclusive().await;
+
+            // Re-verify the path still names the inode we hashed: a concurrent
+            // delete+re-push may have replaced the file since our hash.
+            let path_ino = {
+                let full = self.root.join(&rel);
+                match std::fs::symlink_metadata(&full) {
+                    Ok(m) => {
+                        use std::os::unix::fs::MetadataExt;
+                        (m.dev(), m.ino())
+                    }
+                    Err(_) => {
+                        // Path gone — nothing to quarantine.
+                        return (ScrubResult::Corrupt, file_size);
+                    }
+                }
+            };
+            if path_ino != hashed_ino {
+                // A different inode is now at the path — the corrupt data was
+                // already replaced; skip quarantine (the new file is presumed
+                // valid until next scrub).
+                tracing::info!(
+                    repo,
+                    digest = digest_str,
+                    "scrub: inode replaced since hash; skipping quarantine"
+                );
+                return (ScrubResult::Corrupt, file_size);
+            }
+
+            // Quarantine this repo's copy.
             match quarantine_blob(&self.root, repo, &digest, digest_str).await {
                 Ok(()) => {
                     self.blob_left(repo, digest_str, Some(file_size));
                 }
                 Err(e) => {
-                    // If quarantine rename failed (e.g. blob already gone), try
-                    // blob_left anyway so the bookkeeping is updated.
+                    // Rename failed: leave the corrupt file in place for the
+                    // next pass. Do NOT call blob_left — the CAS file is still
+                    // present, and clearing bookkeeping would allow the next
+                    // restart to reseed and serve the known-bad bytes without
+                    // recourse, and would permanently undercount quota.
                     tracing::error!(
                         repo = repo,
                         digest = digest_str,
                         error = %e,
-                        "scrub: quarantine rename failed"
+                        "scrub: quarantine rename failed; leaving for next pass"
                     );
-                    self.blob_left(repo, digest_str, Some(file_size));
+                    return (ScrubResult::Corrupt, file_size);
                 }
             }
+
+            // Hard-link fallback shares one inode across repositories.
+            // Quarantine every other repo's hard-linked copy (same dev+ino)
+            // of this digest so those repos can't continue serving the bad
+            // bytes until a later scrub pass discovers them independently.
+            self.quarantine_hard_linked_copies(digest_str, &digest, hashed_ino, repo)
+                .await;
+
             (ScrubResult::Corrupt, file_size)
+        }
+    }
+
+    /// Quarantine all other repos' hard-linked copies of `digest` that share
+    /// the same `(dev, ino)` as the already-quarantined copy. Called under
+    /// the exclusive GC fence.
+    async fn quarantine_hard_linked_copies(
+        &self,
+        digest_str: &str,
+        digest: &Digest,
+        corrupt_ino: (u64, u64),
+        already_quarantined_repo: &str,
+    ) {
+        let root = self.root.clone();
+        let digest_clone = digest.clone();
+        let corrupt_ino_val = corrupt_ino;
+        let already_repo = already_quarantined_repo.to_string();
+        // Collect repos whose CAS copy of this digest shares the corrupt inode.
+        let linked: Vec<(String, u64)> = {
+            let root = root.clone();
+            let digest_c = digest_clone.clone();
+            run_blocking(move || {
+                let mut hits = Vec::new();
+                for_each_cas_blob(&root, |r, d, entry| {
+                    if d.as_string() != digest_c.as_string() {
+                        return;
+                    }
+                    if r == already_repo {
+                        return;
+                    }
+                    if let Ok(m) = entry.metadata() {
+                        use std::os::unix::fs::MetadataExt;
+                        if (m.dev(), m.ino()) == corrupt_ino_val {
+                            hits.push((r.to_string(), m.len()));
+                        }
+                    }
+                });
+                Ok(hits)
+            })
+            .await
+            .unwrap_or_default()
+        };
+        for (other_repo, size) in linked {
+            match quarantine_blob(&self.root, &other_repo, digest, digest_str).await {
+                Ok(()) => {
+                    self.blob_left(&other_repo, digest_str, Some(size));
+                    tracing::warn!(
+                        repo = other_repo,
+                        digest = digest_str,
+                        "scrub: quarantined hard-linked copy"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        repo = other_repo,
+                        digest = digest_str,
+                        error = %e,
+                        "scrub: quarantine of hard-linked copy failed; leaving for next pass"
+                    );
+                }
+            }
         }
     }
 
@@ -1133,5 +1246,34 @@ mod tests {
         ));
         let q_dir = _dir.path().join(QUARANTINE_DIR);
         assert!(q_dir.is_dir());
+    }
+
+    #[tokio::test]
+    async fn corrupt_hard_linked_copies_are_quarantined_in_every_repo() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, s) = test_store(); // dedupe on: the second push hard-links
+        let data = b"shared and then rotted";
+        let d = sha256_of(data);
+        s.put_blob("a", &d, data).await.unwrap();
+        s.put_blob("b", &d, data).await.unwrap();
+        let pa = s.blob_path("a", &d).unwrap();
+        let pb = s.blob_path("b", &d).unwrap();
+        if std::fs::metadata(&pa).unwrap().ino() != std::fs::metadata(&pb).unwrap().ino() {
+            return; // reflink filesystem: copies are independent extents
+        }
+        let mut bytes = std::fs::read(&pa).unwrap();
+        bytes[0] ^= 0xFF;
+        std::fs::write(&pa, &bytes).unwrap(); // same inode → both names rot
+        s.scrub_pass().await;
+        for repo in ["a", "b"] {
+            assert!(matches!(
+                s.blob_size(repo, &d).await,
+                Err(crate::StorageError::NotFound)
+            ));
+        }
+        let quarantined = std::fs::read_dir(dir.path().join(".roci-quarantine"))
+            .unwrap()
+            .count();
+        assert_eq!(quarantined, 2);
     }
 }

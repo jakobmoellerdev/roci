@@ -2,26 +2,41 @@
 //! `root/uploads/<repo components>/<id>` with random 128-bit hex ids,
 //! per-session lock, Content-Range precondition.
 //!
+//! All staging file I/O uses `roci_storage::beneath` component-wise no-follow
+//! opens so a symlink planted at `uploads/<repo>` or at the session id cannot
+//! redirect operations outside the storage root.
+//!
 //! Staging is repo-scoped: a session id is only usable within its originating
 //! repo, matching FsStorage's isolation semantics.
 
 use crate::S3Storage;
+use roci_storage::beneath::{
+    create_empty_beneath, open_append_beneath, open_beneath, stat_beneath, unlink_beneath,
+};
 use roci_storage::StorageError;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 impl S3Storage {
-    /// Staging directory for a repo: `root/uploads/<repo>`.
-    fn repo_staging_dir(&self, repo: &str) -> Result<PathBuf, StorageError> {
+    /// Relative path from root to the staging directory for a repo:
+    /// `uploads/<repo>`.
+    pub(crate) fn repo_staging_rel(&self, repo: &str) -> Result<PathBuf, StorageError> {
         validate_repo_for_staging(repo)?;
-        Ok(self.root.join("uploads").join(repo))
+        Ok(Path::new("uploads").join(repo))
     }
 
-    /// Staging file path for an upload session: `root/uploads/<repo>/<id>`.
+    /// Relative path from root to a staging file: `uploads/<repo>/<id>`.
+    pub(crate) fn staging_rel(&self, repo: &str, id: &str) -> Result<PathBuf, StorageError> {
+        validate_session_id(id)?;
+        Ok(self.repo_staging_rel(repo)?.join(id))
+    }
+
+    /// Full staging file path (for legacy callers that need it, e.g. enumeration).
     pub(crate) fn staging_path(&self, repo: &str, id: &str) -> Result<PathBuf, StorageError> {
         validate_session_id(id)?;
-        Ok(self.repo_staging_dir(repo)?.join(id))
+        validate_repo_for_staging(repo)?;
+        Ok(self.root.join("uploads").join(repo).join(id))
     }
 
     /// Begin a new upload session. Returns the session id.
@@ -32,14 +47,9 @@ impl S3Storage {
         // Validate the id before creating the lock entry.
         validate_session_id(&id)?;
         self.quota.begin_session()?;
-        // Ensure repo staging dir exists.
-        let dir = self.repo_staging_dir(repo)?;
-        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-            self.quota.end_session();
-            return Err(StorageError::Io(e));
-        }
-        let path = self.staging_path(repo, &id)?;
-        if let Err(e) = tokio::fs::File::create(&path).await {
+        // Create the staging file via no-follow beneath-root open.
+        let dir_rel = self.repo_staging_rel(repo)?;
+        if let Err(e) = create_empty_beneath(&self.root, &dir_rel, &id).await {
             self.quota.end_session();
             return Err(StorageError::Io(e));
         }
@@ -54,10 +64,8 @@ impl S3Storage {
         chunk: &[u8],
         expected_offset: Option<u64>,
     ) -> Result<u64, StorageError> {
-        let path = self.staging_path(repo, id)?;
-        let mut f = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
+        let rel = self.staging_rel(repo, id)?;
+        let mut f = open_append_beneath(&self.root, &rel)
             .await
             .map_err(map_not_found)?;
         if let Some(offset) = expected_offset {
@@ -76,15 +84,22 @@ impl S3Storage {
 
     /// Get the current size of a staging file.
     pub(crate) async fn staging_size(&self, repo: &str, id: &str) -> Result<u64, StorageError> {
-        let path = self.staging_path(repo, id)?;
-        let meta = tokio::fs::metadata(&path).await.map_err(map_not_found)?;
-        Ok(meta.len())
+        let rel = self.staging_rel(repo, id)?;
+        match stat_beneath(&self.root, &rel)
+            .await
+            .map_err(map_not_found)?
+        {
+            Some((true, size)) => Ok(size),
+            _ => Err(StorageError::NotFound),
+        }
     }
 
     /// Remove a staging file and release the session.
     pub(crate) async fn remove_staging(&self, repo: &str, id: &str) {
-        if let Ok(path) = self.staging_path(repo, id) {
-            let _ = tokio::fs::remove_file(&path).await;
+        if let Ok(dir_rel) = self.repo_staging_rel(repo) {
+            if validate_session_id(id).is_ok() {
+                let _ = unlink_beneath(&self.root, &dir_rel, id).await;
+            }
         }
         self.quota.end_session();
     }
@@ -96,8 +111,10 @@ impl S3Storage {
         id: &str,
         algorithm: &str,
     ) -> Result<(roci_storage::Digest, u32, u64), StorageError> {
-        let path = self.staging_path(repo, id)?;
-        let mut f = tokio::fs::File::open(&path).await.map_err(map_not_found)?;
+        let rel = self.staging_rel(repo, id)?;
+        let mut f = open_beneath(&self.root, &rel)
+            .await
+            .map_err(map_not_found)?;
         let size = f.metadata().await?.len();
 
         let (digest, crc) = match algorithm {

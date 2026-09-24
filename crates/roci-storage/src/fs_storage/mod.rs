@@ -83,6 +83,7 @@ impl FsStorage {
             quota,
             dedupe: Arc::new(DedupeIndex::new(config.dedupe)),
             upload_locks: Arc::new(StdMutex::new(HashMap::new())),
+            blob_admit_locks: Arc::new(StdMutex::new(HashMap::new())),
             index_dirty: Arc::new(StdMutex::new(HashMap::new())),
             index_notify: Arc::new(Notify::new()),
             _index_cancel: Arc::new(cancel_tx),
@@ -160,6 +161,35 @@ impl FsStorage {
             .lock()
             .expect("upload-locks poisoned")
             .remove(&(repo.to_string(), id.to_string()));
+    }
+
+    /// Per-`(repo, digest)` async lock serializing blob admission + publication.
+    /// Prevents two concurrent uploads of the same absent blob from both
+    /// charging quota while only one actually lands.
+    fn blob_admit_lock(&self, repo: &str, digest: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .blob_admit_locks
+            .lock()
+            .expect("blob-admit-locks poisoned");
+        Arc::clone(
+            locks
+                .entry((repo.to_string(), digest.to_string()))
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
+    /// Drop a blob-admission lock entry after publication.
+    /// Removed only when no other admission of the same blob holds or waits
+    /// on it (map + the caller's clone), so a waiter never races a fresh lock.
+    fn drop_blob_admit_lock(&self, repo: &str, digest: &str) {
+        let mut locks = self
+            .blob_admit_locks
+            .lock()
+            .expect("blob-admit-locks poisoned");
+        let key = (repo.to_string(), digest.to_string());
+        if locks.get(&key).is_some_and(|l| Arc::strong_count(l) <= 2) {
+            locks.remove(&key);
+        }
     }
 
     /// One startup walk over every CAS blob and staged upload: seeds the

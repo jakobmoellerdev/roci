@@ -263,11 +263,7 @@ pub async fn unlink_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io::Resu
 /// stage an upload session (`<repo…>/uploads/<id>`) without following a planted
 /// `uploads` symlink the way a path-based `File::create` would.
 #[cfg(unix)]
-pub async fn create_empty_beneath(
-    root: &Path,
-    dir_rel: &Path,
-    leaf: &str,
-) -> io::Result<()> {
+pub async fn create_empty_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io::Result<()> {
     use rustix::fs::{Mode, OFlags};
     let root = root.to_path_buf();
     let dir_rel = dir_rel.to_path_buf();

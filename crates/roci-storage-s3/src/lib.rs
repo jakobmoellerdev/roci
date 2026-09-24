@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 
-/// Per-session upload locks: `(repo, id) → async lock`.
+/// Keyed async locks: `(repo, id-or-digest) → lock` (upload sessions, blob admission).
 type UploadLocks = Arc<StdMutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>>;
 
 /// S3-compatible object-store backend for roci.
@@ -63,6 +63,9 @@ pub struct S3Storage {
     manifest_sizes: Arc<StdMutex<HashMap<(String, String), u64>>>,
     /// Cached remote index.json for synchronous media-type lookups.
     cached_remote_index: Arc<StdMutex<HashMap<String, serde_json::Value>>>,
+    /// Striped per-`(repo, digest)` async locks serialising admit+publish so
+    /// concurrent uploads of the same blob cannot double-charge quota.
+    admit_locks: UploadLocks,
 }
 
 impl S3Storage {
@@ -105,6 +108,7 @@ impl S3Storage {
             layout_cache: Arc::new(StdMutex::new(HashSet::new())),
             manifest_sizes: Arc::new(StdMutex::new(HashMap::new())),
             cached_remote_index: Arc::new(StdMutex::new(HashMap::new())),
+            admit_locks: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -124,6 +128,28 @@ impl S3Storage {
             .lock()
             .expect("upload_locks poisoned")
             .remove(&(repo.to_string(), id.to_string()));
+    }
+
+    /// Acquire (or create) a per-`(repo, digest)` async lock so that
+    /// concurrent uploads of the same blob serialise through admit+publish.
+    fn admit_lock(&self, repo: &str, digest: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let key = (repo.to_string(), digest.to_string());
+        let mut map = self.admit_locks.lock().expect("admit_locks poisoned");
+        Arc::clone(
+            map.entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
+    /// Drop an admit lock entry once the publish is complete.
+    /// Removed only when no other admission of the same blob holds or waits
+    /// on it (map + the caller's clone), so a waiter never races a fresh lock.
+    fn drop_admit_lock(&self, repo: &str, digest: &str) {
+        let mut locks = self.admit_locks.lock().expect("admit_locks poisoned");
+        let key = (repo.to_string(), digest.to_string());
+        if locks.get(&key).is_some_and(|l| Arc::strong_count(l) <= 2) {
+            locks.remove(&key);
+        }
     }
 
     /// Mark a repo's remote `index.json` as needing a rewrite.

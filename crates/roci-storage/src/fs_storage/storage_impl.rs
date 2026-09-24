@@ -261,15 +261,21 @@ impl Storage for FsStorage {
         self.ensure_layout(repo).await?;
         let (up_dir, up_leaf) = upload_dir_rel(repo, id)?;
         let (alg_rel, hex) = blob_dir_rel(repo, expected)?;
+        let digest_str = expected.as_string();
+        // Serialize admission + publication per (repo, digest) so concurrent
+        // uploads of the same absent blob cannot both charge quota.
+        let admit_lock = self.blob_admit_lock(repo, &digest_str);
+        let _admit_guard = admit_lock.lock().await;
         let charged = match self.admit_blob(repo, &alg_rel, &hex, staged_size).await {
             Ok(c) => c,
             Err(e) => {
                 // Over quota: the session can never complete, so drop it.
+                drop(_admit_guard);
+                self.drop_blob_admit_lock(repo, &digest_str);
                 self.discard_session(repo, id).await?;
                 return Err(e);
             }
         };
-        let digest_str = expected.as_string();
         // Hold the GC pin from before the blob lands until it is stamped, so a
         // sweep never sees it half-registered.
         let pin = self.gc.pin().await;
@@ -292,6 +298,8 @@ impl Storage for FsStorage {
         if let Err(e) = landed {
             drop(pin);
             self.quota.release(repo, charged);
+            drop(_admit_guard);
+            self.drop_blob_admit_lock(repo, &digest_str);
             return Err(e);
         }
         self.quota.end_session();
@@ -305,6 +313,8 @@ impl Storage for FsStorage {
             }),
         );
         drop(pin);
+        drop(_admit_guard);
+        self.drop_blob_admit_lock(repo, &digest_str);
         // Warm the small-blob cache for a cacheable blob: read it back through
         // the same no-follow beneath-root open (the blob path is the validated
         // `alg_rel/hex` just promoted). A genuine IO hiccup skips the warm.
@@ -350,10 +360,14 @@ impl Storage for FsStorage {
         // marker so the directory is a well-formed OCI image layout.
         self.ensure_layout(repo).await?;
         let (alg_rel, leaf) = blob_dir_rel(repo, digest)?;
+        let digest_str = digest.as_string();
+        // Serialize admission + publication per (repo, digest) so concurrent
+        // uploads of the same absent blob cannot both charge quota.
+        let admit_lock = self.blob_admit_lock(repo, &digest_str);
+        let _admit_guard = admit_lock.lock().await;
         let charged = self
             .admit_blob(repo, &alg_rel, &leaf, data.len() as u64)
             .await?;
-        let digest_str = digest.as_string();
         let pin = self.gc.pin().await;
         // Dedupe-link an identical blob another repo holds; otherwise publish
         // the bytes into the CAS crash-atomically, anchored to a dirfd walked
@@ -366,6 +380,8 @@ impl Storage for FsStorage {
             if let Err(e) = publish_bytes(&self.root, &alg_rel, &leaf, data).await {
                 drop(pin);
                 self.quota.release(repo, charged);
+                drop(_admit_guard);
+                self.drop_blob_admit_lock(repo, &digest_str);
                 return Err(e.into());
             }
         }
@@ -378,6 +394,8 @@ impl Storage for FsStorage {
             }),
         );
         drop(pin);
+        drop(_admit_guard);
+        self.drop_blob_admit_lock(repo, &digest_str);
         // Warm the small-blob cache (a no-op for large layers).
         self.cache.put(repo, &digest_str, data);
         Ok(())
@@ -417,14 +435,66 @@ impl Storage for FsStorage {
             )),
             None => None,
         };
-        // A manifest is a blob addressed by its digest; store it in the CAS
-        // (put_blob verifies the digest and ensures the layout marker).
-        self.put_blob(repo, digest, data).await?;
+        // ── Publish the manifest blob under a GC fence held continuously
+        // from here through the MetaOp::PutManifest apply and the GC clears.
+        // The fence is the backend's shared RwLock read guard (`gc.pin()`);
+        // do NOT re-acquire it (a waiting writer deadlocks). ──
+        //
+        // Verify digest.
+        let actual = digest_of(data, digest.algorithm());
+        if !actual.ct_eq(digest) {
+            return Err(StorageError::DigestMismatch {
+                expected: digest.as_string(),
+                actual: actual.as_string(),
+            });
+        }
+        self.ensure_layout(repo).await?;
+        let (alg_rel, leaf) = blob_dir_rel(repo, digest)?;
+        let charged = self
+            .admit_blob(repo, &alg_rel, &leaf, data.len() as u64)
+            .await?;
+        let digest_str = digest.as_string();
+
+        // Hold the GC pin from before the blob lands through the metadata
+        // commit and GC clears — no sweep can see it half-registered or
+        // delete a referenced blob between put_blob and PutManifest.
+        let pin = self.gc.pin().await;
+        if !self.dedupe_link(repo, &alg_rel, &leaf, &digest_str).await {
+            if let Err(e) = publish_bytes(&self.root, &alg_rel, &leaf, data).await {
+                drop(pin);
+                self.quota.release(repo, charged);
+                return Err(e.into());
+            }
+        }
+        self.blob_entered(
+            repo,
+            &digest_str,
+            Some(BlobChecksum {
+                crc32c: crc32c::crc32c(data),
+                size: data.len() as u64,
+            }),
+        );
+        self.cache.put(repo, &digest_str, data);
+
+        // Under the same fence, re-verify every `required` digest (config +
+        // layers the core already checked) is still present. A sweep that ran
+        // before this pin cannot have deleted them (the pin blocks), and one
+        // that starts after will see them referenced. This closes the gap
+        // between the core's blob_exists check and the metadata commit.
+        for req in links.required {
+            let req_rel = blob_rel(repo, req)?;
+            match stat_beneath(&self.root, &req_rel).await? {
+                Some((true, _)) => {} // present as regular file
+                _ => {
+                    drop(pin);
+                    return Err(StorageError::MissingReference(req.as_string()));
+                }
+            }
+        }
 
         // Manifest, tag, backref edges and referrer land in ONE metadata record
         // (authoritative immediately), then the coalesced index.json rewrite is
         // scheduled. A crash can never keep the manifest but lose its edges.
-        let digest_str = digest.as_string();
         let references: Vec<String> = links.references.iter().map(Digest::as_string).collect();
         self.apply_meta(
             repo,
@@ -442,6 +512,7 @@ impl Storage for FsStorage {
         for r in &references {
             self.gc.clear(repo, r);
         }
+        drop(pin);
         Ok(())
     }
 
@@ -645,7 +716,17 @@ impl Storage for FsStorage {
             return Ok(true);
         }
         self.ensure_layout(to_repo).await?;
-        let charged = self.admit_blob(to_repo, &to_alg_rel, &leaf, size).await?;
+        // Admission and promotion are one critical section per destination
+        // blob, so a concurrent duplicate sees the promoted file (no charge).
+        let admit_lock = self.blob_admit_lock(to_repo, &digest_str);
+        let _admitting = admit_lock.lock().await;
+        let charged = match self.admit_blob(to_repo, &to_alg_rel, &leaf, size).await {
+            Ok(c) => c,
+            Err(e) => {
+                self.drop_blob_admit_lock(to_repo, &digest_str);
+                return Err(e);
+            }
+        };
         let pin = self.gc.pin().await;
         // Promote via dirfds walked no-follow beneath the store root, contract
         // order reflink → hard link → streaming copy (SECURITY.md:124). A
@@ -659,6 +740,7 @@ impl Storage for FsStorage {
             Err(e) => {
                 drop(pin);
                 self.quota.release(to_repo, charged);
+                self.drop_blob_admit_lock(to_repo, &digest_str);
                 return Err(match e.kind() {
                     io::ErrorKind::AlreadyExists => StorageError::BadPath(format!(
                         "mount destination for {digest_str} is not a regular file"
@@ -674,6 +756,7 @@ impl Storage for FsStorage {
         let checksum = self.meta.checksum(from_repo, &digest_str);
         self.blob_entered(to_repo, &digest_str, checksum);
         drop(pin);
+        self.drop_blob_admit_lock(to_repo, &digest_str);
         Ok(true)
     }
 }

@@ -108,7 +108,10 @@ impl FsStorage {
     }
 
     /// Read and parse `<repo>/index.json` beneath the root, no-follow. `Ok(None)`
-    /// when absent or unparseable (the rebuild then starts from the store).
+    /// when absent. `Err` when the file exists but cannot be read or parsed
+    /// (the GC must treat an unreadable existing index differently from an
+    /// absent one — a missing index is benign, but a corrupt/unreadable one
+    /// means root digests are unknown and GC must not sweep that repo).
     pub(super) async fn read_index_beneath(
         root: &Path,
         repo: &str,
@@ -123,7 +126,9 @@ impl FsStorage {
         };
         let mut b = Vec::new();
         f.read_to_end(&mut b).await?;
-        Ok(serde_json::from_slice(&b).ok())
+        serde_json::from_slice(&b)
+            .map(Some)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Startup reconciliation (crash recovery for the write-behind): for every

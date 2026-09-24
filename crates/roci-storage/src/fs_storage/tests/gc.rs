@@ -838,15 +838,22 @@ async fn stale_upload_locked_session_survives_sweep() {
     let past = filetime::FileTime::from_unix_time(0, 0);
     filetime::set_file_mtime(&upload_path, past).unwrap();
 
-    // Sweep: the upload is stale by mtime, but the lock entry keeps it alive.
+    // Sweep while an append/finalize holds the session: stale by mtime, but
+    // a held session is in use and survives.
+    let lock = s.session_lock("r", &id).unwrap();
+    let held = lock.lock().await;
     s.sweep_at(Instant::now()).await;
     assert!(
         upload_path.exists(),
         "locked upload session should survive sweep"
     );
+    drop(held);
 
-    // Abort the session to release the lock, then sweep again.
-    s.abort_upload("r", &id).await.unwrap();
+    // Released and still stale: the next sweep expires it and frees the slot.
+    let before = s.quota.sessions();
+    s.sweep_at(Instant::now()).await;
+    assert!(!upload_path.exists(), "idle stale session is expired");
+    assert_eq!(s.quota.sessions(), before - 1);
 }
 
 #[tokio::test]
@@ -895,4 +902,42 @@ async fn start_maintenance_runs_a_tick_and_shuts_down() {
     // Signal shutdown (the `break` on maintenance.rs line 92).
     let _ = tx.send(true);
     tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
+async fn malformed_index_json_makes_repo_unsafe() {
+    // An index.json that exists but cannot be parsed hides the repo's roots:
+    // GC must not treat its blobs as garbage.
+    let (dir, s) = gc_store(0);
+    let blob = sha256_of(b"live-but-unindexed");
+    s.put_blob("r", &blob, b"live-but-unindexed").await.unwrap();
+    std::fs::write(dir.path().join("r/index.json"), b"{not json").unwrap();
+    s.gc_consistency_check().await;
+    assert!(s.gc.is_unsafe("r"));
+    s.sweep_at(Instant::now() + Duration::from_secs(10)).await;
+    assert!(s.blob_exists("r", &blob).await.unwrap());
+}
+
+#[tokio::test]
+async fn oversized_root_manifest_makes_repo_unsafe_without_buffering_it() {
+    let (dir, s) = gc_store(0);
+    // A layout-listed "manifest" larger than the 4 MiB root cap.
+    let big = vec![b' '; 4 * 1024 * 1024 + 1];
+    let big_d = sha256_of(&big);
+    s.put_blob("r", &big_d, &big).await.unwrap();
+    let layer = sha256_of(b"layer-of-big");
+    s.put_blob("r", &layer, b"layer-of-big").await.unwrap();
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "manifests": [{"mediaType": MEDIA_TYPE_IMAGE_MANIFEST, "digest": big_d.as_string(), "size": big.len()}]
+    });
+    std::fs::write(
+        dir.path().join("r/index.json"),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .unwrap();
+    s.gc_consistency_check().await;
+    assert!(s.gc.is_unsafe("r"));
+    s.sweep_at(Instant::now() + Duration::from_secs(10)).await;
+    assert!(s.blob_exists("r", &layer).await.unwrap());
 }

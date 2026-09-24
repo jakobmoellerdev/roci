@@ -165,14 +165,20 @@ impl Storage for S3Storage {
         validate_repo(repo)?;
         let lock = self.session_lock(repo, id);
         let _guard = lock.lock().await;
-        let path = match self.staging_path(repo, id) {
-            Ok(p) => p,
+        // staging_rel validates both repo and session-id components.
+        let dir_rel = match self.repo_staging_rel(repo) {
+            Ok(d) => d,
             Err(_) => {
                 self.drop_session_lock(repo, id);
                 return Ok(false);
             }
         };
-        let removed = match tokio::fs::remove_file(&path).await {
+        // Validate the session id is safe to use as a leaf component.
+        if self.staging_rel(repo, id).is_err() {
+            self.drop_session_lock(repo, id);
+            return Ok(false);
+        }
+        let removed = match roci_storage::beneath::unlink_beneath(&self.root, &dir_rel, id).await {
             Ok(()) => true,
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(StorageError::Io(e)),
@@ -221,8 +227,12 @@ impl Storage for S3Storage {
             });
         }
 
-        // Quota admission.
+        // Serialize admit+publish per (repo, digest) to prevent double quota charge.
         let digest_str = expected.as_string();
+        let admit_lock = self.admit_lock(repo, &digest_str);
+        let _admit_guard = admit_lock.lock().await;
+
+        // Quota admission.
         let charged = match self.admit_blob(repo, expected, size).await {
             Ok(c) => c,
             Err(e) => {
@@ -234,6 +244,15 @@ impl Storage for S3Storage {
 
         // GC pin.
         let pin = self.gc.pin().await;
+
+        // Ensure OCI layout marker exists BEFORE publishing the object so a
+        // layout-creation failure cannot leave an orphaned S3 blob.
+        if let Err(e) = self.ensure_layout(repo).await {
+            drop(pin);
+            self.quota.release(repo, charged);
+            self.discard_session(repo, id).await;
+            return Err(e);
+        }
 
         // Dedupe: server-side copy from another repo if available.
         let linked = self
@@ -250,9 +269,6 @@ impl Storage for S3Storage {
             }
         }
 
-        // Ensure OCI layout marker exists.
-        self.ensure_layout(repo).await?;
-
         // Cleanup local staging + end session.
         self.remove_staging(repo, id).await;
         self.drop_session_lock(repo, id);
@@ -260,6 +276,7 @@ impl Storage for S3Storage {
         // Bookkeeping.
         self.blob_entered(repo, &digest_str, Some(BlobChecksum { crc32c, size }));
         drop(pin);
+        self.drop_admit_lock(repo, &digest_str);
         Ok(())
     }
 
@@ -274,9 +291,22 @@ impl Storage for S3Storage {
             });
         }
 
-        let charged = self.admit_blob(repo, digest, data.len() as u64).await?;
         let digest_str = digest.as_string();
+
+        // Serialize admit+publish per (repo, digest) to prevent double quota charge.
+        let admit_lock = self.admit_lock(repo, &digest_str);
+        let _admit_guard = admit_lock.lock().await;
+
+        let charged = self.admit_blob(repo, digest, data.len() as u64).await?;
         let pin = self.gc.pin().await;
+
+        // Ensure OCI layout marker exists BEFORE publishing the object so a
+        // layout-creation failure cannot leave an orphaned S3 blob.
+        if let Err(e) = self.ensure_layout(repo).await {
+            drop(pin);
+            self.quota.release(repo, charged);
+            return Err(e);
+        }
 
         // Dedupe: server-side copy from another repo.
         let linked = self
@@ -299,7 +329,6 @@ impl Storage for S3Storage {
             }
         }
 
-        self.ensure_layout(repo).await?;
         self.blob_entered(
             repo,
             &digest_str,
@@ -309,6 +338,7 @@ impl Storage for S3Storage {
             }),
         );
         drop(pin);
+        self.drop_admit_lock(repo, &digest_str);
         Ok(())
     }
 
@@ -357,8 +387,25 @@ impl Storage for S3Storage {
             None => None,
         };
 
+        // ── Hold one GC pin from blob publication through MetaOp apply ──
+        // This prevents a concurrent sweep from deleting the manifest blob
+        // (or a required blob) in the gap between put and metadata commit.
+        let pin = self.gc.pin().await;
+
         // Store manifest as a blob (verifies digest, ensures layout).
+        // put_blob internally acquires its own pin (a shared read-lock),
+        // which is compatible with the one we already hold.
         self.put_blob(repo, digest, data).await?;
+
+        // Re-verify every required digest is present under the same fence.
+        // A sweep cannot run while we hold the pin, so if they exist now
+        // they will still exist when the metadata record is committed.
+        for required in links.required {
+            if !self.blob_exists(repo, required).await? {
+                drop(pin);
+                return Err(StorageError::MissingReference(required.as_string()));
+            }
+        }
 
         // One atomic metadata record.
         let digest_str = digest.as_string();
@@ -383,6 +430,7 @@ impl Storage for S3Storage {
         for r in &references {
             self.gc.clear(repo, r);
         }
+        drop(pin);
         Ok(())
     }
 
@@ -545,9 +593,21 @@ impl Storage for S3Storage {
             return Ok(true);
         }
 
+        // Serialize admit+publish per (repo, digest) to prevent double quota charge.
+        let admit_lock = self.admit_lock(to_repo, &digest_str);
+        let _admit_guard = admit_lock.lock().await;
+
         // Quota.
         let charged = self.admit_blob(to_repo, digest, size).await?;
         let pin = self.gc.pin().await;
+
+        // Ensure OCI layout marker exists BEFORE copying the object so a
+        // layout-creation failure cannot leave an orphaned S3 blob.
+        if let Err(e) = self.ensure_layout(to_repo).await {
+            drop(pin);
+            self.quota.release(to_repo, charged);
+            return Err(e);
+        }
 
         // Server-side copy (may need parallel copy for >5 GiB).
         if let Err(e) = self.copy_object(from_repo, to_repo, digest, size).await {
@@ -557,10 +617,10 @@ impl Storage for S3Storage {
         }
         roci_telemetry::record_dedupe_link("mount", "server_side_copy");
 
-        self.ensure_layout(to_repo).await?;
         let checksum = self.meta.checksum(from_repo, &digest_str);
         self.blob_entered(to_repo, &digest_str, checksum);
         drop(pin);
+        self.drop_admit_lock(to_repo, &digest_str);
         Ok(true)
     }
 }
@@ -854,17 +914,23 @@ impl S3Storage {
     /// `WriteMultipart::new_with_chunk_size` fed from buffered file reads,
     /// calling `wait_for_capacity(multipart_concurrency)` before each chunk.
     /// Aborts the multipart upload on error.
+    ///
+    /// All local file access goes through no-follow beneath-root opens so a
+    /// symlink planted at `uploads/<repo>` cannot redirect the upload stream.
     async fn upload_staged_blob(
         &self,
         repo: &str,
         digest: &Digest,
         id: &str,
     ) -> Result<(), StorageError> {
-        let path = self.staging_path(repo, id)?;
+        let rel = self.staging_rel(repo, id)?;
         let key = blob_key(&self.client.prefix, repo, digest)?;
         let obj_path = ObjPath::from(key);
 
-        let file_size = tokio::fs::metadata(&path).await?.len();
+        let file_size = match roci_storage::beneath::stat_beneath(&self.root, &rel).await? {
+            Some((true, sz)) => sz,
+            _ => return Err(StorageError::NotFound),
+        };
         let part_size = self.client.multipart_part_size as usize;
         let concurrency = self.client.multipart_concurrency;
 
@@ -872,7 +938,9 @@ impl S3Storage {
             // Single PUT: read entire file (it's below part_size which is the
             // streaming boundary, not the whole-blob invariant boundary — this
             // is bounded by the configured part size, typically 16 MiB).
-            let data = tokio::fs::read(&path).await?;
+            let mut f = roci_storage::beneath::open_beneath(&self.root, &rel).await?;
+            let mut data = Vec::with_capacity(file_size as usize);
+            tokio::io::AsyncReadExt::read_to_end(&mut f, &mut data).await?;
             self.client
                 .store
                 .put(&obj_path, PutPayload::from(Bytes::from(data)))
@@ -888,7 +956,7 @@ impl S3Storage {
                 .map_err(obj_err)?;
             let mut writer = WriteMultipart::new_with_chunk_size(upload, part_size);
 
-            let mut file = tokio::fs::File::open(&path).await?;
+            let mut file = roci_storage::beneath::open_beneath(&self.root, &rel).await?;
             let mut buf = vec![0u8; part_size];
             loop {
                 // Back-pressure: bounded concurrency.
@@ -1193,11 +1261,19 @@ impl S3Storage {
         }
 
         // Expire local staging files older than gc.delay that are not session-locked.
-        self.sweep_stale_uploads();
+        self.sweep_stale_uploads().await;
     }
 
     /// Rebuild backrefs for one repo: discover roots from metadata + remote
     /// index.json, expand image-index children, record missing edges.
+    ///
+    /// # Safety invariants
+    /// - A remote `index.json` that exists but is malformed/unreadable marks
+    ///   the repo GC-unsafe (only a genuine `NotFound` means blob-only repo).
+    /// - Root manifests are HEAD-checked and refuse >4 MiB reads; oversized or
+    ///   unreadable roots mark the repo unsafe.
+    /// - Missing/unreadable checks use `all_roots` (including children) so no
+    ///   sweep runs with unknown liveness.
     async fn gc_rebuild_repo(&self, repo: &str) {
         let mut root_digests: HashSet<String> = HashSet::new();
 
@@ -1207,15 +1283,31 @@ impl S3Storage {
         }
 
         // (b) From remote index.json descriptors.
-        if let Ok(index) = self.read_remote_index(repo).await {
-            if let Some(manifests) = index.get("manifests").and_then(|m| m.as_array()) {
-                for entry in manifests {
-                    if let Some(d) = entry.get("digest").and_then(|v| v.as_str()) {
-                        root_digests.insert(d.to_string());
+        // Distinguish NotFound (blob-only repo) from parse/read errors (unsafe).
+        match self.read_remote_index(repo).await {
+            Ok(index) => {
+                if let Some(manifests) = index.get("manifests").and_then(|m| m.as_array()) {
+                    for entry in manifests {
+                        if let Some(d) = entry.get("digest").and_then(|v| v.as_str()) {
+                            root_digests.insert(d.to_string());
+                        }
                     }
                 }
             }
+            Err(StorageError::NotFound) => {
+                // No index.json: blob-only repo, not an error.
+            }
+            Err(e) => {
+                // Existing but malformed/unreadable: GC-unsafe.
+                tracing::warn!(repo, error = %e, "remote index.json unreadable; repo is GC-unsafe");
+                self.gc.mark_unsafe(repo);
+                return;
+            }
         }
+
+        /// Maximum root manifest size allowed during GC consistency check
+        /// (4 MiB — same cap the registry's manifest-input policy enforces).
+        const MAX_ROOT_SIZE: u64 = 4 * 1024 * 1024;
 
         // Recursively include image-index children present in the store.
         let mut to_visit: Vec<String> = root_digests.iter().cloned().collect();
@@ -1225,23 +1317,36 @@ impl S3Storage {
                 Ok(d) => d,
                 Err(_) => continue,
             };
+
+            // HEAD first: refuse oversized roots to avoid unbounded allocation.
+            let size = match self.blob_size(repo, &parsed).await {
+                Ok(s) => s,
+                Err(_) => {
+                    // Missing root or child → repo unsafe.
+                    tracing::warn!(repo, digest = %digest_str, "root manifest missing from CAS; repo is GC-unsafe");
+                    self.gc.mark_unsafe(repo);
+                    continue;
+                }
+            };
+            if size > MAX_ROOT_SIZE {
+                tracing::warn!(repo, digest = %digest_str, size, "oversized root manifest; repo is GC-unsafe");
+                self.gc.mark_unsafe(repo);
+                continue;
+            }
+
             let bytes = match self.read_blob(repo, &parsed).await {
                 Ok(b) => b,
                 Err(_) => {
-                    if root_digests.contains(&digest_str) {
-                        tracing::warn!(repo, digest = %digest_str, "root manifest missing from CAS; repo is GC-unsafe");
-                        self.gc.mark_unsafe(repo);
-                    }
+                    tracing::warn!(repo, digest = %digest_str, "root manifest unreadable; repo is GC-unsafe");
+                    self.gc.mark_unsafe(repo);
                     continue;
                 }
             };
             let manifest: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(v) => v,
                 Err(_) => {
-                    if root_digests.contains(&digest_str) {
-                        tracing::warn!(repo, digest = %digest_str, "unparseable root manifest; repo is GC-unsafe");
-                        self.gc.mark_unsafe(repo);
-                    }
+                    tracing::warn!(repo, digest = %digest_str, "unparseable root manifest; repo is GC-unsafe");
+                    self.gc.mark_unsafe(repo);
                     continue;
                 }
             };
@@ -1391,7 +1496,7 @@ impl S3Storage {
         }
 
         // Stale upload cleanup.
-        let (stale_uploads, stale_bytes) = self.sweep_stale_uploads();
+        let (stale_uploads, stale_bytes) = self.sweep_stale_uploads().await;
 
         let total_collected = collected_blobs + stale_uploads;
         if total_collected > 0 {
@@ -1408,8 +1513,11 @@ impl S3Storage {
     }
 
     /// Clean up uploads whose mtime exceeds the GC delay and whose session is
-    /// not locked. Returns `(count, bytes)`.
-    pub(crate) fn sweep_stale_uploads(&self) -> (u64, u64) {
+    /// not locked. Acquires the per-session lock (try_lock, skip if held) and
+    /// rechecks the file age before removing, so a concurrent upload that
+    /// acquires the session after the initial enumeration cannot lose its
+    /// staging file. Returns `(count, bytes)`.
+    pub(crate) async fn sweep_stale_uploads(&self) -> (u64, u64) {
         let delay = self.gc.delay();
         let stale = self.enumerate_staging_files();
         let mut count: u64 = 0;
@@ -1420,16 +1528,22 @@ impl S3Storage {
             if age < delay {
                 continue;
             }
-            // Skip if the session is currently locked.
-            if self
-                .upload_locks
-                .lock()
-                .expect("upload-locks poisoned")
-                .contains_key(&(repo.clone(), id.clone()))
-            {
+            // Acquire the per-session lock; skip if currently held by an upload.
+            let lock = self.session_lock(&repo, &id);
+            let Ok(_guard) = lock.try_lock() else {
                 continue;
-            }
+            };
+            // Re-check age under the lock: a concurrent append could have
+            // touched the file between the enumeration and our lock acquire.
             if let Ok(path) = self.staging_path(&repo, &id) {
+                let fresh_age = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|mt| std::time::SystemTime::now().duration_since(mt).ok())
+                    .unwrap_or(Duration::ZERO);
+                if fresh_age < delay {
+                    continue;
+                }
                 if std::fs::remove_file(&path).is_ok() {
                     self.quota.end_session();
                     roci_telemetry::record_gc_collected("upload", size);
@@ -1437,6 +1551,7 @@ impl S3Storage {
                     bytes += size;
                 }
             }
+            self.drop_session_lock(&repo, &id);
         }
         (count, bytes)
     }

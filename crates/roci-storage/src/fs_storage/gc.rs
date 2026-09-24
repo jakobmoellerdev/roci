@@ -36,6 +36,11 @@ use tracing::Instrument;
 /// Maximum number of candidates processed in one exclusive-fence batch.
 const SWEEP_BATCH_SIZE: usize = 256;
 
+/// Maximum bytes to buffer when reading a root manifest during the GC
+/// consistency check. This caps startup allocation at a sane default (the
+/// same 4 MiB default `max_manifest` the registry uses for incoming pushes).
+const MAX_ROOT_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+
 impl FsStorage {
     /// Start the GC subsystem: background consistency check → `gc.set_ready()`
     /// → periodic sweeps every `config.gc.interval_secs`. Called from
@@ -123,11 +128,23 @@ impl FsStorage {
         }
 
         // (b) From on-disk index.json descriptors.
-        if let Ok(Some(index)) = Self::read_index_beneath(&self.root, repo).await {
-            for entry in index_manifests(&index) {
-                if let Some(d) = descriptor_digest(entry) {
-                    root_digests.insert(d.to_string());
+        match Self::read_index_beneath(&self.root, repo).await {
+            Ok(Some(index)) => {
+                for entry in index_manifests(&index) {
+                    if let Some(d) = descriptor_digest(entry) {
+                        root_digests.insert(d.to_string());
+                    }
                 }
+            }
+            Ok(None) => {
+                // Genuinely absent index.json — blob-only repo; fine.
+            }
+            Err(e) => {
+                // Existing but unreadable/malformed index.json: root digests
+                // are unknown, so GC must not sweep this repo.
+                tracing::warn!(repo, error = %e, "unreadable index.json; repo is GC-unsafe");
+                self.gc.mark_unsafe(repo);
+                return;
             }
         }
 
@@ -144,18 +161,28 @@ impl FsStorage {
                 Ok((dir, leaf)) => dir.join(leaf),
                 Err(_) => continue,
             };
-            let bytes = match self.read_cas_blob_beneath(&rel).await {
-                Some(b) => b,
-                None => continue,
+            // Stat+cap: refuse to buffer root manifests > 4 MiB (the default
+            // max_manifest) — prevents an externally-supplied oversized blob
+            // from causing unbounded allocation during startup.
+            let bytes = match self
+                .read_cas_blob_bounded(&rel, MAX_ROOT_MANIFEST_BYTES)
+                .await
+            {
+                Ok(Some(b)) => b,
+                Ok(None) => continue, // absent
+                Err(_oversized_or_io) => {
+                    // Oversized or unreadable root → repo unsafe.
+                    tracing::warn!(repo, digest = %digest_str, "oversized or unreadable root manifest; repo is GC-unsafe");
+                    self.gc.mark_unsafe(repo);
+                    continue;
+                }
             };
             let manifest: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(v) => v,
                 Err(_) => {
-                    // Unparseable root → repo unsafe.
-                    if root_digests.contains(&digest_str) {
-                        tracing::warn!(repo, digest = %digest_str, "unparseable root manifest; repo is GC-unsafe");
-                        self.gc.mark_unsafe(repo);
-                    }
+                    // Unparseable root/child → repo unsafe.
+                    tracing::warn!(repo, digest = %digest_str, "unparseable root manifest; repo is GC-unsafe");
+                    self.gc.mark_unsafe(repo);
                     continue;
                 }
             };
@@ -182,6 +209,9 @@ impl FsStorage {
         }
 
         // For each root manifest, read it, derive edges, and record missing ones.
+        // Use `all_roots` (not just `root_digests`) so missing/unreadable
+        // image-index children also mark the repo unsafe — their edges are
+        // equally unknown.
         for digest_str in &all_roots {
             let parsed = match Digest::parse(digest_str) {
                 Ok(d) => d,
@@ -191,23 +221,26 @@ impl FsStorage {
                 Ok((dir, leaf)) => dir.join(leaf),
                 Err(_) => continue,
             };
-            let bytes = match self.read_cas_blob_beneath(&rel).await {
-                Some(b) => b,
-                None => {
-                    // A root manifest that exists in the index but not in the CAS:
-                    // this makes the repo GC-unsafe — we can't know its edges.
-                    if root_digests.contains(digest_str) {
-                        tracing::warn!(repo, digest = %digest_str, "root manifest missing from CAS; repo is GC-unsafe");
-                        self.gc.mark_unsafe(repo);
-                    }
+            let bytes = match self
+                .read_cas_blob_bounded(&rel, MAX_ROOT_MANIFEST_BYTES)
+                .await
+            {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    // A root/child manifest missing from the CAS: edges unknown.
+                    tracing::warn!(repo, digest = %digest_str, "root manifest missing from CAS; repo is GC-unsafe");
+                    self.gc.mark_unsafe(repo);
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(repo, digest = %digest_str, "oversized/unreadable root manifest; repo is GC-unsafe");
+                    self.gc.mark_unsafe(repo);
                     continue;
                 }
             };
             let manifest: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(v) => v,
                 Err(_) => {
-                    // Already warned above for root_digests, but a child manifest
-                    // that's unparseable also makes the repo unsafe.
                     tracing::warn!(repo, digest = %digest_str, "unparseable manifest; repo is GC-unsafe");
                     self.gc.mark_unsafe(repo);
                     continue;
@@ -242,15 +275,29 @@ impl FsStorage {
         }
     }
 
-    /// Read a CAS blob beneath the store root; returns `None` for absent or
-    /// unreadable blobs (best-effort, never an error).
-    async fn read_cas_blob_beneath(&self, rel: &Path) -> Option<Vec<u8>> {
-        let mut f = open_beneath(&self.root, rel).await.ok()?;
-        let mut bytes = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut f, &mut bytes)
-            .await
-            .ok()?;
-        Some(bytes)
+    /// Read a CAS blob beneath the store root with an upper size bound.
+    /// Returns `Ok(None)` for absent blobs, `Ok(Some(bytes))` for present
+    /// blobs within the cap, and `Err` for oversized or unreadable blobs.
+    async fn read_cas_blob_bounded(
+        &self,
+        rel: &Path,
+        max_bytes: u64,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        let mut f = match open_beneath(&self.root, rel).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let meta = f.metadata().await?;
+        if meta.len() > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("root manifest {} bytes exceeds {max_bytes} cap", meta.len()),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(meta.len() as usize);
+        tokio::io::AsyncReadExt::read_to_end(&mut f, &mut bytes).await?;
+        Ok(Some(bytes))
     }
 
     // ------------------------------------------------------------------
@@ -401,22 +448,56 @@ impl FsStorage {
         .unwrap_or_default();
         let mut count: u64 = 0;
         let mut bytes: u64 = 0;
-        for (repo, upload_dir, name, size) in stale {
-            // A session currently being appended/finalized is not stale.
-            if self
-                .upload_locks
-                .lock()
-                .expect("upload-locks poisoned")
-                .contains_key(&(repo.clone(), name.clone()))
-            {
+        for (repo, upload_dir, name, _initial_size) in stale {
+            // Acquire the per-session lock (non-blocking). If the session is
+            // currently held by an append/finalize/abort, skip it — a PATCH
+            // that creates/acquires the lock after our initial scan cannot
+            // have its staging file deleted out from under it.
+            let lock = {
+                let Ok(l) = self.session_lock(&repo, &name) else {
+                    continue;
+                };
+                l
+            };
+            let Some(guard) = lock.try_lock().ok() else {
+                // Session is currently in use — skip.
                 continue;
-            }
+            };
+            // Re-check the file's age under the lock: between our initial
+            // scan and acquiring the lock the file may have been appended to
+            // (refreshing its mtime) or removed by a finish/abort.
+            let rel = upload_dir.join(&name);
+            let still_stale = match stat_beneath(&self.root, &rel).await {
+                Ok(Some((true, size))) => {
+                    // Re-stat the mtime via symlink_metadata (no follow) on the
+                    // full path; stat_beneath only gives (is_file, size).
+                    let full = self.root.join(&rel);
+                    let age = std::fs::symlink_metadata(&full)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|m| SystemTime::now().duration_since(m).ok())
+                        .unwrap_or(Duration::ZERO);
+                    if age >= delay {
+                        Some(size)
+                    } else {
+                        None
+                    }
+                }
+                _ => None, // gone or not a regular file
+            };
+            let Some(size) = still_stale else {
+                drop(guard);
+                self.drop_session_lock(&repo, &name);
+                continue;
+            };
             if unlink_beneath(&self.root, &upload_dir, &name).await.is_ok() {
                 self.quota.end_session();
                 roci_telemetry::record_gc_collected("upload", size);
                 count += 1;
                 bytes += size;
             }
+            drop(guard);
+            self.drop_session_lock(&repo, &name);
         }
         (count, bytes)
     }

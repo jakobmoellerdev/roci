@@ -1247,7 +1247,7 @@ async fn sweep_stale_uploads_removes_old_files() {
     f.set_times(std::fs::FileTimes::new().set_modified(old))
         .unwrap();
     drop(f);
-    let (count, bytes) = s.sweep_stale_uploads();
+    let (count, bytes) = s.sweep_stale_uploads().await;
     assert_eq!(count, 1);
     assert!(bytes > 0);
     assert!(!path.exists());
@@ -1265,7 +1265,7 @@ async fn sweep_stale_uploads_keeps_fresh_files() {
         .await
         .unwrap();
 
-    let (count, _) = s.sweep_stale_uploads();
+    let (count, _) = s.sweep_stale_uploads().await;
     assert_eq!(count, 0);
     let path = s.staging_path("repo", &id).unwrap();
     assert!(path.exists());
@@ -2847,4 +2847,50 @@ mod http_e2e {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
+}
+
+#[tokio::test]
+async fn malformed_remote_index_makes_repo_unsafe() {
+    let (_dir, s) = gc_test_store();
+    let data = b"live layer";
+    let d = roci_storage::sha256_of(data);
+    s.put_blob("repo", &d, data).await.unwrap();
+    s.client
+        .store
+        .put(
+            &ObjPath::from("repo/index.json"),
+            PutPayload::from_static(b"{broken"),
+        )
+        .await
+        .unwrap();
+    s.gc_consistency_check().await;
+    assert!(s.gc.is_unsafe("repo"));
+}
+
+#[tokio::test]
+async fn manifest_commit_rechecks_required_blobs() {
+    let (_dir, s) = test_store();
+    let missing = roci_storage::sha256_of(b"never pushed");
+    let body = br#"{"schemaVersion":2}"#;
+    let d = roci_storage::sha256_of(body);
+    let err = s
+        .put_manifest(
+            "repo",
+            Some("v1"),
+            &d,
+            "application/json",
+            body,
+            ManifestLinks {
+                references: std::slice::from_ref(&missing),
+                required: std::slice::from_ref(&missing),
+                subject: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        roci_storage::StorageError::MissingReference(_)
+    ));
+    assert!(s.meta.resolve_tag("repo", "v1").is_none());
 }
