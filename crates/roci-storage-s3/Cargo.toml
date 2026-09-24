@@ -9,3 +9,25 @@ authors.workspace = true
 
 [dependencies]
 roci-storage.workspace = true
+roci-config.workspace = true
+roci-telemetry.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+futures.workspace = true
+crc32c.workspace = true
+sha2 = "0.10"
+hex.workspace = true
+getrandom.workspace = true
+object_store = { version = "0.14", features = ["aws"] }
+url = "2"
+http = "1"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
+roci-core = { workspace = true }
+http-body-util = "0.1"
+tower = { workspace = true, features = ["util"] }
