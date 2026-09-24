@@ -1465,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "roci-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1496,11 +1496,11 @@ dependencies = [
 
 [[package]]
 name = "roci-cluster"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "roci-config"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -1510,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "roci-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
@@ -1534,23 +1534,23 @@ dependencies = [
 
 [[package]]
 name = "roci-ext-scan"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "roci-ext-search"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "roci-ext-sig"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "roci-ext-sync"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "roci-storage"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "cuckoofilter",
  "futures",
@@ -1570,14 +1570,14 @@ dependencies = [
 
 [[package]]
 name = "roci-storage-s3"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "roci-storage",
 ]
 
 [[package]]
 name = "roci-telemetry"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
