@@ -43,6 +43,20 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # OCI pre-defined annotation keys (created, version, revision, source, …),
+      # computed reproducibly from the commit + Cargo.toml by one script.
+      - name: OCI metadata
+        id: meta
+        shell: bash
+        env:
+          GIT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          {
+            echo 'kv<<OCI_META_EOF'
+            scripts/oci-meta.sh "$GIT_REF"
+            echo 'OCI_META_EOF'
+          } >> "$GITHUB_OUTPUT"
 
       # Load the native-arch image and smoke-test the running container.
       - name: Build image (native ${{ matrix.plat.arch }})
@@ -52,6 +66,7 @@ jobs:
           file: Containerfile
           platforms: linux/${{ matrix.plat.arch }}
           tags: roci:smoke
+          labels: ${{ steps.meta.outputs.kv }}
           load: true
 
       - name: Run container and smoke-test /v2/ + push/pull
@@ -103,6 +118,9 @@ jobs:
           file: Containerfile
           platforms: linux/${{ matrix.plat.arch }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # Image config labels + per-arch manifest annotations.
+          labels: ${{ steps.meta.outputs.kv }}
+          annotations: ${{ steps.meta.outputs.kv }}
           sbom: true
           provenance: mode=max
       - name: Export digest
@@ -136,7 +154,24 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # OCI pre-defined annotation keys (created, version, revision, source, …),
+      # computed reproducibly from the commit + Cargo.toml by one script.
+      - name: OCI metadata
+        id: meta
+        shell: bash
+        env:
+          GIT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          {
+            echo 'kv<<OCI_META_EOF'
+            scripts/oci-meta.sh "$GIT_REF"
+            echo 'OCI_META_EOF'
+          } >> "$GITHUB_OUTPUT"
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -167,6 +202,11 @@ jobs:
           fi
           args=()
           for t in "${tags[@]}"; do args+=("-t" "$t"); done
+          # Same OCI annotations on the multi-arch index (GHCR reads e.g.
+          # description/source/licenses from here for multi-arch packages).
+          while IFS= read -r kv; do
+            [ -n "$kv" ] && args+=("--annotation" "index:${kv}")
+          done <<< "$OCI_META"
           # shellcheck disable=SC2046
           docker buildx imagetools create "${args[@]}" \
             $(for d in *; do echo "${IMAGE}@sha256:${d}"; done)
@@ -176,6 +216,7 @@ jobs:
         env:
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_REF: ${{ github.ref }}
+          OCI_META: ${{ steps.meta.outputs.kv }}
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:

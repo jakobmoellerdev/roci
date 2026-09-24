@@ -185,7 +185,8 @@ conformance: init
 container:
     #!/usr/bin/env bash
     set -euo pipefail
-    docker build -t roci:local -f Containerfile .
+    labels=(); while IFS= read -r kv; do labels+=(--label "$kv"); done <<< "$(scripts/oci-meta.sh)"
+    docker build "${labels[@]}" -t roci:local -f Containerfile .
     docker rm -f roci-local >/dev/null 2>&1 || true
     docker volume rm roci-local-data >/dev/null 2>&1 || true
     docker volume create roci-local-data >/dev/null
@@ -202,7 +203,10 @@ container:
 
 # Build the multi-arch image for both Linux platforms (requires buildx + QEMU).
 container-multiarch:
-    docker buildx build --platform linux/amd64,linux/arm64 -t roci:multiarch -f Containerfile .
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=(); while IFS= read -r kv; do args+=(--label "$kv" --annotation "index,manifest:$kv"); done <<< "$(scripts/oci-meta.sh)"
+    docker buildx build "${args[@]}" --platform linux/amd64,linux/arm64 -t roci:multiarch -f Containerfile .
 
 # Build a release binary with all features (allocator, OTel, extensions).
 release-build:

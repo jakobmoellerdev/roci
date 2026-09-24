@@ -53,6 +53,26 @@ docker run -d --name roci --read-only \
 
 In Kubernetes, mount the file from a ConfigMap and TLS keys from a Secret. See [Configuration](/guide/configuration) for every key.
 
+## Image metadata
+
+Every published image carries the [OCI pre-defined annotation keys](https://github.com/opencontainers/image-spec/blob/v1.1.1/annotations.md#pre-defined-annotation-keys) in three places: as image-config labels (`docker inspect`), as annotations on each per-arch manifest, and as annotations on the multi-arch index (which GHCR uses for the package description, source link, and license).
+
+| Key | Value |
+| --- | --- |
+| `created` | Commit date of the built revision (UTC, RFC 3339). It is not the wall-clock build time, so rebuilding a commit gives the same value. |
+| `version` | `X.Y.Z` for a `vX.Y.Z` release tag, otherwise `<cargo version>+g<short sha>` |
+| `revision` | Full commit SHA |
+| `source`, `url` | `https://github.com/jakobmoellerdev/roci` |
+| `documentation` | `https://jakobmoellerdev.github.io/roci/` |
+| `authors`, `vendor`, `licenses` | From `[workspace.package]` in `Cargo.toml` (`licenses` is an SPDX expression: `Apache-2.0`) |
+| `title`, `description` | `roci`, plus a one-line summary |
+
+`base.name`/`base.digest` are omitted because the runtime stage is `FROM scratch`, which has no reference or digest. `ref.name` is omitted because the spec scopes it to `index.json` descriptors in an image layout. [`scripts/oci-meta.sh`](https://github.com/jakobmoellerdev/roci/blob/main/scripts/oci-meta.sh) is the single source of these values for CI and `just container`. A release build fails if the tag does not match the `Cargo.toml` version.
+
+```sh
+docker buildx imagetools inspect --raw ghcr.io/jakobmoellerdev/roci:latest | jq .annotations
+```
+
 ## Build locally
 
 ```sh
