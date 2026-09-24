@@ -217,13 +217,13 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 
 ### Storage
 
-- [ ] Online, O(garbage) garbage collection (grace-period, backref index; never offline)
-- [x] Copy-on-write (reflink `FICLONE`) deduplication across repos, hard-link then streaming-copy fallback
-- [ ] Data scrubbing (CRC32C staggered, FS-scrub offload, BLAKE3 escalation)
-- [ ] Serve multiple storage paths (and backends) from a single server
-- [ ] Per-repo / per-total storage quotas
+- [x] Online, O(garbage) garbage collection (grace-period, backref index, startup backref rebuild; never offline)
+- [x] Copy-on-write (reflink `FICLONE`) deduplication across repos — mounts and uploads — hard-link then streaming-copy fallback
+- [x] Data scrubbing (CRC32C staggered + adaptive, FS-scrub offload, digest re-hash escalation, quarantine)
+- [x] Serve multiple storage paths (and backends, incl. S3-compatible object storage) from a single server
+- [x] Per-repo / per-total storage quotas and a concurrent upload-session cap
 - [ ] In-memory small-blob content cache; 2-level fanout at scale
-- [ ] Embedded metadata index — append-log + in-RAM maps default, B-tree KV upgrade
+- [x] Embedded metadata index — append-log + in-RAM maps default (compaction, rkyv mmap snapshot, optional HMAC), redb B-tree KV upgrade
 
 ### Replication
 
