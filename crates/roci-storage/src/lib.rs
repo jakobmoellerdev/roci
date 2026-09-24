@@ -20,7 +20,7 @@ mod filter;
 use cache::SmallBlobCache;
 mod metadata;
 use filter::BlobPresenceFilter;
-pub use metadata::{LogMetadataStore, MetaOp, MetadataStore};
+pub use metadata::{LogMetadataStore, MetaOp, MetadataStore, Page, Referrer};
 
 /// A parsed `algorithm:hex` content digest.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -233,11 +233,16 @@ pub trait Storage: Send + Sync + 'static {
         repo: &str,
         digest: &Digest,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
-    /// List tags for a repo, sorted lexically.
+    /// One page of `repo`'s tags in lexical order: at most `limit` tags
+    /// strictly after `last` (from the start when `None`, whether or not
+    /// `last` itself still exists). Per-request work is bounded by the page,
+    /// not the repo (SECURITY inv. 14).
     fn list_tags(
         &self,
         repo: &str,
-    ) -> impl Future<Output = Result<Vec<String>, StorageError>> + Send;
+        last: Option<&str>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Page<String>, StorageError>> + Send;
     /// Record a referrer: `subject` is the digest a manifest points at via its
     /// `subject` field; `referrer_descriptor` is the JSON descriptor of the
     /// referring manifest to include in the subject's referrers index.
@@ -248,12 +253,19 @@ pub trait Storage: Send + Sync + 'static {
         referrer: &Digest,
         referrer_descriptor: &[u8],
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
-    /// List the referrer descriptors recorded for `subject`, as raw JSON blobs.
+    /// One page of the referrers recorded for `subject` as
+    /// `(referrer_digest, descriptor_json)`, ordered by referrer digest: at
+    /// most `limit` entries strictly after `last`, restricted to descriptors
+    /// whose `artifactType` equals `artifact_type` when given. Per-request work
+    /// is bounded by the page, not the subject's referrer set.
     fn list_referrers(
         &self,
         repo: &str,
         subject: &Digest,
-    ) -> impl Future<Output = Result<Vec<Vec<u8>>, StorageError>> + Send;
+        artifact_type: Option<&str>,
+        last: Option<&str>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Page<Referrer>, StorageError>> + Send;
     /// Record the reverse edges `blob_digest → manifest_digest` for every blob
     /// a manifest references (its config + layers), so a future GC can reclaim
     /// a blob the moment its last referencing manifest is deleted. Called by
@@ -369,13 +381,7 @@ impl FsStorage {
                     continue;
                 };
                 // Already known (log replay or live push): nothing to upgrade.
-                if self.meta.referrers(&repo, subject).iter().any(|d| {
-                    serde_json::from_slice::<serde_json::Value>(d)
-                        .ok()
-                        .as_ref()
-                        .and_then(descriptor_digest)
-                        == Some(referrer)
-                }) {
+                if self.meta.has_referrer(&repo, subject, referrer) {
                     continue;
                 }
                 let Ok(descriptor) = serde_json::to_vec(entry) else {
@@ -753,8 +759,8 @@ impl FsStorage {
 
         // Emit: one descriptor per tag, then untagged known manifests, then
         // foreign entries. Sorted for a deterministic, diff-friendly file.
-        let mut tags = meta.tags_snapshot(repo);
-        tags.sort();
+        // `tags_snapshot` is tag-sorted.
+        let tags = meta.tags_snapshot(repo);
         let mut tagged: HashSet<&str> = HashSet::new();
         let mut manifests: Vec<serde_json::Value> = Vec::with_capacity(base.len() + tags.len());
         for (tag, digest, _) in &tags {
@@ -1191,6 +1197,40 @@ fn descriptor_tag(descriptor: &serde_json::Value) -> Option<&str> {
 /// The `digest` field of a descriptor, if present and a string.
 fn descriptor_digest(descriptor: &serde_json::Value) -> Option<&str> {
     descriptor.get("digest").and_then(|v| v.as_str())
+}
+
+/// Page an in-memory list already sorted and de-duplicated by `key`: at most
+/// `limit` items strictly after `last`. Used only by the layout fallbacks,
+/// whose cost is bounded by the document they must read whole anyway.
+fn page_sorted<T>(items: Vec<T>, key: fn(&T) -> &str, last: Option<&str>, limit: usize) -> Page<T> {
+    let start = last.map_or(0, |l| items.partition_point(|i| key(i) <= l));
+    metadata::take_page(items.into_iter().skip(start), limit)
+}
+
+/// Page referrer candidates read from the layout, `(digest, descriptor)`, the
+/// way the metadata store pages its index: keep the `artifactType` matches,
+/// order and de-duplicate by digest (first occurrence wins), and serialize
+/// only the served page.
+fn page_layout_referrers(
+    mut refs: Vec<(String, &serde_json::Value)>,
+    artifact_type: Option<&str>,
+    last: Option<&str>,
+    limit: usize,
+) -> Page<Referrer> {
+    refs.retain(|(_, d)| {
+        artifact_type.is_none_or(|t| d.get("artifactType").and_then(|v| v.as_str()) == Some(t))
+    });
+    refs.sort_by(|a, b| a.0.cmp(&b.0));
+    refs.dedup_by(|a, b| a.0 == b.0);
+    let page = page_sorted(refs, |(d, _)| d, last, limit);
+    Page {
+        items: page
+            .items
+            .into_iter()
+            .map(|(d, v)| (d, v.to_string().into_bytes()))
+            .collect(),
+        more: page.more,
+    }
 }
 
 /// Whether two image indexes carry the same descriptor set (order-insensitive).
@@ -2510,13 +2550,17 @@ impl Storage for FsStorage {
         )
     }
 
-    async fn list_tags(&self, repo: &str) -> Result<Vec<String>, StorageError> {
-        // Fast path: the in-RAM tag map. A repo the store does not yet cover
-        // (e.g. an out-of-band layout mutation after startup) falls back to the
-        // on-disk index.json, the source of truth.
-        let tags = self.meta.list_tags(repo);
-        if !tags.is_empty() {
-            return Ok(tags);
+    async fn list_tags(
+        &self,
+        repo: &str,
+        last: Option<&str>,
+        limit: usize,
+    ) -> Result<Page<String>, StorageError> {
+        // Fast path: a seek into the in-RAM sorted tag map. A repo the store
+        // does not yet cover (e.g. an out-of-band layout mutation after
+        // startup) falls back to the on-disk index.json, the source of truth.
+        if let Some(page) = self.meta.tags_page(repo, last, limit) {
+            return Ok(page);
         }
         let index = self.read_index(repo).await?;
         let mut tags: Vec<String> = index
@@ -2529,7 +2573,8 @@ impl Storage for FsStorage {
             })
             .unwrap_or_default();
         tags.sort();
-        Ok(tags)
+        tags.dedup();
+        Ok(page_sorted(tags, String::as_str, last, limit))
     }
 
     async fn add_referrer(
@@ -2570,16 +2615,21 @@ impl Storage for FsStorage {
         &self,
         repo: &str,
         subject: &Digest,
-    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        artifact_type: Option<&str>,
+        last: Option<&str>,
+        limit: usize,
+    ) -> Result<Page<Referrer>, StorageError> {
         let target = subject.as_string();
-        // Fast path: the in-RAM subject→referrers map.
-        let refs = self.meta.referrers(repo, &target);
-        if !refs.is_empty() {
-            return Ok(refs);
+        // Fast path: a seek into the in-RAM subject→referrers index.
+        if let Some(page) = self
+            .meta
+            .referrers_page(repo, &target, artifact_type, last, limit)
+        {
+            return Ok(page);
         }
         // Fallback: scan index.json for any descriptor carrying `subject`.
         let index = self.read_index(repo).await?;
-        let out: Vec<Vec<u8>> = index
+        let linked: Vec<(String, &serde_json::Value)> = index
             .get("manifests")
             .and_then(|m| m.as_array())
             .map(|ms| {
@@ -2590,12 +2640,12 @@ impl Storage for FsStorage {
                             .and_then(|v| v.as_str())
                             == Some(target.as_str())
                     })
-                    .filter_map(|e| serde_json::to_vec(e).ok())
+                    .filter_map(|e| Some((descriptor_digest(e)?.to_string(), e)))
                     .collect()
             })
             .unwrap_or_default();
-        if !out.is_empty() {
-            return Ok(out);
+        if !linked.is_empty() {
+            return Ok(page_layout_referrers(linked, artifact_type, last, limit));
         }
         // Tag-schema fallback (dist-spec §Referrers tag schema): a client that
         // pushed to a registry without the referrers API maintains an image
@@ -2612,41 +2662,29 @@ impl Storage for FsStorage {
                 .map(|(d, _)| d),
         };
         let Some(tag_blob_digest) = resolved else {
-            return Ok(Vec::new());
+            return Ok(Page::default());
         };
         let bytes: Vec<u8> = match self.read_blob(repo, &tag_blob_digest).await {
             Ok(b) => b,
-            Err(_) => return Ok(Vec::new()),
+            Err(_) => return Ok(Page::default()),
         };
         let parsed: serde_json::Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
-            Err(_) => return Ok(Vec::new()),
+            Err(_) => return Ok(Page::default()),
         };
         let Some(arr) = parsed.get("manifests").and_then(|m| m.as_array()) else {
-            return Ok(Vec::new());
+            return Ok(Page::default());
         };
-        let mut dedup: HashSet<String> = HashSet::new();
-        let mut result = Vec::new();
-        for entry in arr {
-            // Only well-formed descriptors: an object whose digest parses under
-            // the registry's digest grammar. Anything else is skipped.
-            let Some(d) = entry
-                .as_object()
-                .and_then(|o| o.get("digest"))
-                .and_then(|v| v.as_str())
-            else {
-                continue;
-            };
-            let Ok(parsed) = Digest::parse(d) else {
-                continue;
-            };
-            if dedup.insert(parsed.as_string()) {
-                if let Ok(b) = serde_json::to_vec(entry) {
-                    result.push(b);
-                }
-            }
-        }
-        Ok(result)
+        // Only well-formed descriptors: an object whose digest parses under
+        // the registry's digest grammar. Anything else is skipped.
+        let listed: Vec<(String, &serde_json::Value)> = arr
+            .iter()
+            .filter_map(|entry| {
+                let d = Digest::parse(descriptor_digest(entry)?).ok()?;
+                Some((d.as_string(), entry))
+            })
+            .collect();
+        Ok(page_layout_referrers(listed, artifact_type, last, limit))
     }
 
     async fn mount_blob(
@@ -2814,7 +2852,10 @@ mod tests {
         assert_eq!(by_tag.digest, d);
         let by_digest = s.get_manifest("r", &d.as_string()).await.unwrap();
         assert_eq!(by_digest.bytes, body);
-        assert_eq!(s.list_tags("r").await.unwrap(), vec!["v1".to_string()]);
+        assert_eq!(
+            s.list_tags("r", None, usize::MAX).await.unwrap().items,
+            vec!["v1".to_string()]
+        );
         s.delete_manifest("r", &d).await.unwrap();
         assert!(matches!(
             s.get_manifest("r", "v1").await,
@@ -2915,14 +2956,23 @@ mod tests {
         let subject = sha256_of(b"subject");
         let referrer = sha256_of(b"referrer");
         // Empty before anything is recorded.
-        assert!(s.list_referrers("r", &subject).await.unwrap().is_empty());
+        assert!(s
+            .list_referrers("r", &subject, None, None, usize::MAX)
+            .await
+            .unwrap()
+            .items
+            .is_empty());
         s.add_referrer("r", &subject, &referrer, br#"{"digest":"x"}"#)
             .await
             .unwrap();
-        let listed = s.list_referrers("r", &subject).await.unwrap();
+        let listed = s
+            .list_referrers("r", &subject, None, None, usize::MAX)
+            .await
+            .unwrap()
+            .items;
         assert_eq!(listed.len(), 1);
         // add_referrer merges the subject link into the stored descriptor.
-        let parsed: serde_json::Value = serde_json::from_slice(&listed[0]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&listed[0].1).unwrap();
         assert_eq!(parsed.get("digest").and_then(|v| v.as_str()), Some("x"));
         assert_eq!(
             parsed
@@ -2937,7 +2987,12 @@ mod tests {
     async fn empty_repo_lists_no_tags() {
         let dir = tempfile::tempdir().unwrap();
         let s = FsStorage::new(dir.path()).unwrap();
-        assert!(s.list_tags("brand-new").await.unwrap().is_empty());
+        assert!(s
+            .list_tags("brand-new", None, usize::MAX)
+            .await
+            .unwrap()
+            .items
+            .is_empty());
     }
 
     #[test]
@@ -3019,12 +3074,18 @@ mod tests {
             .unwrap();
         s.delete_manifest("r", &d).await.unwrap();
         // "a" and "b" removed; "other" remains.
-        assert_eq!(s.list_tags("r").await.unwrap(), vec!["other".to_string()]);
+        assert_eq!(
+            s.list_tags("r", None, usize::MAX).await.unwrap().items,
+            vec!["other".to_string()]
+        );
         // Re-pushing the same (tag, digest) is idempotent (dedup keeps one entry).
         s.put_manifest("r", Some("other"), &other, "application/json", b"different")
             .await
             .unwrap();
-        assert_eq!(s.list_tags("r").await.unwrap(), vec!["other".to_string()]);
+        assert_eq!(
+            s.list_tags("r", None, usize::MAX).await.unwrap().items,
+            vec!["other".to_string()]
+        );
         // Deleting an untagged manifest in a fresh repo touches no tags.
         let d2 = sha256_of(b"lonely");
         s.put_manifest("solo", None, &d2, "application/json", b"lonely")
@@ -3035,7 +3096,12 @@ mod tests {
             .await
             .unwrap();
         s.delete_manifest("solo", &d2).await.unwrap();
-        assert!(s.list_tags("solo").await.unwrap().is_empty());
+        assert!(s
+            .list_tags("solo", None, usize::MAX)
+            .await
+            .unwrap()
+            .items
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3046,17 +3112,24 @@ mod tests {
         let s = FsStorage::new(dir.path()).unwrap();
         let repo_dir = dir.path().join("r");
         std::fs::create_dir_all(repo_dir.join("index.json")).unwrap();
-        assert!(matches!(s.list_tags("r").await, Err(StorageError::Io(_))));
+        assert!(matches!(
+            s.list_tags("r", None, usize::MAX).await,
+            Err(StorageError::Io(_))
+        ));
         let subject = sha256_of(b"s");
         assert!(matches!(
-            s.list_referrers("r", &subject).await,
+            s.list_referrers("r", &subject, None, None, usize::MAX)
+                .await,
             Err(StorageError::Io(_))
         ));
         // A syntactically corrupt index.json is also an internal Io error.
         let repo2 = dir.path().join("r2");
         std::fs::create_dir_all(&repo2).unwrap();
         std::fs::write(repo2.join("index.json"), b"{ not json").unwrap();
-        assert!(matches!(s.list_tags("r2").await, Err(StorageError::Io(_))));
+        assert!(matches!(
+            s.list_tags("r2", None, usize::MAX).await,
+            Err(StorageError::Io(_))
+        ));
     }
 
     #[tokio::test]
@@ -3079,8 +3152,18 @@ mod tests {
             .await
             .unwrap();
         // The foreign entry contributes no tag and is not a referrer.
-        assert!(s.list_tags("r").await.unwrap().is_empty());
-        assert!(s.list_referrers("r", &subject).await.unwrap().is_empty());
+        assert!(s
+            .list_tags("r", None, usize::MAX)
+            .await
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(s
+            .list_referrers("r", &subject, None, None, usize::MAX)
+            .await
+            .unwrap()
+            .items
+            .is_empty());
         // add_referrer with no pre-existing manifest entry appends the merged
         // descriptor (carrying the subject link) — covers the append branch.
         s.add_referrer(
@@ -3091,9 +3174,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let listed = s.list_referrers("r", &subject).await.unwrap();
+        let listed = s
+            .list_referrers("r", &subject, None, None, usize::MAX)
+            .await
+            .unwrap()
+            .items;
         assert_eq!(listed.len(), 1);
-        let parsed: serde_json::Value = serde_json::from_slice(&listed[0]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&listed[0].1).unwrap();
         assert_eq!(
             parsed
                 .get("subject")
@@ -3136,9 +3223,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let listed = s.list_referrers("r", &subject).await.unwrap();
+        let listed = s
+            .list_referrers("r", &subject, None, None, usize::MAX)
+            .await
+            .unwrap()
+            .items;
         assert_eq!(listed.len(), 1, "de-duplicated by digest");
-        let d: serde_json::Value = serde_json::from_slice(&listed[0]).unwrap();
+        let d: serde_json::Value = serde_json::from_slice(&listed[0].1).unwrap();
         assert_eq!(d["digest"], referrer.as_string());
         // A malformed body under the fallback tag yields no referrers.
         let other = sha256_of(b"other-subject");
@@ -3148,7 +3239,12 @@ mod tests {
         s.put_manifest("r", Some(&tag2), &jd, "application/json", junk)
             .await
             .unwrap();
-        assert!(s.list_referrers("r", &other).await.unwrap().is_empty());
+        assert!(s
+            .list_referrers("r", &other, None, None, usize::MAX)
+            .await
+            .unwrap()
+            .items
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3182,13 +3278,84 @@ mod tests {
         let s = FsStorage::new(dir.path()).unwrap();
         s.warm_referrers_from_layout().await;
         // Served from the metadata store (fast path), not the index.json scan.
-        let from_meta = s.meta.referrers("r", &subject.as_string());
+        let page = |s: &FsStorage| {
+            s.meta
+                .referrers_page("r", &subject.as_string(), None, None, usize::MAX)
+                .unwrap()
+                .items
+        };
+        let from_meta = page(&s);
         assert_eq!(from_meta.len(), 1);
         // Idempotent: a second pass records nothing new.
         s.warm_referrers_from_layout().await;
-        assert_eq!(s.meta.referrers("r", &subject.as_string()).len(), 1);
-        let d: serde_json::Value = serde_json::from_slice(&from_meta[0]).unwrap();
-        assert_eq!(d["digest"], referrer.as_string());
+        assert_eq!(page(&s).len(), 1);
+        assert_eq!(from_meta[0].0, referrer.as_string());
+    }
+
+    #[tokio::test]
+    async fn layout_fallback_pages_like_the_store() {
+        // An out-of-band layout roci's store has never seen: tags and the
+        // subject link are served from index.json, with the same cursor,
+        // order, de-dup and filter semantics as the in-RAM fast path.
+        let dir = tempfile::tempdir().unwrap();
+        let subject = sha256_of(b"subject");
+        let mut refs: Vec<(String, &str)> = (0..3u8)
+            .map(|i| {
+                (
+                    sha256_of(&[i]).as_string(),
+                    ["a/sig", "a/sbom"][usize::from(i % 2)],
+                )
+            })
+            .collect();
+        let tagged = |tag: &str, d: &str| serde_json::json!({"digest": d, "annotations": {(REF_NAME_ANNOTATION): tag}});
+        let mut manifests: Vec<serde_json::Value> = refs
+            .iter()
+            .map(|(d, at)| {
+                serde_json::json!({"digest": d, "artifactType": at,
+                                   "subject": {"digest": subject.as_string()}})
+            })
+            .collect();
+        // Unsorted, with one tag listed twice.
+        for t in ["c", "a", "b", "a"] {
+            manifests.push(tagged(t, &refs[0].0));
+        }
+        let repo = dir.path().join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("index.json"),
+            serde_json::json!({"schemaVersion": 2, "manifests": manifests}).to_string(),
+        )
+        .unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+
+        let p = s.list_tags("r", None, 2).await.unwrap();
+        assert_eq!((p.items, p.more), (vec!["a".into(), "b".into()], true));
+        let p = s.list_tags("r", Some("b"), 2).await.unwrap();
+        assert_eq!((p.items, p.more), (vec!["c".to_string()], false));
+
+        refs.sort();
+        let sigs: Vec<&String> = refs
+            .iter()
+            .filter(|(_, at)| *at == "a/sig")
+            .map(|(d, _)| d)
+            .collect();
+        let p = s
+            .list_referrers("r", &subject, Some("a/sig"), None, 1)
+            .await
+            .unwrap();
+        assert_eq!((&p.items[0].0, p.more), (sigs[0], true));
+        let p = s
+            .list_referrers("r", &subject, Some("a/sig"), Some(sigs[0]), 1)
+            .await
+            .unwrap();
+        assert_eq!((&p.items[0].0, p.more), (sigs[1], false));
+        let all = s
+            .list_referrers("r", &subject, None, None, usize::MAX)
+            .await
+            .unwrap()
+            .items;
+        let digests: Vec<&String> = all.iter().map(|(d, _)| d).collect();
+        assert_eq!(digests, refs.iter().map(|(d, _)| d).collect::<Vec<_>>());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3201,7 +3368,10 @@ mod tests {
             .await
             .unwrap();
         // The in-RAM index is authoritative immediately.
-        assert_eq!(s.list_tags("r").await.unwrap(), ["v1"]);
+        assert_eq!(
+            s.list_tags("r", None, usize::MAX).await.unwrap().items,
+            ["v1"]
+        );
         // The on-disk index.json converges without any read through roci.
         let path = dir.path().join("r").join("index.json");
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
@@ -3269,7 +3439,10 @@ mod tests {
             s.put_manifest("r", Some("v1"), &d, "application/json", body)
                 .await
                 .unwrap();
-            assert_eq!(s.list_tags("r").await.unwrap(), ["v1"]);
+            assert_eq!(
+                s.list_tags("r", None, usize::MAX).await.unwrap().items,
+                ["v1"]
+            );
             s.reconcile_index_json().await;
         });
         let v: serde_json::Value =
@@ -3423,7 +3596,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let listed = s.list_referrers("r", &subject).await.unwrap();
+        let listed = s
+            .list_referrers("r", &subject, None, None, usize::MAX)
+            .await
+            .unwrap()
+            .items;
         assert_eq!(listed.len(), 1);
     }
 
@@ -3449,7 +3626,9 @@ mod tests {
         .unwrap();
         let s = FsStorage::new(dir.path()).unwrap();
         s.warm_referrers_from_layout().await;
-        assert!(s.meta.referrers("repo", &subject.as_string()).is_empty());
+        assert!(!s
+            .meta
+            .has_referrer("repo", &subject.as_string(), &r.as_string()));
     }
 
     #[test]
@@ -3505,7 +3684,10 @@ mod tests {
             "application/vnd.oci.image.manifest.v1+json"
         );
         assert_eq!(by_tag.bytes, manifest.as_bytes());
-        assert_eq!(s.list_tags("app").await.unwrap(), vec!["v1".to_string()]);
+        assert_eq!(
+            s.list_tags("app", None, usize::MAX).await.unwrap().items,
+            vec!["v1".to_string()]
+        );
         assert_eq!(s.read_blob("app", &config_d).await.unwrap(), config);
         // A by-digest manifest blob present but unlisted in index.json falls
         // back to the image-manifest media type.
@@ -3633,9 +3815,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let listed = s.list_referrers("r", &subject).await.unwrap();
+        let listed = s
+            .list_referrers("r", &subject, None, None, usize::MAX)
+            .await
+            .unwrap()
+            .items;
         assert_eq!(listed.len(), 1);
-        let d: serde_json::Value = serde_json::from_slice(&listed[0]).unwrap();
+        let d: serde_json::Value = serde_json::from_slice(&listed[0].1).unwrap();
         // The referrer descriptor (from the metadata store) carries the subject
         // link and its own artifactType.
         assert_eq!(
