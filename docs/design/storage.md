@@ -20,7 +20,7 @@ Online, O(garbage) garbage collection — never offline — using a grace period
 
 ## Metadata index
 
-An embedded metadata index designed for a footprint budget: append-log + in-RAM maps by default, upgradeable to a B-tree KV store, with mmap-offloadable metadata so the index can run on a Raspberry Pi.
+An embedded metadata index designed for a footprint budget: append-log + in-RAM maps by default, upgradeable to a B-tree KV store, with mmap-offloadable metadata so the index can run on a Raspberry Pi. Tags and referrers live in ordered maps, so every `tags/list` and referrers page (including `artifactType`-filtered pages) is a seek past the cursor: per-request work is bounded by the page size, not by how many tags or referrers a repository holds.
 
 The spec-visible `index.json` is maintained by **coalescing write-behind**: a mutation is authoritative in the metadata log immediately, and a background task rewrites `index.json` atomically (no-follow beneath the storage root), preserving descriptors written by other tools. At startup roci reconciles `index.json` against the replayed log, so a crash between the two never leaves the layout behind. See the canonical [Architecture](https://github.com/jakobmoellerdev/roci/blob/main/ARCHITECTURE.md) invariant 12.
 

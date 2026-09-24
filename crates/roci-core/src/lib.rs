@@ -1104,19 +1104,13 @@ async fn upload_status<S: Storage>(st: &AppState<S>, repo: &str, id: &str) -> Re
 // ---- end-8: tag listing --------------------------------------------------
 
 async fn list_tags<S: Storage>(st: &AppState<S>, repo: &str, q: TagsQuery) -> Response {
-    let mut tags = match st.storage.list_tags(repo).await {
-        Ok(t) => t,
+    // Clamp the requested page size to the server-side cap (SECURITY inv. 14);
+    // storage seeks past `last` and returns only this page.
+    let limit = q.n.map(|n| n.min(MAX_PAGE)).unwrap_or(MAX_PAGE);
+    let page = match st.storage.list_tags(repo, q.last.as_deref(), limit).await {
+        Ok(p) => p,
         Err(e) => return map_storage_err(e),
     };
-    if let Some(last) = q.last.as_ref() {
-        if let Some(pos) = tags.iter().position(|t| t == last) {
-            tags = tags.split_off(pos + 1);
-        }
-    }
-    // Clamp the requested page size to the server-side cap (SECURITY inv. 14).
-    let limit = q.n.map(|n| n.min(MAX_PAGE)).unwrap_or(MAX_PAGE);
-    let total_len = tags.len();
-    tags.truncate(limit);
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -1124,15 +1118,15 @@ async fn list_tags<S: Storage>(st: &AppState<S>, repo: &str, q: TagsQuery) -> Re
     );
     // Pagination (dist-spec end-8): when tags remain past this page, advertise
     // the next page with an RFC 5988 `Link` whose cursor is the last tag served.
-    if total_len > tags.len() && limit > 0 {
-        let cursor = tags.last().map(String::as_str).unwrap_or_default();
+    if page.more && limit > 0 {
+        let cursor = page.items.last().map(String::as_str).unwrap_or_default();
         insert_next_link(
             &mut headers,
             &format!("/v2/{repo}/tags/list"),
             &[("n", &limit.to_string()), ("last", cursor)],
         );
     }
-    let body = serde_json::json!({ "name": repo, "tags": tags });
+    let body = serde_json::json!({ "name": repo, "tags": page.items });
     (StatusCode::OK, headers, body.to_string()).into_response()
 }
 
@@ -1158,42 +1152,22 @@ async fn referrers<S: Storage>(
     q: ReferrersQuery,
 ) -> Response {
     // Referrers for a subject are returned even if the subject manifest itself
-    // is absent; a missing index is simply an empty list.
-    let raw = st
-        .storage
-        .list_referrers(repo, subject)
-        .await
-        .unwrap_or_default();
+    // is absent; a missing index is simply an empty list. Storage seeks past
+    // the `last` cursor and applies the artifactType filter itself, so both
+    // lookup and parse work are bounded by the page, never by the whole
+    // referrer set (GHSA-259w-8hf6-59bj amplification class).
     let limit = q.n.map(|n| n.min(MAX_PAGE)).unwrap_or(MAX_PAGE);
     let filter = q.artifact_type.as_deref();
-    // Stream the (stable, insertion-ordered) referrer list: skip through the
-    // `last` cursor, apply the artifactType filter, and stop after `limit + 1`
-    // matches — so parse work is bounded by the page, never by the whole
-    // referrer set (GHSA-259w-8hf6-59bj amplification class), and every page
-    // stays reachable via the cursor.
-    let mut past_cursor = q.last.is_none();
-    let mut manifests: Vec<serde_json::Value> = Vec::with_capacity(limit.min(64) + 1);
-    for bytes in raw {
-        let Ok(m) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
-        };
-        let digest = m.get("digest").and_then(|v| v.as_str());
-        if !past_cursor {
-            past_cursor = digest == q.last.as_deref();
-            continue;
-        }
-        if let Some(f) = filter {
-            if m.get("artifactType").and_then(|v| v.as_str()) != Some(f) {
-                continue;
-            }
-        }
-        manifests.push(m);
-        if manifests.len() > limit {
-            break;
-        }
-    }
-    let had_more = manifests.len() > limit;
-    manifests.truncate(limit);
+    let page = st
+        .storage
+        .list_referrers(repo, subject, filter, q.last.as_deref(), limit)
+        .await
+        .unwrap_or_default();
+    let manifests: Vec<serde_json::Value> = page
+        .items
+        .iter()
+        .filter_map(|(_, bytes)| serde_json::from_slice(bytes).ok())
+        .collect();
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -1209,10 +1183,11 @@ async fn referrers<S: Storage>(
         headers.insert(header::VARY, HeaderValue::from_static("Accept"));
     }
     // RFC 5988 `Link` to the next page when this one is truncated.
-    if had_more && limit > 0 {
-        let last_digest = manifests
+    if page.more && limit > 0 {
+        let last_digest = page
+            .items
             .last()
-            .and_then(|m| m.get("digest").and_then(|v| v.as_str()))
+            .map(|(d, _)| d.as_str())
             .unwrap_or_default();
         let n = limit.to_string();
         let mut query: Vec<(&str, &str)> = vec![("n", &n), ("last", last_digest)];
@@ -2566,6 +2541,8 @@ mod tests {
                 None => break,
             }
         }
+        // Pages walk the referrer set in digest order.
+        sigs.sort();
         assert_eq!(seen, sigs);
     }
 
@@ -3215,21 +3192,32 @@ mod tests {
         let (app, storage, _d) = app_with_storage();
         let m = br#"{"schemaVersion":2}"#;
         let md = sha256_of(m);
-        storage
-            .put_manifest("r", Some("a"), &md, "application/json", m)
-            .await
-            .unwrap();
-        let resp = app
-            .oneshot(
-                HttpRequest::get("/v2/r/tags/list?last=zzz")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let v: serde_json::Value =
-            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-        assert_eq!(v["tags"], serde_json::json!(["a"]));
+        for t in ["a", "c"] {
+            storage
+                .put_manifest("r", Some(t), &md, "application/json", m)
+                .await
+                .unwrap();
+        }
+        // A cursor that no longer names a tag (e.g. deleted between pages)
+        // still resumes lexically after it (dist-spec end-8b), never restarts.
+        for (last, want) in [
+            ("b", serde_json::json!(["c"])),
+            ("zzz", serde_json::json!([])),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::get(format!("/v2/r/tags/list?last={last}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let v: serde_json::Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(v["tags"], want, "last={last}");
+        }
     }
 
     // ---- Phase 1: streaming Range + cache-control read-path tests ----------

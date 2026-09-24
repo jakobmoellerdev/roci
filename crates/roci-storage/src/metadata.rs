@@ -9,8 +9,9 @@
 //! truth (invariant 6); this index is a cache, always reconstructable by
 //! replaying the log or, failing that, walking the layout.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Write};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -53,10 +54,26 @@ pub trait MetadataStore: Send + Sync + 'static {
     fn resolve_tag(&self, repo: &str, tag: &str) -> Option<(String, String)>;
     /// The stored media type for a manifest digest, if known.
     fn manifest_media_type(&self, repo: &str, digest: &str) -> Option<String>;
-    /// All tags in a repo, sorted lexically.
-    fn list_tags(&self, repo: &str) -> Vec<String>;
-    /// The referrer descriptors recorded for a subject digest, as raw JSON.
-    fn referrers(&self, repo: &str, subject: &str) -> Vec<Vec<u8>>;
+    /// One page of `repo`'s tags in lexical order: at most `limit` tags
+    /// strictly after `last` (from the start when `None`) — an O(log n) seek,
+    /// so the work is bounded by the page, not the repo. `None` when the store
+    /// records no tag for `repo` (the caller falls back to the layout).
+    fn tags_page(&self, repo: &str, last: Option<&str>, limit: usize) -> Option<Page<String>>;
+    /// One page of the referrers recorded for `subject`, ordered by referrer
+    /// digest: at most `limit` entries strictly after `last`, restricted to
+    /// descriptors whose `artifactType` equals `artifact_type` when given (an
+    /// O(log n) seek into a per-type index, never a filtered scan). `None`
+    /// when the store records no referrer for `subject` at all.
+    fn referrers_page(
+        &self,
+        repo: &str,
+        subject: &str,
+        artifact_type: Option<&str>,
+        last: Option<&str>,
+        limit: usize,
+    ) -> Option<Page<Referrer>>;
+    /// Whether `referrer` is recorded as a referrer of `subject`.
+    fn has_referrer(&self, repo: &str, subject: &str, referrer: &str) -> bool;
     /// The manifest digests currently recorded as referencing `blob` in `repo`.
     fn backrefs(&self, repo: &str, blob: &str) -> Vec<String>;
     /// Apply and durably record a mutation.
@@ -97,17 +114,109 @@ type RepoKey = (String, String);
 /// One referrer: `(referrer_digest, descriptor_bytes)`; the digest de-dups.
 pub type Referrer = (String, Vec<u8>);
 
-/// The mutable in-RAM state. Keyed by `(repo, key)` so repos stay isolated.
+/// One page of a cursor-paginated listing: at most the requested number of
+/// items strictly after the request cursor, in the listing's stable order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    /// At least one further item follows `items` (→ a `Link: rel="next"`).
+    pub more: bool,
+}
+
+/// Collect at most `limit` items of `it` and record whether any remain.
+pub(crate) fn take_page<T>(mut it: impl Iterator<Item = T>, limit: usize) -> Page<T> {
+    let items: Vec<T> = it.by_ref().take(limit).collect();
+    let more = it.next().is_some();
+    Page { items, more }
+}
+
+/// The key range strictly after the cursor `last` (everything when `None`).
+fn after(last: Option<&str>) -> (Bound<&str>, Bound<&str>) {
+    (
+        last.map_or(Bound::Unbounded, Bound::Excluded),
+        Bound::Unbounded,
+    )
+}
+
+/// The referrers of one subject, ordered by referrer digest so a page is an
+/// O(log n) seek past the cursor. `by_type` indexes the same digests by their
+/// descriptor's `artifactType`, so a filtered page is an equally bounded seek.
+#[derive(Default)]
+struct SubjectReferrers {
+    /// `referrer_digest → (artifactType, descriptor_bytes)`.
+    by_digest: BTreeMap<String, (Option<String>, Vec<u8>)>,
+    /// `artifactType → {referrer_digest}`; holds exactly the typed entries of
+    /// `by_digest`, and a type whose set empties is removed.
+    by_type: HashMap<String, BTreeSet<String>>,
+}
+
+impl SubjectReferrers {
+    /// Record (or replace, de-duplicating by digest) one referrer descriptor.
+    fn insert(&mut self, referrer: &str, descriptor: &[u8]) {
+        let artifact_type = serde_json::from_slice::<serde_json::Value>(descriptor)
+            .ok()
+            .and_then(|v| v.get("artifactType")?.as_str().map(str::to_string));
+        self.remove(referrer);
+        if let Some(t) = &artifact_type {
+            self.by_type
+                .entry(t.clone())
+                .or_default()
+                .insert(referrer.to_string());
+        }
+        self.by_digest
+            .insert(referrer.to_string(), (artifact_type, descriptor.to_vec()));
+    }
+
+    /// Drop `referrer` from both indexes.
+    fn remove(&mut self, referrer: &str) {
+        let Some((Some(t), _)) = self.by_digest.remove(referrer) else {
+            return;
+        };
+        if let Some(set) = self.by_type.get_mut(&t) {
+            set.remove(referrer);
+            if set.is_empty() {
+                self.by_type.remove(&t);
+            }
+        }
+    }
+
+    fn page(
+        &self,
+        artifact_type: Option<&str>,
+        last: Option<&str>,
+        limit: usize,
+    ) -> Page<Referrer> {
+        match artifact_type {
+            None => take_page(
+                self.by_digest
+                    .range::<str, _>(after(last))
+                    .map(|(d, (_, bytes))| (d.clone(), bytes.clone())),
+                limit,
+            ),
+            Some(t) => match self.by_type.get(t) {
+                Some(set) => take_page(
+                    set.range::<str, _>(after(last))
+                        .map(|d| (d.clone(), self.by_digest[d].1.clone())),
+                    limit,
+                ),
+                None => Page::default(),
+            },
+        }
+    }
+}
+
+/// The mutable in-RAM state. Repo-scoped so repositories stay isolated.
 #[derive(Default)]
 struct State {
-    /// `(repo, tag) → (digest, media_type)` — media type stored alongside so a
-    /// tag resolution needs no second lookup and carries no fallback default.
-    tags: HashMap<RepoKey, (String, String)>,
+    /// `repo → tag → (digest, media_type)` — lexically ordered per repo so a
+    /// tag page is a seek; a repo whose last tag goes is removed. The media
+    /// type is stored alongside so a tag resolution needs no second lookup.
+    tags: HashMap<String, BTreeMap<String, (String, String)>>,
     /// `(repo, digest) → media_type`.
     media_types: HashMap<RepoKey, String>,
-    /// `(repo, subject) → [(referrer_digest, descriptor_bytes)]`. The referrer
-    /// digest keys de-dup so a re-push replaces rather than appends.
-    referrers: HashMap<RepoKey, Vec<Referrer>>,
+    /// `(repo, subject) → referrers`; a subject whose last referrer goes is
+    /// removed.
+    referrers: HashMap<RepoKey, SubjectReferrers>,
     /// `(repo, blob_digest) → [manifest_digest]`: reverse edges from a blob to
     /// every manifest that references it. Maintained on manifest put/delete for
     /// a future online GC; manifest digests de-dup within a set.
@@ -149,22 +258,30 @@ impl LogMetadataStore {
                     .media_types
                     .insert((repo.clone(), digest.clone()), media_type.clone());
                 if let Some(tag) = tag {
-                    state.tags.insert(
-                        (repo.clone(), tag.clone()),
-                        (digest.clone(), media_type.clone()),
-                    );
+                    state
+                        .tags
+                        .entry(repo.clone())
+                        .or_default()
+                        .insert(tag.clone(), (digest.clone(), media_type.clone()));
                 }
             }
             MetaOp::DeleteManifest { repo, digest } => {
                 state.media_types.remove(&(repo.clone(), digest.clone()));
                 // Drop every tag pointing at this digest.
-                state
-                    .tags
-                    .retain(|(r, _), (d, _)| !(r == repo && d == digest));
-                // Drop the deleted manifest as a referrer of any subject.
-                for refs in state.referrers.values_mut() {
-                    refs.retain(|(rd, _)| rd != digest);
+                if let Some(tags) = state.tags.get_mut(repo) {
+                    tags.retain(|_, (d, _)| d != digest);
+                    if tags.is_empty() {
+                        state.tags.remove(repo);
+                    }
                 }
+                // Drop the deleted manifest as a referrer of any subject in
+                // this repo; a subject left without referrers is removed.
+                state.referrers.retain(|(r, _), refs| {
+                    if r == repo {
+                        refs.remove(digest);
+                    }
+                    !refs.by_digest.is_empty()
+                });
                 // Drop the deleted manifest from every blob's backref set in
                 // this repo; a set that empties is removed entirely.
                 state.backrefs.retain(|(r, _), manifests| {
@@ -195,16 +312,11 @@ impl LogMetadataStore {
                 referrer,
                 descriptor,
             } => {
-                let entry = state
+                state
                     .referrers
                     .entry((repo.clone(), subject.clone()))
-                    .or_default();
-                // De-dup by referrer digest: replace an existing descriptor.
-                if let Some(slot) = entry.iter_mut().find(|(rd, _)| rd == referrer) {
-                    slot.1 = descriptor.clone();
-                } else {
-                    entry.push((referrer.clone(), descriptor.clone()));
-                }
+                    .or_default()
+                    .insert(referrer, descriptor);
             }
         }
     }
@@ -213,10 +325,7 @@ impl LogMetadataStore {
 impl MetadataStore for LogMetadataStore {
     fn resolve_tag(&self, repo: &str, tag: &str) -> Option<(String, String)> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        state
-            .tags
-            .get(&(repo.to_string(), tag.to_string()))
-            .cloned()
+        state.tags.get(repo)?.get(tag).cloned()
     }
 
     fn manifest_media_type(&self, repo: &str, digest: &str) -> Option<String> {
@@ -227,25 +336,36 @@ impl MetadataStore for LogMetadataStore {
             .cloned()
     }
 
-    fn list_tags(&self, repo: &str) -> Vec<String> {
+    fn tags_page(&self, repo: &str, last: Option<&str>, limit: usize) -> Option<Page<String>> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        let mut tags: Vec<String> = state
-            .tags
-            .keys()
-            .filter(|(r, _)| r == repo)
-            .map(|(_, t)| t.clone())
-            .collect();
-        tags.sort();
-        tags
+        let tags = state.tags.get(repo)?;
+        Some(take_page(
+            tags.range::<str, _>(after(last)).map(|(t, _)| t.clone()),
+            limit,
+        ))
     }
 
-    fn referrers(&self, repo: &str, subject: &str) -> Vec<Vec<u8>> {
+    fn referrers_page(
+        &self,
+        repo: &str,
+        subject: &str,
+        artifact_type: Option<&str>,
+        last: Option<&str>,
+        limit: usize,
+    ) -> Option<Page<Referrer>> {
+        let state = self.inner.lock().expect("metadata lock poisoned");
+        let refs = state
+            .referrers
+            .get(&(repo.to_string(), subject.to_string()))?;
+        Some(refs.page(artifact_type, last, limit))
+    }
+
+    fn has_referrer(&self, repo: &str, subject: &str, referrer: &str) -> bool {
         let state = self.inner.lock().expect("metadata lock poisoned");
         state
             .referrers
             .get(&(repo.to_string(), subject.to_string()))
-            .map(|v| v.iter().map(|(_, d)| d.clone()).collect())
-            .unwrap_or_default()
+            .is_some_and(|refs| refs.by_digest.contains_key(referrer))
     }
 
     fn backrefs(&self, repo: &str, blob: &str) -> Vec<String> {
@@ -345,15 +465,18 @@ impl LogMetadataStore {
         repos
     }
 
-    /// Snapshot the tags for `repo` as `(tag, digest, media_type)`.
+    /// Snapshot the tags for `repo` as `(tag, digest, media_type)`, sorted by tag.
     pub fn tags_snapshot(&self, repo: &str) -> Vec<(String, String, String)> {
         let state = self.inner.lock().expect("metadata lock poisoned");
         state
             .tags
-            .iter()
-            .filter(|((r, _), _)| r == repo)
-            .map(|((_, tag), (digest, media))| (tag.clone(), digest.clone(), media.clone()))
-            .collect()
+            .get(repo)
+            .map(|tags| {
+                tags.iter()
+                    .map(|(tag, (digest, media))| (tag.clone(), digest.clone(), media.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Snapshot referrers for `repo` as `(subject_digest, [(referrer_digest, descriptor_bytes)])`.
@@ -363,7 +486,14 @@ impl LogMetadataStore {
             .referrers
             .iter()
             .filter(|((r, _), _)| r == repo)
-            .map(|((_, subject), refs)| (subject.clone(), refs.clone()))
+            .map(|((_, subject), refs)| {
+                let refs = refs
+                    .by_digest
+                    .iter()
+                    .map(|(d, (_, bytes))| (d.clone(), bytes.clone()))
+                    .collect();
+                (subject.clone(), refs)
+            })
             .collect()
     }
 }
@@ -559,8 +689,11 @@ mod tests {
             Some("application/vnd.oci.image.manifest.v1+json")
         );
         assert_eq!(s.manifest_media_type("r", "sha256:zz"), None);
-        assert_eq!(s.list_tags("r"), vec!["v1".to_string(), "v2".to_string()]);
-        assert!(s.list_tags("other").is_empty());
+        assert_eq!(
+            s.tags_page("r", None, usize::MAX).unwrap().items,
+            vec!["v1".to_string(), "v2".to_string()]
+        );
+        assert!(s.tags_page("other", None, usize::MAX).is_none());
     }
 
     #[test]
@@ -577,21 +710,29 @@ mod tests {
             descriptor: br#"{"digest":"sha256:rr"}"#.to_vec(),
         })
         .unwrap();
-        assert_eq!(s.referrers("r", "sha256:aa").len(), 1);
+        assert_eq!(
+            s.referrers_page("r", "sha256:aa", None, None, usize::MAX)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
         // Deleting the referrer manifest drops it from the subject's set.
         s.apply(MetaOp::DeleteManifest {
             repo: "r".into(),
             digest: "sha256:rr".into(),
         })
         .unwrap();
-        assert!(s.referrers("r", "sha256:aa").is_empty());
+        assert!(s
+            .referrers_page("r", "sha256:aa", None, None, usize::MAX)
+            .is_none());
         // Deleting the subject manifest drops both its tags and media type.
         s.apply(MetaOp::DeleteManifest {
             repo: "r".into(),
             digest: "sha256:aa".into(),
         })
         .unwrap();
-        assert!(s.list_tags("r").is_empty());
+        assert!(s.tags_page("r", None, usize::MAX).is_none());
         assert_eq!(s.manifest_media_type("r", "sha256:aa"), None);
     }
 
@@ -607,10 +748,93 @@ mod tests {
         };
         s.apply(mk(br#"{"v":1}"#)).unwrap();
         s.apply(mk(br#"{"v":2}"#)).unwrap();
-        let refs = s.referrers("r", "sha256:s");
+        let refs = s
+            .referrers_page("r", "sha256:s", None, None, usize::MAX)
+            .unwrap()
+            .items;
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0], br#"{"v":2}"#);
-        assert!(s.referrers("r", "sha256:none").is_empty());
+        assert_eq!(refs[0].1, br#"{"v":2}"#);
+        assert!(s
+            .referrers_page("r", "sha256:none", None, None, usize::MAX)
+            .is_none());
+    }
+
+    #[test]
+    fn tags_page_seeks_past_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = LogMetadataStore::open(dir.path()).unwrap();
+        for t in ["v4", "v1", "v3", "v2"] {
+            s.apply(put("r", "sha256:aa", Some(t))).unwrap();
+        }
+        s.apply(put("other", "sha256:aa", Some("v0"))).unwrap();
+        let page = |last, limit| {
+            let p = s.tags_page("r", last, limit).unwrap();
+            (p.items, p.more)
+        };
+        let v = |ts: &[&str]| ts.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        assert_eq!(page(None, 2), (v(&["v1", "v2"]), true));
+        assert_eq!(page(Some("v2"), 2), (v(&["v3", "v4"]), false), "exact fit");
+        // A cursor that is not (or no longer) a tag resumes lexically after it.
+        assert_eq!(page(Some("v25"), 1), (v(&["v3"]), true));
+        assert_eq!(page(Some("v9"), 5), (v(&[]), false));
+        assert_eq!(page(None, 0), (v(&[]), true));
+    }
+
+    #[test]
+    fn referrers_page_filters_through_type_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = LogMetadataStore::open(dir.path()).unwrap();
+        let add = |repo: &str, referrer: &str, descriptor: &str| {
+            s.apply(MetaOp::PutReferrer {
+                repo: repo.into(),
+                subject: "sha256:s".into(),
+                referrer: referrer.into(),
+                descriptor: descriptor.as_bytes().to_vec(),
+            })
+            .unwrap();
+        };
+        add("r", "sha256:c", r#"{"artifactType":"sig"}"#);
+        add("r", "sha256:a", r#"{"artifactType":"sig"}"#);
+        add("r", "sha256:b", r#"{"artifactType":"sbom"}"#);
+        add("r", "sha256:d", r#"{}"#);
+        add("other", "sha256:a", r#"{"artifactType":"sig"}"#);
+        let page = |filter, last, limit| {
+            let p = s
+                .referrers_page("r", "sha256:s", filter, last, limit)
+                .unwrap();
+            (
+                p.items.into_iter().map(|(d, _)| d).collect::<Vec<_>>(),
+                p.more,
+            )
+        };
+        let v = |ds: &[&str]| ds.iter().map(|d| d.to_string()).collect::<Vec<_>>();
+        // Digest order, independent of insertion order.
+        assert_eq!(
+            page(None, None, 9),
+            (v(&["sha256:a", "sha256:b", "sha256:c", "sha256:d"]), false)
+        );
+        assert_eq!(page(Some("sig"), None, 1), (v(&["sha256:a"]), true));
+        assert_eq!(
+            page(Some("sig"), Some("sha256:a"), 1),
+            (v(&["sha256:c"]), false)
+        );
+        assert_eq!(page(Some("nope"), None, 9), (v(&[]), false));
+        // Re-typing a referrer moves it between type indexes.
+        add("r", "sha256:c", r#"{"artifactType":"sbom"}"#);
+        assert_eq!(page(Some("sig"), None, 9), (v(&["sha256:a"]), false));
+        assert_eq!(
+            page(Some("sbom"), None, 9),
+            (v(&["sha256:b", "sha256:c"]), false)
+        );
+        // Deleting a manifest drops it from this repo's indexes only.
+        s.apply(MetaOp::DeleteManifest {
+            repo: "r".into(),
+            digest: "sha256:a".into(),
+        })
+        .unwrap();
+        assert_eq!(page(Some("sig"), None, 9), (v(&[]), false));
+        assert!(s.has_referrer("other", "sha256:s", "sha256:a"));
+        assert!(!s.has_referrer("r", "sha256:s", "sha256:a"));
     }
 
     #[test]
@@ -674,7 +898,13 @@ mod tests {
             s2.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
             Some("sha256:aa")
         );
-        assert_eq!(s2.referrers("r", "sha256:aa").len(), 1);
+        assert_eq!(
+            s2.referrers_page("r", "sha256:aa", None, None, usize::MAX)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
         // The deleted manifest's tag did not survive replay.
         assert_eq!(s2.resolve_tag("r", "v2"), None);
     }
