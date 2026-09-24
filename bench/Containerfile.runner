@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1
+# Benchmark runner: pinned load tools + stdlib-only Python orchestrator.
+# Build context: bench/.  Built and driven by bench/run.sh.
+
+# --- Go load tools (vegeta, crane, loadgen) + zot's zb release binary ---------
+FROM golang:1.27-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS tools
+ENV CGO_ENABLED=0 GOFLAGS=-trimpath
+ARG TARGETARCH
+RUN go install github.com/tsenart/vegeta/v12@v12.13.0 && \
+    go install github.com/google/go-containerregistry/cmd/crane@v0.22.1
+COPY loadgen /src/loadgen
+RUN cd /src/loadgen && go build -o /go/bin/loadgen .
+RUN case "$TARGETARCH" in \
+      amd64) sum=6f2561ca049f265b1a2568f21980d9a6e4c872ec48c59d4a2d0afcaa6af9908c ;; \
+      arm64) sum=26a7b44d569c3fb2d0d39c945e21a214d0620b182ea5687eb23195ca6d41799e ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL -o /go/bin/zb "https://github.com/project-zot/zot/releases/download/v2.1.21/zb-linux-${TARGETARCH}" && \
+    echo "$sum  /go/bin/zb" | sha256sum -c - && \
+    chmod +x /go/bin/zb
+
+# --- Flamegraph tooling (inferno) -------------------------------------------
+FROM rust:1.98-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS rtools
+RUN cargo install inferno@0.12.8 --locked --root /out
+
+# --- Runner ------------------------------------------------------------------
+FROM python:3.13-slim-bookworm@sha256:2325bb286ec344af3e5898cc224b5844e2707ac6e26b1632516fd3edc84a5e26
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends linux-perf strace && \
+    rm -rf /var/lib/apt/lists/* && \
+    # Older Debian ships /usr/bin/perf as a wrapper that refuses a mismatched kernel; link the versioned
+    # binary when present (bookworm's linux-perf 6.1 installs the real ELF at /usr/bin/perf).
+    real="$(ls /usr/bin/perf_* 2>/dev/null | sort -V | tail -n1)" && \
+    ln -sf "${real:-/usr/bin/perf}" /usr/local/bin/perf && \
+    /usr/local/bin/perf --version
+COPY --from=rtools /out/bin/inferno-collapse-perf /out/bin/inferno-flamegraph /usr/local/bin/
+COPY --from=docker:29.8.0-cli@sha256:eccaacfeed644c7de222ff047483568cb988dde95476fbaaf10ea2d04921bb66 /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=tools /go/bin/vegeta /go/bin/crane /go/bin/loadgen /go/bin/zb /usr/local/bin/
+COPY harness /bench/harness
+COPY config.toml /bench/config.toml
+COPY registries /bench/registries
+RUN mkdir -p /compare /results /work
+WORKDIR /bench
+ENTRYPOINT ["python3", "-m", "harness.bench"]

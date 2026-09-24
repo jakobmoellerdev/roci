@@ -208,6 +208,16 @@ container-multiarch:
     args=(); while IFS= read -r kv; do args+=(--label "$kv" --annotation "index,manifest:$kv"); done <<< "$(scripts/oci-meta.sh)"
     docker buildx build "${args[@]}" --platform linux/amd64,linux/arm64 -t roci:multiarch -f Containerfile .
 
+# Benchmark roci vs CNCF distribution vs zot in pinned containers (requires rootful Docker, ≥4 CPUs).
+# `quick` ≈ 10 min smoke; `full` = 5 interleaved reps (authoritative only on a dedicated Linux host).
+bench profile="quick":
+    bash bench/run.sh compare {{profile}}
+
+# Profile roci alone (perf CPU flamegraphs, syscall summary, server-side route latency, findings) with a
+# symbolized build. Pass a prior `just bench` results dir to get a "gaps vs competitors" table.
+bench-perf profile="quick" compare="":
+    bash bench/run.sh perf {{profile}} {{compare}}
+
 # Build a release binary with all features (allocator, OTel, extensions).
 release-build:
     cargo build --release -p roci-cli --features full

@@ -1,0 +1,58 @@
+# syntax=docker/dockerfile:1
+
+# Profiling build of roci for `just bench-perf` (bench/run.sh perf). NOT for release.
+# Identical to the root Containerfile except: line-table debug info, forced frame
+# pointers, and no `strip` — so `perf` can symbolize and unwind. Build context: repo root.
+# Keep the builder/runtime stages in sync with ../Containerfile.
+
+# --- Build stage: musl-static compile --------------------------------------
+FROM --platform=$BUILDPLATFORM rust:1.98-alpine AS builder
+
+# musl-dev provides the static C runtime; mimalloc (in `full`) compiles C via
+# cc — musl-friendly, no background threads, smaller than jemalloc.
+RUN apk add --no-cache musl-dev
+
+# [bench perf] symbols + line info with unchanged optimization; frame pointers for unwinding.
+ENV CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+ENV RUSTFLAGS="-C force-frame-pointers=yes"
+
+WORKDIR /src
+
+# Map the target platform to a Rust musl target so cross-arch builds work.
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) echo "x86_64-unknown-linux-musl" > /tmp/rust-target ;; \
+      arm64) echo "aarch64-unknown-linux-musl" > /tmp/rust-target ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    rustup target add "$(cat /tmp/rust-target)"
+
+# Copy the whole workspace and build the CLI statically. (Spec submodules are
+# not needed to build the binary; only to run the conformance suite.)
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    target="$(cat /tmp/rust-target)" && \
+    cargo build --release --target "$target" -p roci-cli --features full && \
+    cp "target/$target/release/roci" /roci  # [bench perf] not stripped
+
+# Pre-create the storage directory owned by the nonroot UID so the scratch
+# image has a writable data dir without needing a shell or chown at runtime.
+RUN mkdir -p /rootfs/var/lib/roci && chown -R 65532:65532 /rootfs/var/lib/roci
+
+# --- Final stage: scratch --------------------------------------------------
+FROM scratch AS runtime
+
+# Copy the static binary and the pre-owned storage directory.
+COPY --from=builder /roci /roci
+COPY --from=builder --chown=65532:65532 /rootfs/var/lib/roci /var/lib/roci
+
+# Run as an unprivileged, well-known nonroot UID:GID (no shell, no root).
+USER 65532:65532
+
+# The storage directory is the only writable path; the rest of the root FS can
+# be mounted read-only.
+VOLUME ["/var/lib/roci"]
+EXPOSE 5000
+
+ENTRYPOINT ["/roci"]
+CMD ["--listen", "0.0.0.0:5000", "--storage-root", "/var/lib/roci"]

@@ -1,0 +1,48 @@
+# Manual registry benchmark: roci vs CNCF distribution vs zot (bench/run.sh).
+#
+# Non-gating, read-only token, no secrets. GitHub-hosted runners are shared and
+# noisy: only ratios *within one run* are meaningful — never compare absolute
+# numbers across runs. The runner has 4 vCPU, so bench/run.sh splits server
+# cpus 0-1 / client cpus 2-3. Authoritative numbers need a dedicated Linux host
+# (docs/guide/benchmarks.md).
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: compare (roci vs distribution vs zot) or perf (roci profiling)
+        type: choice
+        options: [compare, perf]
+        default: compare
+      profile:
+        description: workload size
+        type: choice
+        options: [quick, full]
+        default: quick
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run benchmark
+        env:
+          MODE: ${{ inputs.mode }}
+          PROFILE: ${{ inputs.profile }}
+        run: bash bench/run.sh "$MODE" "$PROFILE"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: bench-results
+          path: bench/results/
+          if-no-files-found: error
