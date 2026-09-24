@@ -195,6 +195,14 @@ impl From<StorageError> for ApiError {
     }
 }
 
+/// Map `StorageError::NotFound` to `unknown()` and every other error through `From`.
+pub(crate) fn not_found_as(unknown: fn() -> ApiError) -> impl FnOnce(StorageError) -> ApiError {
+    move |e| match e {
+        StorageError::NotFound => unknown(),
+        other => ApiError::from(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
