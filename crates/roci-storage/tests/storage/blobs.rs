@@ -45,6 +45,59 @@ async fn blob_roundtrip_and_digest_verify() {
 }
 
 #[tokio::test]
+async fn open_blob_streams_ranges_across_chunk_boundaries() {
+    use futures::TryStreamExt;
+    let (_dir, s) = store();
+    // > 2 read chunks (256 KiB) of position-dependent bytes, so a dropped,
+    // repeated or misordered chunk changes the output.
+    let data: Vec<u8> = (0..600 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let d = sha256_of(&data);
+    s.put_blob("r", &d, &data).await.unwrap();
+    for (start, len) in [(0, data.len()), (1, data.len() - 2), (262_143, 262_146)] {
+        let blob = s.open_blob("r", &d).await.unwrap();
+        let chunks: Vec<_> = blob
+            .into_stream(start as u64, len as u64)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            chunks.concat(),
+            &data[start..start + len],
+            "range {start}+{len}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn open_blob_stream_errors_when_file_is_shorter_than_its_size() {
+    use futures::TryStreamExt;
+    let (dir, s) = store();
+    let data = vec![7u8; 300 * 1024];
+    let d = sha256_of(&data);
+    s.put_blob("r", &d, &data).await.unwrap();
+    let blob = s.open_blob("r", &d).await.unwrap();
+    // Truncated underneath an open read: the body must fail, not end short
+    // and look like a complete (smaller) blob.
+    let path = dir.path().join("r/blobs/sha256").join(d.hex());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(1024)
+        .unwrap();
+    let err = blob
+        .into_stream(0, data.len() as u64)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+}
+
+#[tokio::test]
 async fn open_blob_streams_and_missing_is_not_found() {
     use futures::TryStreamExt;
     let (_dir, s) = store();

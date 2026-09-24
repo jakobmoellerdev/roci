@@ -10,7 +10,59 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use std::future::Future;
 use std::io;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+/// Bytes read per blocking-pool hop when streaming a local blob. Each hop is a
+/// thread hand-off costing tens of µs, so `ReaderStream`'s 4 KiB default made
+/// pulls hop-bound; 256 KiB amortizes it while bounding per-stream memory to
+/// two chunks (the one being sent + one read ahead).
+const FILE_CHUNK: u64 = 256 * 1024;
+
+type ChunkRead = tokio::task::JoinHandle<io::Result<(std::fs::File, Bytes)>>;
+
+/// Read exactly `n` bytes (after seeking to `seek`, if given) on the blocking
+/// pool. The file is moved in and handed back, so no lock is needed and only
+/// one read per stream is ever in flight.
+fn read_chunk(file: std::fs::File, seek: Option<u64>, n: u64) -> ChunkRead {
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek};
+        let mut file = file;
+        if let Some(start) = seek {
+            file.seek(io::SeekFrom::Start(start))?;
+        }
+        let mut buf = Vec::with_capacity(n as usize);
+        (&mut file).take(n).read_to_end(&mut buf)?;
+        if (buf.len() as u64) < n {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "blob file is shorter than its recorded size",
+            ));
+        }
+        Ok((file, Bytes::from(buf)))
+    })
+}
+
+/// Stream `[start, start + len)` of a local file in [`FILE_CHUNK`] pieces with
+/// one chunk of read-ahead: the next read runs while the current chunk is being
+/// written to the socket. Backpressure is async (an unpolled stream holds a
+/// finished chunk, never a blocking-pool thread), so slow clients cannot pin
+/// the pool. A read error ends the stream after yielding it.
+fn file_stream(file: std::fs::File, start: u64, len: u64) -> BlobStream {
+    let first = FILE_CHUNK.min(len);
+    let pending = read_chunk(file, (start > 0).then_some(start), first);
+    futures::stream::unfold(Some((pending, len - first)), |state| async move {
+        let (pending, remaining) = state?;
+        let (file, bytes) = match pending.await.map_err(io::Error::other).and_then(|r| r) {
+            Ok(read) => read,
+            Err(e) => return Some((Err(e), None)),
+        };
+        let next = (remaining > 0).then(|| {
+            let n = FILE_CHUNK.min(remaining);
+            (read_chunk(file, None, n), remaining - n)
+        });
+        Some((Ok(bytes), next))
+    })
+    .boxed()
+}
 
 /// A resolved reference target: either a tag pointing at a manifest digest, or
 /// a direct manifest digest.
@@ -85,12 +137,7 @@ impl BlobRead {
     /// redirect has no local body: [`io::ErrorKind::Unsupported`].
     pub async fn into_stream(self, start: u64, len: u64) -> io::Result<BlobStream> {
         match self.source {
-            BlobSource::File(mut f) => {
-                if start > 0 {
-                    f.seek(io::SeekFrom::Start(start)).await?;
-                }
-                Ok(tokio_util::io::ReaderStream::new(f.take(len)).boxed())
-            }
+            BlobSource::File(f) => Ok(file_stream(f.into_std().await, start, len)),
             BlobSource::Ranged(open) => open(start, len).await,
             BlobSource::Redirect(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
