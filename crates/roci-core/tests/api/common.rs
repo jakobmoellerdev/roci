@@ -5,6 +5,7 @@ use axum::http::{header, HeaderName, Method, Request, StatusCode};
 use axum::response::Response;
 use axum::Router;
 use http_body_util::BodyExt;
+use roci_config::Config;
 use roci_core::{build_router, AppState};
 use roci_storage::{sha256_of, Digest, FsStorage};
 use tempfile::TempDir;
@@ -12,32 +13,21 @@ use tower::ServiceExt;
 
 /// App over a fresh store; hold the `TempDir` for the test's lifetime.
 pub fn app() -> (Router, TempDir) {
-    app_configured(|s| s)
+    app_with_config(Config::default())
 }
 
-/// App with an adjusted `AppState` (limits, config).
-pub fn app_configured(
-    f: impl FnOnce(AppState<FsStorage>) -> AppState<FsStorage>,
-) -> (Router, TempDir) {
-    let (app, _, dir) = app_with(f);
-    (app, dir)
+/// App with a custom config (for limits, delete flags, etc.).
+pub fn app_with_config(config: Config) -> (Router, TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = FsStorage::new(dir.path()).unwrap();
+    (build_router(AppState::new_with(storage, config)), dir)
 }
 
 /// App plus the storage handle, for direct seeding / IO-error injection.
 pub fn app_with_storage() -> (Router, FsStorage, TempDir) {
-    app_with(|s| s)
-}
-
-fn app_with(
-    f: impl FnOnce(AppState<FsStorage>) -> AppState<FsStorage>,
-) -> (Router, FsStorage, TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(dir.path()).unwrap();
-    (
-        build_router(f(AppState::new(storage.clone()))),
-        storage,
-        dir,
-    )
+    (build_router(AppState::new(storage.clone())), storage, dir)
 }
 
 /// App whose repo `r` has `index.json` as a directory, so reading the index

@@ -207,7 +207,7 @@ jobs:
       - name: Build release binary
         env:
           TARGET: ${{ steps.t.outputs.target }}
-        run: cargo build --release --target "$TARGET" -p roci-cli
+        run: cargo build --release --target "$TARGET" -p roci-cli --features full
       - name: Package
         shell: bash
         env:

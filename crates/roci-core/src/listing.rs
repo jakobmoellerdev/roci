@@ -22,12 +22,9 @@ pub(crate) struct ReferrersQuery {
     last: Option<String>,
 }
 
-/// Maximum page size for list endpoints (tags/referrers); server-side cap.
-pub(crate) const MAX_PAGE: usize = 1000;
-
 /// Clamp an optional page-size request to the server-side cap.
-fn page_limit(n: Option<usize>) -> usize {
-    n.map_or(MAX_PAGE, |n| n.min(MAX_PAGE))
+fn page_limit(n: Option<usize>, max_page: usize) -> usize {
+    n.map_or(max_page, |n| n.min(max_page))
 }
 
 pub(crate) async fn tags<S: Storage>(
@@ -37,7 +34,7 @@ pub(crate) async fn tags<S: Storage>(
 ) -> Result<Response, ApiError> {
     // Clamp the requested page size to the server-side cap (SECURITY inv. 14);
     // storage seeks past `last` and returns only this page.
-    let limit = page_limit(q.n);
+    let limit = page_limit(q.n, st.max_page());
     let page = st.storage.list_tags(repo, q.last.as_deref(), limit).await?;
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -69,7 +66,7 @@ pub(crate) async fn referrers<S: Storage>(
     // the `last` cursor and applies the artifactType filter itself, so both
     // lookup and parse work are bounded by the page, never by the whole
     // referrer set (GHSA-259w-8hf6-59bj amplification class).
-    let limit = page_limit(q.n);
+    let limit = page_limit(q.n, st.max_page());
     let filter = q.artifact_type.as_deref();
     let page = st
         .storage
@@ -127,9 +124,9 @@ pub(crate) async fn referrers<S: Storage>(
 /// spaces round-trip through the next request; a value that still cannot form
 /// a header (control bytes) omits the link rather than panicking.
 pub(crate) fn insert_next_link(headers: &mut HeaderMap, path: &str, query: &[(&str, &str)]) {
-    let Ok(qs) = serde_urlencoded::to_string(query) else {
-        return;
-    };
+    // `serde_urlencoded::to_string` on `&[(&str, &str)]` is infallible (str
+    // pairs always serialize), so unwrap is safe here.
+    let qs = serde_urlencoded::to_string(query).expect("str pairs always serialize");
     if let Ok(v) = HeaderValue::from_str(&format!("<{path}?{qs}>; rel=\"next\"")) {
         headers.insert(header::LINK, v);
     }

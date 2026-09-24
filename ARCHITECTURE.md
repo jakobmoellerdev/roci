@@ -156,7 +156,7 @@ A single configuration file governs the instance, divided into sections:
 
 **Sensitive-credential exception (from zot):** config items containing secrets (S3 keys, LDAP bind password, token signing keys) MAY be stored in separate referenced files, allowing stricter filesystem permissions and native Kubernetes Secret mounting. Only authorization config is live-reloadable while running (see [`PLAN.md`](PLAN.md) Phase 6); other changes require restart.
 
-**[roci divergence]** config format is a roci decision (likely TOML/YAML with a documented schema and load-time validation), whereas zot uses JSON. Zero-config defaults must yield a working local registry with no file at all.
+**[roci divergence]** config format is **TOML** (`roci --config <path>`, schema in `roci-config`), whereas zot uses JSON: sections `http` (listen, `tls`, `timeouts`, `rate_limit`), `storage`, `limits`, `delete`, `log`, `telemetry`; unknown keys are rejected and `Config::validate` enforces cross-field invariants on load. Zero-config defaults yield a working local registry with no file at all. A key is added only together with the subsystem it configures — no inert knobs.
 
 ## Storage subsystem
 
@@ -378,7 +378,7 @@ span: http.server (root)  attrs: http.route, oci.operation=end-3, oci.repository
 
 - **Attributes** carry the high-cardinality domain identifiers (digest, repo, reference, upload UUID) that are forbidden as metric labels — this is where per-request detail lives.
 - **Cross-subsystem propagation:** the context flows into storage-trait calls, the metadata store, and (in cluster mode) across the **peer proxy hop** so a forwarded request is one distributed trace across two instances. Background tasks (GC/scrub/sync sweeps) are their own root span trees, linked to the triggering config/schedule.
-- **Sampling:** low head-based default (Dapper lesson); **tail-based sampling keeps all error and high-latency traces** regardless of rate, so rare failures are never sampled away. Sampling is configurable; instrumentation cost stays on the benchmark dashboard (target < ~2% at default).
+- **Sampling:** low head-based default (Dapper lesson; `ParentBased(TraceIdRatioBased(telemetry.sample_ratio))`, default 1%); **tail-based sampling keeps all error and high-latency traces** regardless of rate, so rare failures are never sampled away — implemented in the OTel Collector (`tail_sampling` processor), not in-process, so roci holds no span buffer. Sampling is configurable; instrumentation cost stays on the benchmark dashboard (target < ~2% at default).
 - **Span status** is set from the outcome: an error span records `error.type` = the spec `error_code`, `otel.status_code=ERROR`, and the HTTP status; success spans stay unset (cheap).
 
 ### Errors

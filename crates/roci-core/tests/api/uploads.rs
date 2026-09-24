@@ -1,5 +1,6 @@
 use axum::body::Body;
 use axum::http::{header, Method, StatusCode};
+use roci_config::Config;
 use roci_storage::*;
 
 use super::common::*;
@@ -208,7 +209,10 @@ async fn finish_upload_append_error_on_directory_session() {
 
 #[tokio::test]
 async fn oversized_bodies_are_413() {
-    let (app, _d) = app_configured(|s| s.with_max_body(4));
+    let mut cfg = Config::default();
+    cfg.limits.max_body = 4;
+    cfg.limits.max_manifest = 4;
+    let (app, _d) = app_with_config(cfg);
     // A manifest over the configured request-body limit (4 bytes here) →
     // 413 (payload too large), since the effective cap is the smaller of
     // the configured limit and the fixed 4 MiB manifest cap.
@@ -369,7 +373,9 @@ async fn monolithic_empty_body_upload() {
 
 #[tokio::test]
 async fn chunked_upload_over_session_cap_is_413_and_drops_session() {
-    let (app, _d) = app_configured(|s| s.with_max_upload(4));
+    let mut cfg = Config::default();
+    cfg.limits.max_upload = 4;
+    let (app, _d) = app_with_config(cfg);
     // Open a session.
     let loc = start_session(&app, "r").await;
     // A PATCH exceeding the 4-byte session cap → 413 SIZE_INVALID.
@@ -383,7 +389,9 @@ async fn chunked_upload_over_session_cap_is_413_and_drops_session() {
 
 #[tokio::test]
 async fn finish_upload_over_session_cap_is_413() {
-    let (app, _d) = app_configured(|s| s.with_max_upload(4));
+    let mut cfg = Config::default();
+    cfg.limits.max_upload = 4;
+    let (app, _d) = app_with_config(cfg);
     // Open a session, then a monolithic PUT whose trailing body exceeds the
     // 4-byte session cap → 413 SIZE_INVALID (the finish-path cap branch).
     let loc = start_session(&app, "r").await;
@@ -402,7 +410,9 @@ async fn finish_upload_over_session_cap_is_413() {
 async fn monolithic_upload_over_session_cap_is_413() {
     // A monolithic POST ?digest= whose body exceeds max_upload → 413, even
     // though it is under max_body (the cap applies to monolithic too).
-    let (app, _d) = app_configured(|s| s.with_max_upload(4));
+    let mut cfg = Config::default();
+    cfg.limits.max_upload = 4;
+    let (app, _d) = app_with_config(cfg);
     let data = b"way over the four byte cap";
     let d = sha256_of(data);
     let resp = send(
