@@ -639,3 +639,249 @@ async fn concurrent_push_delete_preserves_reachable_set() {
         "GC should eventually collect blobs of deleted manifests"
     );
 }
+
+#[tokio::test]
+async fn image_index_children_are_protected_as_roots() {
+    // A multi-platform manifest list (image index) whose child manifests
+    // are CAS blobs; GC must protect both the index and every child.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let repo_dir = root.join("multi");
+    std::fs::create_dir_all(repo_dir.join("blobs").join("sha256")).unwrap();
+    std::fs::write(
+        repo_dir.join("oci-layout"),
+        r#"{"imageLayoutVersion":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    // A child manifest (a real image manifest).
+    let child_config = b"child-config-bytes";
+    let child_config_d = sha256_of(child_config);
+    std::fs::write(
+        repo_dir.join("blobs/sha256").join(child_config_d.hex()),
+        child_config,
+    )
+    .unwrap();
+    let child_manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "digest": child_config_d.as_string(),
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": child_config.len()
+        },
+        "layers": []
+    });
+    let child_bytes = serde_json::to_vec(&child_manifest).unwrap();
+    let child_d = sha256_of(&child_bytes);
+    std::fs::write(
+        repo_dir.join("blobs/sha256").join(child_d.hex()),
+        &child_bytes,
+    )
+    .unwrap();
+
+    // The image index referencing the child.
+    let index_manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": child_d.as_string(),
+            "size": child_bytes.len()
+        }]
+    });
+    let index_bytes = serde_json::to_vec(&index_manifest).unwrap();
+    let index_d = sha256_of(&index_bytes);
+    std::fs::write(
+        repo_dir.join("blobs/sha256").join(index_d.hex()),
+        &index_bytes,
+    )
+    .unwrap();
+
+    // An unreferenced blob that should be collected.
+    let garbage = b"garbage-multi";
+    let garbage_d = sha256_of(garbage);
+    std::fs::write(repo_dir.join("blobs/sha256").join(garbage_d.hex()), garbage).unwrap();
+
+    // On-disk index.json
+    let on_disk_index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "digest": index_d.as_string(),
+            "size": index_bytes.len()
+        }]
+    });
+    std::fs::write(
+        repo_dir.join("index.json"),
+        serde_json::to_vec(&on_disk_index).unwrap(),
+    )
+    .unwrap();
+
+    let config = StorageConfig {
+        gc: GcConfig {
+            enabled: true,
+            delay_secs: 0,
+            interval_secs: 3600,
+        },
+        ..StorageConfig::default()
+    };
+    let s = FsStorage::with_config(root, &config, Arc::new(QuotaTracker::default())).unwrap();
+    s.gc_consistency_check().await;
+    s.gc.set_ready();
+
+    // The child manifest and the index are roots — neither should be a candidate.
+    assert!(
+        s.gc.is_root("multi", &index_d.as_string())
+            || s.meta
+                .manifest_media_type("multi", &index_d.as_string())
+                .is_some()
+    );
+    assert!(
+        s.gc.is_root("multi", &child_d.as_string())
+            || s.meta
+                .manifest_media_type("multi", &child_d.as_string())
+                .is_some()
+    );
+
+    // Sweep should collect only the garbage blob.
+    let later = Instant::now() + Duration::from_secs(10);
+    s.sweep_at(later).await;
+    // Child and index still exist.
+    assert!(repo_dir.join("blobs/sha256").join(child_d.hex()).exists());
+    assert!(repo_dir.join("blobs/sha256").join(index_d.hex()).exists());
+    // Garbage should be gone.
+    assert!(!repo_dir.join("blobs/sha256").join(garbage_d.hex()).exists());
+}
+
+#[tokio::test]
+async fn missing_cas_root_makes_repo_unsafe() {
+    // A root manifest that appears in the on-disk index but is absent from
+    // the CAS: the repo must be marked GC-unsafe so nothing is collected.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let repo_dir = root.join("ghost");
+    std::fs::create_dir_all(repo_dir.join("blobs").join("sha256")).unwrap();
+    std::fs::write(
+        repo_dir.join("oci-layout"),
+        r#"{"imageLayoutVersion":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    // Index references a digest that has no CAS blob.
+    let phantom_data = b"phantom-manifest";
+    let phantom_d = sha256_of(phantom_data);
+    let on_disk = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": phantom_d.as_string(),
+            "size": phantom_data.len()
+        }]
+    });
+    std::fs::write(
+        repo_dir.join("index.json"),
+        serde_json::to_vec(&on_disk).unwrap(),
+    )
+    .unwrap();
+
+    // An unreferenced blob.
+    let blob_data = b"should-survive-unsafe";
+    let blob_d = sha256_of(blob_data);
+    std::fs::write(repo_dir.join("blobs/sha256").join(blob_d.hex()), blob_data).unwrap();
+
+    let config = StorageConfig {
+        gc: GcConfig {
+            enabled: true,
+            delay_secs: 0,
+            interval_secs: 3600,
+        },
+        ..StorageConfig::default()
+    };
+    let s = FsStorage::with_config(root, &config, Arc::new(QuotaTracker::default())).unwrap();
+    s.gc_consistency_check().await;
+    s.gc.set_ready();
+
+    assert!(s.gc.is_unsafe("ghost"));
+    // Sweep: unsafe repo → nothing collected.
+    s.sweep_at(Instant::now() + Duration::from_secs(10)).await;
+    assert!(repo_dir.join("blobs/sha256").join(blob_d.hex()).exists());
+}
+
+#[tokio::test]
+async fn stale_upload_locked_session_survives_sweep() {
+    // A stale upload whose session is currently locked should not be cleaned up.
+    let (_dir, s) = gc_store_with_quota(0);
+    let blob = sha256_of(b"anchor-lock");
+    s.put_blob("r", &blob, b"anchor-lock").await.unwrap();
+
+    let id = s.begin_upload("r").await.unwrap();
+    // Append some data to create a lock entry (session_lock is called).
+    s.append_upload("r", &id, b"partial", None).await.unwrap();
+
+    // Touch the staging file mtime to the past.
+    let upload_path = _dir.path().join("r").join("uploads").join(&id);
+    assert!(upload_path.exists());
+    let past = filetime::FileTime::from_unix_time(0, 0);
+    filetime::set_file_mtime(&upload_path, past).unwrap();
+
+    // Sweep: the upload is stale by mtime, but the lock entry keeps it alive.
+    s.sweep_at(Instant::now()).await;
+    assert!(
+        upload_path.exists(),
+        "locked upload session should survive sweep"
+    );
+
+    // Abort the session to release the lock, then sweep again.
+    s.abort_upload("r", &id).await.unwrap();
+}
+
+#[tokio::test]
+async fn sweep_handles_already_deleted_blob() {
+    // A candidate whose file was already externally removed: sweep should
+    // clear it without error.
+    let (_dir, s) = gc_store(0);
+    let data = b"will-vanish";
+    let d = sha256_of(data);
+    s.put_blob("r", &d, data).await.unwrap();
+    assert!(!s.gc.is_empty());
+
+    // Externally remove the blob file.
+    let blob_path = s.blob_path("r", &d).unwrap();
+    std::fs::remove_file(&blob_path).unwrap();
+
+    // Sweep: the stat sees NotFound → blob is cleared from candidates.
+    let later = Instant::now() + Duration::from_secs(10);
+    s.sweep_at(later).await;
+    assert_eq!(s.gc.len(), 0, "candidate should be cleared");
+}
+
+#[tokio::test]
+async fn start_maintenance_runs_a_tick_and_shuts_down() {
+    // Exercises start_maintenance → spawn_periodic running at least one
+    // tick (covering maintenance.rs lines 39-42, 49-54, 56, 62, 85-87, 92).
+    let dir = tempfile::tempdir().unwrap();
+    let config = StorageConfig {
+        gc: GcConfig {
+            enabled: true,
+            delay_secs: 3600,
+            interval_secs: 1,
+        },
+        scrub: roci_config::ScrubConfig {
+            enabled: true,
+            interval_secs: 1,
+            ..roci_config::ScrubConfig::default()
+        },
+        ..StorageConfig::default()
+    };
+    let s = FsStorage::with_config(dir.path(), &config, Arc::new(QuotaTracker::default())).unwrap();
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    crate::storage::StorageBackend::start_maintenance(&s, rx);
+    // Wait for spawned tasks to run consistency check + at least one tick.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Signal shutdown (the `break` on maintenance.rs line 92).
+    let _ = tx.send(true);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}

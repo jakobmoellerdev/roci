@@ -27,6 +27,9 @@ pub(crate) struct S3Client {
     pub multipart_part_size: u64,
     /// Maximum parts in flight per multipart upload/copy.
     pub multipart_concurrency: usize,
+    /// Single CopyObject ceiling; objects above this use parallel ranged-read
+    /// → multipart copy. Production default: 5 GiB; tests may lower it.
+    pub copy_limit: u64,
 }
 
 /// The HTTPS client is built on rustls without a bundled provider: make
@@ -93,6 +96,7 @@ impl S3Client {
             redirect_ttl: Duration::from_secs(s3.redirect_ttl_secs),
             multipart_part_size: s3.multipart_part_size,
             multipart_concurrency: s3.multipart_concurrency,
+            copy_limit: super::storage_impl::S3_COPY_LIMIT,
         })
     }
 
@@ -116,6 +120,7 @@ impl S3Client {
             redirect_ttl,
             multipart_part_size,
             multipart_concurrency,
+            copy_limit: super::storage_impl::S3_COPY_LIMIT,
         }
     }
 }

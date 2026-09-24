@@ -358,4 +358,99 @@ mod tests {
         let err = VerifiedSnapshot::open(&path, None).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
+
+    #[test]
+    fn verify_header_too_small() {
+        // < HEADER_SIZE bytes → "snapshot too small for header" (line 130)
+        let result = verify_header(&[0u8; 10], None);
+        assert_eq!(result.unwrap_err(), "snapshot too small for header");
+    }
+
+    #[test]
+    fn verify_header_bad_magic() {
+        // Wrong magic bytes (line 133)
+        let mut data = [0u8; HEADER_SIZE + 8];
+        data[..8].copy_from_slice(b"BADMAGIC");
+        let result = verify_header(&data, None);
+        assert_eq!(result.unwrap_err(), "bad snapshot magic");
+    }
+
+    #[test]
+    fn verify_header_bad_version() {
+        // Wrong version (line 137)
+        let mut data = [0u8; HEADER_SIZE + 8];
+        data[..8].copy_from_slice(MAGIC);
+        data[8..12].copy_from_slice(&99u32.to_le_bytes()); // version 99
+        let result = verify_header(&data, None);
+        assert_eq!(result.unwrap_err(), "unsupported snapshot version");
+    }
+
+    #[test]
+    fn verify_header_truncated_body() {
+        // body_len exceeds available data (line 143)
+        let mut data = vec![0u8; HEADER_SIZE]; // exactly header, no body
+        data[..8].copy_from_slice(MAGIC);
+        data[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        data[12..20].copy_from_slice(&999u64.to_le_bytes()); // body_len = 999
+        let result = verify_header(&data, None);
+        assert_eq!(result.unwrap_err(), "snapshot body truncated");
+    }
+
+    #[test]
+    fn verify_header_integrity_mismatch() {
+        // Valid structure but wrong integrity hash (line 149)
+        let state = sample_state();
+        let body = rkyv::to_bytes::<rkyv::rancor::Error>(&state).unwrap();
+        let hdr = encode_header(&body, None);
+        let mut data = Vec::new();
+        data.extend_from_slice(&hdr);
+        data.extend_from_slice(&body);
+        // Flip a byte in the integrity field
+        data[20] ^= 0xFF;
+        let result = verify_header(&data, None);
+        assert_eq!(result.unwrap_err(), "snapshot integrity check failed");
+    }
+
+    #[test]
+    fn verified_snapshot_debug() {
+        // Cover Debug impl (lines 181-185)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("roci-meta.snapshot");
+        let state = sample_state();
+        let body = rkyv::to_bytes::<rkyv::rancor::Error>(&state).unwrap();
+        let hdr = encode_header(&body, None);
+        write_atomic(&path, &hdr, &body).unwrap();
+        let snap = VerifiedSnapshot::open(&path, None).unwrap().unwrap();
+        let dbg = format!("{snap:?}");
+        assert!(dbg.contains("VerifiedSnapshot"), "got: {dbg}");
+        assert!(dbg.contains("body_len"), "got: {dbg}");
+    }
+
+    #[test]
+    fn snapshot_rejects_invalid_rkyv_archive() {
+        // Valid header but garbled rkyv body → rkyv validation error (lines 209-213)
+        let garbage_body = vec![0xFFu8; 128];
+        let hdr = encode_header(&garbage_body, None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("roci-meta.snapshot");
+        write_atomic(&path, &hdr, &garbage_body).unwrap();
+        let err = VerifiedSnapshot::open(&path, None).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("rkyv"),
+            "error should mention rkyv: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn snapshot_open_io_error_propagates() {
+        // Open a path that exists but is a directory → non-NotFound error (line 193)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("roci-meta.snapshot");
+        std::fs::create_dir(&path).unwrap();
+        let err = VerifiedSnapshot::open(&path, None).unwrap_err();
+        // Should NOT be NotFound; should propagate the directory-open error.
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+    }
 }

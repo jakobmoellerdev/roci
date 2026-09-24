@@ -171,4 +171,23 @@ mod tests {
         assert!(aside.exists());
         assert_eq!(std::fs::read(&aside).unwrap(), b"data");
     }
+
+    #[test]
+    fn key_load_missing_file() {
+        // Covers error wrapping in HmacKey::load lines 32-39
+        let err = HmacKey::load(Path::new("/nonexistent/path/to/hmac.key")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("hmac_key_file"), "msg: {}", err);
+    }
+
+    #[test]
+    fn decode_header_unknown_mode_byte() {
+        // Covers the _ => None branch at line 109
+        let mut payload = Vec::new();
+        payload.extend_from_slice(HEADER_MAGIC);
+        payload.push(0x09); // unknown mode byte
+        assert_eq!(decode_header(&payload), None);
+        // Already tested in header_roundtrip but this explicitly targets
+        // the specific match arm.
+    }
 }

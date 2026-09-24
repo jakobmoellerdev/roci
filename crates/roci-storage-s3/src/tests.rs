@@ -3,6 +3,8 @@
 use crate::client::S3Client;
 use crate::S3Storage;
 use object_store::memory::InMemory;
+use object_store::path::Path as ObjPath;
+use object_store::{ObjectStoreExt, PutPayload};
 use roci_config::StorageConfig;
 use roci_storage::quota::{QuotaLimits, QuotaTracker};
 use roci_storage::{Digest, ManifestLinks, Storage, StorageBackend};
@@ -799,6 +801,1413 @@ async fn rejects_traversal_in_repo() {
 }
 
 use futures::StreamExt;
+
+// ── S3Client::from_config offline tests ────────────────────────────────
+
+#[test]
+fn from_config_secret_file_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret_file = dir.path().join("secret.txt");
+    std::fs::write(&secret_file, "  my-secret-key  \n").unwrap();
+    let s3 = roci_config::S3Config {
+        bucket: "test-bucket".into(),
+        region: "us-east-1".into(),
+        endpoint: Some("https://localhost:9999".into()),
+        prefix: "pfx".into(),
+        access_key_id: Some("AKID".into()),
+        secret_access_key_file: Some(secret_file),
+        allow_http: false,
+        redirect_min_size: 0,
+        redirect_ttl_secs: 60,
+        multipart_part_size: 16 * 1024 * 1024,
+        multipart_concurrency: 8,
+    };
+    let client = S3Client::from_config(&s3).unwrap();
+    assert_eq!(client.prefix, "pfx");
+    assert!(client.signer.is_some());
+    assert_eq!(client.copy_limit, crate::storage_impl::S3_COPY_LIMIT);
+}
+
+#[test]
+fn from_config_missing_secret_file() {
+    let s3 = roci_config::S3Config {
+        bucket: "test-bucket".into(),
+        region: "us-east-1".into(),
+        endpoint: None,
+        prefix: String::new(),
+        access_key_id: Some("AKID".into()),
+        secret_access_key_file: Some(std::path::PathBuf::from("/nonexistent/secret")),
+        allow_http: false,
+        redirect_min_size: 0,
+        redirect_ttl_secs: 60,
+        multipart_part_size: 16 * 1024 * 1024,
+        multipart_concurrency: 8,
+    };
+    let err = S3Client::from_config(&s3).err().expect("expected error");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(err.to_string().contains("secret_access_key_file"));
+}
+
+#[test]
+fn from_config_key_id_without_file() {
+    let s3 = roci_config::S3Config {
+        bucket: "test-bucket".into(),
+        region: "us-east-1".into(),
+        endpoint: None,
+        prefix: String::new(),
+        access_key_id: Some("AKID".into()),
+        secret_access_key_file: None,
+        allow_http: false,
+        redirect_min_size: 0,
+        redirect_ttl_secs: 60,
+        multipart_part_size: 16 * 1024 * 1024,
+        multipart_concurrency: 8,
+    };
+    let err = S3Client::from_config(&s3).err().expect("expected error");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err
+        .to_string()
+        .contains("secret_access_key_file is missing"));
+}
+
+#[test]
+fn from_config_allow_http_and_path_style() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret_file = dir.path().join("secret.txt");
+    std::fs::write(&secret_file, "key").unwrap();
+    let s3 = roci_config::S3Config {
+        bucket: "bucket".into(),
+        region: "eu-west-1".into(),
+        endpoint: Some("http://minio:9000".into()),
+        prefix: String::new(),
+        access_key_id: Some("AKID".into()),
+        secret_access_key_file: Some(secret_file),
+        allow_http: true,
+        redirect_min_size: 0,
+        redirect_ttl_secs: 60,
+        multipart_part_size: 5 * 1024 * 1024,
+        multipart_concurrency: 4,
+    };
+    // Should succeed: allow_http + path-style (endpoint provided)
+    let client = S3Client::from_config(&s3).unwrap();
+    assert!(client.signer.is_some());
+}
+
+#[test]
+fn from_config_no_credentials() {
+    // No access_key_id → environment/instance chain (still builds).
+    let s3 = roci_config::S3Config {
+        bucket: "bucket".into(),
+        region: "us-east-1".into(),
+        endpoint: None,
+        prefix: String::new(),
+        access_key_id: None,
+        secret_access_key_file: None,
+        allow_http: false,
+        redirect_min_size: 0,
+        redirect_ttl_secs: 60,
+        multipart_part_size: 16 * 1024 * 1024,
+        multipart_concurrency: 8,
+    };
+    let client = S3Client::from_config(&s3).unwrap();
+    assert!(client.signer.is_some());
+}
+
+// ── GC consistency check tests ─────────────────────────────────────────
+
+fn gc_test_store() -> (tempfile::TempDir, S3Storage) {
+    let mut config = StorageConfig::default();
+    config.gc.enabled = true;
+    config.gc.delay_secs = 0;
+    test_store_with_config(config, QuotaTracker::default())
+}
+
+#[tokio::test]
+async fn gc_consistency_check_layout_only_root() {
+    // A manifest known only from the remote index.json (not in metadata)
+    // should be registered as a layout-only root.
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let mut config = StorageConfig::default();
+    config.gc.enabled = true;
+    config.gc.delay_secs = 0;
+    let client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+
+    // Push a blob + manifest.
+    let data = b"layout-root-cfg";
+    let cd = sha256_digest(data);
+    s.put_blob("repo", &cd, data).await.unwrap();
+    let manifest = test_manifest(&cd.as_string(), &[]);
+    let md = sha256_digest(&manifest);
+    s.put_manifest(
+        "repo",
+        Some("v1"),
+        &md,
+        "application/vnd.oci.image.manifest.v1+json",
+        &manifest,
+        ManifestLinks {
+            references: std::slice::from_ref(&cd),
+            subject: None,
+        },
+    )
+    .await
+    .unwrap();
+    s.write_remote_index("repo").await.unwrap();
+
+    // Create a fresh store with the same InMemory (metadata is empty).
+    let dir2 = tempfile::tempdir().unwrap();
+    let client2 = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let mut config2 = StorageConfig::default();
+    config2.gc.enabled = true;
+    config2.gc.delay_secs = 0;
+    let s2 = S3Storage::open_with_client(
+        dir2.path(),
+        client2,
+        &config2,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+
+    // Run the consistency check.
+    s2.gc_consistency_check().await;
+
+    // The manifest should be registered as a root.
+    assert!(s2.gc.is_root("repo", &md.as_string()));
+    // The blob should NOT be a GC candidate (it has backrefs after rebuild).
+    assert!(!s2.gc.is_due(
+        "repo",
+        &cd.as_string(),
+        std::time::Instant::now() + Duration::from_secs(1)
+    ));
+}
+
+#[tokio::test]
+async fn gc_consistency_check_missing_root_marks_unsafe() {
+    // A root manifest in the index that's not in the CAS → repo is GC-unsafe.
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let mut config = StorageConfig::default();
+    config.gc.enabled = true;
+    config.gc.delay_secs = 0;
+
+    // Write a fake index.json that references a nonexistent manifest.
+    let fake_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "digest": fake_digest,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "size": 100
+        }]
+    });
+    mem.put(
+        &ObjPath::from("repo/index.json"),
+        PutPayload::from(serde_json::to_vec(&index).unwrap()),
+    )
+    .await
+    .unwrap();
+    // Write oci-layout marker.
+    mem.put(
+        &ObjPath::from("repo/oci-layout"),
+        PutPayload::from_static(b"{\"imageLayoutVersion\":\"1.0.0\"}"),
+    )
+    .await
+    .unwrap();
+
+    let client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    s.gc_consistency_check().await;
+
+    assert!(s.gc.is_unsafe("repo"));
+}
+
+#[tokio::test]
+async fn gc_consistency_check_unparseable_root_marks_unsafe() {
+    // A root manifest that is present but unparseable → repo is GC-unsafe.
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let mut config = StorageConfig::default();
+    config.gc.enabled = true;
+    config.gc.delay_secs = 0;
+
+    // Create a blob that is not valid JSON.
+    let bad_data = b"this is not json";
+    let bd = sha256_digest(bad_data);
+    let digest_str = bd.as_string();
+
+    // Write it directly under blobs path.
+    let (alg, hex) = digest_str.split_once(':').unwrap();
+    mem.put(
+        &ObjPath::from(format!("repo/blobs/{alg}/{hex}")),
+        PutPayload::from(bytes::Bytes::from_static(bad_data)),
+    )
+    .await
+    .unwrap();
+
+    // Write index.json referencing this "manifest".
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "digest": digest_str,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "size": bad_data.len()
+        }]
+    });
+    mem.put(
+        &ObjPath::from("repo/index.json"),
+        PutPayload::from(serde_json::to_vec(&index).unwrap()),
+    )
+    .await
+    .unwrap();
+    mem.put(
+        &ObjPath::from("repo/oci-layout"),
+        PutPayload::from_static(b"{\"imageLayoutVersion\":\"1.0.0\"}"),
+    )
+    .await
+    .unwrap();
+
+    let client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    s.gc_consistency_check().await;
+
+    assert!(s.gc.is_unsafe("repo"));
+}
+
+#[tokio::test]
+async fn gc_consistency_check_seeds_unreferenced_candidates() {
+    // An unreferenced blob (no manifest, no backrefs) → GC candidate.
+    let (_dir, s) = gc_test_store();
+
+    let data = b"orphan-blob";
+    let digest = sha256_digest(data);
+    s.put_blob("repo", &digest, data).await.unwrap();
+
+    s.gc_consistency_check().await;
+
+    // The blob should now be a candidate (mark_at was called).
+    let now_plus = std::time::Instant::now() + Duration::from_secs(1);
+    assert!(s.gc.is_due("repo", &digest.as_string(), now_plus));
+}
+
+#[tokio::test]
+async fn gc_consistency_check_missing_backref_rebuild() {
+    // A manifest that references a blob but metadata has no backref edge:
+    // the consistency check should add the edge, and the blob should NOT be
+    // a candidate.
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let mut config = StorageConfig::default();
+    config.gc.enabled = true;
+    config.gc.delay_secs = 0;
+    let client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s1 = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+
+    // Push layer + manifest.
+    let layer = b"layer-data";
+    let ld = sha256_digest(layer);
+    s1.put_blob("repo", &ld, layer).await.unwrap();
+    let manifest = test_manifest(&ld.as_string(), &[]);
+    let md = sha256_digest(&manifest);
+    s1.put_manifest(
+        "repo",
+        Some("v1"),
+        &md,
+        "application/vnd.oci.image.manifest.v1+json",
+        &manifest,
+        ManifestLinks {
+            references: std::slice::from_ref(&ld),
+            subject: None,
+        },
+    )
+    .await
+    .unwrap();
+    s1.write_remote_index("repo").await.unwrap();
+
+    // Create a fresh store — metadata is blank, no backref edges.
+    let dir2 = tempfile::tempdir().unwrap();
+    let client2 = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s2 = S3Storage::open_with_client(
+        dir2.path(),
+        client2,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    s2.gc_consistency_check().await;
+
+    // The layer should NOT be a candidate (backrefs rebuilt).
+    let now_plus = std::time::Instant::now() + Duration::from_secs(1);
+    assert!(!s2.gc.is_due("repo", &ld.as_string(), now_plus));
+    // The manifest should be a root.
+    assert!(s2.gc.is_root("repo", &md.as_string()));
+}
+
+// ── stale upload expiry ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn sweep_stale_uploads_removes_old_files() {
+    let mut config = StorageConfig::default();
+    config.gc.enabled = true;
+    config.gc.delay_secs = 0; // immediate delay
+    let (_dir, s) = test_store_with_config(config, QuotaTracker::default());
+
+    // Create a staging file manually (not via begin_upload, which would hold a session lock).
+    // Create staging dir + file directly.
+    let repo_dir = _dir.path().join("uploads").join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let path = repo_dir.join("00000000000000000000000000000000");
+    std::fs::write(&path, b"stale-data").unwrap();
+    // Set the file's mtime far in the past.
+    let old = std::time::SystemTime::UNIX_EPOCH;
+    let f = std::fs::File::open(&path).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    drop(f);
+    let (count, bytes) = s.sweep_stale_uploads();
+    assert_eq!(count, 1);
+    assert!(bytes > 0);
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn sweep_stale_uploads_keeps_fresh_files() {
+    let mut config = StorageConfig::default();
+    config.gc.enabled = true;
+    config.gc.delay_secs = 3600; // 1 hour
+    let (_dir, s) = test_store_with_config(config, QuotaTracker::default());
+
+    let id = s.begin_upload("repo").await.unwrap();
+    s.append_upload("repo", &id, b"fresh-data", None)
+        .await
+        .unwrap();
+
+    let (count, _) = s.sweep_stale_uploads();
+    assert_eq!(count, 0);
+    let path = s.staging_path("repo", &id).unwrap();
+    assert!(path.exists());
+}
+
+// ── recovery tests ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn recover_foreign_tag_import_and_referrer_warmup() {
+    // Push manifest with subject in s1, then create s2 and recover.
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let config = StorageConfig::default();
+    let client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s1 = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+
+    // Push a subject manifest.
+    let cfg_data = b"subject-config";
+    let cd = sha256_digest(cfg_data);
+    s1.put_blob("repo", &cd, cfg_data).await.unwrap();
+    let subject_manifest = test_manifest(&cd.as_string(), &[]);
+    let smd = sha256_digest(&subject_manifest);
+    s1.put_manifest(
+        "repo",
+        Some("subject"),
+        &smd,
+        "application/vnd.oci.image.manifest.v1+json",
+        &subject_manifest,
+        ManifestLinks {
+            references: std::slice::from_ref(&cd),
+            subject: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Push a referrer manifest.
+    let ref_data = b"referrer-config";
+    let rcd = sha256_digest(ref_data);
+    s1.put_blob("repo", &rcd, ref_data).await.unwrap();
+    let referrer_manifest = test_manifest_with_subject(&rcd.as_string(), &[], &smd.as_string());
+    let rmd = sha256_digest(&referrer_manifest);
+    let descriptor = serde_json::to_vec(&serde_json::json!({
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "size": referrer_manifest.len(),
+        "digest": rmd.as_string(),
+        "artifactType": "test/artifact"
+    }))
+    .unwrap();
+    s1.put_manifest(
+        "repo",
+        Some("referrer"),
+        &rmd,
+        "application/vnd.oci.image.manifest.v1+json",
+        &referrer_manifest,
+        ManifestLinks {
+            references: std::slice::from_ref(&rcd),
+            subject: Some((&smd, &descriptor)),
+        },
+    )
+    .await
+    .unwrap();
+
+    // Write the index.
+    s1.write_remote_index("repo").await.unwrap();
+
+    // Create fresh s2 and recover.
+    let dir2 = tempfile::tempdir().unwrap();
+    let client2 = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s2 = S3Storage::open_with_client(
+        dir2.path(),
+        client2,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    s2.recover().await;
+
+    // Should resolve tags.
+    let m = s2.get_manifest("repo", "subject").await.unwrap();
+    assert_eq!(m.bytes, subject_manifest);
+    let m2 = s2.get_manifest("repo", "referrer").await.unwrap();
+    assert_eq!(m2.bytes, referrer_manifest);
+}
+
+#[tokio::test]
+async fn recover_seeds_quota_and_dedupe() {
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let config = StorageConfig {
+        dedupe: true,
+        ..StorageConfig::default()
+    };
+    let quota = QuotaTracker::new(QuotaLimits {
+        max_repo_bytes: 1024 * 1024,
+        max_total_bytes: 0,
+        max_upload_sessions: 10,
+    });
+    let client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s1 = S3Storage::open_with_client(dir.path(), client, &config, Arc::new(quota)).unwrap();
+
+    let data = b"seed-blob-data";
+    let digest = sha256_digest(data);
+    s1.put_blob("repo", &digest, data).await.unwrap();
+    s1.write_remote_index("repo").await.unwrap();
+
+    // Create fresh store.
+    let dir2 = tempfile::tempdir().unwrap();
+    let quota2 = QuotaTracker::new(QuotaLimits {
+        max_repo_bytes: 1024 * 1024,
+        max_total_bytes: 0,
+        max_upload_sessions: 10,
+    });
+    let client2 = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s2 = S3Storage::open_with_client(dir2.path(), client2, &config, Arc::new(quota2)).unwrap();
+    s2.recover().await;
+
+    // Dedupe index should know about the blob.
+    assert!(s2.dedupe.enabled());
+    // Putting the same blob in another repo should succeed (dedupe kicks in).
+    let result = s2.put_blob("other", &digest, data).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn recover_seeds_sessions_from_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let config = StorageConfig::default();
+    let client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s1 = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+
+    // Create two upload sessions.
+    let _id1 = s1.begin_upload("repo").await.unwrap();
+    let _id2 = s1.begin_upload("repo").await.unwrap();
+
+    // Create fresh store pointing to the same root.
+    let client2 = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s2 = S3Storage::open_with_client(
+        dir.path(),
+        client2,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    s2.recover().await;
+    // Session count should be seeded — subsequent begin_upload should work.
+    let _id3 = s2.begin_upload("repo").await.unwrap();
+}
+
+// ── debounced index.json writer ────────────────────────────────────────
+
+#[tokio::test]
+async fn write_remote_index_and_read_back() {
+    let (_dir, s) = test_store();
+
+    let data = b"index-cfg";
+    let cd = sha256_digest(data);
+    s.put_blob("repo", &cd, data).await.unwrap();
+    let manifest = test_manifest(&cd.as_string(), &[]);
+    let md = sha256_digest(&manifest);
+    s.put_manifest(
+        "repo",
+        Some("v1"),
+        &md,
+        "application/vnd.oci.image.manifest.v1+json",
+        &manifest,
+        ManifestLinks {
+            references: std::slice::from_ref(&cd),
+            subject: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Explicitly write the index.
+    s.write_remote_index("repo").await.unwrap();
+
+    // Read back the remote index and verify.
+    let index = s.read_remote_index("repo").await.unwrap();
+    let manifests = index.get("manifests").and_then(|m| m.as_array()).unwrap();
+    assert!(!manifests.is_empty());
+
+    // Verify tag is present.
+    let has_tag = manifests.iter().any(|e| {
+        e.get("annotations")
+            .and_then(|a| a.get("org.opencontainers.image.ref.name"))
+            .and_then(|v| v.as_str())
+            == Some("v1")
+    });
+    assert!(has_tag);
+}
+
+#[tokio::test]
+async fn write_remote_index_not_found_existing() {
+    // When no remote index exists yet, write_remote_index should still succeed.
+    let (_dir, s) = test_store();
+
+    let data = b"no-existing-idx";
+    let cd = sha256_digest(data);
+    s.put_blob("repo2", &cd, data).await.unwrap();
+    let manifest = test_manifest(&cd.as_string(), &[]);
+    let md = sha256_digest(&manifest);
+    s.put_manifest(
+        "repo2",
+        Some("t"),
+        &md,
+        "application/vnd.oci.image.manifest.v1+json",
+        &manifest,
+        ManifestLinks {
+            references: std::slice::from_ref(&cd),
+            subject: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Write index without prior ensure_layout for index.json specifically.
+    s.write_remote_index("repo2").await.unwrap();
+}
+
+// ── multipart upload above part_size ───────────────────────────────────
+
+#[tokio::test]
+async fn finish_upload_multipart_above_part_size() {
+    // Use 5 MiB part size; upload a ~6 MiB blob via chunked session.
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let part_size = 5 * 1024 * 1024_u64; // 5 MiB
+    let config = StorageConfig::default();
+    let client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        part_size,
+        4,
+    );
+    let s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+
+    // Create a blob larger than part_size (6 MiB).
+    let blob_size = 6 * 1024 * 1024;
+    let data: Vec<u8> = (0..blob_size).map(|i| (i % 251) as u8).collect();
+    let digest = sha256_digest(&data);
+
+    // Upload in two chunks.
+    let id = s.begin_upload("repo").await.unwrap();
+    let half = data.len() / 2;
+    let off1 = s
+        .append_upload("repo", &id, &data[..half], Some(0))
+        .await
+        .unwrap();
+    assert_eq!(off1, half as u64);
+    let off2 = s
+        .append_upload("repo", &id, &data[half..], Some(half as u64))
+        .await
+        .unwrap();
+    assert_eq!(off2, data.len() as u64);
+
+    s.finish_upload("repo", &id, &digest, data.len() as u64 + 1, &[])
+        .await
+        .unwrap();
+
+    // Read back and verify.
+    let read_back = s.read_blob("repo", &digest).await.unwrap();
+    assert_eq!(read_back.len(), data.len());
+    assert_eq!(sha256_digest(&read_back), digest);
+}
+
+#[tokio::test]
+async fn put_blob_below_part_size_single_put() {
+    // Small blob (< part_size) should use single PUT path in upload_staged_blob.
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let part_size = 5 * 1024 * 1024_u64;
+    let config = StorageConfig::default();
+    let client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        part_size,
+        4,
+    );
+    let s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+
+    let data = b"small-blob";
+    let digest = sha256_digest(data);
+    let id = s.begin_upload("repo").await.unwrap();
+    s.append_upload("repo", &id, data, None).await.unwrap();
+    s.finish_upload("repo", &id, &digest, 1024, &[])
+        .await
+        .unwrap();
+    assert_eq!(s.read_blob("repo", &digest).await.unwrap(), data);
+}
+
+// ── parallel ranged-read → multipart copy ──────────────────────────────
+
+#[tokio::test]
+async fn parallel_copy_via_mount_with_small_copy_limit() {
+    // Lower copy_limit so a small blob triggers the parallel copy path.
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let part_size = 5 * 1024 * 1024_u64; // 5 MiB minimum
+    let config = StorageConfig::default();
+    let mut client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        part_size,
+        4,
+    );
+    // Set copy_limit to 0 so ALL copies go through parallel path.
+    client.copy_limit = 0;
+    let s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+
+    // Create a blob > part_size in "from" repo.
+    let blob_size = 6 * 1024 * 1024;
+    let data: Vec<u8> = (0..blob_size).map(|i| (i % 199) as u8).collect();
+    let digest = sha256_digest(&data);
+    s.put_blob("from", &digest, &data).await.unwrap();
+
+    // Mount it into "to" repo — should use parallel copy.
+    let mounted = s.mount_blob("from", "to", &digest).await.unwrap();
+    assert!(mounted);
+
+    // Verify the copy is identical.
+    let read_back = s.read_blob("to", &digest).await.unwrap();
+    assert_eq!(read_back.len(), data.len());
+    assert_eq!(sha256_digest(&read_back), digest);
+}
+
+#[tokio::test]
+async fn parallel_copy_small_object() {
+    // Even a small object (below part_size) should work through parallel copy.
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let part_size = 5 * 1024 * 1024_u64;
+    let config = StorageConfig::default();
+    let mut client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        part_size,
+        4,
+    );
+    client.copy_limit = 0;
+    let s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+
+    let data = b"tiny-for-parallel-copy";
+    let digest = sha256_digest(data);
+    s.put_blob("a", &digest, data).await.unwrap();
+
+    let mounted = s.mount_blob("a", "b", &digest).await.unwrap();
+    assert!(mounted);
+    assert_eq!(s.read_blob("b", &digest).await.unwrap(), data);
+}
+
+// ── page_sorted and page_layout_referrers ──────────────────────────────
+
+#[tokio::test]
+async fn list_tags_fallback_and_pagination() {
+    // Use a fresh store where metadata has no tags: force fallback to index.json.
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let config = StorageConfig::default();
+
+    // Populate index.json directly (bypassing metadata).
+    let fake_digest1 = "sha256:aaaa000000000000000000000000000000000000000000000000000000000001";
+    let fake_digest2 = "sha256:aaaa000000000000000000000000000000000000000000000000000000000002";
+    let fake_digest3 = "sha256:aaaa000000000000000000000000000000000000000000000000000000000003";
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            { "digest": fake_digest3, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+              "size": 10, "annotations": { "org.opencontainers.image.ref.name": "c-tag" } },
+            { "digest": fake_digest1, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+              "size": 10, "annotations": { "org.opencontainers.image.ref.name": "a-tag" } },
+            { "digest": fake_digest2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+              "size": 10, "annotations": { "org.opencontainers.image.ref.name": "b-tag" } },
+        ]
+    });
+    mem.put(
+        &ObjPath::from("repo/index.json"),
+        PutPayload::from(serde_json::to_vec(&index).unwrap()),
+    )
+    .await
+    .unwrap();
+
+    let client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+
+    // Page 1: limit 2.
+    let page1 = s.list_tags("repo", None, 2).await.unwrap();
+    assert_eq!(page1.items, vec!["a-tag", "b-tag"]);
+    assert!(page1.more);
+
+    // Page 2.
+    let page2 = s.list_tags("repo", Some("b-tag"), 2).await.unwrap();
+    assert_eq!(page2.items, vec!["c-tag"]);
+    assert!(!page2.more);
+}
+
+#[tokio::test]
+async fn list_referrers_fallback_from_index() {
+    // Test referrer listing via index.json fallback.
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let config = StorageConfig::default();
+
+    let subject_digest = "sha256:bbbb000000000000000000000000000000000000000000000000000000000001";
+    let ref_digest1 = "sha256:cccc000000000000000000000000000000000000000000000000000000000001";
+    let ref_digest2 = "sha256:cccc000000000000000000000000000000000000000000000000000000000002";
+
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            { "digest": ref_digest1, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+              "size": 10, "artifactType": "test/type",
+              "subject": { "digest": subject_digest } },
+            { "digest": ref_digest2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+              "size": 10, "artifactType": "test/type",
+              "subject": { "digest": subject_digest } },
+        ]
+    });
+    mem.put(
+        &ObjPath::from("repo/index.json"),
+        PutPayload::from(serde_json::to_vec(&index).unwrap()),
+    )
+    .await
+    .unwrap();
+
+    let client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    let subject = Digest::parse(subject_digest).unwrap();
+
+    // Without artifact_type filter.
+    let page = s
+        .list_referrers("repo", &subject, None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 2);
+
+    // With artifact_type filter.
+    let page2 = s
+        .list_referrers("repo", &subject, Some("test/type"), None, 1)
+        .await
+        .unwrap();
+    assert_eq!(page2.items.len(), 1);
+    assert!(page2.more);
+
+    // With cursor.
+    let last = &page2.items[0].0;
+    let page3 = s
+        .list_referrers("repo", &subject, Some("test/type"), Some(last), 10)
+        .await
+        .unwrap();
+    assert_eq!(page3.items.len(), 1);
+    assert!(!page3.more);
+}
+
+// ── index_resolve_tag / index_media_type_for_digest ────────────────────
+
+#[tokio::test]
+async fn index_resolve_tag_finds_tag() {
+    // Write an index.json with tags; resolve one.
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let config = StorageConfig::default();
+
+    let digest_str = "sha256:dddd000000000000000000000000000000000000000000000000000000000001";
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "digest": digest_str,
+            "mediaType": "application/vnd.custom.type+json",
+            "size": 42,
+            "annotations": { "org.opencontainers.image.ref.name": "latest" }
+        }]
+    });
+    mem.put(
+        &ObjPath::from("repo/index.json"),
+        PutPayload::from(serde_json::to_vec(&index).unwrap()),
+    )
+    .await
+    .unwrap();
+    // Put the manifest blob so get_manifest can read it.
+    let manifest_data = test_manifest(digest_str, &[]);
+    let real_digest = sha256_digest(&manifest_data);
+    // Re-create the index with the correct digest.
+    let real_digest_str = real_digest.as_string();
+    let (alg2, hex2) = real_digest_str.split_once(':').unwrap();
+    let index2 = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "digest": real_digest_str,
+            "mediaType": "application/vnd.custom.type+json",
+            "size": manifest_data.len(),
+            "annotations": { "org.opencontainers.image.ref.name": "latest" }
+        }]
+    });
+    mem.put(
+        &ObjPath::from("repo/index.json"),
+        PutPayload::from(serde_json::to_vec(&index2).unwrap()),
+    )
+    .await
+    .unwrap();
+    mem.put(
+        &ObjPath::from(format!("repo/blobs/{alg2}/{hex2}")),
+        PutPayload::from(bytes::Bytes::from(manifest_data.clone())),
+    )
+    .await
+    .unwrap();
+
+    let client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+
+    // Resolve the tag via fallback.
+    let m = s.get_manifest("repo", "latest").await.unwrap();
+    assert_eq!(m.digest, real_digest);
+    assert_eq!(m.media_type, "application/vnd.custom.type+json");
+    assert_eq!(m.bytes, manifest_data);
+}
+
+#[tokio::test]
+async fn index_resolve_tag_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(InMemory::new());
+    let config = StorageConfig::default();
+
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": []
+    });
+    mem.put(
+        &ObjPath::from("repo/index.json"),
+        PutPayload::from(serde_json::to_vec(&index).unwrap()),
+    )
+    .await
+    .unwrap();
+
+    let client = S3Client::in_memory(
+        mem.clone(),
+        None,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+
+    let result = s.get_manifest("repo", "nonexistent").await;
+    assert!(matches!(result, Err(roci_storage::StorageError::NotFound)));
+}
+
+// ── obj_err mapping ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn obj_err_not_found_mapped() {
+    let (_dir, s) = test_store();
+    let fake =
+        Digest::parse("sha256:0000000000000000000000000000000000000000000000000000000000000099")
+            .unwrap();
+    let result = s.read_blob("repo", &fake).await;
+    assert!(matches!(result, Err(roci_storage::StorageError::NotFound)));
+}
+
+// ── delete_blob error paths ────────────────────────────────────────────
+
+#[tokio::test]
+async fn delete_blob_not_found() {
+    let (_dir, s) = test_store();
+    let fake =
+        Digest::parse("sha256:0000000000000000000000000000000000000000000000000000000000000099")
+            .unwrap();
+    let result = s.delete_blob("repo", &fake).await;
+    assert!(matches!(result, Err(roci_storage::StorageError::NotFound)));
+}
+
+// ── delete_manifest error paths ────────────────────────────────────────
+
+#[tokio::test]
+async fn delete_manifest_cleans_up() {
+    let (_dir, s) = test_store();
+
+    let data = b"dm-config";
+    let cd = sha256_digest(data);
+    s.put_blob("repo", &cd, data).await.unwrap();
+    let manifest = test_manifest(&cd.as_string(), &[]);
+    let md = sha256_digest(&manifest);
+    s.put_manifest(
+        "repo",
+        Some("del-me"),
+        &md,
+        "application/vnd.oci.image.manifest.v1+json",
+        &manifest,
+        ManifestLinks {
+            references: std::slice::from_ref(&cd),
+            subject: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    s.delete_manifest("repo", &md).await.unwrap();
+
+    // Tag should be gone.
+    let result = s.get_manifest("repo", "del-me").await;
+    assert!(matches!(result, Err(roci_storage::StorageError::NotFound)));
+    // Manifest blob should be gone.
+    assert!(!s.blob_exists("repo", &md).await.unwrap());
+}
+
+// ── bad tag validation ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn put_manifest_bad_tag() {
+    let (_dir, s) = test_store();
+    let data = b"bad-tag-cfg";
+    let cd = sha256_digest(data);
+    s.put_blob("repo", &cd, data).await.unwrap();
+    let manifest = test_manifest(&cd.as_string(), &[]);
+    let md = sha256_digest(&manifest);
+
+    // ".." is a bad tag.
+    let result = s
+        .put_manifest(
+            "repo",
+            Some(".."),
+            &md,
+            "application/vnd.oci.image.manifest.v1+json",
+            &manifest,
+            ManifestLinks {
+                references: std::slice::from_ref(&cd),
+                subject: None,
+            },
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(roci_storage::StorageError::BadPath(_))
+    ));
+
+    // "/" in tag.
+    let result2 = s
+        .put_manifest(
+            "repo",
+            Some("a/b"),
+            &md,
+            "application/vnd.oci.image.manifest.v1+json",
+            &manifest,
+            ManifestLinks {
+                references: std::slice::from_ref(&cd),
+                subject: None,
+            },
+        )
+        .await;
+    assert!(matches!(
+        result2,
+        Err(roci_storage::StorageError::BadPath(_))
+    ));
+}
+
+// ── abort upload (not found path) ──────────────────────────────────────
+
+#[tokio::test]
+async fn abort_upload_invalid_id() {
+    let (_dir, s) = test_store();
+    // Invalid session id (has a slash).
+    let result = s.abort_upload("repo", "a/b").await;
+    // Should return Ok(false) because staging_path fails.
+    assert!(!result.unwrap());
+}
+
+#[tokio::test]
+async fn abort_upload_missing_file() {
+    let (_dir, s) = test_store();
+    // Valid hex id but no corresponding file.
+    let result = s
+        .abort_upload("repo", "00000000000000000000000000000000")
+        .await;
+    assert!(!result.unwrap());
+}
+
+// ── ensure_layout caching ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn ensure_layout_caches_after_first_call() {
+    let (_dir, s) = test_store();
+    // First push creates layout.
+    let data = b"layout-test";
+    let digest = sha256_digest(data);
+    s.put_blob("repo", &digest, data).await.unwrap();
+
+    // Second push hits cache.
+    let data2 = b"layout-test-2";
+    let digest2 = sha256_digest(data2);
+    s.put_blob("repo", &digest2, data2).await.unwrap();
+
+    // Both blobs present (layout was ensured).
+    assert!(s.blob_exists("repo", &digest).await.unwrap());
+    assert!(s.blob_exists("repo", &digest2).await.unwrap());
+}
+
+// ── uploads.rs: staging path validation ────────────────────────────────
+
+#[tokio::test]
+async fn staging_path_rejects_bad_repo() {
+    let (_dir, s) = test_store();
+    let result = s.staging_path("..", "00000000000000000000000000000000");
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn staging_path_rejects_bad_id() {
+    let (_dir, s) = test_store();
+    // Non-hex id.
+    let result = s.staging_path("repo", "not-hex-!!!!");
+    assert!(result.is_err());
+}
+
+// ── uploads.rs: enumerate and walk staging files ───────────────────────
+
+#[tokio::test]
+async fn enumerate_staging_files_lists_sessions() {
+    let (_dir, s) = test_store();
+    let id1 = s.begin_upload("repo").await.unwrap();
+    s.append_upload("repo", &id1, b"data1", None).await.unwrap();
+    let id2 = s.begin_upload("repo/nested").await.unwrap();
+    s.append_upload("repo/nested", &id2, b"data2", None)
+        .await
+        .unwrap();
+
+    let files = s.enumerate_staging_files();
+    assert_eq!(files.len(), 2);
+    // Verify we get the right repos and ids.
+    let repos: std::collections::HashSet<_> = files.iter().map(|(r, _, _, _)| r.clone()).collect();
+    assert!(repos.contains("repo"));
+    assert!(repos.contains("repo/nested"));
+}
+
+// ── uploads.rs: map_not_found ──────────────────────────────────────────
+
+#[tokio::test]
+async fn staging_size_not_found() {
+    let (_dir, s) = test_store();
+    let result = s
+        .staging_size("repo", "00000000000000000000000000000000")
+        .await;
+    assert!(matches!(result, Err(roci_storage::StorageError::NotFound)));
+}
+
+// ── uploads.rs: hash_staging unsupported algorithm ─────────────────────
+
+#[tokio::test]
+async fn hash_staging_bad_algorithm() {
+    let (_dir, s) = test_store();
+    let id = s.begin_upload("repo").await.unwrap();
+    s.append_upload("repo", &id, b"hello", None).await.unwrap();
+    let result = s.hash_staging("repo", &id, "md5").await;
+    assert!(matches!(
+        result,
+        Err(roci_storage::StorageError::BadDigest(_))
+    ));
+}
+
+// ── extract helpers ────────────────────────────────────────────────────
+
+#[test]
+fn extract_repo_from_index_key_works() {
+    use crate::storage_impl::*;
+    // With prefix.
+    assert_eq!(
+        extract_repo_from_index_key("pfx/myrepo/index.json", "pfx"),
+        Some("myrepo".into())
+    );
+    // Without prefix.
+    assert_eq!(
+        extract_repo_from_index_key("myrepo/index.json", ""),
+        Some("myrepo".into())
+    );
+    // Nested repo.
+    assert_eq!(
+        extract_repo_from_index_key("myrepo/sub/index.json", ""),
+        Some("myrepo/sub".into())
+    );
+    // Not an index.json key.
+    assert_eq!(
+        extract_repo_from_index_key("myrepo/blobs/sha256/abc", ""),
+        None
+    );
+    // Empty repo after stripping.
+    assert_eq!(extract_repo_from_index_key("index.json", ""), None);
+}
+
+#[test]
+fn extract_digest_from_blob_key_works() {
+    use crate::storage_impl::*;
+    assert_eq!(
+        extract_digest_from_blob_key("myrepo/blobs/sha256/abcdef", "myrepo"),
+        Some("sha256:abcdef".into())
+    );
+    assert_eq!(
+        extract_digest_from_blob_key("myrepo/not-blobs/sha256/abcdef", "myrepo"),
+        None
+    );
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // End-to-end tests through the HTTP stack

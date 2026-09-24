@@ -55,7 +55,7 @@ fn empty_index() -> serde_json::Value {
 const SWEEP_BATCH_SIZE: usize = 256;
 
 /// S3 single CopyObject limit: 5 GiB.
-const S3_COPY_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
+pub(crate) const S3_COPY_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
 
 // ── Storage trait impl ─────────────────────────────────────────────────
 
@@ -758,7 +758,7 @@ impl S3Storage {
         let from_path = ObjPath::from(from_key);
         let to_path = ObjPath::from(to_key);
 
-        if size <= S3_COPY_LIMIT {
+        if size <= self.client.copy_limit {
             // Single CopyObject request.
             self.client
                 .store
@@ -928,7 +928,10 @@ impl S3Storage {
     }
 
     /// Read the remote index.json for `repo`.
-    async fn read_remote_index(&self, repo: &str) -> Result<serde_json::Value, StorageError> {
+    pub(crate) async fn read_remote_index(
+        &self,
+        repo: &str,
+    ) -> Result<serde_json::Value, StorageError> {
         let key = index_key(&self.client.prefix, repo)?;
         let path = ObjPath::from(key);
         let result = self.client.store.get(&path).await.map_err(obj_err)?;
@@ -1406,7 +1409,7 @@ impl S3Storage {
 
     /// Clean up uploads whose mtime exceeds the GC delay and whose session is
     /// not locked. Returns `(count, bytes)`.
-    fn sweep_stale_uploads(&self) -> (u64, u64) {
+    pub(crate) fn sweep_stale_uploads(&self) -> (u64, u64) {
         let delay = self.gc.delay();
         let stale = self.enumerate_staging_files();
         let mut count: u64 = 0;
@@ -1567,7 +1570,7 @@ impl S3Storage {
 // ── free functions ─────────────────────────────────────────────────────
 
 /// Extract repo name from an index.json key like `prefix/repo/index.json`.
-fn extract_repo_from_index_key(key: &str, prefix: &str) -> Option<String> {
+pub(crate) fn extract_repo_from_index_key(key: &str, prefix: &str) -> Option<String> {
     let suffix = "/index.json";
     if !key.ends_with(suffix) {
         return None;
@@ -1585,7 +1588,7 @@ fn extract_repo_from_index_key(key: &str, prefix: &str) -> Option<String> {
 }
 
 /// Extract `alg:hex` digest from a blob key like `prefix/repo/blobs/alg/hex`.
-fn extract_digest_from_blob_key(key: &str, repo_prefix: &str) -> Option<String> {
+pub(crate) fn extract_digest_from_blob_key(key: &str, repo_prefix: &str) -> Option<String> {
     let rest = key.strip_prefix(repo_prefix)?.strip_prefix("/blobs/")?;
     let (alg, hex) = rest.split_once('/')?;
     Some(format!("{alg}:{hex}"))

@@ -666,3 +666,121 @@ async fn referrer_merges_into_annotated_entry() {
         Some(subject.as_string().as_str())
     );
 }
+
+#[tokio::test]
+async fn import_foreign_tags_imports_new_tags_from_layout() {
+    // Exercise layout::import_foreign_tags for a descriptor with a tag+digest
+    // that the metadata store doesn't know → it should get imported.
+    // Covers layout.rs lines 205, 208, 222.
+    let (_dir, s) = store();
+    // Write a repo layout with a tagged descriptor the metadata store doesn't know.
+    s.ensure_layout("ext").await.unwrap();
+    let body = br#"{"schemaVersion":2}"#;
+    let d = sha256_of(body);
+    s.put_blob("ext", &d, body).await.unwrap();
+    let existing = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": d.as_string(),
+            "size": body.len(),
+            "annotations": {"org.opencontainers.image.ref.name": "foreign"}
+        }]
+    });
+    // The tag "foreign" is not in the metadata store yet.
+    assert!(s.meta.resolve_tag("ext", "foreign").is_none());
+    crate::layout::import_foreign_tags(&*s.meta, "ext", &existing);
+    // Now the tag is imported.
+    assert!(s.meta.resolve_tag("ext", "foreign").is_some());
+    // Re-import is idempotent (resolve_tag returns Some → skip).
+    crate::layout::import_foreign_tags(&*s.meta, "ext", &existing);
+}
+
+#[tokio::test]
+async fn import_foreign_tags_skips_invalid_digest_and_untagged() {
+    // Descriptors without a tag, without a digest, or with an invalid digest
+    // are skipped by import_foreign_tags (coverage for the continue branches).
+    let (_dir, s) = store();
+    let existing = serde_json::json!({
+        "schemaVersion": 2,
+        "manifests": [
+            // No tag → skipped
+            {"digest": "sha256:0000000000000000000000000000000000000000000000000000000000000001", "size": 1},
+            // No digest → skipped
+            {"annotations": {"org.opencontainers.image.ref.name": "v1"}, "size": 1},
+            // Invalid digest → skipped
+            {"digest": "garbage", "annotations": {"org.opencontainers.image.ref.name": "v2"}, "size": 1}
+        ]
+    });
+    crate::layout::import_foreign_tags(&*s.meta, "r", &existing);
+    assert!(s.meta.resolve_tag("r", "v1").is_none());
+    assert!(s.meta.resolve_tag("r", "v2").is_none());
+}
+
+#[tokio::test]
+async fn index_from_meta_handles_non_object_and_foreign_entries() {
+    // An existing index with a non-object element (e.g. a bare string) in
+    // manifests[] → treated as foreign (layout.rs lines 256-257).
+    let (_dir, s) = store();
+    let body = br#"{"schemaVersion":2}"#;
+    let d = sha256_of(body);
+    s.put_manifest(
+        "r",
+        Some("t1"),
+        &d,
+        "application/json",
+        body,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
+    let existing = serde_json::json!({
+        "schemaVersion": 2,
+        "manifests": [
+            "a bare string entry",
+            {"digest": d.as_string(), "size": body.len()}
+        ]
+    });
+    let rebuilt = crate::layout::index_from_meta(&*s.meta, "r", Some(existing), |_| None).unwrap();
+    let ms = rebuilt["manifests"].as_array().unwrap();
+    // The known manifest should be present with its tag, plus the foreign string.
+    assert!(ms.iter().any(|e| e.is_string()));
+    assert!(ms
+        .iter()
+        .any(|e| crate::layout::descriptor_tag(e) == Some("t1")));
+}
+
+#[tokio::test]
+async fn index_from_meta_referrer_non_json_descriptor_skipped() {
+    // A referrer whose descriptor bytes are not valid JSON → the `let Ok(r) =
+    // serde_json::from_slice` guard skips it (layout.rs lines 310-311).
+    let (_dir, s) = store();
+    let subject = sha256_of(b"subj");
+    // Directly register a referrer with invalid JSON descriptor bytes.
+    s.meta
+        .apply(crate::metadata::MetaOp::PutReferrer {
+            repo: "r".to_string(),
+            subject: subject.as_string(),
+            referrer: "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+                .to_string(),
+            descriptor: b"not json at all".to_vec(),
+        })
+        .unwrap();
+    let rebuilt = crate::layout::index_from_meta(&*s.meta, "r", None, |_| None).unwrap();
+    // Should not panic — the broken descriptor is skipped.
+    assert!(rebuilt["manifests"].is_array());
+}
+
+#[tokio::test]
+async fn index_from_meta_uses_existing_top_level_as_base_object() {
+    // When the existing index is a JSON Value::Object with extra top-level
+    // keys, those keys are preserved in the rebuilt index. layout.rs line 380
+    // covers the `_ => None` branch when existing is not an object.
+    let (_dir, s) = store();
+    // Rebuild from a non-object existing (e.g. a null/array) → line 380.
+    let rebuilt =
+        crate::layout::index_from_meta(&*s.meta, "r", Some(serde_json::Value::Null), |_| None)
+            .unwrap();
+    assert_eq!(rebuilt["schemaVersion"], 2);
+}

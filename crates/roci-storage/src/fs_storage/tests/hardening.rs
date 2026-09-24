@@ -265,3 +265,116 @@ async fn publish_bytes_rejects_non_regular_eexist() {
         .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
 }
+
+// rename_beneath rejects a mismatched inode: calling it with a wrong
+// expected_ino reports NotFound (beneath.rs line 206).
+#[cfg(unix)]
+#[tokio::test]
+async fn rename_beneath_rejects_inode_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("from")).unwrap();
+    std::fs::write(root.join("from/leaf"), b"data").unwrap();
+    let err = crate::beneath::rename_beneath(
+        root,
+        Path::new("from"),
+        "leaf",
+        Path::new("to"),
+        "leaf",
+        (0, 0), // wrong inode
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+// rename_beneath with a pre-existing regular-file destination: EEXIST → Ok
+// (idempotent dedup, beneath.rs lines 225-229).
+#[cfg(unix)]
+#[tokio::test]
+async fn rename_beneath_eexist_regular_file_is_idempotent() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("dst")).unwrap();
+    std::fs::write(root.join("src/blob"), b"content").unwrap();
+    std::fs::write(root.join("dst/blob"), b"content").unwrap();
+    let st = std::fs::metadata(root.join("src/blob")).unwrap();
+    let ino = (st.dev(), st.ino());
+    // Destination already exists as a regular file → Ok (idempotent).
+    crate::beneath::rename_beneath(
+        root,
+        Path::new("src"),
+        "blob",
+        Path::new("dst"),
+        "blob",
+        ino,
+    )
+    .await
+    .unwrap();
+}
+
+// rename_beneath with a pre-existing non-regular destination (symlink):
+// EEXIST + stat shows not a file → AlreadyExists error (beneath.rs lines 231-234).
+#[cfg(unix)]
+#[tokio::test]
+async fn rename_beneath_eexist_symlink_is_rejected() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("dst")).unwrap();
+    std::fs::write(root.join("src/blob"), b"data").unwrap();
+    // Plant a symlink at the destination.
+    std::os::unix::fs::symlink(root.join("outside"), root.join("dst/blob")).unwrap();
+    let st = std::fs::metadata(root.join("src/blob")).unwrap();
+    let ino = (st.dev(), st.ino());
+    let err = crate::beneath::rename_beneath(
+        root,
+        Path::new("src"),
+        "blob",
+        Path::new("dst"),
+        "blob",
+        ino,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+}
+
+// ensure_layout_beneath with a non-regular oci-layout (e.g. a directory):
+// returns AlreadyExists error (beneath.rs lines 313-316).
+#[cfg(unix)]
+#[tokio::test]
+async fn ensure_layout_beneath_rejects_non_regular_oci_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let repo_dir = root.join("evil");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    // Plant a directory named `oci-layout`.
+    std::fs::create_dir_all(repo_dir.join("oci-layout")).unwrap();
+    let err = crate::beneath::ensure_layout_beneath(
+        root,
+        Path::new("evil"),
+        r#"{"imageLayoutVersion":"1.0.0"}"#,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+}
+
+// dir_beneath with create=true, when a racer replaces a just-created dir with
+// a symlink: the re-open yields LOOP/NOTDIR → NotFound (beneath.rs lines 153-154).
+#[cfg(unix)]
+#[tokio::test]
+async fn dir_beneath_race_replace_with_symlink() {
+    // Simulate the race by creating a symlink at a component before calling
+    // dir_beneath (the mkdir finds EEXIST, then re-open hits LOOP).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::os::unix::fs::symlink(root.join("outside"), root.join("link")).unwrap();
+    // dir_beneath with create=true tries mkdir("link") → EEXIST, then re-opens → LOOP → NotFound.
+    let err = crate::beneath::dir_beneath(root, Path::new("link/sub"), true).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}

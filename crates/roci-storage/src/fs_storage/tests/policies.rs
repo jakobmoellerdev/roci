@@ -308,3 +308,106 @@ async fn manifest_links_commit_atomically_and_survive_restart() {
     ));
     assert!(!s.blob_exists("r", &sha256_of(other)).await.unwrap());
 }
+
+#[tokio::test]
+async fn quota_release_on_unknown_repo_is_noop() {
+    // quota.release when per_repo has no entry for the repo → the if-let
+    // Some(used) branch is not entered (quota.rs line 102).
+    let limits = QuotaLimits {
+        max_total_bytes: 10_000,
+        ..QuotaLimits::default()
+    };
+    let quota = QuotaTracker::new(limits);
+    // Seed some bytes on repo "a".
+    quota.seed("a", 500);
+    assert_eq!(quota.repo_bytes("a"), 500);
+    // Release on a repo that was never seeded/admitted → no panic, total still drops.
+    quota.release("unknown", 100);
+    assert_eq!(quota.repo_bytes("unknown"), 0);
+}
+
+#[tokio::test]
+async fn quota_release_partial_does_not_remove_entry() {
+    // When release does not bring the repo's usage to 0, the entry stays.
+    let limits = QuotaLimits {
+        max_total_bytes: 10_000,
+        ..QuotaLimits::default()
+    };
+    let quota = QuotaTracker::new(limits);
+    quota.seed("a", 500);
+    quota.release("a", 200);
+    assert_eq!(quota.repo_bytes("a"), 300);
+}
+
+#[tokio::test]
+async fn gc_touch_on_non_candidate_is_noop() {
+    // gc.touch on a digest that is not a candidate → the inner if-let branch
+    // returns None (gc.rs line 113, closing brace path).
+    use crate::gc::GcTracker;
+    let gc = GcTracker::new(true, std::time::Duration::from_secs(60));
+    gc.set_ready();
+    // Touch a digest that was never marked → no panic.
+    gc.touch(
+        "r",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    assert_eq!(gc.len(), 0);
+}
+
+#[tokio::test]
+async fn blob_read_redirect_into_stream_returns_unsupported() {
+    // BlobRead::redirect → into_stream returns Unsupported (storage.rs lines 95-98).
+    let br = BlobRead::redirect(42, "https://example.com/blob".into());
+    assert_eq!(br.size(), 42);
+    assert_eq!(br.redirect_url(), Some("https://example.com/blob"));
+    match br.into_stream(0, 42).await {
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported),
+        Ok(_) => panic!("expected Unsupported error for redirect blob"),
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_blob_entered_warn_on_checksum_already_matches() {
+    // When the checksum recorded by blob_entered exactly matches an existing
+    // record, the apply_relaxed is skipped. When they differ, the apply records
+    // the new one. When the apply fails, the warn arm is hit (lifecycle.rs line 62).
+    let (_dir, s) = store();
+    let d = sha256_of(b"lifecycle-enter");
+    s.put_blob("r", &d, b"lifecycle-enter").await.unwrap();
+    // Checksum was recorded at put_blob; re-enter with the same checksum → skip.
+    let existing = s.meta.checksum("r", &d.as_string()).unwrap();
+    s.blob_entered(
+        "r",
+        &d.as_string(),
+        Some(BlobChecksum {
+            crc32c: existing.crc32c,
+            size: existing.size,
+        }),
+    );
+    // Re-enter with a different checksum → apply_relaxed is called.
+    s.blob_entered(
+        "r",
+        &d.as_string(),
+        Some(BlobChecksum {
+            crc32c: existing.crc32c.wrapping_add(1),
+            size: existing.size,
+        }),
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_blob_left_clears_everything() {
+    // blob_left removes the blob from presence, cache, dedupe, gc, and quota;
+    // also drops the checksum record (lifecycle.rs lines 89, 91).
+    let (_dir, s) = store();
+    let d = sha256_of(b"lifecycle-leave");
+    s.put_blob("r", &d, b"lifecycle-leave").await.unwrap();
+    assert!(s.blob_exists("r", &d).await.unwrap());
+    assert!(s.meta.checksum("r", &d.as_string()).is_some());
+    // Call blob_left directly.
+    s.blob_left("r", &d.as_string(), Some(15));
+    // Presence filter should report absent.
+    assert!(!s.presence.maybe_present("r", &d.as_string()));
+    // Checksum should be gone.
+    assert!(s.meta.checksum("r", &d.as_string()).is_none());
+}

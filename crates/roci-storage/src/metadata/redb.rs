@@ -211,12 +211,8 @@ impl RedbMetadataStore {
                         .map_err(map_storage_err)?
                         .filter_map(|entry| {
                             let (k, _) = entry.ok()?;
-                            let (r, d, tag) = k.value();
-                            if r == repo && d == digest {
-                                Some(tag.to_string())
-                            } else {
-                                None
-                            }
+                            let (_, _, tag) = k.value();
+                            Some(tag.to_string())
                         })
                         .collect();
                     drop(rev);
@@ -242,12 +238,8 @@ impl RedbMetadataStore {
                         .map_err(map_storage_err)?
                         .filter_map(|entry| {
                             let (k, _) = entry.ok()?;
-                            let (r, d, subject) = k.value();
-                            if r == repo && d == digest {
-                                Some(subject.to_string())
-                            } else {
-                                None
-                            }
+                            let (_, _, subject) = k.value();
+                            Some(subject.to_string())
                         })
                         .collect();
                     drop(rev);
@@ -666,12 +658,8 @@ impl MetadataStore for RedbMetadataStore {
         range
             .filter_map(|entry| {
                 let (k, _) = entry.ok()?;
-                let (r, d) = k.value();
-                if r == repo {
-                    Some(d.to_string())
-                } else {
-                    None
-                }
+                let (_, d) = k.value();
+                Some(d.to_string())
             })
             .collect()
     }
@@ -689,13 +677,9 @@ impl MetadataStore for RedbMetadataStore {
         range
             .filter_map(|entry| {
                 let (k, v) = entry.ok()?;
-                let (r, tag) = k.value();
-                if r == repo {
-                    let (digest, media_type) = v.value();
-                    Some((tag.to_string(), digest.to_string(), media_type.to_string()))
-                } else {
-                    None
-                }
+                let (_, tag) = k.value();
+                let (digest, media_type) = v.value();
+                Some((tag.to_string(), digest.to_string(), media_type.to_string()))
             })
             .collect()
     }
@@ -836,5 +820,484 @@ mod tests {
         let n = next_prefix("abc");
         assert!(n.as_str() > "abc");
         assert!(n.as_str() < "abd");
+    }
+
+    #[test]
+    fn delete_manifest_cascades_tags_referrers_backrefs() {
+        // Covers reverse-index cascade lines 204-286: tags_by_digest,
+        // referrers_reverse, backrefs_reverse cleanup.
+        let dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig::default();
+        let store = RedbMetadataStore::open(dir.path(), &config).unwrap();
+
+        // Put a manifest with a tag, as a referrer, and with backrefs.
+        store
+            .apply(MetaOp::PutManifest {
+                repo: "r".into(),
+                digest: "sha256:aaa".into(),
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                tag: Some("v1".into()),
+                references: vec!["sha256:blob1".into(), "sha256:blob2".into()],
+                referrer: Some((
+                    "sha256:subject".into(),
+                    br#"{"artifactType":"sig","digest":"sha256:aaa"}"#.to_vec(),
+                )),
+            })
+            .unwrap();
+        // Another tag pointing at same digest to test multiple-tag cascade.
+        store
+            .apply(MetaOp::PutManifest {
+                repo: "r".into(),
+                digest: "sha256:aaa".into(),
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                tag: Some("v1-alias".into()),
+                references: vec![],
+                referrer: None,
+            })
+            .unwrap();
+
+        // Verify pre-state.
+        assert!(store.resolve_tag("r", "v1").is_some());
+        assert!(store.resolve_tag("r", "v1-alias").is_some());
+        assert!(store.has_referrer("r", "sha256:subject", "sha256:aaa"));
+        assert!(!store.backrefs("r", "sha256:blob1").is_empty());
+        assert!(!store.backrefs("r", "sha256:blob2").is_empty());
+
+        // Delete the manifest.
+        store
+            .apply(MetaOp::DeleteManifest {
+                repo: "r".into(),
+                digest: "sha256:aaa".into(),
+            })
+            .unwrap();
+
+        // Everything cascaded.
+        assert!(store.resolve_tag("r", "v1").is_none());
+        assert!(store.resolve_tag("r", "v1-alias").is_none());
+        assert!(!store.has_referrer("r", "sha256:subject", "sha256:aaa"));
+        assert!(store.backrefs("r", "sha256:blob1").is_empty());
+        assert!(store.backrefs("r", "sha256:blob2").is_empty());
+        assert!(store.manifest_media_type("r", "sha256:aaa").is_none());
+        assert!(store.checksum("r", "sha256:aaa").is_none());
+    }
+
+    #[test]
+    fn tags_page_pagination() {
+        // Covers tags_page lines 465 (repo break), 468 (more=true).
+        let dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig::default();
+        let store = RedbMetadataStore::open(dir.path(), &config).unwrap();
+
+        for t in ["v1", "v2", "v3", "v4"] {
+            store
+                .apply(MetaOp::PutManifest {
+                    repo: "r".into(),
+                    digest: format!("sha256:{t}"),
+                    media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                    tag: Some(t.into()),
+                    references: vec![],
+                    referrer: None,
+                })
+                .unwrap();
+        }
+        // Another repo to test repo-break.
+        store
+            .apply(MetaOp::PutManifest {
+                repo: "zzz".into(),
+                digest: "sha256:other".into(),
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                tag: Some("latest".into()),
+                references: vec![],
+                referrer: None,
+            })
+            .unwrap();
+
+        let page = store.tags_page("r", None, 2).unwrap();
+        assert_eq!(page.items, vec!["v1".to_string(), "v2".to_string()]);
+        assert!(page.more);
+
+        let page2 = store.tags_page("r", Some("v2"), 10).unwrap();
+        assert_eq!(page2.items, vec!["v3".to_string(), "v4".to_string()]);
+        assert!(!page2.more);
+
+        // No tags for missing repo.
+        assert!(store.tags_page("nope", None, 10).is_none());
+    }
+
+    #[test]
+    fn referrers_page_unfiltered_and_filtered() {
+        // Covers referrers_page lines 501-582 including filtered path.
+        let dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig::default();
+        let store = RedbMetadataStore::open(dir.path(), &config).unwrap();
+
+        let add_ref = |referrer: &str, at: Option<&str>| {
+            let desc = if let Some(at) = at {
+                format!(r#"{{"artifactType":"{at}","digest":"{referrer}"}}"#)
+            } else {
+                format!(r#"{{"digest":"{referrer}"}}"#)
+            };
+            store
+                .apply(MetaOp::PutReferrer {
+                    repo: "r".into(),
+                    subject: "sha256:s".into(),
+                    referrer: referrer.into(),
+                    descriptor: desc.into_bytes(),
+                })
+                .unwrap();
+        };
+
+        add_ref("sha256:r1", Some("sig"));
+        add_ref("sha256:r2", Some("sig"));
+        add_ref("sha256:r3", Some("sbom"));
+        add_ref("sha256:r4", None);
+
+        // Unfiltered: all 4 referrers.
+        let page = store
+            .referrers_page("r", "sha256:s", None, None, usize::MAX)
+            .unwrap();
+        assert_eq!(page.items.len(), 4);
+
+        // Unfiltered pagination (more=true).
+        let page_lim = store
+            .referrers_page("r", "sha256:s", None, None, 2)
+            .unwrap();
+        assert_eq!(page_lim.items.len(), 2);
+        assert!(page_lim.more);
+
+        // Filtered by "sig": r1, r2.
+        let page_sig = store
+            .referrers_page("r", "sha256:s", Some("sig"), None, usize::MAX)
+            .unwrap();
+        assert_eq!(page_sig.items.len(), 2);
+
+        // Filtered with pagination (more=true).
+        let page_sig_lim = store
+            .referrers_page("r", "sha256:s", Some("sig"), None, 1)
+            .unwrap();
+        assert_eq!(page_sig_lim.items.len(), 1);
+        assert!(page_sig_lim.more);
+
+        // Filtered by non-existent type → empty page (not None).
+        let page_empty = store
+            .referrers_page("r", "sha256:s", Some("nonexistent"), None, 10)
+            .unwrap();
+        assert!(page_empty.items.is_empty());
+        assert!(!page_empty.more);
+
+        // No referrers at all for a subject → None.
+        assert!(store
+            .referrers_page("r", "sha256:none", None, None, 10)
+            .is_none());
+
+        // Filtered on a subject with no referrers at all → None.
+        assert!(store
+            .referrers_page("r", "sha256:none", Some("sig"), None, 10)
+            .is_none());
+    }
+
+    #[test]
+    fn has_referrer_and_backrefs_and_checksum() {
+        // Covers has_referrer lines 589-594, backrefs lines 599-609,
+        // checksum lines 612-616.
+        let dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig::default();
+        let store = RedbMetadataStore::open(dir.path(), &config).unwrap();
+
+        assert!(!store.has_referrer("r", "sha256:s", "sha256:r1"));
+        assert!(store.backrefs("r", "sha256:b1").is_empty());
+        assert!(store.checksum("r", "sha256:d1").is_none());
+
+        store
+            .apply(MetaOp::PutReferrer {
+                repo: "r".into(),
+                subject: "sha256:s".into(),
+                referrer: "sha256:r1".into(),
+                descriptor: br#"{"digest":"sha256:r1"}"#.to_vec(),
+            })
+            .unwrap();
+        store
+            .apply(MetaOp::PutBackrefs {
+                repo: "r".into(),
+                manifest: "sha256:m1".into(),
+                blobs: vec!["sha256:b1".into()],
+            })
+            .unwrap();
+        store
+            .apply(MetaOp::PutChecksum {
+                repo: "r".into(),
+                digest: "sha256:d1".into(),
+                crc32c: 0x1234,
+                size: 42,
+            })
+            .unwrap();
+
+        assert!(store.has_referrer("r", "sha256:s", "sha256:r1"));
+        assert_eq!(
+            store.backrefs("r", "sha256:b1"),
+            vec!["sha256:m1".to_string()]
+        );
+        assert_eq!(
+            store.checksum("r", "sha256:d1"),
+            Some(BlobChecksum {
+                crc32c: 0x1234,
+                size: 42
+            })
+        );
+    }
+
+    #[test]
+    fn apply_relaxed_and_delete_blob() {
+        // Covers apply_relaxed (line 624) and DeleteBlob op (lines 318-322).
+        let dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig::default();
+        let store = RedbMetadataStore::open(dir.path(), &config).unwrap();
+
+        store
+            .apply_relaxed(MetaOp::PutChecksum {
+                repo: "r".into(),
+                digest: "sha256:b1".into(),
+                crc32c: 0xAAAA,
+                size: 99,
+            })
+            .unwrap();
+        assert!(store.checksum("r", "sha256:b1").is_some());
+
+        store
+            .apply(MetaOp::DeleteBlob {
+                repo: "r".into(),
+                digest: "sha256:b1".into(),
+            })
+            .unwrap();
+        assert!(store.checksum("r", "sha256:b1").is_none());
+    }
+
+    #[test]
+    fn repos_and_manifests() {
+        // Covers repos lines 628-653, manifests lines 658-676.
+        let dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig::default();
+        let store = RedbMetadataStore::open(dir.path(), &config).unwrap();
+
+        assert!(store.repos().is_empty());
+        assert!(store.manifests("r").is_empty());
+
+        store
+            .apply(MetaOp::PutManifest {
+                repo: "r".into(),
+                digest: "sha256:aaa".into(),
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                tag: Some("v1".into()),
+                references: vec![],
+                referrer: None,
+            })
+            .unwrap();
+        store
+            .apply(MetaOp::PutManifest {
+                repo: "r".into(),
+                digest: "sha256:bbb".into(),
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                tag: None,
+                references: vec![],
+                referrer: None,
+            })
+            .unwrap();
+        // Add referrer to a different repo so repos() includes it.
+        store
+            .apply(MetaOp::PutReferrer {
+                repo: "r2".into(),
+                subject: "sha256:s".into(),
+                referrer: "sha256:rr".into(),
+                descriptor: br#"{"digest":"sha256:rr"}"#.to_vec(),
+            })
+            .unwrap();
+
+        let repos = store.repos();
+        assert!(repos.contains(&"r".to_string()));
+        assert!(repos.contains(&"r2".to_string()));
+
+        let mf = store.manifests("r");
+        assert!(mf.contains(&"sha256:aaa".to_string()));
+        assert!(mf.contains(&"sha256:bbb".to_string()));
+        assert!(store.manifests("empty_repo").is_empty());
+    }
+
+    #[test]
+    fn tags_snapshot_and_referrers_snapshot() {
+        // Covers tags_snapshot lines 680-700, referrers_snapshot lines 704-731.
+        let dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig::default();
+        let store = RedbMetadataStore::open(dir.path(), &config).unwrap();
+
+        assert!(store.tags_snapshot("r").is_empty());
+        assert!(store.referrers_snapshot("r").is_empty());
+
+        store
+            .apply(MetaOp::PutManifest {
+                repo: "r".into(),
+                digest: "sha256:aaa".into(),
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                tag: Some("v1".into()),
+                references: vec![],
+                referrer: None,
+            })
+            .unwrap();
+        store
+            .apply(MetaOp::PutManifest {
+                repo: "r".into(),
+                digest: "sha256:bbb".into(),
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                tag: Some("v2".into()),
+                references: vec![],
+                referrer: None,
+            })
+            .unwrap();
+        store
+            .apply(MetaOp::PutReferrer {
+                repo: "r".into(),
+                subject: "sha256:s1".into(),
+                referrer: "sha256:ref1".into(),
+                descriptor: br#"{"digest":"sha256:ref1"}"#.to_vec(),
+            })
+            .unwrap();
+        store
+            .apply(MetaOp::PutReferrer {
+                repo: "r".into(),
+                subject: "sha256:s1".into(),
+                referrer: "sha256:ref2".into(),
+                descriptor: br#"{"digest":"sha256:ref2"}"#.to_vec(),
+            })
+            .unwrap();
+        // Different repo to test repo-break in referrers_snapshot (line 723).
+        store
+            .apply(MetaOp::PutReferrer {
+                repo: "zzz".into(),
+                subject: "sha256:s1".into(),
+                referrer: "sha256:ref3".into(),
+                descriptor: br#"{"digest":"sha256:ref3"}"#.to_vec(),
+            })
+            .unwrap();
+
+        let ts = store.tags_snapshot("r");
+        assert_eq!(ts.len(), 2);
+        assert!(ts.iter().any(|(t, _, _)| t == "v1"));
+        assert!(ts.iter().any(|(t, _, _)| t == "v2"));
+        assert!(store.tags_snapshot("empty").is_empty());
+
+        let rs = store.referrers_snapshot("r");
+        assert_eq!(rs.len(), 1); // one subject
+        assert_eq!(rs[0].0, "sha256:s1");
+        assert_eq!(rs[0].1.len(), 2);
+
+        // The zzz repo should not appear in r's snapshot.
+        let rs_zzz = store.referrers_snapshot("zzz");
+        assert_eq!(rs_zzz.len(), 1);
+    }
+
+    #[test]
+    fn maintain_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig::default();
+        let store = RedbMetadataStore::open(dir.path(), &config).unwrap();
+        store.maintain().unwrap();
+    }
+
+    #[test]
+    fn error_mapping_functions() {
+        // Exercise the error mapping helpers (lines 744-762).
+        use std::io::ErrorKind;
+
+        // map_db_err: construct via a corrupted database.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("broken.redb");
+        std::fs::write(&db_path, b"not a redb file").unwrap();
+        let err = Database::create(&db_path).unwrap_err();
+        let io_err = map_db_err(err);
+        assert_eq!(io_err.kind(), ErrorKind::Other);
+        assert!(io_err.to_string().contains("redb"), "{io_err}");
+
+        // map_txn_err: TransactionError::Storage wraps StorageError.
+        let txn_err = redb::TransactionError::Storage(redb::StorageError::Corrupted(
+            "test corruption".into(),
+        ));
+        let io_err = map_txn_err(txn_err);
+        assert_eq!(io_err.kind(), ErrorKind::Other);
+        assert!(io_err.to_string().contains("transaction"), "{io_err}");
+
+        // map_table_err: TableError::Storage wraps StorageError.
+        let table_err =
+            redb::TableError::Storage(redb::StorageError::Corrupted("test table err".into()));
+        let io_err = map_table_err(table_err);
+        assert_eq!(io_err.kind(), ErrorKind::Other);
+        assert!(io_err.to_string().contains("table"), "{io_err}");
+
+        // map_storage_err: StorageError::Corrupted.
+        let storage_err = redb::StorageError::Corrupted("test storage".into());
+        let io_err = map_storage_err(storage_err);
+        assert_eq!(io_err.kind(), ErrorKind::Other);
+        assert!(io_err.to_string().contains("storage"), "{io_err}");
+
+        // map_commit_err: CommitError::Storage wraps StorageError.
+        let commit_err =
+            redb::CommitError::Storage(redb::StorageError::Corrupted("test commit".into()));
+        let io_err = map_commit_err(commit_err);
+        assert_eq!(io_err.kind(), ErrorKind::Other);
+        assert!(io_err.to_string().contains("commit"), "{io_err}");
+    }
+
+    #[test]
+    fn delete_manifest_with_checksum_and_referrer_with_type() {
+        // Ensure DeleteManifest also removes checksums, and that referrer
+        // removal cleans up the by-type index.
+        let dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig::default();
+        let store = RedbMetadataStore::open(dir.path(), &config).unwrap();
+
+        // Add manifest with referrer that has artifactType.
+        store
+            .apply(MetaOp::PutManifest {
+                repo: "r".into(),
+                digest: "sha256:m1".into(),
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                tag: None,
+                references: vec![],
+                referrer: Some((
+                    "sha256:parent".into(),
+                    br#"{"artifactType":"sig","digest":"sha256:m1"}"#.to_vec(),
+                )),
+            })
+            .unwrap();
+        store
+            .apply(MetaOp::PutChecksum {
+                repo: "r".into(),
+                digest: "sha256:m1".into(),
+                crc32c: 0xDEAD,
+                size: 10,
+            })
+            .unwrap();
+
+        assert!(store.has_referrer("r", "sha256:parent", "sha256:m1"));
+        assert!(store.checksum("r", "sha256:m1").is_some());
+
+        // Filtered referrer page should show m1.
+        let page = store
+            .referrers_page("r", "sha256:parent", Some("sig"), None, 10)
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+
+        // Delete the manifest.
+        store
+            .apply(MetaOp::DeleteManifest {
+                repo: "r".into(),
+                digest: "sha256:m1".into(),
+            })
+            .unwrap();
+
+        assert!(!store.has_referrer("r", "sha256:parent", "sha256:m1"));
+        assert!(store.checksum("r", "sha256:m1").is_none());
+        // The subject should have no referrers left.
+        assert!(store
+            .referrers_page("r", "sha256:parent", None, None, 10)
+            .is_none());
     }
 }

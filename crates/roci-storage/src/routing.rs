@@ -504,4 +504,173 @@ mod tests {
         let _ = tx.send(true);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+
+    #[test]
+    fn debug_impl_shows_route_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = FsStorage::new(dir.path().join("default")).unwrap();
+        let team = FsStorage::new(dir.path().join("team")).unwrap();
+        let routed = Routed::new(default, vec![("team".into(), team)]);
+        let dbg = format!("{:?}", routed);
+        assert!(dbg.contains("Routed"));
+        assert!(dbg.contains("team"));
+    }
+
+    #[tokio::test]
+    async fn delegation_blob_exists_and_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = FsStorage::new(dir.path().join("default")).unwrap();
+        let team = FsStorage::new(dir.path().join("team")).unwrap();
+        let routed = Routed::new(default, vec![("team".into(), team)]);
+
+        let data = b"exists-test";
+        let digest = crate::sha256_of(data);
+
+        routed.put_blob("team/app", &digest, data).await.unwrap();
+
+        // blob_exists and blob_size delegate to the right backend
+        assert!(routed.blob_exists("team/app", &digest).await.unwrap());
+        assert!(!routed.blob_exists("other/app", &digest).await.unwrap());
+        assert_eq!(
+            routed.blob_size("team/app", &digest).await.unwrap(),
+            data.len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn delegation_read_and_open_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = FsStorage::new(dir.path().join("default")).unwrap();
+        let team = FsStorage::new(dir.path().join("team")).unwrap();
+        let routed = Routed::new(default, vec![("team".into(), team)]);
+
+        let data = b"read-open-test";
+        let digest = crate::sha256_of(data);
+        routed.put_blob("team/x", &digest, data).await.unwrap();
+
+        // read_blob
+        assert_eq!(routed.read_blob("team/x", &digest).await.unwrap(), data);
+
+        // open_blob
+        let blob_read = routed.open_blob("team/x", &digest).await.unwrap();
+        assert_eq!(blob_read.size(), data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn delegation_upload_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = FsStorage::new(dir.path().join("default")).unwrap();
+        let team = FsStorage::new(dir.path().join("team")).unwrap();
+        let routed = Routed::new(default, vec![("team".into(), team)]);
+
+        let data = b"upload-lifecycle";
+        let digest = crate::sha256_of(data);
+
+        // begin_upload, append_upload, upload_size, finish_upload
+        let id = routed.begin_upload("team/up").await.unwrap();
+        let offset = routed
+            .append_upload("team/up", &id, data, None)
+            .await
+            .unwrap();
+        assert_eq!(offset, data.len() as u64);
+        let size = routed.upload_size("team/up", &id).await.unwrap();
+        assert_eq!(size, data.len() as u64);
+        routed
+            .finish_upload("team/up", &id, &digest, u64::MAX, b"")
+            .await
+            .unwrap();
+        assert_eq!(routed.read_blob("team/up", &digest).await.unwrap(), data);
+
+        // abort_upload through the default backend
+        let id2 = routed.begin_upload("other/up").await.unwrap();
+        routed
+            .append_upload("other/up", &id2, b"junk", None)
+            .await
+            .unwrap();
+        assert!(routed.abort_upload("other/up", &id2).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delegation_delete_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = FsStorage::new(dir.path().join("default")).unwrap();
+        let team = FsStorage::new(dir.path().join("team")).unwrap();
+        let routed = Routed::new(default, vec![("team".into(), team)]);
+
+        let data = b"to-delete";
+        let digest = crate::sha256_of(data);
+        routed.put_blob("team/del", &digest, data).await.unwrap();
+        assert!(routed.blob_exists("team/del", &digest).await.unwrap());
+        routed.delete_blob("team/del", &digest).await.unwrap();
+        assert!(!routed.blob_exists("team/del", &digest).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delegation_delete_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = FsStorage::new(dir.path().join("default")).unwrap();
+        let team = FsStorage::new(dir.path().join("team")).unwrap();
+        let routed = Routed::new(default, vec![("team".into(), team)]);
+
+        let config_data = b"{}";
+        let config_digest = crate::sha256_of(config_data);
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest.as_string(),
+                "size": config_data.len()
+            },
+            "layers": []
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = crate::sha256_of(&manifest_bytes);
+
+        routed
+            .put_blob("team/dm", &config_digest, config_data)
+            .await
+            .unwrap();
+        routed
+            .put_manifest(
+                "team/dm",
+                Some("v1"),
+                &manifest_digest,
+                "application/vnd.oci.image.manifest.v1+json",
+                &manifest_bytes,
+                ManifestLinks {
+                    references: &[config_digest],
+                    subject: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // get_manifest works through the router
+        let resolved = routed.get_manifest("team/dm", "v1").await.unwrap();
+        assert_eq!(resolved.digest, manifest_digest);
+
+        // delete_manifest
+        routed
+            .delete_manifest("team/dm", &manifest_digest)
+            .await
+            .unwrap();
+        assert!(routed.get_manifest("team/dm", "v1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delegation_list_referrers() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = FsStorage::new(dir.path().join("default")).unwrap();
+        let team = FsStorage::new(dir.path().join("team")).unwrap();
+        let routed = Routed::new(default, vec![("team".into(), team)]);
+
+        // list_referrers on an empty repo returns an empty page
+        let d = crate::sha256_of(b"subject");
+        let page = routed
+            .list_referrers("team/ref", &d, None, None, 100)
+            .await
+            .unwrap();
+        assert!(page.items.is_empty());
+    }
 }

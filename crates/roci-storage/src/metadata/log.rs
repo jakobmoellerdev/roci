@@ -2396,4 +2396,804 @@ mod tests {
         let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
         assert_eq!(s.tags_page("r", None, 100).unwrap().items.len(), 21);
     }
+
+    #[test]
+    fn debug_impl() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = LogMetadataStore::open(dir.path()).unwrap();
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("LogMetadataStore"), "got: {dbg}");
+        assert!(dbg.contains("log_path"), "got: {dbg}");
+    }
+
+    #[test]
+    fn subject_referrers_remove_cleans_type_index() {
+        let mut sr = SubjectReferrers::default();
+        sr.insert("sha256:r1", br#"{"artifactType":"sig"}"#);
+        sr.insert("sha256:r2", br#"{"artifactType":"sig"}"#);
+        assert_eq!(sr.by_type.get("sig").map(|s| s.len()), Some(2));
+        // Remove one: type entry is pruned from the set.
+        sr.remove("sha256:r1");
+        assert_eq!(sr.by_type.get("sig").map(|s| s.len()), Some(1));
+        // Remove the other: the type key is deleted entirely.
+        sr.remove("sha256:r2");
+        assert!(!sr.by_type.contains_key("sig"));
+        // Remove non-existent is a no-op.
+        sr.remove("sha256:r99");
+    }
+
+    // ---- Legacy log (no header) ----------------------------------------
+
+    #[test]
+    fn legacy_log_replays_without_header() {
+        // Build a legacy log (no WAL header, no generation marker) by
+        // directly encoding records.
+        let mut bytes = Vec::new();
+        let payload1 = serialize_op(&put("r", "sha256:aa", Some("v1")));
+        let crc1 = crc32c::crc32c(&payload1);
+        bytes.extend_from_slice(&(payload1.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc1.to_le_bytes());
+        bytes.extend_from_slice(&payload1);
+
+        let payload2 = serialize_op(&MetaOp::PutChecksum {
+            repo: "r".into(),
+            digest: "sha256:b1".into(),
+            crc32c: 0x1111,
+            size: 256,
+        });
+        let crc2 = crc32c::crc32c(&payload2);
+        bytes.extend_from_slice(&(payload2.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc2.to_le_bytes());
+        bytes.extend_from_slice(&payload2);
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("roci-meta.log");
+        std::fs::write(&log_path, &bytes).unwrap();
+
+        let s = LogMetadataStore::open(dir.path()).unwrap();
+        assert_eq!(
+            s.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
+        assert_eq!(
+            s.checksum("r", "sha256:b1"),
+            Some(BlobChecksum {
+                crc32c: 0x1111,
+                size: 256
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_log_truncated_stops_gracefully() {
+        // Build a legacy log with a truncated trailing record.
+        let mut bytes = Vec::new();
+        let payload1 = serialize_op(&put("r", "sha256:aa", Some("v1")));
+        let crc1 = crc32c::crc32c(&payload1);
+        bytes.extend_from_slice(&(payload1.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc1.to_le_bytes());
+        bytes.extend_from_slice(&payload1);
+        // Truncated record: declared length exceeds remaining bytes.
+        bytes.extend_from_slice(&(9999u32).to_le_bytes());
+        bytes.extend_from_slice(&(0u32).to_le_bytes());
+        bytes.extend_from_slice(b"short");
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("roci-meta.log");
+        std::fs::write(&log_path, &bytes).unwrap();
+
+        let s = LogMetadataStore::open(dir.path()).unwrap();
+        assert_eq!(
+            s.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa"),
+            "should replay the valid record before the torn tail"
+        );
+    }
+
+    #[test]
+    fn legacy_log_bad_crc_stops_replay() {
+        let mut bytes = Vec::new();
+        let payload1 = serialize_op(&put("r", "sha256:aa", Some("v1")));
+        let crc1 = crc32c::crc32c(&payload1);
+        bytes.extend_from_slice(&(payload1.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc1.to_le_bytes());
+        bytes.extend_from_slice(&payload1);
+        // Record with bad CRC.
+        let payload2 = serialize_op(&put("r", "sha256:bb", Some("v2")));
+        bytes.extend_from_slice(&(payload2.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(0xDEAD_BEEFu32).to_le_bytes()); // wrong CRC
+        bytes.extend_from_slice(&payload2);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("roci-meta.log"), &bytes).unwrap();
+
+        let s = LogMetadataStore::open(dir.path()).unwrap();
+        assert_eq!(
+            s.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
+        assert_eq!(s.resolve_tag("r", "v2"), None);
+    }
+
+    // ---- Framing edge cases -------------------------------------------
+
+    #[test]
+    fn check_framing_short_bytes() {
+        // < 8 bytes ⇒ NoHeader (line 1284)
+        assert!(matches!(
+            check_log_framing(b"short", FramingMode::Plain, None),
+            LogFramingCheck::NoHeader
+        ));
+    }
+
+    #[test]
+    fn check_framing_truncated_payload() {
+        // Declared payload length exceeds remaining bytes (line 1290)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(999u32).to_le_bytes());
+        buf.extend_from_slice(&(0u32).to_le_bytes());
+        buf.extend_from_slice(b"x");
+        assert!(matches!(
+            check_log_framing(&buf, FramingMode::Plain, None),
+            LogFramingCheck::NoHeader
+        ));
+    }
+
+    #[test]
+    fn check_framing_bad_crc() {
+        // Payload CRC mismatch (line 1294)
+        let payload = wal_hmac::encode_header(FramingMode::Plain);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(0xBAAD_F00Du32).to_le_bytes());
+        buf.extend_from_slice(&payload);
+        assert!(matches!(
+            check_log_framing(&buf, FramingMode::Plain, None),
+            LogFramingCheck::NoHeader
+        ));
+    }
+
+    #[test]
+    fn check_framing_hmac_truncated_tag() {
+        // HMAC mode but tag bytes missing (line 1304)
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = make_key(dir.path());
+        let key = HmacKey::load(&key_path).unwrap();
+        let payload = wal_hmac::encode_header(FramingMode::HmacSha256);
+        let crc = crc32c::crc32c(&payload);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf.extend_from_slice(&payload);
+        // No HMAC tag appended → Incompatible
+        assert!(matches!(
+            check_log_framing(&buf, FramingMode::HmacSha256, Some(&key)),
+            LogFramingCheck::Incompatible
+        ));
+    }
+
+    #[test]
+    fn check_framing_hmac_wrong_tag() {
+        // Valid framing but HMAC tag is wrong → Incompatible (line 1308)
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = make_key(dir.path());
+        let key = HmacKey::load(&key_path).unwrap();
+        let payload = wal_hmac::encode_header(FramingMode::HmacSha256);
+        let crc = crc32c::crc32c(&payload);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf.extend_from_slice(&payload);
+        buf.extend_from_slice(&[0xFFu8; 32]); // wrong HMAC
+        assert!(matches!(
+            check_log_framing(&buf, FramingMode::HmacSha256, Some(&key)),
+            LogFramingCheck::Incompatible
+        ));
+    }
+
+    #[test]
+    fn check_framing_mode_mismatch() {
+        // Plain header but expecting HmacSha256 → Incompatible (line 1314)
+        let payload = wal_hmac::encode_header(FramingMode::Plain);
+        let crc = crc32c::crc32c(&payload);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf.extend_from_slice(&payload);
+        assert!(matches!(
+            check_log_framing(&buf, FramingMode::HmacSha256, None),
+            LogFramingCheck::Incompatible
+        ));
+    }
+
+    #[test]
+    fn check_framing_non_header_payload() {
+        // Valid CRC but payload isn't a header → NoHeader (line 1314)
+        let payload = b"not_a_header_record";
+        let crc = crc32c::crc32c(payload);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf.extend_from_slice(payload);
+        assert!(matches!(
+            check_log_framing(&buf, FramingMode::Plain, None),
+            LogFramingCheck::NoHeader
+        ));
+    }
+
+    // ---- deserialize_op: DeleteBlob (lines 1548-1549) --------------------
+
+    #[test]
+    fn deserialize_delete_blob() {
+        let op = MetaOp::DeleteBlob {
+            repo: "r".into(),
+            digest: "sha256:xx".into(),
+        };
+        let bytes = serialize_op(&op);
+        let round = deserialize_op(&bytes).expect("should parse DeleteBlob");
+        assert_eq!(round, op);
+    }
+
+    // ---- Incompatible framing with snapshot discards both ----------------
+
+    #[test]
+    fn incompatible_framing_discards_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = make_key(dir.path());
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            hmac_key_file: Some(key_path),
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.maintain().unwrap();
+        drop(s);
+
+        assert!(dir.path().join("roci-meta.snapshot").exists());
+
+        // Now open without HMAC — the log's HMAC header is "Incompatible"
+        // with Plain. Snapshot and log should both be discarded (lines 397-400).
+        let cfg2 = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s2 = LogMetadataStore::open_with(dir.path(), &cfg2).unwrap();
+        assert_eq!(s2.resolve_tag("r", "v1"), None);
+    }
+
+    #[test]
+    fn noheader_with_hmac_key_discards_snapshot() {
+        // Write a plain log (no HMAC) then open with HMAC key + snapshot.
+        // The legacy log triggers NoHeader+hmac_key.is_some() path
+        // (lines 405-414).
+        let dir = tempfile::tempdir().unwrap();
+        let s = LogMetadataStore::open(dir.path()).unwrap();
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        drop(s);
+
+        // Also create a dummy snapshot file to test cleanup
+        let snap_path = dir.path().join("roci-meta.snapshot");
+        std::fs::write(&snap_path, b"dummy-snapshot").unwrap();
+
+        let key_path = make_key(dir.path());
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            hmac_key_file: Some(key_path),
+            ..Default::default()
+        };
+        let s2 = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        // Everything is discarded because the existing log has no header
+        // and an HMAC key is configured.
+        assert_eq!(s2.resolve_tag("r", "v1"), None);
+        assert!(!snap_path.exists(), "snapshot should be removed");
+    }
+
+    #[test]
+    fn legacy_replay_path_no_hmac() {
+        // Legacy log without header, no HMAC key → replay_legacy (line 416).
+        let mut bytes = Vec::new();
+        let p = serialize_op(&put("r", "sha256:aa", Some("v1")));
+        let crc = crc32c::crc32c(&p);
+        bytes.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        bytes.extend_from_slice(&p);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("roci-meta.log"), &bytes).unwrap();
+
+        let s = LogMetadataStore::open(dir.path()).unwrap();
+        assert_eq!(
+            s.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa")
+        );
+    }
+
+    // ---- Snapshot base+delta merge for ALL query methods ----------------
+    // These tests create state → snapshot → delta modifications, then
+    // exercise every MetadataStore method to cover the base+delta merge
+    // paths (lines 238-310, 560, 578-584, 612-689, 708-717, 742, 777,
+    // 801-817, 833-840, 863, 880-892, 899).
+
+    #[test]
+    fn snapshot_base_delta_tags_and_media_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+
+        // Base: two tags and their media types.
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.apply(put("r", "sha256:bb", Some("v2"))).unwrap();
+        s.apply(put("r2", "sha256:cc", Some("latest"))).unwrap();
+        s.maintain().unwrap();
+
+        // Delta: add a tag, delete one from base.
+        s.apply(put("r", "sha256:dd", Some("v3"))).unwrap();
+        s.apply(MetaOp::DeleteManifest {
+            repo: "r".into(),
+            digest: "sha256:aa".into(),
+        })
+        .unwrap();
+
+        // resolve_tag: v1 deleted from base, v2 from base, v3 from delta.
+        assert_eq!(s.resolve_tag("r", "v1"), None);
+        assert_eq!(
+            s.resolve_tag("r", "v2").map(|(d, _)| d).as_deref(),
+            Some("sha256:bb")
+        );
+        assert_eq!(
+            s.resolve_tag("r", "v3").map(|(d, _)| d).as_deref(),
+            Some("sha256:dd")
+        );
+        // resolve_tag miss in base (line 560)
+        assert_eq!(s.resolve_tag("r", "v_missing"), None);
+
+        // manifest_media_type: deleted from base, present in base, delta.
+        assert_eq!(s.manifest_media_type("r", "sha256:aa"), None);
+        assert!(s.manifest_media_type("r", "sha256:bb").is_some()); // base
+        assert!(s.manifest_media_type("r", "sha256:dd").is_some()); // delta
+                                                                    // Missing entirely from both.
+        assert_eq!(s.manifest_media_type("r", "sha256:zz"), None);
+
+        // tags_page: merged from base+delta, tombstones excluded.
+        let page = s.tags_page("r", None, usize::MAX).unwrap();
+        assert_eq!(page.items, vec!["v2".to_string(), "v3".to_string()]);
+
+        // tags_page paging across base+delta.
+        let p1 = s.tags_page("r", None, 1).unwrap();
+        assert_eq!(p1.items, vec!["v2".to_string()]);
+        assert!(p1.more);
+        let p2 = s.tags_page("r", Some("v2"), 1).unwrap();
+        assert_eq!(p2.items, vec!["v3".to_string()]);
+        assert!(!p2.more);
+
+        // tags_page for repo with nothing left after tombstones.
+        // Delete the only tag in r2 from base.
+        s.apply(MetaOp::DeleteManifest {
+            repo: "r2".into(),
+            digest: "sha256:cc".into(),
+        })
+        .unwrap();
+        assert!(s.tags_page("r2", None, usize::MAX).is_none());
+
+        // tags_page for missing repo (both base and delta have nothing).
+        assert!(s.tags_page("no_repo", None, usize::MAX).is_none());
+
+        // tags_snapshot merges base+delta.
+        let snap = s.tags_snapshot("r");
+        assert_eq!(snap.len(), 2);
+        assert!(snap.iter().any(|(t, _, _)| t == "v2"));
+        assert!(snap.iter().any(|(t, _, _)| t == "v3"));
+
+        // repos: merges base+delta, excludes repos with only tombstoned entries.
+        let repos = s.repos();
+        assert!(repos.contains(&"r".to_string()));
+        assert!(!repos.contains(&"r2".to_string()));
+
+        // manifests: merges base (not tombstoned) + delta.
+        let mf = s.manifests("r");
+        assert!(!mf.contains(&"sha256:aa".to_string()), "aa is tombstoned");
+        assert!(mf.contains(&"sha256:bb".to_string()), "bb from base");
+        assert!(mf.contains(&"sha256:dd".to_string()), "dd from delta");
+    }
+
+    #[test]
+    fn snapshot_base_delta_referrers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+
+        // Base referrers.
+        s.apply(MetaOp::PutReferrer {
+            repo: "r".into(),
+            subject: "sha256:s".into(),
+            referrer: "sha256:r1".into(),
+            descriptor: br#"{"artifactType":"sig","digest":"sha256:r1"}"#.to_vec(),
+        })
+        .unwrap();
+        s.apply(MetaOp::PutReferrer {
+            repo: "r".into(),
+            subject: "sha256:s".into(),
+            referrer: "sha256:r2".into(),
+            descriptor: br#"{"artifactType":"sbom","digest":"sha256:r2"}"#.to_vec(),
+        })
+        .unwrap();
+        // Also add a second subject for referrers_snapshot coverage.
+        s.apply(MetaOp::PutReferrer {
+            repo: "r".into(),
+            subject: "sha256:s2".into(),
+            referrer: "sha256:r3".into(),
+            descriptor: br#"{"digest":"sha256:r3"}"#.to_vec(),
+        })
+        .unwrap();
+        s.maintain().unwrap();
+
+        // Delta: delete r1 from base, add r4 in delta.
+        s.apply(MetaOp::DeleteManifest {
+            repo: "r".into(),
+            digest: "sha256:r1".into(),
+        })
+        .unwrap();
+        s.apply(MetaOp::PutReferrer {
+            repo: "r".into(),
+            subject: "sha256:s".into(),
+            referrer: "sha256:r4".into(),
+            descriptor: br#"{"artifactType":"sig","digest":"sha256:r4"}"#.to_vec(),
+        })
+        .unwrap();
+
+        // referrers_page: base minus tombstones + delta.
+        let page = s
+            .referrers_page("r", "sha256:s", None, None, usize::MAX)
+            .unwrap();
+        let digests: Vec<_> = page.items.iter().map(|(d, _)| d.as_str()).collect();
+        assert!(!digests.contains(&"sha256:r1"), "r1 is tombstoned");
+        assert!(digests.contains(&"sha256:r2"), "r2 from base");
+        assert!(digests.contains(&"sha256:r4"), "r4 from delta");
+
+        // referrers_page: empty after all deleted from a subject.
+        s.apply(MetaOp::DeleteManifest {
+            repo: "r".into(),
+            digest: "sha256:r3".into(),
+        })
+        .unwrap();
+        assert!(s
+            .referrers_page("r", "sha256:s2", None, None, usize::MAX)
+            .is_none());
+
+        // referrers_page: no referrers at all for a subject.
+        assert!(s
+            .referrers_page("r", "sha256:none", None, None, usize::MAX)
+            .is_none());
+
+        // has_referrer: from base, from delta, tombstoned.
+        assert!(!s.has_referrer("r", "sha256:s", "sha256:r1"), "tombstoned");
+        assert!(s.has_referrer("r", "sha256:s", "sha256:r2"), "from base");
+        assert!(s.has_referrer("r", "sha256:s", "sha256:r4"), "from delta");
+
+        // referrers_snapshot: covers base+delta per subject.
+        let rs = s.referrers_snapshot("r");
+        // Subject s should have r2 + r4; s2 should have nothing.
+        let s_entry = rs.iter().find(|(sub, _)| sub == "sha256:s");
+        assert!(s_entry.is_some());
+        let (_, refs) = s_entry.unwrap();
+        assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_base_delta_backrefs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+
+        // Base backrefs.
+        s.apply(MetaOp::PutBackrefs {
+            repo: "r".into(),
+            manifest: "sha256:m1".into(),
+            blobs: vec!["sha256:b1".into(), "sha256:b2".into()],
+        })
+        .unwrap();
+        s.apply(MetaOp::PutBackrefs {
+            repo: "r".into(),
+            manifest: "sha256:m2".into(),
+            blobs: vec!["sha256:b1".into()],
+        })
+        .unwrap();
+        s.maintain().unwrap();
+
+        // Delta: delete m1 from base, add m3 referencing b1.
+        s.apply(MetaOp::DeleteManifest {
+            repo: "r".into(),
+            digest: "sha256:m1".into(),
+        })
+        .unwrap();
+        s.apply(MetaOp::PutBackrefs {
+            repo: "r".into(),
+            manifest: "sha256:m3".into(),
+            blobs: vec!["sha256:b1".into(), "sha256:b3".into()],
+        })
+        .unwrap();
+
+        // backrefs: b1 should have m2 (base, not tombstoned) + m3 (delta).
+        let br = s.backrefs("r", "sha256:b1");
+        assert!(!br.contains(&"sha256:m1".to_string()), "m1 is tombstoned");
+        assert!(br.contains(&"sha256:m2".to_string()), "m2 from base");
+        assert!(br.contains(&"sha256:m3".to_string()), "m3 from delta");
+
+        // b2 had m1 as only backref → m1 tombstoned → empty.
+        assert!(s.backrefs("r", "sha256:b2").is_empty());
+
+        // b3 is delta-only.
+        assert_eq!(s.backrefs("r", "sha256:b3"), vec!["sha256:m3".to_string()]);
+    }
+
+    #[test]
+    fn snapshot_base_delta_checksums() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+
+        // Base checksums.
+        s.apply(MetaOp::PutChecksum {
+            repo: "r".into(),
+            digest: "sha256:c1".into(),
+            crc32c: 0x1111,
+            size: 100,
+        })
+        .unwrap();
+        s.apply(MetaOp::PutChecksum {
+            repo: "r".into(),
+            digest: "sha256:c2".into(),
+            crc32c: 0x2222,
+            size: 200,
+        })
+        .unwrap();
+        s.maintain().unwrap();
+
+        // Delta: delete c1 via DeleteBlob, add c3.
+        s.apply(MetaOp::DeleteBlob {
+            repo: "r".into(),
+            digest: "sha256:c1".into(),
+        })
+        .unwrap();
+        s.apply(MetaOp::PutChecksum {
+            repo: "r".into(),
+            digest: "sha256:c3".into(),
+            crc32c: 0x3333,
+            size: 300,
+        })
+        .unwrap();
+
+        // checksum: c1 deleted, c2 from base, c3 from delta.
+        assert_eq!(s.checksum("r", "sha256:c1"), None);
+        assert_eq!(
+            s.checksum("r", "sha256:c2"),
+            Some(BlobChecksum {
+                crc32c: 0x2222,
+                size: 200
+            })
+        );
+        assert_eq!(
+            s.checksum("r", "sha256:c3"),
+            Some(BlobChecksum {
+                crc32c: 0x3333,
+                size: 300
+            })
+        );
+        // Missing entirely.
+        assert_eq!(s.checksum("r", "sha256:c99"), None);
+    }
+
+    #[test]
+    fn snapshot_materialize_full_round_trip() {
+        // Build a snapshot base with everything, apply deltas including
+        // tombstones, then compact (which calls materialize) and verify
+        // the new compacted state is correct.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+
+        // Build base state.
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.apply(put("r", "sha256:bb", Some("v2"))).unwrap();
+        s.apply(MetaOp::PutReferrer {
+            repo: "r".into(),
+            subject: "sha256:aa".into(),
+            referrer: "sha256:ref1".into(),
+            descriptor: br#"{"artifactType":"sig","digest":"sha256:ref1"}"#.to_vec(),
+        })
+        .unwrap();
+        s.apply(MetaOp::PutBackrefs {
+            repo: "r".into(),
+            manifest: "sha256:aa".into(),
+            blobs: vec!["sha256:b1".into()],
+        })
+        .unwrap();
+        s.apply(MetaOp::PutChecksum {
+            repo: "r".into(),
+            digest: "sha256:b1".into(),
+            crc32c: 0xABCD,
+            size: 512,
+        })
+        .unwrap();
+        s.maintain().unwrap(); // snapshot1
+
+        // Delta: delete aa and ref1 (tags, referrers, backrefs tombstoned), add new.
+        s.apply(MetaOp::DeleteManifest {
+            repo: "r".into(),
+            digest: "sha256:aa".into(),
+        })
+        .unwrap();
+        // Delete ref1 to tombstone it as a referrer of aa.
+        s.apply(MetaOp::DeleteManifest {
+            repo: "r".into(),
+            digest: "sha256:ref1".into(),
+        })
+        .unwrap();
+        s.apply(put("r", "sha256:cc", Some("v3"))).unwrap();
+        s.apply(MetaOp::PutReferrer {
+            repo: "r".into(),
+            subject: "sha256:cc".into(),
+            referrer: "sha256:ref2".into(),
+            descriptor: br#"{"digest":"sha256:ref2"}"#.to_vec(),
+        })
+        .unwrap();
+        s.apply(MetaOp::PutBackrefs {
+            repo: "r".into(),
+            manifest: "sha256:cc".into(),
+            blobs: vec!["sha256:b1".into()],
+        })
+        .unwrap();
+        s.apply(MetaOp::PutChecksum {
+            repo: "r".into(),
+            digest: "sha256:b2".into(),
+            crc32c: 0x1234,
+            size: 64,
+        })
+        .unwrap();
+
+        // Compact again — this calls materialize(base) on the delta.
+        s.maintain().unwrap();
+
+        // Verify final state after re-compaction.
+        assert_eq!(s.resolve_tag("r", "v1"), None);
+        assert_eq!(
+            s.resolve_tag("r", "v2").map(|(d, _)| d).as_deref(),
+            Some("sha256:bb")
+        );
+        assert_eq!(
+            s.resolve_tag("r", "v3").map(|(d, _)| d).as_deref(),
+            Some("sha256:cc")
+        );
+        assert!(!s.has_referrer("r", "sha256:aa", "sha256:ref1"));
+        assert!(s.has_referrer("r", "sha256:cc", "sha256:ref2"));
+        assert_eq!(s.backrefs("r", "sha256:b1"), vec!["sha256:cc".to_string()]);
+        // Reopen and verify again.
+        drop(s);
+        let s2 = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        assert_eq!(s2.resolve_tag("r", "v1"), None);
+        assert_eq!(
+            s2.resolve_tag("r", "v3").map(|(d, _)| d).as_deref(),
+            Some("sha256:cc")
+        );
+        assert_eq!(
+            s2.checksum("r", "sha256:b2"),
+            Some(BlobChecksum {
+                crc32c: 0x1234,
+                size: 64
+            })
+        );
+    }
+
+    #[test]
+    fn snapshot_repos_from_base_with_referrers() {
+        // Cover line 809-817: repos() iterates base referrers to find
+        // repos with live referrer entries.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            snapshot: true,
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+        // Put only a referrer (no PutManifest with media_type for this repo).
+        s.apply(MetaOp::PutReferrer {
+            repo: "ref-only".into(),
+            subject: "sha256:s".into(),
+            referrer: "sha256:r1".into(),
+            descriptor: br#"{"digest":"sha256:r1"}"#.to_vec(),
+        })
+        .unwrap();
+        s.maintain().unwrap();
+
+        // repos() should find "ref-only" from the base referrers.
+        let repos = s.repos();
+        assert!(
+            repos.contains(&"ref-only".to_string()),
+            "repos should include ref-only from base referrers"
+        );
+
+        // Now delete the referrer → repo should disappear.
+        s.apply(MetaOp::DeleteManifest {
+            repo: "ref-only".into(),
+            digest: "sha256:r1".into(),
+        })
+        .unwrap();
+        let repos2 = s.repos();
+        assert!(
+            !repos2.contains(&"ref-only".to_string()),
+            "tombstoned referrer should hide the repo"
+        );
+    }
+
+    // ---- DeleteBlob round-trip through log replay ----------------------
+
+    #[test]
+    fn delete_blob_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = LogMetadataStore::open(dir.path()).unwrap();
+        s.apply(MetaOp::PutChecksum {
+            repo: "r".into(),
+            digest: "sha256:b1".into(),
+            crc32c: 0xAAAA,
+            size: 128,
+        })
+        .unwrap();
+        assert!(s.checksum("r", "sha256:b1").is_some());
+        s.apply(MetaOp::DeleteBlob {
+            repo: "r".into(),
+            digest: "sha256:b1".into(),
+        })
+        .unwrap();
+        assert!(s.checksum("r", "sha256:b1").is_none());
+        // Replay verifies deserialization of DeleteBlob.
+        drop(s);
+        let s2 = LogMetadataStore::open(dir.path()).unwrap();
+        assert!(s2.checksum("r", "sha256:b1").is_none());
+    }
+
+    // ---- apply_relaxed covers relaxed-commit path ----------------------
+
+    #[test]
+    fn apply_relaxed_does_not_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = LogMetadataStore::open(dir.path()).unwrap();
+        s.apply_relaxed(MetaOp::PutChecksum {
+            repo: "r".into(),
+            digest: "sha256:b1".into(),
+            crc32c: 0xBBBB,
+            size: 99,
+        })
+        .unwrap();
+        assert_eq!(
+            s.checksum("r", "sha256:b1"),
+            Some(BlobChecksum {
+                crc32c: 0xBBBB,
+                size: 99
+            })
+        );
+    }
 }
