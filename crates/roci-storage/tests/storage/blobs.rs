@@ -46,15 +46,32 @@ async fn blob_roundtrip_and_digest_verify() {
 
 #[tokio::test]
 async fn open_blob_streams_and_missing_is_not_found() {
-    use tokio::io::AsyncReadExt;
+    use futures::TryStreamExt;
     let (_dir, s) = store();
     let data = b"streamed";
     let d = sha256_of(data);
     s.put_blob("r", &d, data).await.unwrap();
-    let mut f = s.open_blob("r", &d).await.unwrap();
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).await.unwrap();
-    assert_eq!(buf, data);
+    let blob = s.open_blob("r", &d).await.unwrap();
+    assert_eq!(blob.size(), data.len() as u64);
+    assert!(blob.redirect_url().is_none());
+    let chunks: Vec<_> = blob
+        .into_stream(0, 8)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(chunks.concat(), data);
+    // A range streams exactly its window.
+    let blob = s.open_blob("r", &d).await.unwrap();
+    let chunks: Vec<_> = blob
+        .into_stream(2, 3)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(chunks.concat(), b"rea");
     let absent = sha256_of(b"absent");
     assert!(matches!(
         s.open_blob("r", &absent).await,
@@ -185,41 +202,29 @@ async fn backrefs_track_referenced_blobs_across_delete() {
     let b1 = sha256_of(b"blob-1");
     let b2 = sha256_of(b"blob-2");
     let manifest = sha256_of(b"the-manifest");
-    // Store the manifest blob then record its backrefs (mirrors the core).
-    s.put_manifest(
-        "r",
-        None,
-        &manifest,
-        "application/vnd.oci.image.manifest.v1+json",
-        b"the-manifest",
-    )
-    .await
-    .unwrap();
-    s.record_backrefs("r", &manifest, &[b1.clone(), b2.clone()])
+    // The manifest commits its backref edges atomically with itself.
+    for repo in ["r", "other"] {
+        s.put_manifest(
+            repo,
+            None,
+            &manifest,
+            "application/vnd.oci.image.manifest.v1+json",
+            b"the-manifest",
+            ManifestLinks {
+                references: &[b1.clone(), b2.clone()],
+                required: &[],
+                subject: None,
+            },
+        )
         .await
         .unwrap();
-    assert_eq!(
-        s.backrefs("r", &b1).await.unwrap(),
-        vec![manifest.as_string()]
-    );
-    assert_eq!(
-        s.backrefs("r", &b2).await.unwrap(),
-        vec![manifest.as_string()]
-    );
-    // A backref edge in a *different* repo is untouched by this repo's
-    // delete (exercises the `r != repo` skip in the drop path).
-    s.record_backrefs("other", &manifest, std::slice::from_ref(&b1))
-        .await
-        .unwrap();
-    // Recording an empty blob set is a no-op success.
-    s.record_backrefs("r", &manifest, &[]).await.unwrap();
+    }
+    assert_eq!(s.backrefs("r", &b1), vec![manifest.as_string()]);
+    assert_eq!(s.backrefs("r", &b2), vec![manifest.as_string()]);
     // Deleting the manifest clears its edges from every referenced blob in
-    // this repo, but leaves the other repo's edge intact.
+    // this repo, but leaves the other repo's edges intact.
     s.delete_manifest("r", &manifest).await.unwrap();
-    assert!(s.backrefs("r", &b1).await.unwrap().is_empty());
-    assert!(s.backrefs("r", &b2).await.unwrap().is_empty());
-    assert_eq!(
-        s.backrefs("other", &b1).await.unwrap(),
-        vec![manifest.as_string()]
-    );
+    assert!(s.backrefs("r", &b1).is_empty());
+    assert!(s.backrefs("r", &b2).is_empty());
+    assert_eq!(s.backrefs("other", &b1), vec![manifest.as_string()]);
 }

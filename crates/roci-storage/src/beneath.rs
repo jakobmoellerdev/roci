@@ -244,7 +244,7 @@ pub(crate) async fn rename_beneath(
 /// on a dirfd walked no-follow beneath `root`, so a symlinked parent cannot
 /// redirect the deletion. Maps a missing entry / symlinked parent to `NotFound`.
 #[cfg(unix)]
-pub(crate) async fn unlink_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io::Result<()> {
+pub async fn unlink_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io::Result<()> {
     let root = root.to_path_buf();
     let dir_rel = dir_rel.to_path_buf();
     let leaf = leaf.to_string();
@@ -263,11 +263,7 @@ pub(crate) async fn unlink_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> i
 /// stage an upload session (`<repo…>/uploads/<id>`) without following a planted
 /// `uploads` symlink the way a path-based `File::create` would.
 #[cfg(unix)]
-pub(crate) async fn create_empty_beneath(
-    root: &Path,
-    dir_rel: &Path,
-    leaf: &str,
-) -> io::Result<()> {
+pub async fn create_empty_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io::Result<()> {
     use rustix::fs::{Mode, OFlags};
     let root = root.to_path_buf();
     let dir_rel = dir_rel.to_path_buf();
@@ -346,7 +342,7 @@ pub(crate) async fn ensure_layout_beneath(
 /// Async wrapper: open `rel` beneath `root` read-only, no-follow at every
 /// component (the symlink-escape backstop for blob reads).
 #[cfg(unix)]
-pub(crate) async fn open_beneath(root: &Path, rel: &Path) -> io::Result<tokio::fs::File> {
+pub async fn open_beneath(root: &Path, rel: &Path) -> io::Result<tokio::fs::File> {
     use rustix::fs::OFlags;
     let root = root.to_path_buf();
     let rel = rel.to_path_buf();
@@ -358,7 +354,7 @@ pub(crate) async fn open_beneath(root: &Path, rel: &Path) -> io::Result<tokio::f
 /// component (so a planted `uploads` *or* `uploads/<id>` symlink cannot redirect
 /// a PATCH append outside the store).
 #[cfg(unix)]
-pub(crate) async fn open_append_beneath(root: &Path, rel: &Path) -> io::Result<tokio::fs::File> {
+pub async fn open_append_beneath(root: &Path, rel: &Path) -> io::Result<tokio::fs::File> {
     use rustix::fs::OFlags;
     let root = root.to_path_buf();
     let rel = rel.to_path_buf();
@@ -372,7 +368,7 @@ pub(crate) async fn open_append_beneath(root: &Path, rel: &Path) -> io::Result<t
 /// file (symlink/dir/etc.), `None` = absent. Never follows a symlink at any
 /// path component.
 #[cfg(unix)]
-pub(crate) async fn stat_beneath(root: &Path, rel: &Path) -> io::Result<Option<(bool, u64)>> {
+pub async fn stat_beneath(root: &Path, rel: &Path) -> io::Result<Option<(bool, u64)>> {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     let root = root.to_path_buf();
     let rel = rel.to_path_buf();

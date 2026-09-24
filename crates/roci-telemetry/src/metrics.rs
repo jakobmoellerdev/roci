@@ -59,6 +59,18 @@ impl MetricReader for SharedReader {
 static REQUEST_DURATION: OnceLock<Histogram<f64>> = OnceLock::new();
 static ERROR_COUNTER: OnceLock<Counter<u64>> = OnceLock::new();
 static PROM_READER: OnceLock<SharedReader> = OnceLock::new();
+/// Storage-subsystem counters (GC, scrub, dedupe, quota) — defined once here
+/// so every label stays within the bounded cardinality set.
+static STORAGE: OnceLock<StorageInstruments> = OnceLock::new();
+
+struct StorageInstruments {
+    gc_collected: Counter<u64>,
+    gc_collected_bytes: Counter<u64>,
+    scrub_checked: Counter<u64>,
+    scrub_bytes: Counter<u64>,
+    dedupe_links: Counter<u64>,
+    quota_rejections: Counter<u64>,
+}
 
 pub(crate) fn set_reader(reader: SharedReader) {
     let _ = PROM_READER.set(reader);
@@ -82,6 +94,29 @@ pub(crate) fn install(provider: opentelemetry_sdk::metrics::SdkMeterProvider) {
         .with_description("Count of registry request errors by error code")
         .build();
     let _ = ERROR_COUNTER.set(errors);
+    let counter = |name: &'static str, desc: &'static str| {
+        meter.u64_counter(name).with_description(desc).build()
+    };
+    let _ = STORAGE.set(StorageInstruments {
+        gc_collected: counter(
+            "registry.gc.collected",
+            "Objects reclaimed by garbage collection by kind",
+        ),
+        gc_collected_bytes: counter(
+            "registry.gc.collected.bytes",
+            "Bytes reclaimed by garbage collection by kind",
+        ),
+        scrub_checked: counter("registry.scrub.checked", "Blobs scrubbed by result"),
+        scrub_bytes: counter("registry.scrub.bytes", "Bytes read by the scrub"),
+        dedupe_links: counter(
+            "registry.dedupe.links",
+            "Cross-repo blob promotions by operation and mechanism",
+        ),
+        quota_rejections: counter(
+            "registry.quota.rejections",
+            "Writes rejected by a storage quota by scope",
+        ),
+    });
 }
 
 // ── Recording API ───────────────────────────────────────────────────────
@@ -111,6 +146,46 @@ pub fn record_request(endpoint: &str, method: &str, status: u16, duration: std::
 pub fn record_error(error_code: &str) {
     if let Some(counter) = ERROR_COUNTER.get() {
         counter.add(1, &[KeyValue::new("error_code", error_code.to_string())]);
+    }
+}
+
+/// Count one object reclaimed by GC (`kind` = `blob`/`upload`) and its bytes.
+pub fn record_gc_collected(kind: &str, bytes: u64) {
+    if let Some(s) = STORAGE.get() {
+        let attrs = [KeyValue::new("kind", kind.to_string())];
+        s.gc_collected.add(1, &attrs);
+        s.gc_collected_bytes.add(bytes, &attrs);
+    }
+}
+
+/// Count one scrubbed blob by `result` (`ok`/`repaired`/`corrupt`) and the
+/// bytes read.
+pub fn record_scrub(result: &str, bytes: u64) {
+    if let Some(s) = STORAGE.get() {
+        s.scrub_checked
+            .add(1, &[KeyValue::new("result", result.to_string())]);
+        s.scrub_bytes.add(bytes, &[]);
+    }
+}
+
+/// Count one cross-repo promotion by `op` (`mount`/`dedupe`) and `mechanism`.
+pub fn record_dedupe_link(op: &str, mechanism: &str) {
+    if let Some(s) = STORAGE.get() {
+        s.dedupe_links.add(
+            1,
+            &[
+                KeyValue::new("op", op.to_string()),
+                KeyValue::new("mechanism", mechanism.to_string()),
+            ],
+        );
+    }
+}
+
+/// Count one write rejected by a quota (`repository`/`total`/`sessions`).
+pub fn record_quota_rejection(scope: &str) {
+    if let Some(s) = STORAGE.get() {
+        s.quota_rejections
+            .add(1, &[KeyValue::new("scope", scope.to_string())]);
     }
 }
 

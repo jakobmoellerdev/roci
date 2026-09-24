@@ -29,11 +29,11 @@ The workspace separates the stable dist-spec core from cleanly isolated extensio
 
 ## Storage subsystem
 
-Storage is a plain [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md) on disk. Highlights (see the canonical doc for the full design): content-addressable dedup, online O(garbage) garbage collection, an embedded metadata index (append-log + in-RAM maps by default, B-tree KV upgrade) with coalescing write-behind of the spec-visible `index.json` (reconciled at startup), and zero-copy blob serving.
+Storage is a plain [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md) on disk. Highlights (see the canonical doc for the full design): content-addressable dedup across repositories (reflink → hard link, including on upload), online O(garbage) garbage collection with a grace period and a startup backref rebuild, CRC32C scrubbing with quarantine, per-repository / registry-wide / upload-session quotas, multiple storage paths and an S3-compatible backend behind one `Storage` trait, an embedded metadata index (append-log + in-RAM maps with compaction, an optional rkyv mmap snapshot and HMAC authentication, or a redb B-tree KV) with coalescing write-behind of the spec-visible `index.json` (reconciled at startup), and zero-copy blob serving. One background scheduler per storage path runs GC, scrub and metadata upkeep.
 
 ## Configuration & observability
 
-One TOML file (`roci --config`) with `http`, `storage`, `limits`, `delete`, `log`, and `telemetry` sections, validated on load; zero-config defaults need no file. The `otel` build exports traces, metrics, and logs over OTLP and serves a Prometheus scrape view of the same meters; metric labels are bounded by construction, and tail-based sampling is delegated to the OTel Collector.
+One TOML file (`roci --config`) with `http`, `storage` (incl. `gc`, `scrub`, `quota`, `metadata`, `subpaths`, `s3`), `limits`, `delete`, `log`, and `telemetry` sections, validated on load; zero-config defaults need no file. The `otel` build exports traces, metrics, and logs over OTLP and serves a Prometheus scrape view of the same meters; metric labels are bounded by construction, and tail-based sampling is delegated to the OTel Collector.
 
 ## Scaling
 

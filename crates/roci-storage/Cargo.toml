@@ -21,7 +21,22 @@ lru.workspace = true
 futures.workspace = true
 getrandom.workspace = true
 rustix.workspace = true
+bytes.workspace = true
+tokio-util.workspace = true
+crc32c.workspace = true
+roci-telemetry.workspace = true
+roci-config.workspace = true
+rkyv.workspace = true
+memmap2.workspace = true
+hmac.workspace = true
+redb = { workspace = true, optional = true }
+
+[features]
+default = []
+# Embedded B-tree KV metadata engine (`storage.metadata.engine = "redb"`).
+redb = ["dep:redb"]
 
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+filetime = "0.2"

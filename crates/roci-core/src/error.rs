@@ -12,7 +12,7 @@
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use roci_storage::StorageError;
+use roci_storage::{QuotaScope, StorageError};
 
 /// A dist-spec error code with its canonical wire string and HTTP status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,12 +78,15 @@ impl ErrorCode {
 /// An error rendered as the dist-spec JSON envelope. `Spec` carries one of the
 /// 14 canonical codes; `Internal` is the sole non-spec (500 / `UNKNOWN`) case;
 /// `PayloadTooLarge` renders `413` with the `SIZE_INVALID` code (the dist-spec
-/// binds end-7 body-limit rejection to `413`, spec endpoint table).
+/// binds end-7 body-limit rejection to `413`, spec endpoint table);
+/// `InsufficientStorage` renders `507` with `DENIED` when the registry-wide
+/// storage quota is exhausted (a 5xx body is not bound to the code table).
 #[derive(Debug, Clone)]
 pub enum ApiError {
     Spec { code: ErrorCode, message: String },
     Internal(String),
     PayloadTooLarge(String),
+    InsufficientStorage(String),
 }
 
 impl ApiError {
@@ -133,6 +136,7 @@ impl ApiError {
             ApiError::Spec { code, .. } => code.status(),
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            ApiError::InsufficientStorage(_) => StatusCode::INSUFFICIENT_STORAGE,
         }
     }
 
@@ -142,6 +146,7 @@ impl ApiError {
             ApiError::Spec { code, .. } => code.wire(),
             ApiError::Internal(_) => "UNKNOWN",
             ApiError::PayloadTooLarge(_) => ErrorCode::SizeInvalid.wire(),
+            ApiError::InsufficientStorage(_) => ErrorCode::Denied.wire(),
         }
     }
 
@@ -150,6 +155,7 @@ impl ApiError {
             ApiError::Spec { message, .. } => message,
             ApiError::Internal(m) => m,
             ApiError::PayloadTooLarge(m) => m,
+            ApiError::InsufficientStorage(m) => m,
         }
     }
 }
@@ -199,6 +205,22 @@ impl From<StorageError> for ApiError {
             StorageError::TooLarge { limit, actual } => ApiError::payload_too_large(format!(
                 "upload size {actual} exceeds maximum blob size {limit}"
             )),
+            // A repository over its quota is a client-side size problem (413);
+            // an exhausted registry-wide quota is the server's (507).
+            e @ StorageError::QuotaExceeded {
+                scope: QuotaScope::Repository,
+                ..
+            } => ApiError::payload_too_large(e.to_string()),
+            e @ StorageError::QuotaExceeded {
+                scope: QuotaScope::Total,
+                ..
+            } => ApiError::InsufficientStorage(e.to_string()),
+            e @ StorageError::TooManySessions { .. } => {
+                ApiError::new(ErrorCode::TooManyRequests, e.to_string())
+            }
+            StorageError::MissingReference(d) => {
+                ApiError::manifest_blob_unknown(format!("referenced blob {d} is not present"))
+            }
             StorageError::Io(_) => ApiError::Internal("internal error".to_string()),
         }
     }
@@ -300,6 +322,36 @@ mod tests {
         );
         let io = StorageError::Io(std::io::Error::other("x"));
         assert_eq!(ApiError::from(io).code(), "UNKNOWN");
+    }
+
+    #[test]
+    fn quota_and_session_caps_map_to_their_statuses() {
+        let quota = |scope| {
+            ApiError::from(StorageError::QuotaExceeded {
+                scope,
+                limit: 1,
+                requested: 2,
+            })
+        };
+        let repo = quota(QuotaScope::Repository);
+        assert_eq!(
+            (repo.status(), repo.code()),
+            (StatusCode::PAYLOAD_TOO_LARGE, "SIZE_INVALID")
+        );
+        let total = quota(QuotaScope::Total);
+        assert_eq!(
+            (total.status(), total.code()),
+            (StatusCode::INSUFFICIENT_STORAGE, "DENIED")
+        );
+        assert_eq!(
+            total.clone().into_response().status(),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
+        let sessions = ApiError::from(StorageError::TooManySessions { limit: 3 });
+        assert_eq!(
+            (sessions.status(), sessions.code()),
+            (StatusCode::TOO_MANY_REQUESTS, "TOOMANYREQUESTS")
+        );
     }
 
     #[test]

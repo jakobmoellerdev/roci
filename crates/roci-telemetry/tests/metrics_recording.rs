@@ -40,6 +40,11 @@ async fn metrics_full_lifecycle() {
     roci_telemetry::record_request("uploads", "PUT", 404, Duration::from_millis(2));
     roci_telemetry::record_request("other", "POST", 500, Duration::from_millis(100));
     roci_telemetry::record_error("BLOB_UNKNOWN");
+    // Storage-subsystem counters.
+    roci_telemetry::record_gc_collected("blob", 4096);
+    roci_telemetry::record_scrub("corrupt", 512);
+    roci_telemetry::record_dedupe_link("dedupe", "hardlink");
+    roci_telemetry::record_quota_rejection("total");
 
     let router = roci_telemetry::metrics_router(&config);
     let resp = router
@@ -65,5 +70,19 @@ async fn metrics_full_lifecycle() {
     assert!(
         text.contains("BLOB_UNKNOWN"),
         "should contain BLOB_UNKNOWN label: {text}"
+    );
+    // Storage counters are exported with their bounded labels and values.
+    for series in [
+        "registry_gc_collected_total{kind=\"blob\"} 1",
+        "registry_gc_collected_bytes_total{kind=\"blob\"} 4096",
+        "registry_scrub_checked_total{result=\"corrupt\"} 1",
+        "registry_scrub_bytes_total{} 512",
+        "registry_quota_rejections_total{scope=\"total\"} 1",
+    ] {
+        assert!(text.contains(series), "missing `{series}` in: {text}");
+    }
+    assert!(
+        text.contains("registry_dedupe_links_total{") && text.contains("mechanism=\"hardlink\""),
+        "missing dedupe link series in: {text}"
     );
 }

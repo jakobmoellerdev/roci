@@ -8,9 +8,9 @@ use crate::beneath::*;
 use crate::digest::Digest;
 use crate::error::StorageError;
 use crate::layout::*;
-use crate::metadata::{LogMetadataStore, MetaOp, MetadataStore};
+use crate::metadata::MetadataStore;
 use futures::channel::oneshot;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -60,7 +60,7 @@ impl FsStorage {
                     _ = tokio::time::sleep(INDEX_RETRY_BACKOFF), if pending => {}
                     _ = &mut cancel => return,
                 }
-                Self::flush_dirty(&root, &meta, &dirty).await;
+                Self::flush_dirty(&root, &*meta, &dirty).await;
             }
         });
     }
@@ -71,7 +71,7 @@ impl FsStorage {
     /// its foreign descriptors.
     pub(super) async fn flush_dirty(
         root: &Path,
-        meta: &LogMetadataStore,
+        meta: &dyn MetadataStore,
         dirty: &StdMutex<HashMap<String, u64>>,
     ) {
         let snapshot: Vec<(String, u64)> = dirty
@@ -88,7 +88,12 @@ impl FsStorage {
                     continue;
                 }
             };
-            let Ok(index) = Self::index_from_meta(meta, &repo, root, existing) else {
+            let Ok(index) = crate::layout::index_from_meta(meta, &repo, existing, |d| {
+                let (alg, hex) = d.split_once(':')?;
+                std::fs::metadata(root.join(&repo).join("blobs").join(alg).join(hex))
+                    .ok()
+                    .map(|m| m.len())
+            }) else {
                 continue;
             };
             if let Err(e) = Self::write_index_at_root(root, &repo, &index).await {
@@ -103,7 +108,10 @@ impl FsStorage {
     }
 
     /// Read and parse `<repo>/index.json` beneath the root, no-follow. `Ok(None)`
-    /// when absent or unparseable (the rebuild then starts from the store).
+    /// when absent. `Err` when the file exists but cannot be read or parsed
+    /// (the GC must treat an unreadable existing index differently from an
+    /// absent one — a missing index is benign, but a corrupt/unreadable one
+    /// means root digests are unknown and GC must not sweep that repo).
     pub(super) async fn read_index_beneath(
         root: &Path,
         repo: &str,
@@ -118,7 +126,9 @@ impl FsStorage {
         };
         let mut b = Vec::new();
         f.read_to_end(&mut b).await?;
-        Ok(serde_json::from_slice(&b).ok())
+        serde_json::from_slice(&b)
+            .map(Some)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Startup reconciliation (crash recovery for the write-behind): for every
@@ -132,9 +142,14 @@ impl FsStorage {
             let Ok(Some(existing)) = Self::read_index_beneath(&self.root, &repo).await else {
                 continue;
             };
-            self.import_foreign_tags(&repo, &existing);
+            crate::layout::import_foreign_tags(&*self.meta, &repo, &existing);
             let Ok(rebuilt) =
-                Self::index_from_meta(&self.meta, &repo, &self.root, Some(existing.clone()))
+                crate::layout::index_from_meta(&*self.meta, &repo, Some(existing.clone()), |d| {
+                    let (alg, hex) = d.split_once(':')?;
+                    std::fs::metadata(self.root.join(&repo).join("blobs").join(alg).join(hex))
+                        .ok()
+                        .map(|m| m.len())
+                })
             else {
                 continue;
             };
@@ -152,198 +167,7 @@ impl FsStorage {
                 self.mark_index_dirty(&repo);
             }
         }
-        Self::flush_dirty(&self.root, &self.meta, &self.index_dirty).await;
-    }
-
-    /// Record tagged descriptors from an on-disk index that the metadata store
-    /// does not yet know (a layout written by another tool) so the write-behind
-    /// treats them as live, not as deleted roci manifests.
-    pub(super) fn import_foreign_tags(&self, repo: &str, existing: &serde_json::Value) {
-        for e in index_manifests(existing) {
-            let (Some(tag), Some(digest)) = (descriptor_tag(e), descriptor_digest(e)) else {
-                continue;
-            };
-            if Digest::parse(digest).is_err() || self.meta.resolve_tag(repo, tag).is_some() {
-                continue;
-            }
-            let media_type = e
-                .get("mediaType")
-                .and_then(|v| v.as_str())
-                .unwrap_or(MEDIA_TYPE_IMAGE_MANIFEST);
-            if let Err(err) = self.meta.apply(MetaOp::PutManifest {
-                repo: repo.to_string(),
-                digest: digest.to_string(),
-                media_type: media_type.to_string(),
-                tag: Some(tag.to_string()),
-            }) {
-                tracing::warn!(repo = %repo, error = %err, "import of existing tag failed");
-            }
-        }
-    }
-
-    /// Rebuild a spec-valid `index.json` from the metadata store (authoritative
-    /// for everything roci wrote) merged over the existing on-disk index.
-    ///
-    /// Rules: a manifest the store knows emits one descriptor per tag (or one
-    /// untagged descriptor), enriched with its referrer fields (`subject`,
-    /// `artifactType`, annotations) and any extra fields already on disk. An
-    /// on-disk entry the store does not know is kept only if it is *foreign*
-    /// — no `ref.name` tag and no `subject` (roci would have recorded either);
-    /// otherwise it is a deleted manifest and is dropped.
-    pub(super) fn index_from_meta(
-        meta: &LogMetadataStore,
-        repo: &str,
-        root: &Path,
-        existing: Option<serde_json::Value>,
-    ) -> io::Result<serde_json::Value> {
-        type Obj = serde_json::Map<String, serde_json::Value>;
-        let known: HashSet<String> = meta.manifests(repo).into_iter().collect();
-
-        // Per-digest base descriptor (tag stripped) for known manifests, plus
-        // foreign entries passed through verbatim.
-        let mut base: HashMap<String, Obj> = HashMap::new();
-        let mut foreign: Vec<serde_json::Value> = Vec::new();
-        let existing_ms = existing.as_ref().map_or(&[][..], index_manifests);
-        for e in existing_ms {
-            let Some(obj) = e.as_object() else {
-                foreign.push(e.clone());
-                continue;
-            };
-            let digest = obj.get("digest").and_then(|v| v.as_str());
-            match digest {
-                Some(d) if known.contains(d) => {
-                    let mut o = obj.clone();
-                    if let Some(ann) = o.get_mut("annotations").and_then(|a| a.as_object_mut()) {
-                        ann.remove(REF_NAME_ANNOTATION);
-                        if ann.is_empty() {
-                            o.remove("annotations");
-                        }
-                    }
-                    base.entry(d.to_string()).or_insert(o);
-                }
-                _ if descriptor_tag(e).is_none() && e.get("subject").is_none() => {
-                    foreign.push(e.clone());
-                }
-                _ => {} // deleted roci-managed manifest
-            }
-        }
-
-        // Every known manifest gets a base (media type from the store; size
-        // from the CAS when not already recorded).
-        for d in &known {
-            let o = base.entry(d.clone()).or_insert_with(|| {
-                let mut o = Obj::new();
-                o.insert("digest".into(), serde_json::Value::String(d.clone()));
-                o
-            });
-            if let Some(mt) = meta.manifest_media_type(repo, d) {
-                o.insert("mediaType".into(), serde_json::Value::String(mt));
-            }
-            if !o.contains_key("size") {
-                if let Some((alg, hex)) = d.split_once(':') {
-                    if let Ok(m) =
-                        std::fs::metadata(root.join(repo).join("blobs").join(alg).join(hex))
-                    {
-                        o.insert("size".into(), serde_json::Value::Number(m.len().into()));
-                    }
-                }
-            }
-        }
-
-        // Merge referrer descriptor fields into the referring manifest's base
-        // (never overwriting its identity; existing annotations win). A live
-        // referrer whose manifest the store does not track (DeleteManifest
-        // already drops referrers) contributes its own descriptor.
-        for (subject, refs) in meta.referrers_snapshot(repo) {
-            for (ref_digest, ref_bytes) in refs {
-                let o = base.entry(ref_digest.clone()).or_insert_with(|| {
-                    let mut o = Obj::new();
-                    o.insert(
-                        "digest".into(),
-                        serde_json::Value::String(ref_digest.clone()),
-                    );
-                    o
-                });
-                let Ok(r) = serde_json::from_slice::<Obj>(&ref_bytes) else {
-                    continue;
-                };
-                for (k, v) in r {
-                    match k.as_str() {
-                        "digest" => {}
-                        "mediaType" | "size" => {
-                            o.entry(k).or_insert(v);
-                        }
-                        "annotations" => {
-                            let (Some(new), Some(cur)) = (
-                                v.as_object(),
-                                o.entry("annotations")
-                                    .or_insert_with(|| serde_json::Value::Object(Obj::new()))
-                                    .as_object_mut(),
-                            ) else {
-                                continue;
-                            };
-                            for (ak, av) in new {
-                                if ak != REF_NAME_ANNOTATION {
-                                    cur.entry(ak.clone()).or_insert_with(|| av.clone());
-                                }
-                            }
-                        }
-                        _ => {
-                            o.insert(k, v);
-                        }
-                    }
-                }
-                o.insert("subject".into(), serde_json::json!({ "digest": subject }));
-            }
-        }
-
-        // Emit: one descriptor per tag, then untagged known manifests, then
-        // foreign entries. Sorted for a deterministic, diff-friendly file.
-        // `tags_snapshot` is tag-sorted.
-        let tags = meta.tags_snapshot(repo);
-        let mut tagged: HashSet<&str> = HashSet::new();
-        let mut manifests: Vec<serde_json::Value> = Vec::with_capacity(base.len() + tags.len());
-        for (tag, digest, _) in &tags {
-            let Some(b) = base.get(digest) else { continue };
-            let mut o = b.clone();
-            let ann = o
-                .entry("annotations")
-                .or_insert_with(|| serde_json::Value::Object(Obj::new()));
-            if let Some(ann) = ann.as_object_mut() {
-                ann.insert(
-                    REF_NAME_ANNOTATION.into(),
-                    serde_json::Value::String(tag.clone()),
-                );
-            }
-            tagged.insert(digest.as_str());
-            manifests.push(serde_json::Value::Object(o));
-        }
-        let mut untagged: Vec<(&String, &Obj)> = base
-            .iter()
-            .filter(|(d, _)| !tagged.contains(d.as_str()))
-            .collect();
-        untagged.sort_by(|a, b| a.0.cmp(b.0));
-        manifests.extend(
-            untagged
-                .into_iter()
-                .map(|(_, o)| serde_json::Value::Object(o.clone())),
-        );
-        manifests.extend(foreign);
-        // Keep any top-level fields another tool wrote (`annotations`,
-        // `artifactType`, `subject`, …); regenerate only what roci owns.
-        let mut top = existing
-            .and_then(|v| match v {
-                serde_json::Value::Object(o) => Some(o),
-                _ => None,
-            })
-            .unwrap_or_default();
-        top.insert("schemaVersion".into(), serde_json::json!(2));
-        top.insert(
-            "mediaType".into(),
-            serde_json::json!("application/vnd.oci.image.index.v1+json"),
-        );
-        top.insert("manifests".into(), serde_json::Value::Array(manifests));
-        Ok(serde_json::Value::Object(top))
+        Self::flush_dirty(&self.root, &*self.meta, &self.index_dirty).await;
     }
 
     /// Atomically replace `<repo>/index.json`, anchored to a dirfd walked
@@ -408,8 +232,13 @@ impl FsStorage {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => None,
                 Err(e) => return Err(StorageError::Io(e)),
             };
-            return Self::index_from_meta(&self.meta, repo, &self.root, existing)
-                .map_err(StorageError::Io);
+            return crate::layout::index_from_meta(&*self.meta, repo, existing, |d| {
+                let (alg, hex) = d.split_once(':')?;
+                std::fs::metadata(self.root.join(repo).join("blobs").join(alg).join(hex))
+                    .ok()
+                    .map(|m| m.len())
+            })
+            .map_err(StorageError::Io);
         }
         match tokio::fs::read(self.index_path(repo)?).await {
             Ok(bytes) => serde_json::from_slice(&bytes)

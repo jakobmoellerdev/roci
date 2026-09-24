@@ -3,8 +3,10 @@
 //! they live here rather than in the public integration suite.
 
 mod faults;
+mod gc;
 mod hardening;
 mod index;
+mod policies;
 mod sessions;
 
 pub(crate) use crate::beneath::*;

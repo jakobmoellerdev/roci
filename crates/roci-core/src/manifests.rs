@@ -10,7 +10,10 @@ use crate::AppState;
 use axum::extract::Request;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use roci_storage::{digest_of, sha256_of, Digest, Storage, MEDIA_TYPE_IMAGE_MANIFEST};
+use roci_storage::{
+    digest_of, manifest_references, sha256_of, Digest, ManifestLinks, Storage,
+    MEDIA_TYPE_IMAGE_MANIFEST,
+};
 
 /// Maximum JSON nesting depth accepted in a manifest body.
 pub(crate) const MAX_JSON_DEPTH: usize = 32;
@@ -141,26 +144,6 @@ fn required_blobs(manifest: &serde_json::Value) -> Result<Vec<Digest>, ApiError>
         }
     }
     Ok(referenced)
-}
-
-/// Backref edges: required blobs + index children + subject.
-fn backref_edges(
-    manifest: &serde_json::Value,
-    required: &[Digest],
-    subject: Option<&Digest>,
-) -> Vec<Digest> {
-    let mut edges: Vec<Digest> = required.to_vec();
-    if let Some(children) = manifest.get("manifests").and_then(|v| v.as_array()) {
-        for child in children {
-            if let Some(d) = descriptor_digest_str(child).and_then(|s| Digest::parse(s).ok()) {
-                edges.push(d);
-            }
-        }
-    }
-    if let Some(subject) = subject {
-        edges.push(subject.clone());
-    }
-    edges
 }
 
 /// Serialized referrer descriptor (mediaType, digest, size, artifactType
@@ -307,31 +290,33 @@ pub(crate) async fn put<S: Storage>(
         }
     }
 
+    // Manifest, tag, backref edges (config, layers, index children, subject —
+    // everything GC must treat as reachable) and the referrer registration
+    // are committed together as one metadata record, so a crash can never
+    // leave a stored manifest whose blobs look unreferenced. Index children
+    // and a subject are recorded without being required to exist: a subject
+    // may reference an absent manifest per spec, and a child may come later.
+    let references = manifest_references(&parsed);
+    let referrer = subject_digest.as_ref().map(|s| {
+        (
+            s,
+            referrer_descriptor(&parsed, &media_type, &digest, body.len()),
+        )
+    });
     st.storage
-        .put_manifest(repo, tag, &digest, &media_type, &body)
+        .put_manifest(
+            repo,
+            tag,
+            &digest,
+            &media_type,
+            &body,
+            ManifestLinks {
+                references: &references,
+                required: &referenced,
+                subject: referrer.as_ref().map(|(s, d)| (*s, d.as_slice())),
+            },
+        )
         .await?;
-
-    // Record the reverse edges blob→manifest so a future GC (Phase 3) can
-    // reclaim an object once its last referencing manifest is deleted. Beyond
-    // the config+layers checked above, also record an image index's child
-    // `manifests[*]` and a `subject` descriptor — those are CAS objects a GC
-    // must treat as reachable (their existence is NOT enforced here: a subject
-    // may reference an absent manifest per spec, and an index child may be
-    // pushed later). The backref index is a derived, rebuildable-from-the-layout
-    // cache (never the source of truth), so a failed append must not fail an
-    // otherwise-valid push; Phase 3 GC rebuilds/verifies before consuming it.
-    let edges = backref_edges(&parsed, &referenced, subject_digest.as_ref());
-    if !edges.is_empty() {
-        let _ = st.storage.record_backrefs(repo, &digest, &edges).await;
-    }
-
-    if let Some(subject) = subject_digest.as_ref() {
-        let descriptor_bytes = referrer_descriptor(&parsed, &media_type, &digest, body.len());
-        let _ = st
-            .storage
-            .add_referrer(repo, subject, &digest, &descriptor_bytes)
-            .await;
-    }
 
     let mut resp = created(
         &format!("/v2/{repo}/manifests/{}", digest.as_string()),

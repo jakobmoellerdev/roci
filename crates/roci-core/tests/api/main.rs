@@ -4,5 +4,6 @@ mod manifests;
 mod ratelimit;
 mod referrers;
 mod routing;
+mod storage_policies;
 mod tags;
 mod uploads;
