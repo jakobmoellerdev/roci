@@ -29,9 +29,17 @@ pub(crate) struct S3Client {
     pub multipart_concurrency: usize,
 }
 
+/// The HTTPS client is built on rustls without a bundled provider: make
+/// `ring` (roci's audited crypto backend) the process default before any
+/// client is built. Idempotent — a provider installed earlier stays.
+pub(crate) fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 impl S3Client {
     /// Build a real `AmazonS3` from config. Sync (credential file read only).
     pub fn from_config(s3: &S3Config) -> io::Result<Self> {
+        install_crypto_provider();
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&s3.bucket)
             .with_region(&s3.region);

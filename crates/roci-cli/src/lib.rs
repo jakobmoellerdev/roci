@@ -1453,10 +1453,10 @@ max_body = 0
         }
         #[cfg(not(feature = "redb"))]
         {
-            let err = built
-                .err()
-                .expect("redb needs its build feature")
-                .to_string();
+            let Err(err) = built else {
+                panic!("redb needs its build feature");
+            };
+            let err = err.to_string();
             assert!(err.contains("storage.metadata.engine"), "{err}");
         }
     }

@@ -22,6 +22,10 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "MPL-2.0",
+    # Mozilla CA root-certificate data (`webpki-root-certs`), reached via the S3
+    # backend's HTTPS client (object_store → reqwest → rustls-platform-verifier).
+    # A permissive data license: attribution only, no copyleft.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

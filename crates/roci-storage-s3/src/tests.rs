@@ -64,6 +64,7 @@ fn test_store_with_redirect(
 /// Build a test signer from AmazonS3Builder with dummy credentials.
 fn build_test_signer() -> Option<Arc<dyn object_store::signer::Signer>> {
     use object_store::aws::AmazonS3Builder;
+    crate::client::install_crypto_provider();
     let store = AmazonS3Builder::new()
         .with_bucket_name("test-bucket")
         .with_region("us-east-1")

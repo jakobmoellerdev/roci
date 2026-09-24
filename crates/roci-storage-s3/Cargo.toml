@@ -21,7 +21,17 @@ crc32c.workspace = true
 sha2 = "0.10"
 hex.workspace = true
 getrandom.workspace = true
-object_store = { version = "0.14", features = ["aws"] }
+# `aws-base` + the reqwest transport + `ring` signing, with reqwest on rustls
+# but no bundled provider: keeps aws-lc-rs/aws-lc-sys (a C build) out of the
+# static release; ring — the rustls provider roci already audits — is
+# installed as the process default at `S3Storage::open`.
+object_store = { version = "0.14", default-features = false, features = [
+    "aws-base",
+    "reqwest",
+    "ring",
+] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls.workspace = true
 url = "2"
 http = "1"
 
