@@ -110,6 +110,12 @@ pub struct ManifestLinks<'a> {
     /// Every object the manifest references — config, layers, image-index
     /// children, and `subject` — recorded as `object → manifest` backrefs.
     pub references: &'a [Digest],
+    /// The subset of `references` that MUST be present in the repository
+    /// (config + layers). The backend re-checks them under the GC fence held
+    /// through the metadata commit, so no sweep can remove one between the
+    /// client-facing existence check and the commit
+    /// ([`StorageError::MissingReference`] otherwise).
+    pub required: &'a [Digest],
     /// `(subject digest, referrer descriptor JSON)` when the manifest carries a
     /// `subject`; the descriptor is stored with the subject link merged in.
     pub subject: Option<(&'a Digest, &'a [u8])>,

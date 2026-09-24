@@ -212,6 +212,7 @@ async fn backrefs_track_referenced_blobs_across_delete() {
             b"the-manifest",
             ManifestLinks {
                 references: &[b1.clone(), b2.clone()],
+                required: &[],
                 subject: None,
             },
         )

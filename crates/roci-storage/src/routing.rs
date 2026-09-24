@@ -356,6 +356,7 @@ mod tests {
         let refs: Vec<Digest> = vec![config_digest.clone()];
         let links = ManifestLinks {
             references: &refs,
+            required: &[],
             subject: None,
         };
         routed
@@ -421,6 +422,7 @@ mod tests {
                 &manifest_bytes,
                 ManifestLinks {
                     references: &[config_digest],
+                    required: &[],
                     subject: None,
                 },
             )
@@ -640,6 +642,7 @@ mod tests {
                 &manifest_bytes,
                 ManifestLinks {
                     references: &[config_digest],
+                    required: &[],
                     subject: None,
                 },
             )

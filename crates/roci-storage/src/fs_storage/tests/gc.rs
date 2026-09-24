@@ -118,6 +118,7 @@ async fn referenced_blob_survives_sweep() {
         &manifest_body,
         ManifestLinks {
             references: &refs,
+            required: &[],
             subject: None,
         },
     )
@@ -161,6 +162,7 @@ async fn deleting_manifest_makes_blobs_collectable_but_shared_blobs_survive() {
         &ma_body,
         ManifestLinks {
             references: &ma_refs,
+            required: &[],
             subject: None,
         },
     )
@@ -179,6 +181,7 @@ async fn deleting_manifest_makes_blobs_collectable_but_shared_blobs_survive() {
         &mb_body,
         ManifestLinks {
             references: &mb_refs,
+            required: &[],
             subject: None,
         },
     )
@@ -373,6 +376,7 @@ async fn missing_backrefs_are_rebuilt() {
         &manifest_body,
         ManifestLinks {
             references: &[], // empty! simulating missing edges
+            required: &[],
             subject: None,
         },
     )
@@ -574,6 +578,7 @@ async fn concurrent_push_delete_preserves_reachable_set() {
                     &manifest_body,
                     ManifestLinks {
                         references: &refs,
+                        required: &[],
                         subject: None,
                     },
                 )

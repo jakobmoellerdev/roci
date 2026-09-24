@@ -274,6 +274,7 @@ async fn manifest_links_commit_atomically_and_survive_restart() {
             body,
             ManifestLinks {
                 references: &[layer.clone(), subject.clone()],
+                required: &[],
                 subject: Some((&subject, br#"{"artifactType":"a/b"}"#)),
             },
         )
@@ -300,6 +301,7 @@ async fn manifest_links_commit_atomically_and_survive_restart() {
             other,
             ManifestLinks {
                 references: &[],
+                required: &[],
                 subject: Some((&subject, b"not json")),
             },
         )

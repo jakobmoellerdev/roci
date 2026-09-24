@@ -312,6 +312,7 @@ pub(crate) async fn put<S: Storage>(
             &body,
             ManifestLinks {
                 references: &references,
+                required: &referenced,
                 subject: referrer.as_ref().map(|(s, d)| (*s, d.as_slice())),
             },
         )

@@ -218,6 +218,9 @@ impl From<StorageError> for ApiError {
             e @ StorageError::TooManySessions { .. } => {
                 ApiError::new(ErrorCode::TooManyRequests, e.to_string())
             }
+            StorageError::MissingReference(d) => {
+                ApiError::manifest_blob_unknown(format!("referenced blob {d} is not present"))
+            }
             StorageError::Io(_) => ApiError::Internal("internal error".to_string()),
         }
     }

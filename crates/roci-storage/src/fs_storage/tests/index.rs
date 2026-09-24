@@ -117,6 +117,7 @@ async fn index_preserves_foreign_entries_and_referrer_append() {
         b"referrer",
         ManifestLinks {
             references: &[],
+            required: &[],
             subject: Some((&subject, br#"{"digest":"x","artifactType":"a/b"}"#)),
         },
     )
@@ -461,6 +462,7 @@ async fn index_write_refuses_symlinked_repo_and_bad_repo_name() {
             b"s",
             ManifestLinks {
                 references: &[],
+                required: &[],
                 subject: Some((&sub, b"{}")),
             },
         )
@@ -616,6 +618,7 @@ async fn referrer_merges_into_annotated_entry() {
         body,
         ManifestLinks {
             references: &[],
+            required: &[],
             subject: Some((
                 &subject,
                 br#"{"mediaType":"application/json","digest":"x","annotations":{"other":"1"},"artifactType":"a/b"}"#,

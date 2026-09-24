@@ -27,6 +27,9 @@ pub enum StorageError {
         limit: u64,
         requested: u64,
     },
+    /// A manifest's required blob is absent at commit time.
+    #[error("referenced blob {0} is not present")]
+    MissingReference(String),
     /// The concurrent upload-session cap is reached.
     #[error("too many concurrent upload sessions (limit {limit})")]
     TooManySessions { limit: usize },

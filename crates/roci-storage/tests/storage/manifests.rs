@@ -182,6 +182,7 @@ async fn referrers_roundtrip_and_empty() {
         b"referrer",
         ManifestLinks {
             references: &[],
+            required: &[],
             subject: Some((&subject, br#"{"digest":"x"}"#)),
         },
     )

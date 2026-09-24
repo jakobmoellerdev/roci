@@ -333,6 +333,7 @@ async fn put_and_get_manifest_by_tag_and_digest() {
         &manifest,
         ManifestLinks {
             references: &refs,
+            required: &[],
             subject: None,
         },
     )
@@ -372,6 +373,7 @@ async fn delete_manifest_removes_blob_and_metadata() {
         &manifest,
         ManifestLinks {
             references: std::slice::from_ref(&config_digest),
+            required: &[],
             subject: None,
         },
     )
@@ -406,6 +408,7 @@ async fn list_tags_pagination() {
             &manifest,
             ManifestLinks {
                 references: &[cd],
+                required: &[],
                 subject: None,
             },
         )
@@ -442,6 +445,7 @@ async fn referrers_recorded_and_paginated() {
         &subject_manifest,
         ManifestLinks {
             references: &[cd],
+            required: &[],
             subject: None,
         },
     )
@@ -471,6 +475,7 @@ async fn referrers_recorded_and_paginated() {
         &referrer_manifest,
         ManifestLinks {
             references: &[ref_cd.clone(), subject_digest.clone()],
+            required: &[],
             subject: Some((&subject_digest, &descriptor_bytes)),
         },
     )
@@ -691,6 +696,7 @@ async fn recover_imports_from_remote_index() {
         &manifest,
         ManifestLinks {
             references: std::slice::from_ref(&cd),
+            required: &[],
             subject: None,
         },
     )
@@ -775,6 +781,7 @@ async fn gc_does_not_collect_referenced_blob() {
         &manifest,
         ManifestLinks {
             references: std::slice::from_ref(&digest),
+            required: &[],
             subject: None,
         },
     )
@@ -962,6 +969,7 @@ async fn gc_consistency_check_layout_only_root() {
         &manifest,
         ManifestLinks {
             references: std::slice::from_ref(&cd),
+            required: &[],
             subject: None,
         },
     )
@@ -1183,6 +1191,7 @@ async fn gc_consistency_check_missing_backref_rebuild() {
         &manifest,
         ManifestLinks {
             references: std::slice::from_ref(&ld),
+            required: &[],
             subject: None,
         },
     )
@@ -1301,6 +1310,7 @@ async fn recover_foreign_tag_import_and_referrer_warmup() {
         &subject_manifest,
         ManifestLinks {
             references: std::slice::from_ref(&cd),
+            required: &[],
             subject: None,
         },
     )
@@ -1328,6 +1338,7 @@ async fn recover_foreign_tag_import_and_referrer_warmup() {
         &referrer_manifest,
         ManifestLinks {
             references: std::slice::from_ref(&rcd),
+            required: &[],
             subject: Some((&smd, &descriptor)),
         },
     )
@@ -1486,6 +1497,7 @@ async fn write_remote_index_and_read_back() {
         &manifest,
         ManifestLinks {
             references: std::slice::from_ref(&cd),
+            required: &[],
             subject: None,
         },
     )
@@ -1528,6 +1540,7 @@ async fn write_remote_index_not_found_existing() {
         &manifest,
         ManifestLinks {
             references: std::slice::from_ref(&cd),
+            required: &[],
             subject: None,
         },
     )
@@ -1999,6 +2012,7 @@ async fn delete_manifest_cleans_up() {
         &manifest,
         ManifestLinks {
             references: std::slice::from_ref(&cd),
+            required: &[],
             subject: None,
         },
     )
@@ -2035,6 +2049,7 @@ async fn put_manifest_bad_tag() {
             &manifest,
             ManifestLinks {
                 references: std::slice::from_ref(&cd),
+                required: &[],
                 subject: None,
             },
         )
@@ -2054,6 +2069,7 @@ async fn put_manifest_bad_tag() {
             &manifest,
             ManifestLinks {
                 references: std::slice::from_ref(&cd),
+                required: &[],
                 subject: None,
             },
         )
@@ -2497,6 +2513,7 @@ mod http_e2e {
                 &m,
                 ManifestLinks {
                     references: &[cd],
+                    required: &[],
                     subject: None,
                 },
             )
@@ -2542,6 +2559,7 @@ mod http_e2e {
             &subject_manifest,
             ManifestLinks {
                 references: std::slice::from_ref(&cd),
+                required: &[],
                 subject: None,
             },
         )
@@ -2569,6 +2587,7 @@ mod http_e2e {
             &referrer_manifest,
             ManifestLinks {
                 references: &[ref_cd.clone(), subject_digest.clone()],
+                required: &[],
                 subject: Some((&subject_digest, &serde_json::to_vec(&descriptor).unwrap())),
             },
         )

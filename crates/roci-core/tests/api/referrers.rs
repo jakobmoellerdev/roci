@@ -102,6 +102,7 @@ async fn referrers_pagination_filter_link_and_vary() {
                 &bytes,
                 ManifestLinks {
                     references: &[],
+                    required: &[],
                     subject: Some((&subject, desc.to_string().as_bytes())),
                 },
             )
@@ -163,6 +164,7 @@ async fn next_link_encodes_query_values_and_round_trips() {
                 &bytes,
                 ManifestLinks {
                     references: &[],
+                    required: &[],
                     subject: Some((&subject, desc.to_string().as_bytes())),
                 },
             )
