@@ -14,6 +14,9 @@ hero:
       text: Get started
       link: /guide/getting-started
     - theme: alt
+      text: Download
+      link: https://github.com/jakobmoellerdev/roci/releases/latest
+    - theme: alt
       text: What is roci?
       link: /guide/introduction
     - theme: alt

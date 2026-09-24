@@ -3,6 +3,8 @@ name: container
 on:
   push:
     branches: [main]
+    # A `v*` release tag publishes the versioned image (`X.Y.Z`, `X.Y`, `latest`).
+    tags: ["v*"]
   pull_request: {}
   workflow_dispatch: {}
 
@@ -84,9 +86,9 @@ jobs:
           docker rm -f roci-smoke 2>/dev/null || true
           docker volume rm roci-data 2>/dev/null || true
 
-      # On main, log in and push this arch by digest for the manifest merge.
+      # On push (main or a release tag), log in and push this arch by digest for the manifest merge.
       - name: Log in to GHCR
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -94,7 +96,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push image by digest
         id: push
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -104,7 +106,7 @@ jobs:
           sbom: true
           provenance: mode=max
       - name: Export digest
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push'
         shell: bash
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
@@ -112,7 +114,7 @@ jobs:
           mkdir -p /tmp/digests
           touch "/tmp/digests/${DIGEST#sha256:}"
       - name: Upload digest
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: digest-${{ matrix.plat.arch }}
@@ -121,10 +123,11 @@ jobs:
           retention-days: 1
 
   # Assemble the multi-arch manifest from the per-arch digests and attest it.
-  # main only.
+  # Push events only (main or a `v*` tag): main → `:main`; a release tag →
+  # `:X.Y.Z`, `:X.Y`, `:latest`. Both also get the immutable `:<sha>`.
   publish:
     name: publish + attest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -152,7 +155,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tags=("${IMAGE}:latest" "${IMAGE}:${GITHUB_SHA}")
+          tags=("${IMAGE}:${GITHUB_SHA}")
+          if [[ "${GITHUB_REF}" =~ ^refs/tags/v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"; patch="${BASH_REMATCH[3]}"
+            tags+=("${IMAGE}:${major}.${minor}.${patch}" "${IMAGE}:${major}.${minor}" "${IMAGE}:latest")
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            # Pre-release / non-semver tag (e.g. v0.2.0-rc.1): exact tag only, never `latest`.
+            tags+=("${IMAGE}:${GITHUB_REF#refs/tags/v}")
+          else
+            tags+=("${IMAGE}:main")
+          fi
           args=()
           for t in "${tags[@]}"; do args+=("-t" "$t"); done
           # shellcheck disable=SC2046
@@ -163,6 +175,7 @@ jobs:
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
         env:
           GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -171,9 +184,9 @@ jobs:
           push-to-registry: true
 
   # Cross-compile the standalone binary for each Linux arch on its native
-  # runner and attest it. Containers are Linux-only; darwin binaries are
-  # planned as cross-compiled release binaries (macOS runners), not wired up
-  # yet and out of scope here. Same static per-event platform list as `build`.
+  # runner and attest it. Containers are Linux-only; versioned Linux + darwin
+  # release tarballs are built by `release.yml` on `v*` tags. Same static
+  # per-event platform list as `build`.
   binaries:
     name: binary (linux-${{ matrix.plat.arch }})
     strategy:
@@ -216,7 +229,7 @@ jobs:
           mkdir -p dist
           cp "target/${TARGET}/release/roci" "dist/roci-${TARGET}"
       - name: Attest binary provenance
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/roci-${{ steps.t.outputs.target }}

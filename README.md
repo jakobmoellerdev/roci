@@ -19,6 +19,15 @@ roci is built around three goals:
 
 roci targets full conformance with the OCI Distribution Spec v1.1.1 and feature parity with [zot](https://github.com/project-zot/zot), while keeping a clear separation between the core distribution API and optional extensions.
 
+## Quick start
+
+```sh
+docker run -d --read-only -v roci-data:/var/lib/roci -p 5000:5000 ghcr.io/jakobmoellerdev/roci:latest
+skopeo copy --all --dest-tls-verify=false docker://alpine:latest docker://localhost:5000/alpine:latest
+```
+
+Static Linux/macOS binaries (amd64/arm64) are attached to every [release](https://github.com/jakobmoellerdev/roci/releases). The [Getting started guide](https://jakobmoellerdev.github.io/roci/guide/getting-started) covers the binary, container, and source install paths, plus the macOS port-5000 (AirPlay) caveat.
+
 ## Design principles
 
 - **OCI image layout on disk.** Storage is a plain [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), so any OCI layout can be served directly as a registry and inspected with standard tooling.
@@ -129,13 +138,16 @@ writable path (mount the root FS read-only).
 
 ```sh
 just container          # build + smoke-test the running container
-docker run --read-only -v roci-data:/var/lib/roci -p 5000:5000 ghcr.io/jakobmoellerdev/roci
+docker run --read-only -v roci-data:/var/lib/roci -p 5000:5000 ghcr.io/jakobmoellerdev/roci:latest
 ```
+
+Image tags: `latest` (newest release), `X.Y.Z` / `X.Y` (pinned releases), `main` (rolling `main` build), `<commit-sha>` (immutable).
 
 The `container` CI workflow builds and smoke-tests the image on **native
 per-arch runners** (no QEMU emulation): pull requests build only `linux/arm64`
-(on an `ubuntu-24.04-arm` runner) to save time, while `main` builds both
-`linux/amd64` and `linux/arm64`, assembles a multi-arch manifest, and pushes it
+(on an `ubuntu-24.04-arm` runner) to save time, while `main` and `v*` release
+tags build both `linux/amd64` and `linux/arm64`, assemble a multi-arch manifest,
+and push it
 to GHCR with a signed
 [build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations)
 plus an embedded SBOM and SLSA provenance. Verify a pulled image with:
@@ -146,9 +158,9 @@ gh attestation verify oci://ghcr.io/jakobmoellerdev/roci:latest --owner jakobmoe
 
 Alongside the image, the workflow builds a standalone static `roci` binary for
 each Linux arch on its native runner and attests it. Container images are
-Linux-only (OCI/Docker has no darwin runtime); `darwin/amd64` and
-`darwin/arm64` binaries build cleanly from the same workspace and are produced
-by the release pipeline (macOS runners), not as container platforms.
+Linux-only (OCI/Docker has no darwin runtime). Versioned release tarballs
+(static `linux-musl` + `apple-darwin`, amd64/arm64, sha256 + attestation) are
+built by [`release.yml`](.github/workflows/release.yml) on `v*` tags.
 
 ### Security scanning
 
