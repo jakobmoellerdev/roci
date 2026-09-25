@@ -1,0 +1,10 @@
+# OCI conformance under authentication (the `htpasswd` profile of
+# scripts/conformance.sh and the conformance CI matrix). Paths are relative
+# to the repository root, where roci is started. The fixture user is
+# `conformance` / `conformance` (bcrypt, cost 10).
+[auth.htpasswd]
+path = "scripts/conformance/htpasswd"
+
+[[access_control.repositories]]
+pattern = "roci-conformance/**"
+policies = [{ users = ["conformance"], actions = ["pull", "push", "delete"] }]

@@ -70,6 +70,7 @@ struct StorageInstruments {
     scrub_bytes: Counter<u64>,
     dedupe_links: Counter<u64>,
     quota_rejections: Counter<u64>,
+    auth_decisions: Counter<u64>,
 }
 
 pub(crate) fn set_reader(reader: SharedReader) {
@@ -115,6 +116,10 @@ pub(crate) fn install(provider: opentelemetry_sdk::metrics::SdkMeterProvider) {
         quota_rejections: counter(
             "registry.quota.rejections",
             "Writes rejected by a storage quota by scope",
+        ),
+        auth_decisions: counter(
+            "registry.auth.decisions",
+            "Authentication/authorization decisions by method and result",
         ),
     });
 }
@@ -186,6 +191,21 @@ pub fn record_quota_rejection(scope: &str) {
     if let Some(s) = STORAGE.get() {
         s.quota_rejections
             .add(1, &[KeyValue::new("scope", scope.to_string())]);
+    }
+}
+
+/// Count one authentication/authorization decision by `method`
+/// (`anonymous`/`htpasswd`/`ldap`/`bearer`/`mtls`) and `result`
+/// (`allowed`/`denied`/`unauthenticated`/`invalid`).
+pub fn record_auth_decision(method: &str, result: &str) {
+    if let Some(s) = STORAGE.get() {
+        s.auth_decisions.add(
+            1,
+            &[
+                KeyValue::new("method", method.to_string()),
+                KeyValue::new("result", result.to_string()),
+            ],
+        );
     }
 }
 

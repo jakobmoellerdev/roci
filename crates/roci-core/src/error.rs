@@ -9,7 +9,7 @@
 //! registry-specific `UNKNOWN` code (the spec permits registry-defined codes),
 //! preserving the pre-existing internal-error behavior.
 
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use roci_storage::{QuotaScope, StorageError};
@@ -80,13 +80,24 @@ impl ErrorCode {
 /// `PayloadTooLarge` renders `413` with the `SIZE_INVALID` code (the dist-spec
 /// binds end-7 body-limit rejection to `413`, spec endpoint table);
 /// `InsufficientStorage` renders `507` with `DENIED` when the registry-wide
-/// storage quota is exhausted (a 5xx body is not bound to the code table).
+/// storage quota is exhausted (a 5xx body is not bound to the code table);
+/// `Unauthenticated` renders `401 UNAUTHORIZED` plus an optional
+/// `WWW-Authenticate` challenge; `TooEarly` renders `425` with `DENIED` for a
+/// state-changing request replayable from TLS early data (RFC 8470 §5.1).
 #[derive(Debug, Clone)]
 pub enum ApiError {
-    Spec { code: ErrorCode, message: String },
+    Spec {
+        code: ErrorCode,
+        message: String,
+    },
     Internal(String),
     PayloadTooLarge(String),
     InsufficientStorage(String),
+    Unauthenticated {
+        message: String,
+        challenge: Option<HeaderValue>,
+    },
+    TooEarly,
 }
 
 impl ApiError {
@@ -137,6 +148,8 @@ impl ApiError {
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::InsufficientStorage(_) => StatusCode::INSUFFICIENT_STORAGE,
+            ApiError::Unauthenticated { .. } => StatusCode::UNAUTHORIZED,
+            ApiError::TooEarly => StatusCode::from_u16(425).expect("425 is a valid status"),
         }
     }
 
@@ -146,7 +159,8 @@ impl ApiError {
             ApiError::Spec { code, .. } => code.wire(),
             ApiError::Internal(_) => "UNKNOWN",
             ApiError::PayloadTooLarge(_) => ErrorCode::SizeInvalid.wire(),
-            ApiError::InsufficientStorage(_) => ErrorCode::Denied.wire(),
+            ApiError::InsufficientStorage(_) | ApiError::TooEarly => ErrorCode::Denied.wire(),
+            ApiError::Unauthenticated { .. } => ErrorCode::Unauthorized.wire(),
         }
     }
 
@@ -156,6 +170,10 @@ impl ApiError {
             ApiError::Internal(m) => m,
             ApiError::PayloadTooLarge(m) => m,
             ApiError::InsufficientStorage(m) => m,
+            ApiError::Unauthenticated { message, .. } => message,
+            ApiError::TooEarly => {
+                "request sent in TLS early data; retry after the handshake completes"
+            }
         }
     }
 }
@@ -174,12 +192,19 @@ impl IntoResponse for ApiError {
         let body = serde_json::json!({
             "errors": [{ "code": code, "message": self.message() }]
         });
-        (
+        let mut resp = (
             status,
             [(header::CONTENT_TYPE, "application/json")],
             body.to_string(),
         )
-            .into_response()
+            .into_response();
+        if let ApiError::Unauthenticated {
+            challenge: Some(c), ..
+        } = self
+        {
+            resp.headers_mut().insert(header::WWW_AUTHENTICATE, c);
+        }
+        resp
     }
 }
 

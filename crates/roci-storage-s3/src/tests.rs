@@ -1,5 +1,6 @@
 //! Tests for S3Storage against InMemory object store.
 
+use crate::client::RedirectGuard;
 use crate::client::S3Client;
 use crate::S3Storage;
 use object_store::memory::InMemory;
@@ -63,6 +64,34 @@ fn test_store_with_redirect(
     (dir, s, mem)
 }
 
+fn test_store_with_redirect_guard(
+    redirect_min_size: u64,
+    guard: RedirectGuard,
+) -> (tempfile::TempDir, S3Storage, Arc<InMemory>) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StorageConfig::default();
+    let mem = Arc::new(InMemory::new());
+    let signer = build_test_signer();
+    let client = S3Client::in_memory(
+        mem.clone(),
+        signer,
+        String::new(),
+        redirect_min_size,
+        Duration::from_secs(15),
+        16 * 1024 * 1024,
+        8,
+    )
+    .with_redirect_guard(guard);
+    let s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    (dir, s, mem)
+}
+
 /// Build a test signer from AmazonS3Builder with dummy credentials.
 fn build_test_signer() -> Option<Arc<dyn object_store::signer::Signer>> {
     use object_store::aws::AmazonS3Builder;
@@ -72,8 +101,7 @@ fn build_test_signer() -> Option<Arc<dyn object_store::signer::Signer>> {
         .with_region("us-east-1")
         .with_access_key_id("AKIAIOSFODNN7EXAMPLE")
         .with_secret_access_key("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
-        .with_endpoint("http://localhost:9999") // unreachable, signing is offline
-        .with_allow_http(true)
+        .with_endpoint("https://s3.test.example")
         .build()
         .ok()?;
     Some(Arc::new(store))
@@ -3021,4 +3049,112 @@ async fn manifest_commit_rechecks_required_blobs() {
         roci_storage::StorageError::MissingReference(_)
     ));
     assert!(s.meta.resolve_tag("repo", "v1").is_none());
+}
+
+// ── redirect guard unit tests ──────────────────────────────────────────
+
+#[test]
+fn redirect_guard_from_config_aws_default() {
+    let s3 = roci_config::S3Config {
+        bucket: "My-Bucket".into(),
+        region: "eu-central-1".into(),
+        endpoint: None,
+        prefix: String::new(),
+        access_key_id: None,
+        secret_access_key_file: None,
+        allow_http: false,
+        redirect_min_size: 1024,
+        redirect_ttl_secs: 60,
+        multipart_part_size: 16 * 1024 * 1024,
+        multipart_concurrency: 8,
+    };
+    let guard = RedirectGuard::from_config(&s3);
+    // Both path-style and virtual-hosted-style hosts are permitted.
+    let path_url = url::Url::parse("https://s3.eu-central-1.amazonaws.com/My-Bucket/key").unwrap();
+    let vhost_url = url::Url::parse("https://my-bucket.s3.eu-central-1.amazonaws.com/key").unwrap();
+    assert!(guard.permits(&path_url));
+    assert!(guard.permits(&vhost_url));
+    // Unrelated host is rejected.
+    let evil = url::Url::parse("https://evil.example/key").unwrap();
+    assert!(!guard.permits(&evil));
+}
+
+#[test]
+fn redirect_guard_from_config_custom_endpoint() {
+    let s3 = roci_config::S3Config {
+        bucket: "b".into(),
+        region: "us-east-1".into(),
+        endpoint: Some("https://minio.example:9000".into()),
+        prefix: String::new(),
+        access_key_id: None,
+        secret_access_key_file: None,
+        allow_http: false,
+        redirect_min_size: 1024,
+        redirect_ttl_secs: 60,
+        multipart_part_size: 16 * 1024 * 1024,
+        multipart_concurrency: 8,
+    };
+    let guard = RedirectGuard::from_config(&s3);
+    let ok = url::Url::parse("https://minio.example:9000/b/key?sig=abc").unwrap();
+    assert!(guard.permits(&ok));
+    let evil = url::Url::parse("https://evil.example/b/key").unwrap();
+    assert!(!guard.permits(&evil));
+}
+
+#[test]
+fn redirect_guard_permits_rejects_http_when_disallowed() {
+    let guard = RedirectGuard::new(vec!["s3.test.example".into()], false);
+    let http = url::Url::parse("http://s3.test.example/key").unwrap();
+    assert!(
+        !guard.permits(&http),
+        "http must be rejected when allow_http=false"
+    );
+    let https = url::Url::parse("https://s3.test.example/key").unwrap();
+    assert!(guard.permits(&https));
+}
+
+#[test]
+fn redirect_guard_permits_allows_http_when_enabled() {
+    let guard = RedirectGuard::new(vec!["s3.test.example".into()], true);
+    let http = url::Url::parse("http://s3.test.example/key").unwrap();
+    assert!(guard.permits(&http));
+}
+
+#[test]
+fn redirect_guard_rejects_internal_host() {
+    // Even when in the allowlist, an internal host is rejected (SSRF).
+    let guard = RedirectGuard::new(vec!["127.0.0.1".into()], true);
+    let url = url::Url::parse("http://127.0.0.1/some/key").unwrap();
+    assert!(!guard.permits(&url), "internal host must be rejected");
+}
+
+// ── redirect guard integration tests ───────────────────────────────────
+
+#[tokio::test]
+async fn open_blob_redirect_rejected_by_guard_falls_back_to_proxy() {
+    // Mismatched guard: the signer emits s3.test.example URLs,
+    // but the guard only allows "other.example".
+    let guard = RedirectGuard::new(vec!["other.example".into()], false);
+    let (_dir, s, _mem) = test_store_with_redirect_guard(10, guard);
+    let data = b"this is more than ten bytes of content for redirect guard test";
+    let digest = sha256_digest(data);
+    s.put_blob("repo", &digest, data).await.unwrap();
+
+    let blob = s.open_blob("repo", &digest).await.unwrap();
+    assert_eq!(blob.size(), data.len() as u64);
+    // Must NOT be a redirect — the guard rejected the host.
+    assert!(
+        blob.redirect_url().is_none(),
+        "expected proxy fallback when guard rejects host"
+    );
+    // The blob must still be streamable via the ranged proxy.
+    let stream = blob.into_stream(0, data.len() as u64).await.unwrap();
+    let collected: Vec<bytes::Bytes> = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+    let bytes: Vec<u8> = collected.into_iter().flat_map(|b| b.to_vec()).collect();
+    assert_eq!(bytes, data);
 }

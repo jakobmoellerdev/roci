@@ -1,10 +1,13 @@
 //! roci-core: the OCI Distribution Spec v1.1.1 HTTP surface.
 //!
 //! Implements the dist-spec endpoint groups end-1 .. end-13 against the
-//! [`roci_storage::Storage`] trait. AuthN/AuthZ (when added) is evaluated in a
-//! layer *before* these handlers touch storage (ARCHITECTURE.md invariant 3).
+//! [`roci_storage::Storage`] trait. When authentication is configured, the
+//! [`auth`] layer resolves each request's principal and `routes::dispatch`
+//! authorizes it *before* any handler touches storage (ARCHITECTURE.md
+//! invariant 3, SECURITY.md invariant 1).
 #![forbid(unsafe_code)]
 
+pub mod auth;
 mod blobs;
 mod error;
 mod http_util;
@@ -30,6 +33,8 @@ pub struct AppState<S: Storage> {
     storage: Arc<S>,
     /// Effective runtime configuration.
     pub config: Config,
+    /// Authentication/authorization engine; `None` → open registry.
+    auth: Option<Arc<auth::Auth>>,
 }
 
 // Manual Clone: `Arc<S>` + `Config` are both cloneable regardless of whether
@@ -39,6 +44,7 @@ impl<S: Storage> Clone for AppState<S> {
         Self {
             storage: Arc::clone(&self.storage),
             config: self.config.clone(),
+            auth: self.auth.clone(),
         }
     }
 }
@@ -54,7 +60,18 @@ impl<S: Storage> AppState<S> {
         Self {
             storage: Arc::new(storage),
             config,
+            auth: None,
         }
+    }
+
+    /// Install the auth engine built by [`auth::Auth::from_config`].
+    pub fn with_auth(mut self, auth: Option<Arc<auth::Auth>>) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    pub(crate) fn auth(&self) -> Option<&Arc<auth::Auth>> {
+        self.auth.as_ref()
     }
 
     /// Maximum accepted request-body size (from `config.limits.max_body`).
@@ -101,6 +118,15 @@ pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
                 .delete(routes::dispatch::<S>),
         );
 
+    // Authentication: resolves the principal for `dispatch` to authorize.
+    // Only installed when auth is configured (byte-identical otherwise).
+    if let Some(auth) = state.auth.clone() {
+        router = router.layer(axum::middleware::from_fn_with_state(
+            auth,
+            auth::middleware::authn_middleware,
+        ));
+    }
+
     // Rate-limit layer: only installed when enabled (zero overhead otherwise).
     if let Some(rl) = limiter {
         router = router.layer(axum::middleware::from_fn_with_state(
@@ -109,7 +135,12 @@ pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
         ));
     }
 
+    // Layers wrap outward: at runtime a request passes span → early-data →
+    // rate limit → authn → handler.
     router
+        .layer(axum::middleware::from_fn(
+            auth::middleware::early_data_middleware,
+        ))
         // One root span per request; every handler's structured events attach
         // to it (Phase 0 observability spine). OTLP export lands in Phase 4.
         .layer(axum::middleware::from_fn(request_span))

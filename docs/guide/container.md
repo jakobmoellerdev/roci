@@ -1,6 +1,6 @@
 # Container image
 
-roci ships as a **hardened, fully static** container image: a musl-static binary on a `scratch` base with no shell, no libc, and no package manager. It runs as an unprivileged nonroot UID (`65532`), and the storage directory is the only writable path. The image is built with the `full` feature set (OpenTelemetry export, Prometheus `/metrics`, `mimalloc`).
+roci ships as a **hardened, fully static** container image: a musl-static binary on a `scratch` base with no shell, no libc, and no package manager. It runs as an unprivileged nonroot UID (`65532`), and the storage directory is the only writable path. The image is built with the `full` feature set (S3, redb, LDAP, OpenTelemetry export, Prometheus `/metrics`, `mimalloc`).
 
 ## Run
 

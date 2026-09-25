@@ -39,16 +39,16 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 
 ## Security & access control
 
-- [~] TLS support (TLS 1.3, 0-RTT resumption)
-- [ ] TLS mutual authentication
-- [ ] HTTP Basic authentication — local htpasswd
-- [ ] HTTP Basic authentication — LDAP
-- [ ] HTTP Bearer token authentication (per-request scope binding)
-- [ ] Identity-Based Access Control
-- [ ] Live modification of authorization configuration while running
+- [x] TLS support (TLS 1.3, 0-RTT hardening via `425 Too Early`)
+- [x] TLS mutual authentication (client cert, optional CA/leaf-fingerprint pinning)
+- [x] HTTP Basic authentication — local htpasswd (bcrypt)
+- [x] HTTP Basic authentication — LDAP (cargo feature `ldap`)
+- [x] HTTP Bearer token authentication (external token server; ES256/RS256 verification, per-request scope binding)
+- [x] Identity-Based Access Control (glob patterns, specificity matching, admin/group support)
+- [x] Live modification of authorization configuration while running
 - [~] Boundary hardening — path-traversal-safe validation, wire digest allowlist, bounded inputs (size/`n`/depth)
-- [ ] Repository isolation — no cross-repo presence/content oracle; cross-repo mount double-authorized
-- [ ] SSRF containment — no client-URL fetch; host-allowlisted, repo-gated redirects
+- [x] Repository isolation — no cross-repo presence/content oracle; cross-repo mount double-authorized
+- [x] SSRF containment — no client-URL fetch; host-allowlisted, repo-gated redirects; config-load rejection of internal endpoints
 - [ ] Prior-art CVE-class regression suite in CI
 
 ## Storage

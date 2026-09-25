@@ -14,7 +14,8 @@ use clap::Parser;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
-use roci_config::{Config, ConfigError};
+use roci_config::{ClientAuth, Config, ConfigError};
+use roci_core::auth::{Auth, ClientCertIdentity};
 use roci_core::{build_router, AppState};
 use roci_storage::quota::{QuotaLimits, QuotaTracker};
 use roci_storage::routing::Routed;
@@ -214,14 +215,21 @@ fn build_one_backend(
     }
 }
 
+/// How often the config file is polled for `[access_control]` changes.
+const ACCESS_CONTROL_RELOAD_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Bind and serve the registry until `shutdown` resolves. Reports the bound
 /// address via `on_bind` (so tests can drive a request against an ephemeral
-/// port) before entering the serve loop.
+/// port) before entering the serve loop. With auth enabled and a
+/// `config_path`, the file's `[access_control]` section is live-reloaded.
 pub async fn serve(
     config: Config,
+    config_path: Option<PathBuf>,
     on_bind: impl FnOnce(SocketAddr),
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    let auth =
+        Auth::from_config(&config).map_err(|e| anyhow::anyhow!("invalid auth config: {e}"))?;
     let storage = build_storage(&config)?;
 
     // Startup recovery before accepting requests: register pre-existing
@@ -233,7 +241,27 @@ pub async fn serve(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     storage.start_maintenance(shutdown_rx.clone());
 
-    let app = build_router(AppState::new_with(storage, config.clone()))
+    if let Some(auth) = &auth {
+        let header_mechanism = config.auth.htpasswd.is_some()
+            || config.auth.ldap.is_some()
+            || config.auth.bearer.is_some();
+        if config.http.tls.is_none() && header_mechanism {
+            tracing::warn!("authentication enabled without TLS: credentials travel in plaintext");
+        }
+        if let Some(path) = config_path {
+            // Baseline: the file as written (CLI overrides are not changes).
+            let initial = Config::load(&path).unwrap_or_else(|_| config.clone());
+            spawn_access_control_reload(
+                path,
+                Arc::clone(auth),
+                initial,
+                ACCESS_CONTROL_RELOAD_INTERVAL,
+                shutdown_rx.clone(),
+            );
+        }
+    }
+
+    let app = build_router(AppState::new_with(storage, config.clone()).with_auth(auth))
         .merge(roci_telemetry::metrics_router(&config));
 
     let listener = TcpListener::bind(config.http.listen).await?;
@@ -318,20 +346,38 @@ async fn handle_conn(
                     format!("TLS handshake failed: {e}").into()
                 },
             )?;
-            serve_io(tls_stream, &builder, app, shutdown_rx, idle_timeout).await
+            // A peer certificate is present only when mTLS verified it.
+            let identity = tls_stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|chain| chain.first())
+                .and_then(|leaf| roci_core::auth::client_cert_identity(leaf.as_ref()))
+                .map(|name| ClientCertIdentity(name.into()));
+            serve_io(
+                tls_stream,
+                &builder,
+                app,
+                identity,
+                shutdown_rx,
+                idle_timeout,
+            )
+            .await
         }
-        None => serve_io(tcp, &builder, app, shutdown_rx, idle_timeout).await,
+        None => serve_io(tcp, &builder, app, None, shutdown_rx, idle_timeout).await,
     }
 }
 
 /// Serve one (plain or TLS) connection. It is closed once no byte has moved in
 /// either direction for `idle_timeout` — an idle keep-alive or a stalled peer —
 /// never merely because it has been open that long (an active long transfer or
-/// busy keep-alive connection is not cut).
+/// busy keep-alive connection is not cut). `client_identity` (a verified mTLS
+/// certificate's name) is attached to every request on the connection.
 async fn serve_io<T>(
     io: T,
     builder: &AutoBuilder<TokioExecutor>,
     app: axum::Router,
+    client_identity: Option<ClientCertIdentity>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     idle_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
@@ -340,8 +386,13 @@ where
 {
     let io = ActivityIo::new(io);
     let activity = io.activity();
-    let conn = builder
-        .serve_connection_with_upgrades(TokioIo::new(io), TowerToHyperService { service: app });
+    let conn = builder.serve_connection_with_upgrades(
+        TokioIo::new(io),
+        TowerToHyperService {
+            service: app,
+            client_identity,
+        },
+    );
     tokio::pin!(conn);
     tokio::select! {
         res = &mut conn => res?,
@@ -352,6 +403,68 @@ where
         _ = activity.idle_for(idle_timeout) => {}
     }
     Ok(())
+}
+
+/// Poll `path` every `interval` and apply `[access_control]` changes to
+/// `auth` without a restart. Only a byte-level change triggers a full
+/// `Config::load` (validation included); an invalid file keeps the current
+/// policy. Changes to any other section are reported, not applied.
+fn spawn_access_control_reload(
+    path: PathBuf,
+    auth: Arc<Auth>,
+    initial: Config,
+    interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last_bytes = tokio::fs::read(&path).await.unwrap_or_default();
+        let mut last = initial;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = shutdown.changed() => return,
+            }
+            let bytes = match tokio::fs::read(&path).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path.display(), "config reload: cannot read file");
+                    continue;
+                }
+            };
+            if bytes == last_bytes {
+                continue;
+            }
+            last_bytes = bytes;
+            match Config::load(&path) {
+                Ok(new) => {
+                    apply_config_reload(&auth, &last, &new);
+                    last = new;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "config reload rejected; keeping current access control")
+                }
+            }
+        }
+    })
+}
+
+fn apply_config_reload(auth: &Auth, last: &Config, new: &Config) {
+    if new.access_control != last.access_control {
+        auth.reload_access_control(new.access_control.as_ref());
+        tracing::info!("access control reloaded");
+        if new.access_control.is_none() {
+            tracing::warn!(
+                "[access_control] removed: anonymous requests are now denied and authenticated identities are unrestricted"
+            );
+        }
+    }
+    let rest = |c: &Config| Config {
+        access_control: None,
+        ..c.clone()
+    };
+    if rest(new) != rest(last) {
+        tracing::warn!("config changes outside [access_control] require a restart");
+    }
 }
 
 /// Last-activity clock shared between a connection's IO and its idle watcher.
@@ -492,13 +605,19 @@ fn build_tls_acceptor(tls: &roci_config::TlsConfig) -> anyhow::Result<tokio_rust
     // crypto backend): the `s3` backend's HTTP client pulls in rustls'
     // `aws-lc-rs` feature, and with both enabled rustls cannot pick a
     // process default on its own.
-    let mut sc =
-        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .map_err(|e| anyhow::anyhow!("building TLS config: {e}"))?
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| anyhow::anyhow!("building TLS config: {e}"))?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| anyhow::anyhow!("building TLS config: {e}"))?;
+    let builder = match tls.client_auth {
+        ClientAuth::None => builder.with_no_client_auth(),
+        ClientAuth::Optional | ClientAuth::Required => {
+            builder.with_client_cert_verifier(build_client_verifier(tls, provider)?)
+        }
+    };
+    let mut sc = builder
+        .with_single_cert(certs, key)
+        .map_err(|e| anyhow::anyhow!("building TLS config: {e}"))?;
 
     // ALPN: h2 preferred, then http/1.1.
     sc.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
@@ -509,10 +628,129 @@ fn build_tls_acceptor(tls: &roci_config::TlsConfig) -> anyhow::Result<tokio_rust
         .map_err(|e| anyhow::anyhow!("creating TLS ticketer: {e}"))?;
     sc.session_storage = rustls::server::ServerSessionMemoryCache::new(1024);
 
-    // No 0-RTT early data: rustls/hyper cannot honor RFC 8470 `425` semantics.
+    // No 0-RTT early data at all; proxy-forwarded early data is answered
+    // `425` by roci-core's early-data layer (RFC 8470 §5.1).
     sc.max_early_data_size = 0;
 
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(sc)))
+}
+
+/// The mTLS client verifier: WebPKI chain validation against `client_ca`
+/// (anonymous connections allowed for `optional`), wrapped in a leaf-pin
+/// check when `client_cert_sha256` is set so an unpinned certificate fails
+/// the handshake.
+fn build_client_verifier(
+    tls: &roci_config::TlsConfig,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> anyhow::Result<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::CertificateDer;
+
+    let Some(ca_path) = &tls.client_ca else {
+        anyhow::bail!("http.tls.client_ca: required when client_auth is optional or required");
+    };
+    let ca_pem = std::fs::read(ca_path)
+        .map_err(|e| anyhow::anyhow!("reading TLS client_ca {}: {e}", ca_path.display()))?;
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(&ca_pem) {
+        let cert = cert.map_err(|e| anyhow::anyhow!("parsing TLS client_ca: {e}"))?;
+        roots
+            .add(cert)
+            .map_err(|e| anyhow::anyhow!("TLS client_ca {}: {e}", ca_path.display()))?;
+    }
+    if roots.is_empty() {
+        anyhow::bail!(
+            "TLS client_ca {} contains no certificates",
+            ca_path.display()
+        );
+    }
+    let mut verifier =
+        rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider);
+    if tls.client_auth == ClientAuth::Optional {
+        verifier = verifier.allow_unauthenticated();
+    }
+    let verifier = verifier
+        .build()
+        .map_err(|e| anyhow::anyhow!("building TLS client verifier: {e}"))?;
+    if tls.client_cert_sha256.is_empty() {
+        return Ok(verifier);
+    }
+    Ok(Arc::new(PinnedClientVerifier {
+        inner: verifier,
+        pins: tls
+            .client_cert_sha256
+            .iter()
+            .map(|p| p.to_ascii_lowercase())
+            .collect(),
+    }))
+}
+
+/// Accepts a client certificate only if the inner verifier does *and* the
+/// leaf's SHA-256 fingerprint is pinned.
+#[derive(Debug)]
+struct PinnedClientVerifier {
+    inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    /// Lowercase hex SHA-256 fingerprints.
+    pins: Vec<String>,
+}
+
+impl rustls::server::danger::ClientCertVerifier for PinnedClientVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        use sha2::Digest as _;
+        let verified = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+        let fingerprint: String = sha2::Sha256::digest(end_entity.as_ref())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if self.pins.contains(&fingerprint) {
+            Ok(verified)
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -520,10 +758,12 @@ fn build_tls_acceptor(tls: &roci_config::TlsConfig) -> anyhow::Result<tokio_rust
 // ---------------------------------------------------------------------------
 
 /// Minimal adapter: wraps an `axum::Router` (a Tower `Service`) so hyper-util
-/// can drive it. Converts `hyper::body::Incoming` → `axum::body::Body`.
+/// can drive it. Converts `hyper::body::Incoming` → `axum::body::Body` and
+/// attaches the connection's verified client-certificate identity.
 #[derive(Clone)]
 struct TowerToHyperService<S> {
     service: S,
+    client_identity: Option<ClientCertIdentity>,
 }
 
 impl<S> hyper::service::Service<hyper::Request<Incoming>> for TowerToHyperService<S>
@@ -540,10 +780,16 @@ where
     type Future = S::Future;
 
     fn call(&self, req: hyper::Request<Incoming>) -> Self::Future {
-        let req = req.map(axum::body::Body::new);
+        let mut req = req.map(axum::body::Body::new);
+        if let Some(id) = &self.client_identity {
+            req.extensions_mut().insert(id.clone());
+        }
         self.service.clone().call(req)
     }
 }
+
+#[cfg(test)]
+mod auth_tests;
 
 #[cfg(test)]
 mod tests {
@@ -690,6 +936,7 @@ max_body = 0
         let handle = tokio::spawn(async move {
             serve(
                 config,
+                None,
                 move |addr| {
                     let _ = bind_tx.send(addr);
                 },
@@ -713,7 +960,7 @@ max_body = 0
         let mut config = Config::default();
         config.http.listen = taken;
         config.storage.root = dir.path().to_path_buf();
-        let result = serve(config, |_| {}, std::future::pending()).await;
+        let result = serve(config, None, |_| {}, std::future::pending()).await;
         assert!(result.is_err());
     }
 
@@ -735,6 +982,7 @@ max_body = 0
         let handle = tokio::spawn(async move {
             serve(
                 config,
+                None,
                 move |addr| {
                     let _ = bind_tx.send(addr);
                 },
@@ -763,6 +1011,7 @@ max_body = 0
         let handle = tokio::spawn(async move {
             serve(
                 config,
+                None,
                 move |addr| {
                     let _ = bind_tx.send(addr);
                 },
@@ -810,6 +1059,9 @@ max_body = 0
         config.http.tls = Some(roci_config::TlsConfig {
             cert: cert_path.clone(),
             key: key_path.clone(),
+            client_auth: Default::default(),
+            client_ca: None,
+            client_cert_sha256: Vec::new(),
         });
 
         let (bind_tx, bind_rx) = tokio::sync::oneshot::channel();
@@ -817,6 +1069,7 @@ max_body = 0
         let handle = tokio::spawn(async move {
             serve(
                 config,
+                None,
                 move |addr| {
                     let _ = bind_tx.send(addr);
                 },
@@ -909,8 +1162,11 @@ max_body = 0
         config.http.tls = Some(roci_config::TlsConfig {
             cert: cert_path,
             key: key_path,
+            client_auth: Default::default(),
+            client_ca: None,
+            client_cert_sha256: Vec::new(),
         });
-        let result = serve(config, |_| {}, std::future::pending()).await;
+        let result = serve(config, None, |_| {}, std::future::pending()).await;
         assert!(result.is_err());
     }
 
@@ -928,6 +1184,7 @@ max_body = 0
         let handle = tokio::spawn(async move {
             serve(
                 config,
+                None,
                 move |addr| {
                     let _ = bind_tx.send(addr);
                 },
@@ -987,6 +1244,9 @@ max_body = 0
         config.http.tls = Some(roci_config::TlsConfig {
             cert: cert_path,
             key: key_path,
+            client_auth: Default::default(),
+            client_ca: None,
+            client_cert_sha256: Vec::new(),
         });
 
         let (bind_tx, bind_rx) = tokio::sync::oneshot::channel();
@@ -994,6 +1254,7 @@ max_body = 0
         let handle = tokio::spawn(async move {
             serve(
                 config,
+                None,
                 move |addr| {
                     let _ = bind_tx.send(addr);
                 },
@@ -1069,8 +1330,11 @@ max_body = 0
         config.http.tls = Some(roci_config::TlsConfig {
             cert: cert_path,
             key: empty_key,
+            client_auth: Default::default(),
+            client_ca: None,
+            client_cert_sha256: Vec::new(),
         });
-        let result = serve(config, |_| {}, std::future::pending()).await;
+        let result = serve(config, None, |_| {}, std::future::pending()).await;
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("parsing TLS key"),
@@ -1093,8 +1357,11 @@ max_body = 0
         config.http.tls = Some(roci_config::TlsConfig {
             cert: empty_cert,
             key: key_path,
+            client_auth: Default::default(),
+            client_ca: None,
+            client_cert_sha256: Vec::new(),
         });
-        let result = serve(config, |_| {}, std::future::pending()).await;
+        let result = serve(config, None, |_| {}, std::future::pending()).await;
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("no certificates"),
@@ -1117,6 +1384,7 @@ max_body = 0
         let handle = tokio::spawn(async move {
             serve(
                 config,
+                None,
                 move |addr| {
                     let _ = bind_tx.send(addr);
                 },
@@ -1163,6 +1431,7 @@ max_body = 0
         let handle = tokio::spawn(async move {
             serve(
                 config,
+                None,
                 move |addr| {
                     let _ = bind_tx.send(addr);
                 },
@@ -1201,6 +1470,7 @@ max_body = 0
         let handle = tokio::spawn(async move {
             serve(
                 config,
+                None,
                 move |addr| {
                     let _ = bind_tx.send(addr);
                 },
@@ -1342,6 +1612,7 @@ max_body = 0
         let handle = tokio::spawn(async move {
             serve(
                 config,
+                None,
                 move |addr| {
                     let _ = bind_tx.send(addr);
                 },
@@ -1412,6 +1683,7 @@ max_body = 0
         let handle = tokio::spawn(async move {
             serve(
                 config,
+                None,
                 move |addr| {
                     let _ = bind_tx.send(addr);
                 },

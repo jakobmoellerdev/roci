@@ -105,7 +105,13 @@ impl Storage for S3Storage {
                     .signed_url(http::Method::GET, &path, self.client.redirect_ttl)
                     .await;
                 if let Ok(url) = url {
-                    return Ok(BlobRead::redirect(size, url.to_string()));
+                    if self.client.redirect_guard.permits(&url) {
+                        return Ok(BlobRead::redirect(size, url.to_string()));
+                    }
+                    tracing::warn!(
+                        host = url.host_str().unwrap_or("<none>"),
+                        "signed redirect URL rejected by host allowlist; proxying"
+                    );
                 }
                 // Signing failed: fall through to ranged proxy.
             }

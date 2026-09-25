@@ -27,6 +27,7 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
+sha2.workspace = true
 
 mimalloc = { workspace = true, optional = true }
 
@@ -54,6 +55,8 @@ cluster = ["dep:roci-cluster"]
 mimalloc = ["dep:mimalloc"]
 # Embedded B-tree KV metadata engine (`storage.metadata.engine = "redb"`).
 redb = ["roci-storage/redb"]
+# LDAP bind authentication (`[auth.ldap]`).
+ldap = ["roci-core/ldap"]
 # Convenience aggregate enabling every extension + the OTel telemetry spine.
 full = [
     "s3",
@@ -65,6 +68,7 @@ full = [
     "otel",
     "mimalloc",
     "redb",
+    "ldap",
 ]
 otel = ["roci-telemetry/otel", "roci-core/otel"]
 

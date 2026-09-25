@@ -1,11 +1,13 @@
 //! `/v2/<name>/<verb>` path parsing and per-method dispatch to the handlers.
 
+use crate::auth::principal_of;
 use crate::error::ApiError;
 use crate::names::RepositoryName;
 use crate::{blobs, listing, manifests, uploads, AppState};
 use axum::extract::{Path, Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
+use roci_config::Action;
 use roci_storage::{Digest, Storage};
 
 /// The parsed grammar of a `/v2/<name>/<verb>...` path.
@@ -97,9 +99,27 @@ fn query<T: serde::de::DeserializeOwned + Default>(req: &Request) -> T {
     serde_urlencoded::from_str(req.uri().query().unwrap_or("")).unwrap_or_default()
 }
 
+/// The repository and action a (method, path shape) pair requires, or
+/// `None` for shapes `dispatch` rejects as NAME_UNKNOWN without touching
+/// storage.
+fn required_action<'a>(method: &Method, parsed: &'a Parsed) -> Option<(&'a str, Action)> {
+    use Parsed::*;
+    Some(match (method, parsed) {
+        (&Method::GET | &Method::HEAD, Blob { repo, .. } | ManifestRef { repo, .. })
+        | (&Method::GET, TagsList { repo } | Referrers { repo, .. }) => (repo, Action::Pull),
+        (&Method::POST, UploadStart { repo })
+        | (&Method::GET | &Method::PATCH | &Method::PUT, UploadSession { repo, .. })
+        | (&Method::PUT, ManifestRef { repo, .. }) => (repo, Action::Push),
+        (&Method::DELETE, Blob { repo, .. } | ManifestRef { repo, .. }) => (repo, Action::Delete),
+        _ => return None,
+    })
+}
+
 /// Parse `/v2/<rest>` and dispatch on (method, path shape). Unknown shapes and
 /// method/shape mismatches are NAME_UNKNOWN, exactly as the per-method routers
-/// were.
+/// were. With auth configured, the request's principal is authorized for the
+/// endpoint's action here — the single enforcement point, ahead of every
+/// storage call (SECURITY inv. 1).
 pub(crate) async fn dispatch<S: Storage>(
     State(st): State<AppState<S>>,
     Path(rest): Path<String>,
@@ -107,6 +127,11 @@ pub(crate) async fn dispatch<S: Storage>(
 ) -> Result<Response, ApiError> {
     let parsed = parse_path(&rest)?;
     let method = req.method().clone();
+    if let Some(auth) = st.auth() {
+        if let Some((repo, action)) = required_action(&method, &parsed) {
+            auth.authorize(principal_of(req.extensions()), repo, action)?;
+        }
+    }
     match (&method, parsed) {
         (&Method::GET, Parsed::Blob { repo, digest }) => {
             blobs::get(&st, &repo, &digest, false, req.headers()).await

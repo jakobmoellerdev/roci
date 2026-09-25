@@ -1,8 +1,10 @@
 //! Upload-session endpoints: start (monolithic or chunked, cross-repo mount),
 //! PATCH (append), PUT (finish), and status.
 
+use crate::auth::principal_of;
 use crate::error::ApiError;
 use crate::http_util::{blob_location, created};
+use crate::names::RepositoryName;
 use crate::AppState;
 use axum::extract::Request;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -62,9 +64,21 @@ pub(crate) async fn start<S: Storage>(
     q: UploadQuery,
     req: Request,
 ) -> Result<Response, ApiError> {
-    // end-11: cross-repository mount.
+    // end-11: cross-repository mount. The destination's push grant was
+    // checked by dispatch; the source additionally needs pull, else the
+    // mount would read a repo the caller may not. A malformed or forbidden
+    // `from` silently falls through to a normal session (no existence
+    // oracle for repos the caller cannot read).
     if let (Some(mount), Some(from)) = (q.mount.as_ref(), q.from.as_ref()) {
-        if let Ok(d) = Digest::parse(mount) {
+        let source_readable = RepositoryName::parse(from).is_ok()
+            && st.auth().is_none_or(|auth| {
+                auth.allows(
+                    principal_of(req.extensions()),
+                    from,
+                    roci_config::Action::Pull,
+                )
+            });
+        if let (true, Ok(d)) = (source_readable, Digest::parse(mount)) {
             // Promote via a filesystem link (copy-free on one filesystem); no
             // blob bytes pass through memory. `Ok(false)` (source absent) or an
             // error falls through to a normal upload session.

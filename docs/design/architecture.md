@@ -33,7 +33,7 @@ Storage is a plain [OCI image layout](https://github.com/opencontainers/image-sp
 
 ## Configuration & observability
 
-One TOML file (`roci --config`) with `http`, `storage` (incl. `gc`, `scrub`, `quota`, `metadata`, `subpaths`, `s3`), `limits`, `delete`, `log`, and `telemetry` sections, validated on load; zero-config defaults need no file. The `otel` build exports traces, metrics, and logs over OTLP and serves a Prometheus scrape view of the same meters; metric labels are bounded by construction, and tail-based sampling is delegated to the OTel Collector.
+One TOML file (`roci --config`) with `http` (including mTLS fields), `auth` (htpasswd, ldap, bearer), `access_control` (IBAC policies), `storage` (incl. `gc`, `scrub`, `quota`, `metadata`, `subpaths`, `s3`), `limits`, `delete`, `log`, and `telemetry` sections, validated on load; zero-config defaults need no file. Auth is opt-in; only `[access_control]` is live-reloadable (2 s poll). The `otel` build exports traces, metrics, and logs over OTLP and serves a Prometheus scrape view of the same meters; metric labels are bounded by construction, and tail-based sampling is delegated to the OTel Collector. The `/metrics` endpoint stays unauthenticated.
 
 ## Scaling
 

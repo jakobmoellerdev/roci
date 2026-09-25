@@ -44,7 +44,7 @@ async fn run() -> anyhow::Result<()> {
         })
         .unwrap();
     let _telemetry = roci_telemetry::init(&config)?;
-    serve(config, |_| {}, async {
+    serve(config, args.config.clone(), |_| {}, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await
