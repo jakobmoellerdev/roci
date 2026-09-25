@@ -2,9 +2,9 @@ apiVersion: v2
 name: roci
 description: Hardened Helm chart for roci, a Rust OCI registry, with optional HA S3 storage on RustFS.
 type: application
-version: 0.1.0
+version: 0.2.0
 # Published image tag (ghcr.io/jakobmoellerdev/roci:<appVersion>).
-appVersion: "0.2.0"
+appVersion: "0.3.0"
 # appArmorProfile in the security context needs Kubernetes >= 1.30.
 kubeVersion: ">=1.30.0-0"
 home: https://github.com/jakobmoellerdev/roci
