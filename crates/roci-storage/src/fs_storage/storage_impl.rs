@@ -58,6 +58,14 @@ impl Storage for FsStorage {
         }
         // The manifest push checking this blob is about to reference it.
         self.want_blob(repo, &digest_str).await;
+        // A blob roci wrote has its size recorded in lockstep with the CAS
+        // (invariant 15): answer from RAM, no syscall. This is advisory for the
+        // manifest push, which re-checks every referenced blob authoritatively
+        // (no-follow stat) under the GC fence inside `put_manifest` — so a blob
+        // swapped for a symlink since is still rejected (MissingReference).
+        if self.meta.checksum(repo, &digest_str).is_some() {
+            return Ok(true);
+        }
         Ok(matches!(
             stat_beneath(&self.root, &rel).await?,
             Some((true, _))
@@ -487,24 +495,49 @@ impl Storage for FsStorage {
                 actual: actual.as_string(),
             });
         }
-        self.ensure_layout(repo).await?;
         let (alg_rel, leaf) = blob_dir_rel(repo, digest)?;
-        let charged = self
-            .admit_blob(repo, &alg_rel, &leaf, data.len() as u64)
-            .await?;
         let digest_str = digest.as_string();
-
+        let required = links
+            .required
+            .iter()
+            .map(|r| blob_rel(repo, r))
+            .collect::<Result<Vec<_>, _>>()?;
         // Hold the GC pin from before the blob lands through the metadata
         // commit and GC clears — no sweep can see it half-registered or
-        // delete a referenced blob between put_blob and PutManifest.
+        // delete a referenced blob between the publish and PutManifest.
         let pin = self.gc.pin().await;
-        if !self.dedupe_link(repo, &alg_rel, &leaf, &digest_str).await {
-            if let Err(e) = publish_bytes(&self.root, &alg_rel, &leaf, data, true).await {
+        // One blocking hop: layout marker, quota admission, dedupe link or
+        // crash-atomic publish of the manifest blob, then — under the same
+        // fence — the authoritative re-check that every `required` digest
+        // (config + layers the core already checked) is still a regular file.
+        // A sweep that ran before this pin cannot have deleted them (the pin
+        // blocks), and one that starts after will see them referenced.
+        let ctx = ManifestCtx {
+            root: self.root.to_path_buf(),
+            repo: repo.to_string(),
+            repo_rel: super::paths::repo_rel(repo)?,
+            alg_rel,
+            leaf,
+            digest: digest_str.clone(),
+            data: data.to_vec(),
+            required,
+            quota: std::sync::Arc::clone(&self.quota),
+            dedupe: std::sync::Arc::clone(&self.dedupe),
+            commit: self.config.commit,
+        };
+        let landed = run_blocking("manifest_land", move || Ok(land_manifest(ctx))).await?;
+        let (missing, recheck_error) = match landed {
+            ManifestLanded::Rejected(e) => {
+                drop(pin);
+                return Err(e);
+            }
+            ManifestLanded::Failed { charged, error } => {
                 drop(pin);
                 self.quota.release(repo, charged);
-                return Err(e.into());
+                return Err(error);
             }
-        }
+            ManifestLanded::Stored { missing, error } => (missing, error),
+        };
         self.blob_entered(
             repo,
             &digest_str,
@@ -514,21 +547,15 @@ impl Storage for FsStorage {
             }),
         );
         self.cache.put(repo, &digest_str, data);
-
-        // Under the same fence, re-verify every `required` digest (config +
-        // layers the core already checked) is still present. A sweep that ran
-        // before this pin cannot have deleted them (the pin blocks), and one
-        // that starts after will see them referenced. This closes the gap
-        // between the core's blob_exists check and the metadata commit.
-        for req in links.required {
-            let req_rel = blob_rel(repo, req)?;
-            match stat_beneath(&self.root, &req_rel).await? {
-                Some((true, _)) => {} // present as regular file
-                _ => {
-                    drop(pin);
-                    return Err(StorageError::MissingReference(req.as_string()));
-                }
-            }
+        if let Some(e) = recheck_error {
+            drop(pin);
+            return Err(e);
+        }
+        if let Some(i) = missing {
+            drop(pin);
+            return Err(StorageError::MissingReference(
+                links.required[i].as_string(),
+            ));
         }
 
         // Manifest, tag, backref edges and referrer land in ONE metadata record
@@ -968,34 +995,17 @@ enum Landed {
 /// Blocking: the landing half of `finish_upload` in one hop.
 fn land_blob(c: LandCtx) -> Landed {
     use std::io::Read;
-    // Layout marker; on first creation also persist the new repo entry.
-    match ensure_layout_beneath_sync(
-        c.root.clone(),
-        c.repo_rel.clone(),
-        OCI_LAYOUT_MARKER.to_string(),
+    let charged = match layout_and_admit(
+        &c.root,
+        &c.repo_rel,
+        &c.quota,
+        &c.repo,
+        &c.alg_rel,
+        &c.hex,
+        c.size,
     ) {
-        Ok(true) => {
-            let repo_dir = c.root.join(&c.repo_rel);
-            let parent = repo_dir.parent().unwrap_or(&repo_dir);
-            if let Err(e) = std::fs::File::open(parent).and_then(|d| d.sync_all()) {
-                return Landed::Rejected(e.into());
-            }
-        }
-        Ok(false) => {}
-        Err(e) => return Landed::Rejected(e.into()),
-    }
-    // Quota admission: nothing is charged when the blob is already present.
-    let charged = if !c.quota.tracks_bytes() {
-        0
-    } else {
-        match stat_beneath_sync(c.root.clone(), c.alg_rel.join(&c.hex)) {
-            Ok(Some((true, _))) => 0,
-            Ok(_) => match c.quota.admit(&c.repo, c.size) {
-                Ok(()) => c.size,
-                Err(e) => return Landed::Rejected(e),
-            },
-            Err(e) => return Landed::Rejected(e.into()),
-        }
+        Ok(charged) => charged,
+        Err(e) => return Landed::Rejected(e),
     };
     let linked = dedupe_link_sync(&c);
     let result = if linked {
@@ -1033,35 +1043,163 @@ fn land_blob(c: LandCtx) -> Landed {
     Landed::Done { charged, warm }
 }
 
-/// Blocking twin of `FsStorage::dedupe_link` for the landing hop.
+/// Blocking twin of `FsStorage::dedupe_link` for the landing hops.
 fn dedupe_link_sync(c: &LandCtx) -> bool {
-    let Some(src_repo) = c.dedupe.locate(&c.digest, &c.repo) else {
+    dedupe_link_at(
+        &c.root, &c.dedupe, &c.repo, &c.alg_rel, &c.hex, &c.digest, c.commit,
+    )
+}
+
+/// Link `digest` into `repo` (at `alg_rel/hex`) from another repo that already
+/// stores it (reflink → hard link); `false` when there is none or it cannot be
+/// linked, so the caller stores its own copy.
+fn dedupe_link_at(
+    root: &Path,
+    dedupe: &crate::DedupeIndex,
+    repo: &str,
+    alg_rel: &Path,
+    hex: &str,
+    digest: &str,
+    commit: bool,
+) -> bool {
+    let c = (root, dedupe, repo, alg_rel, hex, digest, commit);
+    let (root, dedupe, repo, alg_rel, hex, digest, commit) = c;
+    let Some(src_repo) = dedupe.locate(digest, repo) else {
         return false;
     };
-    let Ok(d) = Digest::parse(&c.digest) else {
+    let Ok(d) = Digest::parse(digest) else {
         return false;
     };
     let Ok((src_alg_rel, _)) = blob_dir_rel(&src_repo, &d) else {
         return false;
     };
     match mount_promote_beneath_sync(
-        c.root.clone(),
+        root.to_path_buf(),
         src_alg_rel,
-        c.alg_rel.clone(),
-        c.hex.clone(),
+        alg_rel.to_path_buf(),
+        hex.to_string(),
         false,
-        c.commit,
+        commit,
     ) {
         Ok(how) => {
-            record_promotion("dedupe", how, &c.repo, &c.digest);
+            record_promotion("dedupe", how, repo, digest);
             true
         }
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
-                c.dedupe.remove(&src_repo, &c.digest);
+                dedupe.remove(&src_repo, digest);
             }
-            tracing::debug!(repo = %c.repo, digest = %c.digest, error = %e, "dedupe link unavailable; storing a copy");
+            tracing::debug!(repo, digest, error = %e, "dedupe link unavailable; storing a copy");
             false
         }
+    }
+}
+
+/// Blocking: ensure the repo's layout marker (persisting a newly created repo
+/// entry) and admit `size` bytes against quota — nothing is charged when the
+/// blob is already present. Returns the bytes charged.
+fn layout_and_admit(
+    root: &Path,
+    repo_rel: &Path,
+    quota: &crate::quota::QuotaTracker,
+    repo: &str,
+    alg_rel: &Path,
+    hex: &str,
+    size: u64,
+) -> Result<u64, StorageError> {
+    let marker = OCI_LAYOUT_MARKER.to_string();
+    if ensure_layout_beneath_sync(root.to_path_buf(), repo_rel.to_path_buf(), marker)? {
+        let repo_dir = root.join(repo_rel);
+        let parent = repo_dir.parent().unwrap_or(&repo_dir);
+        std::fs::File::open(parent).and_then(|d| d.sync_all())?;
+    }
+    if !quota.tracks_bytes() {
+        return Ok(0);
+    }
+    if let Some((true, _)) = stat_beneath_sync(root.to_path_buf(), alg_rel.join(hex))? {
+        return Ok(0);
+    }
+    quota.admit(repo, size)?;
+    Ok(size)
+}
+
+/// Outcome of the manifest landing hop.
+enum ManifestLanded {
+    /// Layout or quota refused before anything was written or charged.
+    Rejected(StorageError),
+    /// Writing the manifest blob failed after `charged` bytes were admitted.
+    Failed { charged: u64, error: StorageError },
+    /// The manifest blob is stored; `missing` indexes the first `required`
+    /// blob that is not (or no longer) a regular file in the repo, and
+    /// `error` is a genuine IO error from that re-check.
+    Stored {
+        missing: Option<usize>,
+        error: Option<StorageError>,
+    },
+}
+
+/// Blocking: the filesystem half of `put_manifest` in one hop — layout marker,
+/// quota admission, dedupe link or crash-atomic publish of the manifest blob
+/// (always synced: a committed WAL record must never name a torn manifest),
+/// then the authoritative no-follow re-check of every `required` blob.
+struct ManifestCtx {
+    root: std::path::PathBuf,
+    repo: String,
+    repo_rel: std::path::PathBuf,
+    alg_rel: std::path::PathBuf,
+    leaf: String,
+    digest: String,
+    data: Vec<u8>,
+    required: Vec<std::path::PathBuf>,
+    quota: std::sync::Arc<crate::quota::QuotaTracker>,
+    dedupe: std::sync::Arc<crate::DedupeIndex>,
+    commit: bool,
+}
+
+fn land_manifest(c: ManifestCtx) -> ManifestLanded {
+    let size = c.data.len() as u64;
+    let charged = match layout_and_admit(
+        &c.root,
+        &c.repo_rel,
+        &c.quota,
+        &c.repo,
+        &c.alg_rel,
+        &c.leaf,
+        size,
+    ) {
+        Ok(charged) => charged,
+        Err(e) => return ManifestLanded::Rejected(e),
+    };
+    let linked = dedupe_link_at(
+        &c.root, &c.dedupe, &c.repo, &c.alg_rel, &c.leaf, &c.digest, c.commit,
+    );
+    if !linked {
+        if let Err(e) = publish_bytes_sync(&c.root, &c.alg_rel, &c.leaf, &c.data, true) {
+            return ManifestLanded::Failed {
+                charged,
+                error: e.into(),
+            };
+        }
+    }
+    for (i, rel) in c.required.iter().enumerate() {
+        match stat_beneath_sync(c.root.clone(), rel.clone()) {
+            Ok(Some((true, _))) => {}
+            Ok(_) => {
+                return ManifestLanded::Stored {
+                    missing: Some(i),
+                    error: None,
+                }
+            }
+            Err(e) => {
+                return ManifestLanded::Stored {
+                    missing: None,
+                    error: Some(e.into()),
+                }
+            }
+        }
+    }
+    ManifestLanded::Stored {
+        missing: None,
+        error: None,
     }
 }
