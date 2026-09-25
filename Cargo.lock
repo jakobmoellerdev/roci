@@ -2237,6 +2237,7 @@ dependencies = [
  "bcrypt",
  "bytes",
  "futures",
+ "http-body",
  "http-body-util",
  "ldap3",
  "ldap3_proto",
