@@ -1,0 +1,8 @@
+# Build context for Containerfile / bench images: sources only.
+# Host build output (tens of GB, and coverage .profraw files written
+# concurrently) must never be sent to the builder.
+target/
+bench/results/
+docs/node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
