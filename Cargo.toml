@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -24,16 +24,16 @@ authors = ["Jakob Möller"]
 
 [workspace.dependencies]
 # Internal crates (path + version so cargo-deny's wildcard ban is satisfied).
-roci-core = { path = "crates/roci-core", version = "0.2.0" }
-roci-storage = { path = "crates/roci-storage", version = "0.2.0" }
-roci-config = { path = "crates/roci-config", version = "0.2.0" }
-roci-telemetry = { path = "crates/roci-telemetry", version = "0.2.0" }
-roci-storage-s3 = { path = "crates/roci-storage-s3", version = "0.2.0" }
-roci-ext-search = { path = "crates/roci-ext-search", version = "0.2.0" }
-roci-ext-sig = { path = "crates/roci-ext-sig", version = "0.2.0" }
-roci-ext-scan = { path = "crates/roci-ext-scan", version = "0.2.0" }
-roci-ext-sync = { path = "crates/roci-ext-sync", version = "0.2.0" }
-roci-cluster = { path = "crates/roci-cluster", version = "0.2.0" }
+roci-core = { path = "crates/roci-core", version = "0.3.0" }
+roci-storage = { path = "crates/roci-storage", version = "0.3.0" }
+roci-config = { path = "crates/roci-config", version = "0.3.0" }
+roci-telemetry = { path = "crates/roci-telemetry", version = "0.3.0" }
+roci-storage-s3 = { path = "crates/roci-storage-s3", version = "0.3.0" }
+roci-ext-search = { path = "crates/roci-ext-search", version = "0.3.0" }
+roci-ext-sig = { path = "crates/roci-ext-sig", version = "0.3.0" }
+roci-ext-scan = { path = "crates/roci-ext-scan", version = "0.3.0" }
+roci-ext-sync = { path = "crates/roci-ext-sync", version = "0.3.0" }
+roci-cluster = { path = "crates/roci-cluster", version = "0.3.0" }
 
 # Third-party.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "fs", "macros", "signal", "sync", "time"] }
