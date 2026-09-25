@@ -1,0 +1,83 @@
+{{- /*
+Run with: helm test <release> --filter name=<fullname>-test
+(the upstream RustFS chart's own test pod is not PSS-restricted compliant).
+*/}}
+{{- $fullname := include "roci.fullname" . }}
+{{- $roundtrip := and (not (include "roci.authHtpasswd" .)) (empty .Values.auth.accessControl) }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ $fullname }}-test
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "roci.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  serviceAccountName: {{ $fullname }}
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  hostUsers: {{ .Values.hostUsers }}
+  securityContext:
+    {{- toYaml .Values.podSecurityContext | nindent 4 }}
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: test
+      image: {{ include "roci.hooksImage" . | quote }}
+      imagePullPolicy: {{ .Values.hooks.image.pullPolicy }}
+      securityContext:
+        {{- toYaml .Values.containerSecurityContext | nindent 8 }}
+      resources:
+        {{- toYaml .Values.hooks.resources | nindent 8 }}
+      env:
+        - name: BASE
+          value: {{ printf "%s://%s:%v" (include "roci.scheme" .) $fullname .Values.service.port | quote }}
+        - name: CURL_TLS
+          # Reachability/auth check only: the test does not know the CA.
+          value: {{ ternary "-k" "" (not (empty .Values.tls.existingSecret)) | quote }}
+        - name: EXPECT_V2
+          value: {{ ternary "401" "200" (not (empty (include "roci.authHtpasswd" .))) | quote }}
+        - name: ROUNDTRIP
+          value: {{ ternary "true" "false" $roundtrip | quote }}
+      command:
+        - /bin/sh
+        - -ec
+        - |
+          code="$(curl -sS $CURL_TLS -o /dev/null -w '%{http_code}' "$BASE/v2/")"
+          if [ "$code" != "$EXPECT_V2" ]; then
+            echo "GET /v2/: HTTP $code, want $EXPECT_V2" >&2
+            exit 1
+          fi
+          echo "GET /v2/: HTTP $code"
+          if [ "$ROUNDTRIP" = "true" ]; then
+            data="roci-helm-test-${HOSTNAME}"
+            digest="sha256:$(printf '%s' "$data" | sha256sum | cut -d' ' -f1)"
+            code="$(printf '%s' "$data" | curl -sS $CURL_TLS -o /dev/null -w '%{http_code}' -X POST \
+              -H 'Content-Type: application/octet-stream' --data-binary @- \
+              "$BASE/v2/helm-test/blobs/uploads/?digest=$digest")"
+            if [ "$code" != "201" ]; then
+              echo "monolithic blob push: HTTP $code, want 201" >&2
+              exit 1
+            fi
+            got="$(curl -sS $CURL_TLS -f "$BASE/v2/helm-test/blobs/$digest")"
+            if [ "$got" != "$data" ]; then
+              echo "blob round-trip mismatch" >&2
+              exit 1
+            fi
+            echo "blob round-trip: $digest"
+          fi
+          echo "roci helm test passed"

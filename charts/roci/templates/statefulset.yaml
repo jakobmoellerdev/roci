@@ -1,0 +1,198 @@
+{{- include "roci.validate" . }}
+{{- $fullname := include "roci.fullname" . }}
+{{- $scheme := include "roci.scheme" . | upper }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "roci.labels" . | nindent 4 }}
+    app.kubernetes.io/component: registry
+spec:
+  {{- /*
+  Exactly one replica: ARCHITECTURE.md invariant 7 (one writing instance per
+  repository) and the local metadata log/upload staging on the RWO volume.
+  OrderedReady + RollingUpdate never runs two pods at once.
+  */}}
+  replicas: 1
+  serviceName: {{ $fullname }}-headless
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  persistentVolumeClaimRetentionPolicy:
+    {{- toYaml .Values.persistence.retentionPolicy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "roci.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: registry
+  template:
+    metadata:
+      labels:
+        {{- include "roci.labels" . | nindent 8 }}
+        app.kubernetes.io/component: registry
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/secret-config.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ $fullname }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostUsers: {{ .Values.hostUsers }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ int64 .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      containers:
+        - name: roci
+          image: {{ include "roci.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config
+            - /etc/roci/config/roci.toml
+          ports:
+            - name: http
+              containerPort: 5000
+              protocol: TCP
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            {{- if include "roci.authHtpasswd" . }}
+            {{- /* /v2/ answers 401 once Basic auth is on: fall back to TCP. */}}
+            tcpSocket:
+              port: http
+            {{- else }}
+            httpGet:
+              path: /v2/
+              port: http
+              scheme: {{ $scheme }}
+            {{- end }}
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/roci
+            - name: config
+              mountPath: /etc/roci/config
+              readOnly: true
+            {{- if .Values.tls.existingSecret }}
+            - name: tls
+              mountPath: /etc/roci/tls
+              readOnly: true
+            {{- end }}
+            {{- if .Values.auth.htpasswd.existingSecret }}
+            - name: htpasswd
+              mountPath: /etc/roci/auth
+              readOnly: true
+            {{- end }}
+            {{- if .Values.metadataHmac.existingSecret }}
+            - name: metadata-hmac
+              mountPath: /etc/roci/metadata
+              readOnly: true
+            {{- end }}
+            {{- if .Values.rustfs.enabled }}
+            - name: s3-credentials
+              mountPath: /etc/roci/s3
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          secret:
+            secretName: {{ $fullname }}-config
+            defaultMode: 0440
+        {{- if .Values.tls.existingSecret }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        {{- end }}
+        {{- if .Values.auth.htpasswd.existingSecret }}
+        - name: htpasswd
+          secret:
+            secretName: {{ .Values.auth.htpasswd.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.auth.htpasswd.key }}
+                path: htpasswd
+        {{- end }}
+        {{- if .Values.metadataHmac.existingSecret }}
+        - name: metadata-hmac
+          secret:
+            secretName: {{ .Values.metadataHmac.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.metadataHmac.key }}
+                path: hmac.key
+        {{- end }}
+        {{- if .Values.rustfs.enabled }}
+        - name: s3-credentials
+          secret:
+            secretName: {{ include "roci.rustfsSecretName" . }}
+            defaultMode: 0440
+            items:
+              - key: RUSTFS_SECRET_KEY
+                path: secret-access-key
+        {{- end }}
+  volumeClaimTemplates:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: data
+        labels:
+          {{- include "roci.selectorLabels" . | nindent 10 }}
+          app.kubernetes.io/component: registry
+        {{- with .Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

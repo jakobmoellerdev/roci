@@ -15,6 +15,10 @@ roci's security posture is reverse-engineered from [zot](https://zotregistry.dev
 
 - Rootless by default; the container image runs as a nonroot UID on a `scratch` base with a read-only root filesystem and only the storage volume writable.
 
+## Kubernetes controls
+
+The Helm chart runs every workload PSS-restricted with default-deny NetworkPolicies, no ServiceAccount token or RBAC, a secure-by-default auth guard, digest-pinned dependency images, and roci's secrets as 0440 file mounts. See [Kubernetes controls (Helm chart)](https://github.com/jakobmoellerdev/roci/blob/main/SECURITY.md#kubernetes-controls-helm-chart) in the canonical doc.
+
 ## Authentication & authorization
 
 **[implemented — Phase 6]** roci supports the full authn/authz matrix: HTTP Basic (local htpasswd with bcrypt; LDAP bind via the opt-in `ldap` feature, not in `full`), external Bearer token verification (ES256/RS256 over `ring`), mTLS client-certificate authentication with optional CA/leaf-fingerprint pinning, and Identity-Based Access Control (IBAC) with glob-pattern policies, specificity-based rule matching, admin/group support, and live-reloadable authorization. Auth is opt-in; without configuration the registry behaves identically to a no-auth build. Bearer token principals are authorized by their token's `access` claims only (IBAC not consulted). The `/metrics` endpoint stays unauthenticated. See [`SECURITY.md`](https://github.com/jakobmoellerdev/roci/blob/main/SECURITY.md) for the full authn order, decision→response matrix, challenge header rules, and credential-cache design.

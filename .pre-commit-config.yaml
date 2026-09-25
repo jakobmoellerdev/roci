@@ -37,6 +37,13 @@ repos:
         files: ^\.github/(workflows|actions)/
         pass_filenames: false
 
+      - id: helm-lint
+        name: helm lint + render guards
+        entry: bash scripts/helm-lint.sh
+        language: system
+        files: ^charts/
+        pass_filenames: false
+
       - id: coverage
         name: coverage (95% floor) + report refresh
         entry: bash scripts/coverage.sh

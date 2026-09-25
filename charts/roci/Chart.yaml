@@ -1,0 +1,23 @@
+apiVersion: v2
+name: roci
+description: Hardened Helm chart for roci, a Rust OCI registry, with optional HA S3 storage on RustFS.
+type: application
+version: 0.1.0
+# Published image tag (ghcr.io/jakobmoellerdev/roci:<appVersion>).
+appVersion: "0.2.0"
+# appArmorProfile in the security context needs Kubernetes >= 1.30.
+kubeVersion: ">=1.30.0-0"
+home: https://github.com/jakobmoellerdev/roci
+sources:
+  - https://github.com/jakobmoellerdev/roci
+icon: https://raw.githubusercontent.com/jakobmoellerdev/roci/main/assets/icon.svg
+keywords:
+  - oci
+  - registry
+  - distribution
+dependencies:
+  # Erasure-coded object storage backing roci's S3 mode (rustfs.enabled=true).
+  - name: rustfs
+    version: 1.0.0
+    repository: https://charts.rustfs.com
+    condition: rustfs.enabled

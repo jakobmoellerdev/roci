@@ -40,6 +40,10 @@ One TOML file (`roci --config`) with `http` (including mTLS fields), `auth` (htp
 - **Vertical** — streaming, zero-copy, bounded memory; RSS scales with reference count, not stored bytes.
 - **Horizontal** — clustered instances with repo sharding via consistent hashing (HRW + bounded-load) and a peer proxy.
 
+## Kubernetes deployment
+
+A hardened Helm chart (`charts/roci/`) deploys roci as a single-replica StatefulSet with optional HA S3 storage on RustFS. See [Kubernetes deployment (Helm chart)](https://github.com/jakobmoellerdev/roci/blob/main/ARCHITECTURE.md#kubernetes-deployment-helm-chart) in the canonical doc.
+
 ## Architectural invariants
 
 The canonical doc enumerates invariants that must never regress (build-flavor isolation, extension-crate naming, storage-format stability, and more). Changing an invariant requires updating `ARCHITECTURE.md` and flagging the change.

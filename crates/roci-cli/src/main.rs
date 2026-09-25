@@ -1,5 +1,5 @@
 //! roci — a single-binary OCI registry. Thin entrypoint over the library
-//! (`roci_cli::serve`); parses args and runs until Ctrl-C. This shim is
+//! (`roci_cli::serve`); parses args and runs until SIGINT/SIGTERM. This shim is
 //! excluded from the coverage gate (`--ignore-filename-regex main.rs`) because
 //! `Args::parse()` reads the real process argv and only runs in the binary.
 #![forbid(unsafe_code)]
@@ -44,8 +44,31 @@ async fn run() -> anyhow::Result<()> {
         })
         .unwrap();
     let _telemetry = roci_telemetry::init(&config)?;
-    serve(config, args.config.clone(), |_| {}, async {
+    serve(config, args.config.clone(), |_| {}, shutdown_signal()).await
+}
+
+/// Resolves on SIGINT (Ctrl-C) or, on Unix, SIGTERM — the signal container
+/// runtimes send on stop (`docker stop`, Kubernetes pod termination). As PID 1
+/// without a SIGTERM handler, roci would ignore it and be SIGKILLed after the
+/// grace period, skipping connection draining.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
         let _ = tokio::signal::ctrl_c().await;
-    })
-    .await
+    }
 }

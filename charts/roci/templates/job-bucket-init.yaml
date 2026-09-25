@@ -1,0 +1,102 @@
+{{- if .Values.rustfs.enabled }}
+{{- /*
+RustFS has no startup bucket creation, so this hook creates s3.bucket with a
+SigV4-signed PUT. Idempotent (409 BucketAlreadyOwnedByYou on upgrade) and
+retrying while RustFS is still forming its erasure set. Credentials reach
+curl through a config on stdin, never argv.
+*/}}
+{{- $fullname := include "roci.fullname" . }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $fullname }}-bucket-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "roci.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bucket-init
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        {{- include "roci.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: bucket-init
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ $fullname }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostUsers: {{ .Values.hostUsers }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: bucket-init
+          image: {{ include "roci.hooksImage" . | quote }}
+          imagePullPolicy: {{ .Values.hooks.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.hooks.resources | nindent 12 }}
+          env:
+            - name: ENDPOINT
+              value: {{ include "roci.s3Endpoint" . | quote }}
+            - name: BUCKET
+              value: {{ .Values.s3.bucket | quote }}
+            - name: REGION
+              value: {{ include "roci.s3Region" . | quote }}
+          volumeMounts:
+            - name: rustfs-credentials
+              mountPath: /etc/rustfs-credentials
+              readOnly: true
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+              ak="$(cat /etc/rustfs-credentials/access-key)"
+              sk="$(cat /etc/rustfs-credentials/secret-key)"
+              cfg="user = \"$(esc "$ak"):$(esc "$sk")\""
+              attempt=0
+              while :; do
+                attempt=$((attempt + 1))
+                code="$(printf '%s\n' "$cfg" | curl -sS -K - -o /dev/null -w '%{http_code}' -X PUT \
+                  --aws-sigv4 "aws:amz:${REGION}:s3" \
+                  -H 'x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' \
+                  "${ENDPOINT}/${BUCKET}" || true)"
+                case "$code" in
+                  200|409) echo "bucket ${BUCKET} ready (HTTP ${code})"; exit 0 ;;
+                esac
+                if [ "$attempt" -ge 60 ]; then
+                  echo "creating bucket ${BUCKET} failed: last HTTP ${code}" >&2
+                  exit 1
+                fi
+                sleep 5
+              done
+      volumes:
+        - name: rustfs-credentials
+          secret:
+            secretName: {{ include "roci.rustfsSecretName" . }}
+            defaultMode: 0440
+            items:
+              - key: RUSTFS_ACCESS_KEY
+                path: access-key
+              - key: RUSTFS_SECRET_KEY
+                path: secret-key
+{{- end }}

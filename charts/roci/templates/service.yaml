@@ -1,0 +1,42 @@
+{{- $portName := include "roci.scheme" . -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "roci.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "roci.labels" . | nindent 4 }}
+    app.kubernetes.io/component: registry
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: {{ $portName }}
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "roci.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: registry
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "roci.fullname" . }}-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "roci.labels" . | nindent 4 }}
+    app.kubernetes.io/component: registry
+spec:
+  clusterIP: None
+  ports:
+    - name: {{ $portName }}
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "roci.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: registry

@@ -12,6 +12,8 @@ docker run -d --name roci --read-only \
 
 Mount the root filesystem read-only; only the storage volume needs to be writable. By default the container listens on `0.0.0.0:5000` and stores content in `/var/lib/roci`.
 
+roci stops gracefully on SIGINT (`Ctrl-C`) and SIGTERM (`docker stop`, Kubernetes pod termination). As PID 1 in a container, the SIGTERM handler ensures connections drain and the process exits cleanly within seconds instead of waiting for the full grace period and being killed.
+
 ::: warning macOS
 The AirPlay Receiver holds port `5000` on macOS. Publish another host port instead: `-p 5001:5000`.
 :::

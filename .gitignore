@@ -23,6 +23,10 @@
 /docs/.vitepress/dist
 /docs/.vitepress/cache
 
+# Helm subchart archives (rebuilt by `helm dependency build`, verified
+# against the committed charts/roci/Chart.lock).
+/charts/roci/charts/
+
 # Benchmark results (bench/run.sh).
 /bench/results
 

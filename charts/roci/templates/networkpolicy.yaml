@@ -1,0 +1,188 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- /*
+Default-deny per workload: each policy lists every allowed flow for the pods
+it selects. Kubelet probes and `kubectl port-forward` arrive from the node and
+stay allowed (kube-router/Calico/Cilium accept node-local traffic).
+*/}}
+{{- $fullname := include "roci.fullname" . }}
+{{- $rustfsPort := include "roci.rustfsPort" . }}
+{{- $dns := .Values.networkPolicy.dns }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "roci.labels" . | nindent 4 }}
+    app.kubernetes.io/component: registry
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "roci.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: registry
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: 5000
+          protocol: TCP
+      {{- with .Values.networkPolicy.ingressFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    - ports:
+        - port: 5000
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "roci.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: test
+  egress:
+    - to:
+        - namespaceSelector:
+            {{- toYaml $dns.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml $dns.podSelector | nindent 12 }}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- if .Values.rustfs.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "roci.rustfsSelectorLabels" . | nindent 14 }}
+      ports:
+        - port: {{ $rustfsPort }}
+          protocol: TCP
+    {{- end }}
+    {{- with .Values.networkPolicy.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- if .Values.rustfs.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-rustfs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "roci.labels" . | nindent 4 }}
+    app.kubernetes.io/component: storage
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "roci.rustfsSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Erasure-set peers (inter-node RPC on the S3 port).
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "roci.rustfsSelectorLabels" . | nindent 14 }}
+    # S3 API for roci and the bucket-init Job only; the console stays closed.
+    - ports:
+        - port: {{ $rustfsPort }}
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "roci.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: registry
+        - podSelector:
+            matchLabels:
+              {{- include "roci.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: bucket-init
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "roci.rustfsSelectorLabels" . | nindent 14 }}
+    - to:
+        - namespaceSelector:
+            {{- toYaml $dns.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml $dns.podSelector | nindent 12 }}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-bucket-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "roci.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bucket-init
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "roci.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: bucket-init
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            {{- toYaml $dns.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml $dns.podSelector | nindent 12 }}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "roci.rustfsSelectorLabels" . | nindent 14 }}
+      ports:
+        - port: {{ $rustfsPort }}
+          protocol: TCP
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-test
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "roci.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "roci.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: test
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            {{- toYaml $dns.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml $dns.podSelector | nindent 12 }}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "roci.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: registry
+      ports:
+        - port: 5000
+          protocol: TCP
+{{- end }}

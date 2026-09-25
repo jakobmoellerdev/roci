@@ -47,4 +47,11 @@ if echo "$staged" | grep -qE '^\.github/(workflows|actions)/'; then
   fi
 fi
 
+# Helm chart lint + render guards only when chart files are staged.
+if echo "$staged" | grep -qE '^charts/'; then
+  if command -v helm >/dev/null 2>&1; then
+    echo "[pre-commit] helm-lint"; bash scripts/helm-lint.sh
+  fi
+fi
+
 echo "[pre-commit] all gates passed"

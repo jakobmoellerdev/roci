@@ -1,0 +1,26 @@
+{{- $fullname := include "roci.fullname" . -}}
+roci is running as StatefulSet {{ $fullname }} (1 replica).
+
+Registry: {{ include "roci.scheme" . }}://{{ $fullname }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+
+Reach it locally:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fullname }} 5000:{{ .Values.service.port }}
+  curl -i {{ include "roci.scheme" . }}://127.0.0.1:5000/v2/
+
+Smoke test:
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }} --filter name={{ $fullname }}-test
+{{- if .Values.rustfs.enabled }}
+
+Storage: S3 mode on RustFS - {{ int (dig "replicaCount" 4 .Values.rustfs) }} pods, bucket {{ .Values.s3.bucket }}.
+{{- else }}
+
+Storage: filesystem on PVC data-{{ $fullname }}-0.
+{{- end }}
+{{- if not (include "roci.authConfigured" .) }}
+
+WARNING: open registry - anyone reaching the Service can push and delete.
+{{- end }}
+{{- if and (include "roci.authHtpasswd" .) (not .Values.tls.existingSecret) }}
+
+WARNING: credentials travel in plaintext - set tls.existingSecret or terminate TLS in front.
+{{- end }}

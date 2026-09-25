@@ -170,7 +170,7 @@ test-filesystems:
     docker exec "$name" bash /roci/scripts/test-filesystems.sh
 
 # Full local gate — run before pushing (the required CI checks).
-ci: lint-workflows fmt clippy test build deps-guard coverage conformance
+ci: lint-workflows fmt clippy test build deps-guard helm-lint coverage conformance
 
 # Build + run the OCI conformance suite against a locally-started roci
 # (CI `conformance` job). Requires Go 1.17+ and the pinned spec submodule
@@ -207,6 +207,10 @@ container-multiarch:
     set -euo pipefail
     args=(); while IFS= read -r kv; do args+=(--label "$kv" --annotation "index,manifest:$kv"); done <<< "$(scripts/oci-meta.sh)"
     docker buildx build "${args[@]}" --platform linux/amd64,linux/arm64 -t roci:multiarch -f Containerfile .
+
+# Lint the Helm chart and assert its render-time security guards (CI `helm` workflow `lint` job). Requires `helm`.
+helm-lint:
+    bash scripts/helm-lint.sh
 
 # Benchmark roci vs CNCF distribution vs zot in pinned containers (requires rootful Docker, ≥4 CPUs).
 # `quick` ≈ 10 min smoke; `full` = 5 interleaved reps (authoritative only on a dedicated Linux host).

@@ -318,6 +318,14 @@ Shared session state for any UI/CLI across instances uses an external Redis-comp
 
 Explicitly (from zot): scale-out is **not** HA. Each repo has a single owning instance, so an instance or its storage going offline **impacts availability** of that shard — sharing load, not providing fault tolerance. HA (redundancy so no service impact on instance/storage loss) is a separate concern layered on top (e.g. replicated/redundant object storage + multiple entry points), out of scope for the base cluster model.
 
+### Kubernetes deployment (Helm chart)
+
+The Helm chart at `charts/roci/` deploys roci as a **single-replica StatefulSet** (invariant 7: each repository has one writing instance; `roci-cluster` is a Phase 8 stub). The S3 backend keeps metadata and upload staging on a local PVC (`open_metadata(root, …)` and `root/uploads`), so a second replica would diverge.
+
+Storage high availability lives in the storage tier, not the registry tier. When `rustfs.enabled=true`, the chart deploys a **RustFS distributed-mode subchart** (4-pod erasure set, default parity 2, write quorum 3). This set tolerates the loss of one pod for both reads and writes. The registry's `redirect_min_size` is set to `0` so that clients never receive a `307` redirect to the in-cluster RustFS endpoint they cannot reach.
+
+The registry process handles **SIGTERM** (the signal container runtimes send on pod termination) in addition to SIGINT, so graceful shutdown completes within seconds rather than waiting the full `terminationGracePeriodSeconds` before a SIGKILL.
+
 ### Hyperscale distribution: be a good origin, integrate external P2P [from RESEARCH]
 
 Beyond the cluster's own capacity, the hyperscale image-distribution path is **P2P fabrics (Uber Kraken, CNCF Dragonfly) sitting *in front of* a standard registry with pluggable object-storage backends** (RESEARCH: Kraken, Dragonfly — Dragonfly reports up to 90% origin-bandwidth savings, tens of millions of launches/day). Decision: **roci does not implement in-registry P2P.** It is a different failure domain and would break the minimal-deps invariant. Instead, roci's growth path is *roci-as-origin* in the compute-only topology (S3 backend) fronted by an external Dragonfly/Kraken fabric. roci's obligation is only to be an excellent origin: fast zero-copy `Range` reads, digest-stable metadata, O(1) referrers, pluggable backends — all already in the core. Likewise, **lazy pulling** (eStargz/SOCI/Nydus) is a client-side property that needs nothing new from roci beyond `Range` + referrers (RESEARCH: Slacker, eStargz, SOCI, Nydus); its ROI is bounded to low-access-density workloads (crossover ~80%; RESEARCH: SOCI, LazyPod), which roci's docs/benchmarks must state honestly.
