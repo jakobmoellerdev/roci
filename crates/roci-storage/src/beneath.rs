@@ -53,7 +53,10 @@ fn openat2_beneath(
     }
     let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
     // Unlike `openat`, `openat2` rejects a non-zero mode without O_CREAT/O_TMPFILE.
-    let mode = if flags.intersects(rustix::fs::OFlags::CREATE | rustix::fs::OFlags::TMPFILE) {
+    // (`OFlags::TMPFILE` includes the O_DIRECTORY bit, so test it exactly.)
+    let mode = if flags.contains(rustix::fs::OFlags::CREATE)
+        || flags.contains(rustix::fs::OFlags::TMPFILE)
+    {
         Mode::from_raw_mode(0o644)
     } else {
         Mode::empty()
