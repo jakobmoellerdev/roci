@@ -16,6 +16,6 @@ Topics covered:
 6. Observability overhead — justifying "OTel on, cheap by default".
 7. Consolidated design implications.
 8. Storage decision stress-test — more efficient alternatives.
-9. Local-store efficiency — is there an even more efficient design?
+9. Local-store efficiency — is there an even more efficient design? (incl. §9.7 comparative benchmark vs distribution/zot)
 
 See also: [Architecture](/design/architecture) · [Storage](/design/storage).
