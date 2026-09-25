@@ -267,12 +267,13 @@ impl FsStorage {
         // cannot redirect the marker write outside the store (a path-based
         // `create_dir_all`+`write` would follow it). Idempotent.
         let repo_rel = repo_rel(repo)?;
-        ensure_layout_beneath(&self.root, &repo_rel, OCI_LAYOUT_MARKER).await?;
-        // Persist the repo path entry itself (its parent dir) so a blob-only
-        // repository is discoverable after a crash. The repo dir is `<root>/…/
-        // <name>`, so it has a parent under the root.
-        let repo_dir = self.repo_dir(repo)?;
-        sync_dir(repo_dir.parent().unwrap_or(&repo_dir)).await?;
+        // On first creation only, persist the repo path entry itself (its
+        // parent dir) so a blob-only repository is discoverable after a crash.
+        // (Syncing on every call cost one fsync per upload.)
+        if ensure_layout_beneath(&self.root, &repo_rel, OCI_LAYOUT_MARKER).await? {
+            let repo_dir = self.repo_dir(repo)?;
+            sync_dir(repo_dir.parent().unwrap_or(&repo_dir)).await?;
+        }
         Ok(())
     }
 }

@@ -44,6 +44,12 @@ pub(crate) static FORCE_STAT_ERROR: std::sync::atomic::AtomicBool =
 pub(crate) static FORCE_SYSCALL_ERROR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Forces the portable per-component walk instead of the `openat2` fast path,
+/// so the walk (the only path on non-Linux / pre-5.6 kernels) stays covered.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) static FORCE_NO_OPENAT2: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Serializes the fault-injection tests (which flip the process-global
 /// `FORCE_*` switches) against each other and against tests that assert on the
 /// real reflink/hard-link behavior, so a stray forced fallback cannot make a

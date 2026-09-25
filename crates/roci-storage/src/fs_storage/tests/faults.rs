@@ -176,3 +176,29 @@ fn stream_copy_rewinds_truncates_and_copies() {
     check.read_to_end(&mut out).unwrap();
     assert_eq!(out, payload);
 }
+
+// Without `openat2` (pre-5.6 kernels, seccomp, non-Linux) every beneath-root
+// open falls back to the per-component walk: the full blob lifecycle — and the
+// symlink refusal — must behave identically on it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn beneath_walk_fallback_serves_the_full_lifecycle() {
+    use std::sync::atomic::Ordering;
+    let _serialize = FAULT_TEST_LOCK.lock().await;
+    FORCE_NO_OPENAT2.store(true, Ordering::Relaxed);
+    let (dir, s) = store();
+    let data = b"walked";
+    let d = sha256_of(data);
+    let put = s.put_blob("team/r", &d, data).await;
+    let read = s.read_blob("team/r", &d).await;
+    let size = s.blob_size("team/r", &d).await;
+    let alg = dir.path().join("team/r/blobs/sha256");
+    std::fs::rename(&alg, dir.path().join("moved")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("moved"), &alg).unwrap();
+    let via_symlink = s.open_blob("team/r", &d).await.map(|_| ());
+    FORCE_NO_OPENAT2.store(false, Ordering::Relaxed);
+    put.unwrap();
+    assert_eq!(read.unwrap(), data);
+    assert_eq!(size.unwrap(), data.len() as u64);
+    assert!(matches!(via_symlink, Err(StorageError::NotFound)));
+}
