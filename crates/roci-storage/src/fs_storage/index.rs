@@ -18,6 +18,10 @@ use tokio::io::AsyncReadExt;
 
 /// Retry interval for dirty `index.json` rewrites that failed (transient IO).
 const INDEX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+/// Quiet period after a mutation before persisting, so a burst of pushes to a
+/// repo rewrites its index once rather than per manifest. Reads through roci
+/// never wait on it (a dirty repo's index is derived in memory).
+const INDEX_COALESCE: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl FsStorage {
     /// Mark `repo` dirty (bumping its generation) and wake the background writer.
@@ -60,6 +64,7 @@ impl FsStorage {
                     _ = tokio::time::sleep(INDEX_RETRY_BACKOFF), if pending => {}
                     _ = &mut cancel => return,
                 }
+                tokio::time::sleep(INDEX_COALESCE).await;
                 Self::flush_dirty(&root, &*meta, &dirty).await;
             }
         });

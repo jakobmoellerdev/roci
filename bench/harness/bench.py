@@ -451,7 +451,8 @@ class Bench:
             stacks, info["instrumentation_pct"] = profile.strip_instrumentation(stacks)
             info["stacks"] = stacks
             # inferno prefixes the thread name (comm); a well-unwound stack then starts at a thread entry.
-            roots = re.compile(r"^(_start|main|clone3?|start_thread|thread_start|__libc_start|std::rt|"
+            # (musl's static binaries root every stack at `libc_start_main_stage2`.)
+            roots = re.compile(r"^(_start|main|clone3?|start_thread|thread_start|_?_?libc_start|std::rt|"
                                r"std::sys::.*thread|ret_from_fork)")
             truncated = sum(n for fr, n in stacks if not any(roots.search(f) for f in fr[:3]))
             total = sum(n for _, n in stacks) or 1

@@ -106,3 +106,21 @@ class Findings(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CgroupRestart(unittest.TestCase):
+    def test_cpu_counter_stays_monotonic_across_restart(self):
+        import tempfile
+        from harness import cgroup
+        d = tempfile.mkdtemp()
+        def write(usage):
+            open(os.path.join(d, "memory.stat"), "w").write("anon 1\nfile 2\n")
+            open(os.path.join(d, "cpu.stat"), "w").write(f"usage_usec {usage}\n")
+        write(500)
+        s = cgroup.Sampler(d, interval=3600)
+        s.stop()
+        write(900); s.sample()
+        write(100); s.sample()  # container restarted: counter reset
+        usages = [x[3] for x in s.samples]
+        self.assertEqual(usages[-2:], [900, 1000])
+        self.assertEqual(usages, sorted(usages))

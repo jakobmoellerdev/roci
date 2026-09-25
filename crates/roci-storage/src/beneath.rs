@@ -33,6 +33,54 @@ fn open_root(root: &Path) -> io::Result<std::os::fd::OwnedFd> {
     .map_err(io::Error::from)
 }
 
+/// Linux ≥ 5.6 fast path: resolve all of `rel` beneath `dir` in **one**
+/// `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`
+/// call — the kernel enforces the same no-symlink-at-any-component rule the
+/// per-component walk does, without one `openat`+`close` per component.
+/// `None` when `openat2` is unavailable (old kernel `ENOSYS`, seccomp `EPERM`):
+/// the caller walks. A refused symlink / non-directory component is `NotFound`,
+/// matching the walk.
+#[cfg(target_os = "linux")]
+fn openat2_beneath(
+    dir: &std::os::fd::OwnedFd,
+    rel: &Path,
+    flags: rustix::fs::OFlags,
+) -> Option<io::Result<std::os::fd::OwnedFd>> {
+    use rustix::fs::{Mode, ResolveFlags};
+    use rustix::io::Errno;
+    if fault!(FORCE_NO_OPENAT2) || rel.as_os_str().is_empty() {
+        return None;
+    }
+    let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
+    // Unlike `openat`, `openat2` rejects a non-zero mode without O_CREAT/O_TMPFILE.
+    // (`OFlags::TMPFILE` includes the O_DIRECTORY bit, so test it exactly.)
+    let mode = if flags.contains(rustix::fs::OFlags::CREATE)
+        || flags.contains(rustix::fs::OFlags::TMPFILE)
+    {
+        Mode::from_raw_mode(0o644)
+    } else {
+        Mode::empty()
+    };
+    match rustix::fs::openat2(dir, rel, flags, mode, resolve) {
+        Ok(fd) => Some(Ok(fd)),
+        Err(Errno::NOSYS | Errno::PERM) => None,
+        Err(Errno::LOOP | Errno::NOTDIR | Errno::XDEV) => {
+            Some(Err(io::Error::from(io::ErrorKind::NotFound)))
+        }
+        Err(e) => Some(Err(io::Error::from(e))),
+    }
+}
+
+/// Non-Linux: no `openat2`; always walk.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn openat2_beneath(
+    _dir: &std::os::fd::OwnedFd,
+    _rel: &Path,
+    _flags: rustix::fs::OFlags,
+) -> Option<io::Result<std::os::fd::OwnedFd>> {
+    None
+}
+
 /// Fsync a directory so a prior `rename` into it is durable (the rename's
 /// effect on the directory entry is not persisted by syncing the file alone).
 /// On Unix this opens the directory and `fsync`s it; on platforms where a
@@ -66,18 +114,23 @@ pub(crate) fn resolve_beneath(
     rel: &Path,
     final_flags: rustix::fs::OFlags,
 ) -> io::Result<std::fs::File> {
-    use rustix::fs::{FileType, Mode, OFlags};
+    use rustix::fs::{Mode, OFlags};
     use std::os::fd::OwnedFd;
     // The store root is trusted (roci created it); open it followed.
     let mut dir: OwnedFd = open_root(root)?;
+    // `O_NONBLOCK` so opening a planted FIFO/device does not block; we fstat and
+    // reject any non-regular final entry below.
+    let leaf_flags = final_flags | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    if let Some(opened) = openat2_beneath(&dir, rel, leaf_flags) {
+        dir = opened?;
+        return regular_file(dir);
+    }
 
     let comps: Vec<&std::ffi::OsStr> = rel.iter().collect();
     for (i, comp) in comps.iter().enumerate() {
         let last = i + 1 == comps.len();
         let flags = if last {
-            // `O_NONBLOCK` so opening a planted FIFO/device does not block; we
-            // fstat and reject any non-regular final entry below.
-            final_flags | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
+            leaf_flags
         } else {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
         };
@@ -94,15 +147,20 @@ pub(crate) fn resolve_beneath(
         };
         dir = next;
     }
-    // The final descriptor must be a *regular file*: a FIFO/device/socket at a
-    // digest path is not a valid CAS blob and must never be served or appended
-    // to (a FIFO read would block, a device would return non-CAS bytes).
-    let st = rustix::fs::fstat(&dir).map_err(io::Error::from)?;
+    regular_file(dir)
+}
+
+/// The final descriptor must be a *regular file*: a FIFO/device/socket at a
+/// digest path is not a valid CAS blob and must never be served or appended to
+/// (a FIFO read would block, a device would return non-CAS bytes).
+#[cfg(unix)]
+fn regular_file(fd: std::os::fd::OwnedFd) -> io::Result<std::fs::File> {
+    use rustix::fs::FileType;
+    let st = rustix::fs::fstat(&fd).map_err(io::Error::from)?;
     if !FileType::from_raw_mode(st.st_mode).is_file() {
         return Err(io::Error::from(io::ErrorKind::NotFound));
     }
-
-    Ok(std::fs::File::from(dir))
+    Ok(std::fs::File::from(fd))
 }
 
 /// Walk a *directory* path `rel` (relative to `root`) component by component
@@ -124,6 +182,15 @@ pub(crate) fn dir_beneath(
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     // The store root is trusted (roci created it); open it followed.
     let mut dir: OwnedFd = open_root(root)?;
+    if !fault!(FORCE_SYSCALL_ERROR) {
+        match openat2_beneath(&dir, rel, dir_flags) {
+            Some(Ok(fd)) => return Ok(fd),
+            // A missing component: the walk below creates it (`create`).
+            Some(Err(e)) if create && e.kind() == io::ErrorKind::NotFound => {}
+            Some(Err(e)) => return Err(e),
+            None => {}
+        }
+    }
     for comp in rel.iter() {
         let opened = if fault!(FORCE_SYSCALL_ERROR) {
             Err(rustix::io::Errno::IO)
@@ -290,24 +357,24 @@ pub async fn create_empty_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io
 /// walked no-follow beneath `root` so a symlink planted at a repo path component
 /// cannot redirect the marker write outside the store (the path-based
 /// `create_dir_all`+`write` would follow it). Idempotent: an existing regular
-/// marker is left as-is; the repo dir and its parent are fsynced so a blob-only
-/// repository survives a crash. Returns whether the marker was newly written.
+/// marker is left as-is. Returns whether the marker was newly written (the
+/// caller then makes the new repo directory entry durable).
 #[cfg(unix)]
 pub(crate) async fn ensure_layout_beneath(
     root: &Path,
     repo_rel: &Path,
     marker: &str,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     let root = root.to_path_buf();
     let repo_rel = repo_rel.to_path_buf();
     let marker = marker.to_string();
-    run_blocking(move || -> io::Result<()> {
+    run_blocking(move || -> io::Result<bool> {
         use std::io::Write as _;
         let dirfd = dir_beneath(&root, &repo_rel, true)?;
         // Idempotent: a pre-existing regular `oci-layout` is the steady state.
         match rustix::fs::statat(&dirfd, "oci-layout", AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => return Ok(()),
+            Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => return Ok(false),
             Ok(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
@@ -333,11 +400,8 @@ pub(crate) async fn ensure_layout_beneath(
         f.write_all(marker.as_bytes())?;
         f.sync_all()?;
         drop(f);
-        match promote_temp_noreplace(&dirfd, tmp.as_str(), "oci-layout", true) {
-            // A concurrent creator won the race: still success (idempotent).
-            Ok(()) => Ok(()),
-            Err(e) => Err(e),
-        }
+        // A concurrent creator winning the race is still success (idempotent).
+        promote_temp_noreplace(&dirfd, tmp.as_str(), "oci-layout", true).map(|()| true)
     })
     .await
 }

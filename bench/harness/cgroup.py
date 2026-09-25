@@ -44,6 +44,10 @@ class Sampler:
         self.samples: list[tuple[float, int, int, int, int]] = []
         self.phases: dict[str, list[float]] = {}
         self._stop = threading.Event()
+        # cpu.stat usage resets when the container restarts (same ID, new
+        # cgroup); keep the series monotonic by carrying the pre-reset total.
+        self._cpu_offset = 0
+        self._last_cpu_raw = 0
         stat = _kv(os.path.join(cgroup_dir, "memory.stat"))
         if "anon" not in stat:
             raise RuntimeError(f"cgroup v2 dir for {cgroup_dir} not found (cgroup v1 hosts unsupported)")
@@ -61,7 +65,11 @@ class Sampler:
                 tasks = int(f.read())
         except (OSError, ValueError):
             tasks = 0
-        s = (time.monotonic(), mem.get("anon", 0), mem.get("file", 0), cpu.get("usage_usec", 0), tasks)
+        raw = cpu.get("usage_usec", 0)
+        if raw < self._last_cpu_raw:
+            self._cpu_offset += self._last_cpu_raw
+        self._last_cpu_raw = raw
+        s = (time.monotonic(), mem.get("anon", 0), mem.get("file", 0), raw + self._cpu_offset, tasks)
         self.samples.append(s)
         return s
 
