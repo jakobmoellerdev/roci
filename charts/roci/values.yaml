@@ -1,0 +1,357 @@
+# Default values for the roci chart. Every default is the hardened choice;
+# values.schema.json rejects unknown keys and insecure security contexts.
+
+image:
+  # roci container image (static musl binary on scratch, nonroot).
+  repository: ghcr.io/jakobmoellerdev/roci
+  # Image tag; defaults to the chart appVersion.
+  tag: ""
+  # Image digest (sha256:...); wins over tag when set.
+  digest: ""
+  # Image pull policy.
+  pullPolicy: IfNotPresent
+
+# Pull secrets for private registries ([{name: ...}]).
+imagePullSecrets: []
+# Override the chart name used in resource names/labels.
+nameOverride: ""
+# Override the full resource name.
+fullnameOverride: ""
+
+auth:
+  # Rendering fails unless htpasswd or accessControl is configured, or this is
+  # true. true + no auth = an OPEN registry: anyone reaching the Service can
+  # push and delete. Ignored when auth is configured.
+  allowAnonymous: false
+  # Realm advertised in the Basic challenge.
+  realm: roci
+  # Lifetime of a cached successful Basic authentication (0 disables).
+  cacheTtlSecs: 60
+  htpasswd:
+    # Secret holding bcrypt htpasswd lines (create with `htpasswd -nbB`).
+    existingSecret: ""
+    # Key inside the Secret.
+    key: htpasswd
+  # roci [access_control] section as YAML (admins, groups, repositories).
+  # Strings, lists and maps ONLY: it is rendered with toToml.
+  accessControl: {}
+
+tls:
+  # kubernetes.io/tls Secret (tls.crt/tls.key); roci terminates TLS itself.
+  existingSecret: ""
+
+metadataHmac:
+  # Secret holding a >= 32-byte key that authenticates every metadata log
+  # record and snapshot (compromised-storage-volume threat model).
+  existingSecret: ""
+  # Key inside the Secret.
+  key: hmac-key
+
+# roci.toml settings (see docs/guide/configuration.md).
+config:
+  log:
+    # EnvFilter directive (e.g. info, roci_core=debug).
+    level: info
+    # text | json
+    format: json
+  http:
+    timeouts:
+      # Max seconds to receive a complete request head.
+      readHeaderSecs: 10
+      # Seconds an idle keep-alive connection is held open.
+      idleSecs: 120
+    rateLimit:
+      # Enable per-method token-bucket rate limiting.
+      enabled: false
+      # Bucket for methods without a perMethod entry.
+      default:
+        # Sustained requests/second.
+        rate: 200
+        # Burst capacity.
+        burst: 400
+      # Per-HTTP-method buckets, e.g. {PUT: {rate: 20, burst: 40}}.
+      perMethod: {}
+  limits:
+    # Max accepted request-body bytes (one chunk / monolithic body).
+    maxBody: 268435456
+    # Max cumulative bytes of one upload session.
+    maxUpload: 5368709120
+    # Max manifest bytes.
+    maxManifest: 4194304
+    # Server-side cap on n for tag/referrer pagination.
+    maxPage: 1000
+  delete:
+    # Accept delete endpoints (false returns 405).
+    enabled: true
+  storage:
+    # Byte budget of the small-blob LRU content cache (0 disables it).
+    cacheMaxBytes: 268435456
+    # Cross-repo dedupe of uploaded blobs.
+    dedupe: true
+    # fsync blob data before acknowledging an upload.
+    commit: false
+    gc:
+      # Garbage-collect unreferenced blobs.
+      enabled: true
+      # Grace period before an unreferenced blob is collected.
+      delaySecs: 3600
+      # Period between sweeps.
+      intervalSecs: 3600
+    scrub:
+      # Periodic integrity scrub.
+      enabled: false
+      # Target period of one full pass.
+      intervalSecs: 86400
+      # Read-bandwidth ceiling (bytes/second).
+      maxBytesPerSec: 67108864
+      # auto | app
+      mode: auto
+    quota:
+      # Per-repository byte cap (0 = unlimited).
+      maxRepoBytes: 0
+      # Registry-wide byte cap (0 = unlimited).
+      maxTotalBytes: 0
+      # Concurrent upload sessions (0 = unlimited).
+      maxUploadSessions: 1024
+    metadata:
+      # log | redb
+      engine: log
+      # Serve the log engine from an mmap snapshot.
+      snapshot: false
+      # Compact the log once it grows past this size.
+      compactThresholdBytes: 67108864
+  telemetry:
+    # Head-sampling ratio in [0, 1] for root traces.
+    sampleRatio: 0.01
+    otlp:
+      # OTLP collector endpoint; "" disables export. Allow the egress with
+      # networkPolicy.extraEgress.
+      endpoint: ""
+      # grpc | http
+      protocol: grpc
+    metrics:
+      # Serve Prometheus metrics. The path is UNAUTHENTICATED on the registry port.
+      enabled: false
+      # Metrics path.
+      path: /metrics
+
+# S3 backend settings; used only when rustfs.enabled=true.
+s3:
+  # Bucket created by the bucket-init hook Job.
+  bucket: roci
+  # Key prefix inside the bucket (no leading/trailing /).
+  prefix: ""
+  # Access key id; required iff rustfs.secret.existingSecret is set (must equal
+  # its RUSTFS_ACCESS_KEY). Defaults to rustfs.secret.rustfs.access_key.
+  accessKeyId: ""
+  # Multipart part size in bytes (>= 5 MiB).
+  multipartPartSize: 16777216
+  # Parts transferred in parallel per multipart upload.
+  multipartConcurrency: 8
+
+# Volume for the metadata WAL and upload staging (plus blobs in filesystem
+# mode). Required in both modes.
+persistence:
+  # Requested size.
+  size: 10Gi
+  # StorageClass; "" omits storageClassName (cluster default).
+  storageClass: ""
+  # Access modes; roci is a single writer.
+  accessModes:
+    - ReadWriteOnce
+  # PVC annotations.
+  annotations: {}
+  # StatefulSet PVC retention on delete/scale-down.
+  retentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+
+service:
+  # ClusterIP | NodePort | LoadBalancer
+  type: ClusterIP
+  # Service port (container port is always 5000).
+  port: 5000
+  # Service annotations.
+  annotations: {}
+
+serviceAccount:
+  # ServiceAccount annotations. The ServiceAccount is always created; its
+  # token is never mounted and the chart grants it no RBAC.
+  annotations: {}
+
+# Extra pod annotations.
+podAnnotations: {}
+# Extra pod labels.
+podLabels: {}
+
+# roci container resources.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+# false = run in a user namespace (Kubernetes >= 1.33, containerd >= 2).
+hostUsers: false
+
+# Pod security context (PSS restricted).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container security context (PSS restricted); the schema pins the
+# privilege-related fields.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+  appArmorProfile:
+    type: RuntimeDefault
+
+# Seconds between SIGTERM and SIGKILL on pod stop.
+terminationGracePeriodSeconds: 30
+# Node selector.
+nodeSelector: {}
+# Tolerations.
+tolerations: []
+# Affinity.
+affinity: {}
+# PriorityClass name.
+priorityClassName: ""
+
+networkPolicy:
+  # Render default-deny NetworkPolicies for every workload in the chart.
+  enabled: true
+  # NetworkPolicyPeer list allowed to reach the registry port; [] = any source.
+  ingressFrom: []
+  # Where cluster DNS runs (egress UDP/TCP 53 is allowed only to it).
+  dns:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: kube-system
+    podSelector:
+      matchLabels:
+        k8s-app: kube-dns
+  # NetworkPolicyEgressRule list appended to the registry policy (e.g. an
+  # OTLP collector).
+  extraEgress: []
+
+# Image and resources for the bucket-init Job and the helm test pod.
+hooks:
+  image:
+    repository: curlimages/curl
+    tag: "8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 200m
+      memory: 64Mi
+
+# Upstream RustFS subchart (https://charts.rustfs.com, 1.0.0). Enabling it
+# switches roci to S3 mode against the in-cluster, erasure-coded RustFS.
+rustfs:
+  # Deploy RustFS and store blobs in it.
+  enabled: false
+  # RustFS pods; >= 4 for a fault-tolerant erasure set.
+  replicaCount: 4
+  # One drive per pod: 4 drives, parity 2, write quorum 3 (tolerates one pod loss).
+  drivesPerNode: 1
+  # Keep pod-identity injection even with a credentials-only existingSecret.
+  localEndpointHost:
+    autoInject: true
+  image:
+    rustfs:
+      repository: rustfs/rustfs
+      tag: "1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff"
+      pullPolicy: IfNotPresent
+    initImage:
+      repository: busybox
+      tag: "1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"
+      pullPolicy: IfNotPresent
+  secret:
+    # Secret with RUSTFS_ACCESS_KEY/RUSTFS_SECRET_KEY; then set s3.accessKeyId.
+    existingSecret: ""
+    # Must stay false (the well-known default credentials are rejected).
+    allowInsecureDefaults: false
+    rustfs:
+      # Access/secret key for a chart-generated Secret (both required).
+      access_key: ""
+      secret_key: ""
+  config:
+    rustfs:
+      # Admin console disabled (port 9001 is also blocked by NetworkPolicy).
+      console_enable: "false"
+      # S3 region (also used by roci and the bucket-init Job).
+      region: us-east-1
+      # "" = log to stdout, no logs PVC.
+      obs_log_directory: ""
+      obs_environment: production
+      log_level: info
+  serviceAccount:
+    create: true
+    # Never mount the API token.
+    automount: false
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    privileged: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
+    appArmorProfile:
+      type: RuntimeDefault
+  # RustFS is reachable only in-cluster (roci, bucket-init, RustFS peers).
+  ingress:
+    enabled: false
+  service:
+    type: ClusterIP
+  # Spread RustFS pods across nodes (one pod loss = one node loss).
+  affinity:
+    podAntiAffinity:
+      enabled: true
+      topologyKey: kubernetes.io/hostname
+    nodeAffinity: {}
+  # Allow at most one RustFS pod down during voluntary disruptions.
+  pdb:
+    create: true
+    maxUnavailable: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  storageclass:
+    # StorageClass for RustFS data PVCs.
+    name: local-path
+    # Size of each RustFS data PVC.
+    dataStorageSize: 10Gi
+  enableServiceLinks: false

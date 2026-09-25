@@ -64,6 +64,7 @@ export default defineConfig({
             { text: 'Getting started', link: '/guide/getting-started' },
             { text: 'Configuration', link: '/guide/configuration' },
             { text: 'Container image', link: '/guide/container' },
+            { text: 'Kubernetes (Helm)', link: '/guide/kubernetes' },
             { text: 'Benchmarks', link: '/guide/benchmarks' },
           ],
         },

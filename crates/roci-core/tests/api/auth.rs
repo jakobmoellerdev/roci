@@ -652,3 +652,40 @@ async fn access_control_reload_takes_effect_on_the_same_router() {
     assert_eq!(status_of(&app, push()).await, StatusCode::ACCEPTED);
     assert_eq!(status_of(&app, anon_pull()).await, StatusCode::UNAUTHORIZED);
 }
+
+/// An upload rejected before its body is read must announce `Connection:
+/// close` on HTTP/1: hyper closes the socket anyway, and a client that pooled
+/// it would send its authenticated retry into a dead connection (EOF).
+#[tokio::test]
+async fn unread_request_body_closes_http1_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _auth, _d) = app_with_auth(htpasswd_config(dir.path(), ""));
+    let data = b"layer bytes".to_vec();
+    let upload = format!(
+        "/v2/r/blobs/uploads/?digest={}",
+        roci_storage::sha256_of(&data)
+    );
+
+    // Anonymous upload: 401 before the body is read.
+    let resp = send(&app, post(&upload, data.clone())).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(hv(&resp, header::CONNECTION), Some("close"));
+
+    // Same rejection over HTTP/2: the header is illegal there, never sent.
+    let mut h2 = post(&upload, data.clone());
+    *h2.version_mut() = axum::http::Version::HTTP_2;
+    let resp = send(&app, h2).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(hv(&resp, header::CONNECTION), None);
+
+    // A body-less rejection leaves nothing unread: keep-alive stays.
+    let resp = send(&app, get("/v2/r/tags/list")).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(hv(&resp, header::CONNECTION), None);
+
+    // The authenticated upload consumes its body: keep-alive stays.
+    let ok = as_user(Method::POST, &upload, &basic("alice", "pw"), data);
+    let resp = send(&app, ok).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(hv(&resp, header::CONNECTION), None);
+}

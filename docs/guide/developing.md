@@ -11,6 +11,7 @@ roci uses [`just`](https://github.com/casey/just) as its task runner. **Every re
 - [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) — coverage gate (`rustup component add llvm-tools-preview` too).
 - **Go 1.17+** — only for the OCI conformance suite.
 - [`actionlint`](https://github.com/rhysd/actionlint) and [`zizmor`](https://github.com/zizmorcore/zizmor) — only for linting/auditing the GitHub Actions workflows.
+- [`helm`](https://helm.sh) — only for chart linting (`just helm-lint`).
 
 Install the cargo tools in one line:
 
@@ -51,12 +52,13 @@ just hooks   # or, with the pre-commit framework: pre-commit install
 | `just audit` | `cargo deny` supply-chain check |
 | `just coverage` | Enforce the 95% line-coverage floor (cargo-llvm-cov) |
 | `just coverage-report` | Show uncovered lines (developer aid) |
-| `just ci` | Run the full local gate before pushing |
+| `just ci` | Run the full local gate before pushing (includes helm-lint) |
 | `just conformance` | Run the OCI dist-spec conformance suite against a local roci |
 | `just container` | Build the hardened scratch image and smoke-test it |
 | `just container-multiarch` | Build the multi-arch image (linux/amd64, linux/arm64) |
 | `just bench` | Benchmark roci vs distribution vs zot in pinned containers (`quick` smoke / `full` 5-rep) — see docs/guide/benchmarks.md |
 | `just bench-perf` | Profile roci (flamegraphs, syscalls, per-route latency, gaps vs a prior `just bench` run) |
+| `just helm-lint` | Lint the Helm chart and assert its render-time security guards (needs `helm`) |
 
 ## CI parity
 

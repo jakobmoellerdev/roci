@@ -7,6 +7,14 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
+  # charts/roci: the RustFS subchart pin (Chart.yaml/Chart.lock) and the
+  # digest-pinned images in values.yaml.
+  - package-ecosystem: helm
+    directory: "/charts/roci"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
   # NOTE: a `cargo` ecosystem entry is added here once a Cargo workspace exists
   # (Dependabot errors on a cargo ecosystem with no manifest). Example:
   #   - package-ecosystem: cargo

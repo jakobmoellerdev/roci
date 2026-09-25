@@ -3,10 +3,10 @@
 # Hardened, fully static, scratch-based image for roci.
 #
 # Build stage compiles a static musl binary; the final stage is `scratch` (no
-# shell, no libc, no package manager) containing only the binary and running as
-# an unprivileged numeric UID. This is the smallest possible attack surface
-# (SECURITY.md: rootless, no capabilities, read-only root FS with the storage
-# volume the only writable mount).
+# shell, no libc, no package manager) containing only the binary and a CA
+# bundle, running as an unprivileged numeric UID. This is the smallest possible
+# attack surface (SECURITY.md: rootless, no capabilities, read-only root FS
+# with the storage volume the only writable mount).
 #
 # Multi-arch: linux/amd64 and linux/arm64 (container images are Linux-only;
 # macOS/darwin binaries are produced as release artifacts, not container images).
@@ -21,7 +21,8 @@ FROM --platform=$BUILDPLATFORM rust:1.98-alpine AS builder
 
 # musl-dev provides the static C runtime; mimalloc (in `full`) compiles C via
 # cc — musl-friendly, no background threads, smaller than jemalloc.
-RUN apk add --no-cache musl-dev
+# ca-certificates-bundle provides the CA bundle copied into the final image.
+RUN apk add --no-cache musl-dev ca-certificates-bundle
 
 WORKDIR /src
 
@@ -53,6 +54,13 @@ FROM scratch AS runtime
 # Copy the static binary and the pre-owned storage directory.
 COPY --from=builder /roci /roci
 COPY --from=builder --chown=65532:65532 /rootfs/var/lib/roci /var/lib/roci
+
+# CA bundle (data only) for outbound TLS. The S3 client (reqwest +
+# rustls-platform-verifier) refuses to build — even for an http:// endpoint —
+# when the system has no root certificates, and LDAP without `ca_file` trusts
+# the system roots.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 # Run as an unprivileged, well-known nonroot UID:GID (no shell, no root).
 USER 65532:65532

@@ -1,0 +1,33 @@
+# k0s e2e (scripts/k0s-e2e.sh, SCENARIO=s3-rustfs): locally built image,
+# htpasswd auth (scripts/conformance/htpasswd, created by the script), S3
+# storage on a 4-pod erasure-coded RustFS.
+image:
+  repository: roci
+  tag: ci
+  pullPolicy: Never
+auth:
+  htpasswd:
+    existingSecret: roci-ci-htpasswd
+persistence:
+  size: 1Gi
+# scripts/k0s-e2e.sh reaches the registry through its NodePort.
+service:
+  type: NodePort
+config:
+  storage:
+    # Forces every blob read to hit RustFS, so the pod-loss test is real.
+    cacheMaxBytes: 0
+rustfs:
+  enabled: true
+  replicaCount: 4
+  drivesPerNode: 1
+  secret:
+    rustfs:
+      access_key: roci-ci-access
+      secret_key: roci-ci-secret-key-0123456789
+  # Off only because the k0s CI cluster is single-node.
+  affinity:
+    podAntiAffinity:
+      enabled: false
+  storageclass:
+    dataStorageSize: 1Gi

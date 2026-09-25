@@ -74,6 +74,7 @@ git submodule update --init --depth 1
 - [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) — coverage gate (`rustup component add llvm-tools-preview` too).
 - **Go 1.17+** — only for the OCI conformance suite.
 - [`actionlint`](https://github.com/rhysd/actionlint) and [`zizmor`](https://github.com/zizmorcore/zizmor) — only for linting/auditing the GitHub Actions workflows (`just lint-workflows`, `just zizmor`).
+- [`helm`](https://helm.sh) — only for chart linting (`just helm-lint`).
 
 Install the cargo tools in one line:
 
@@ -118,12 +119,13 @@ Every recipe mirrors a CI gate, so passing locally means passing the required CI
 | `just coverage-linux` | Reproduce the CI Linux coverage gate in a container (macOS devs; the only way to exercise the Linux-only fast paths) |
 | `just codeql-local` | Reproduce the CI CodeQL rust path-injection analysis in a container (macOS devs; fails if any alert remains) |
 | `just test-filesystems` | Run the storage suite on real ext4/btrfs/XFS loopback filesystems (privileged container) — exercises the actual reflink/hard-link/O_TMPFILE/copy behavior per FS, not the `FORCE_*` simulation |
-| `just ci` | Run the full local gate before pushing (actionlint + fmt + clippy + test + build + deps-guard + coverage + conformance) |
+| `just ci` | Run the full local gate before pushing (actionlint + fmt + clippy + test + build + deps-guard + helm-lint + coverage + conformance) |
 | `just conformance` | Run the OCI dist-spec conformance suite against a local roci |
 | `just container` | Build the hardened scratch image and smoke-test it |
 | `just container-multiarch` | Build the multi-arch image (linux/amd64, linux/arm64) |
 | `just bench` | Benchmark roci vs distribution vs zot in pinned containers (`quick` smoke / `full` 5-rep) — see docs/guide/benchmarks.md |
 | `just bench-perf` | Profile roci (flamegraphs, syscalls, per-route latency, gaps vs a prior `just bench` run) |
+| `just helm-lint` | Lint the Helm chart and assert its render-time security guards (needs `helm`) |
 
 ### Run it locally
 
@@ -164,6 +166,20 @@ Linux-only (OCI/Docker has no darwin runtime). Versioned release tarballs
 (static `linux-musl` + `apple-darwin`, amd64/arm64, sha256 + attestation) are
 built by [`release.yml`](.github/workflows/release.yml) on `v*` tags.
 
+### Kubernetes (Helm)
+
+A hardened Helm chart is provided at `charts/roci/`. Install with:
+
+```sh
+kubectl create namespace roci
+kubectl label namespace roci pod-security.kubernetes.io/enforce=restricted
+helm repo add rustfs https://charts.rustfs.com
+helm dependency build charts/roci
+helm install roci charts/roci -n roci --set auth.allowAnonymous=true
+```
+
+The chart enforces Pod Security Standards restricted, per-workload NetworkPolicies, a secure-by-default auth guard, and supports optional HA S3 storage on RustFS. See the [Kubernetes guide](https://jakobmoellerdev.github.io/roci/guide/kubernetes) for the full configuration reference.
+
 ### Security scanning
 
 Beyond the required gate, CI runs three security/static-analysis workflows: `actionlint` (workflow linting, part of the `CI` workflow), `zizmor` (GitHub Actions security audit), and `codeql` (CodeQL SAST for Rust). `zizmor` and `codeql` publish results to the repository's code-scanning dashboard.
@@ -184,7 +200,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [x] Binaries released for multiple operating systems and architectures
 - [x] Image deletion by tag
 - [ ] Compatible with ecosystem tools (skopeo, cri-o)
-- [ ] Suitable for on-premises deployments (e.g. colocated with Kubernetes)
+- [x] Suitable for on-premises deployments (e.g. colocated with Kubernetes)
 - [~] HTTP/2 multiplexing + keep-alive; TLS 1.3 with optional kTLS zero-copy
 - [~] SHA-512 default digests (SHA-256 accepted); constant-time verification
 - [ ] Immutable-by-digest response caching (`ETag`/`If-None-Match` → `304`), correct tag-vs-digest cache-control
@@ -245,6 +261,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [ ] Node exporter for minimal builds
 - [ ] Swagger-based API documentation
 - [x] Fast cold start (rkyv mmap snapshot, opt-in `fast_restart` stamp) and low-fragmentation allocator
+- [x] Hardened Helm chart (PSS restricted, NetworkPolicies, optional HA S3 storage on RustFS), e2e-tested on k0s
 
 ## License
 

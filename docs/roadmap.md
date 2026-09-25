@@ -18,7 +18,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [x] Binaries released for multiple operating systems and architectures
 - [x] Image deletion by tag
 - [ ] Compatible with ecosystem tools (skopeo, cri-o)
-- [ ] Suitable for on-premises deployments (e.g. colocated with Kubernetes)
+- [x] Suitable for on-premises deployments (e.g. colocated with Kubernetes)
 - [~] HTTP/2 multiplexing + keep-alive; TLS 1.3 with optional kTLS zero-copy
 - [~] SHA-512 default digests (SHA-256 accepted); constant-time verification
 - [ ] Immutable-by-digest response caching (`ETag`/`If-None-Match` → `304`), correct tag-vs-digest cache-control
@@ -79,3 +79,4 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [ ] Node exporter for minimal builds
 - [ ] Swagger-based API documentation
 - [x] Fast cold start (rkyv mmap snapshot, opt-in `fast_restart` stamp) and low-fragmentation allocator
+- [x] Hardened Helm chart (PSS restricted, NetworkPolicies, optional HA S3 storage on RustFS), e2e-tested on k0s

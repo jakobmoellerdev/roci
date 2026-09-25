@@ -1,0 +1,155 @@
+name: helm
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: helm-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Pinned tool versions; bump version + sha256 together.
+env:
+  HELM_VERSION: 4.3.0
+  HELM_SHA256: 86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb # helm-v4.3.0-linux-amd64.tar.gz
+  K0S_VERSION: v1.36.4+k0s.1
+  K0S_SHA256: 18c304d53cdd70095e99c6b859b269b4fef0bb84579d7e7185271a9135694a31 # k0s-v1.36.4+k0s.1-amd64
+  LOCAL_PATH_VERSION: v0.0.37
+  LOCAL_PATH_SHA256: 9781b39c24f3f651bd6d6e41b561e04e4904bbdb6d4f8c7a6009df3a702dcd65 # deploy/local-path-storage.yaml
+
+jobs:
+  lint:
+    name: helm lint + render guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned helm
+        run: |
+          curl -sSfL "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz" -o helm.tgz
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum -c -
+          tar xzf helm.tgz linux-amd64/helm
+          sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
+      - name: Lint chart and assert render guards
+        run: bash scripts/helm-lint.sh
+
+  image:
+    name: build roci image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build image (linux/amd64)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Containerfile
+          platforms: linux/amd64
+          tags: roci:ci
+          provenance: false
+          sbom: false
+          outputs: type=docker,dest=${{ runner.temp }}/roci-image.tar
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: roci-image
+          path: ${{ runner.temp }}/roci-image.tar
+          retention-days: 1
+
+  k0s:
+    name: k0s e2e (${{ matrix.scenario }})
+    runs-on: ubuntu-24.04
+    needs: [lint, image]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [filesystem, s3-rustfs]
+    steps:
+      # Needs spec/distribution-spec/conformance/ from the pinned submodule.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.22"
+      - name: Build conformance binary
+        working-directory: spec/distribution-spec/conformance
+        run: go test -c -o conformance.test
+      - name: Install pinned helm
+        run: |
+          curl -sSfL "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz" -o helm.tgz
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum -c -
+          tar xzf helm.tgz linux-amd64/helm
+          sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
+      - name: Install pinned k0s + single-node cluster
+        run: |
+          curl -sSfL "https://github.com/k0sproject/k0s/releases/download/${K0S_VERSION//+/%2B}/k0s-${K0S_VERSION}-amd64" -o k0s
+          echo "${K0S_SHA256}  k0s" | sha256sum -c -
+          sudo install -m 0755 k0s /usr/local/bin/k0s
+          sudo k0s install controller --single
+          sudo k0s start
+          mkdir -p "$HOME/.kube"
+          for _ in $(seq 1 60); do
+            if kubeconfig="$(sudo k0s kubeconfig admin 2>/dev/null)"; then break; fi
+            sleep 2
+          done
+          printf '%s\n' "$kubeconfig" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          # kubectl matching the cluster version.
+          sudo tee /usr/local/bin/kubectl >/dev/null <<'EOF'
+          #!/bin/sh
+          export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
+          exec /usr/local/bin/k0s kubectl "$@"
+          EOF
+          sudo chmod 0755 /usr/local/bin/kubectl
+          for _ in $(seq 1 90); do
+            if [ -n "$(kubectl get nodes -o name 2>/dev/null)" ]; then break; fi
+            sleep 2
+          done
+          kubectl wait --for=condition=Ready node --all --timeout=180s
+          for _ in $(seq 1 90); do
+            if [ -n "$(kubectl -n kube-system get pods -l k8s-app=kube-dns -o name 2>/dev/null)" ]; then break; fi
+            sleep 2
+          done
+          kubectl -n kube-system wait --for=condition=Ready pod -l k8s-app=kube-dns --timeout=180s
+          kubectl version
+      - name: Install local-path provisioner
+        run: |
+          curl -sSfL "https://raw.githubusercontent.com/rancher/local-path-provisioner/${LOCAL_PATH_VERSION}/deploy/local-path-storage.yaml" -o local-path-storage.yaml
+          echo "${LOCAL_PATH_SHA256}  local-path-storage.yaml" | sha256sum -c -
+          kubectl apply -f local-path-storage.yaml
+          kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+          kubectl -n local-path-storage rollout status deployment/local-path-provisioner --timeout=180s
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: roci-image
+          path: ${{ runner.temp }}/roci-image
+      - name: Load roci image into k0s containerd
+        run: sudo k0s ctr --namespace k8s.io images import "$RUNNER_TEMP/roci-image/roci-image.tar"
+      - name: Run k0s e2e
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+          CONFORMANCE_DIR: ${{ github.workspace }}/spec/distribution-spec/conformance
+          ARTIFACT_DIR: ${{ runner.temp }}/e2e
+        run: |
+          mkdir -p "$ARTIFACT_DIR"
+          bash scripts/k0s-e2e.sh
+      - name: Upload e2e artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: k0s-e2e-${{ matrix.scenario }}
+          path: |
+            ${{ runner.temp }}/e2e/
+            spec/distribution-spec/conformance/report.html
+            spec/distribution-spec/conformance/junit.xml
+          if-no-files-found: ignore

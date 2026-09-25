@@ -9,6 +9,7 @@
 
 pub mod auth;
 mod blobs;
+mod conn_close;
 mod error;
 mod http_util;
 mod listing;
@@ -148,8 +149,9 @@ pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
         ));
     }
 
-    // Layers wrap outward: at runtime a request passes span → early-data →
-    // global rate limit → authn → per-client rate limit → handler.
+    // Layers wrap outward: at runtime a request passes connection-close →
+    // span → early-data → global rate limit → authn → per-client rate limit →
+    // handler.
     router
         .layer(axum::middleware::from_fn(
             auth::middleware::early_data_middleware,
@@ -157,6 +159,9 @@ pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
         // One root span per request; every handler's structured events attach
         // to it (Phase 0 observability spine). OTLP export lands in Phase 4.
         .layer(axum::middleware::from_fn(request_span))
+        // Outermost, so it sees every early rejection (rate limit, authn,
+        // authz, limits) that leaves an HTTP/1 request body unread.
+        .layer(axum::middleware::from_fn(conn_close::close_on_unread_body))
         .with_state(state)
 }
 /// Classify a request path into a low-cardinality endpoint label for metrics.

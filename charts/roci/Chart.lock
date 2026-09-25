@@ -1,0 +1,6 @@
+dependencies:
+- name: rustfs
+  repository: https://charts.rustfs.com
+  version: 1.0.0
+digest: sha256:48e3d8f470b39b238663fe83196d55ef82c90ef46e4035bc830ddb78536781d0
+generated: "2026-09-25T20:53:39.618467+02:00"

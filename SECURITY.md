@@ -59,6 +59,18 @@ Aligns with zot's OSSF best-practices intent:
 
 roci requires **no root privileges** (zot design). Recommended deployment: a dedicated, unprivileged user/group ID, no capabilities, read-only container root FS with the storage volume the only writable mount. No privileged ports by default.
 
+### Kubernetes controls (Helm chart)
+
+The Helm chart at `charts/roci/` applies these controls; `values.schema.json` and render-time guards reject weakening the privilege-related ones:
+
+- **Pod Security Standards restricted.** Every chart workload (registry, bucket-init Job, test pod) and the RustFS overrides pass PSS `restricted`; the k0s e2e installs into a namespace labelled `pod-security.kubernetes.io/enforce=restricted` after a privileged canary proves enforcement is live. Operators label their namespace the same way. UID 65532, read-only root filesystem, `drop: [ALL]` capabilities, seccomp `RuntimeDefault`, AppArmor `RuntimeDefault`, user namespaces (`hostUsers: false`).
+- **No ServiceAccount token or RBAC.** `automountServiceAccountToken: false` on the chart's and RustFS's ServiceAccounts; no Role or RoleBinding in the chart.
+- **Per-workload default-deny NetworkPolicies.** RustFS pods are reachable only from the registry, the bucket-init Job, and peer RustFS pods (the console is disabled and unreachable); egress is limited to cluster DNS plus the flows each workload needs. An unlabelled pod in the namespace cannot reach RustFS.
+- **Secrets as 0440 file mounts.** roci and the bucket-init Job read credentials (htpasswd, TLS key, S3 secret key, metadata HMAC key) from Kubernetes Secret volumes with `defaultMode: 0440`, never from environment variables. The roci config is itself a Secret because it carries the S3 access key id. The upstream RustFS server takes its own credentials via `envFrom` (subchart behavior).
+- **Secure-by-default auth guard.** Rendering fails unless `auth.htpasswd.existingSecret` or `auth.accessControl` is configured, or `auth.allowAnonymous=true` is explicitly set. RustFS's well-known default credentials (`allowInsecureDefaults`) are rejected.
+- **Pinned images.** RustFS, its init image, and the hook (curl) image use `tag@sha256:…` pins; the roci image is pinned by `image.digest` when set, else the chart `appVersion` tag.
+- **`/metrics` note.** The Prometheus `/metrics` endpoint shares the registry port and is unauthenticated when enabled (off by default); `networkPolicy.ingressFrom` restricts which peers reach the registry port as a whole.
+
 ### Enforcement point
 
 **AuthN/AuthZ is enforced before any access into the storage layer** (zot architecture). No handler touches the `Storage` trait before the request identity is authenticated and the action authorized. This is an architectural invariant (see [`ARCHITECTURE.md`](ARCHITECTURE.md)).

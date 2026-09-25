@@ -1,0 +1,13 @@
+# k0s e2e (scripts/k0s-e2e.sh, SCENARIO=filesystem): locally built image,
+# open registry, filesystem storage on the PVC.
+image:
+  repository: roci
+  tag: ci
+  pullPolicy: Never
+auth:
+  allowAnonymous: true
+persistence:
+  size: 1Gi
+# scripts/k0s-e2e.sh reaches the registry through its NodePort.
+service:
+  type: NodePort
