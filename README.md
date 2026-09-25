@@ -208,7 +208,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [x] TLS support (TLS 1.3, 0-RTT hardening via `425 Too Early`)
 - [x] TLS mutual authentication (client cert, optional CA/leaf-fingerprint pinning)
 - [x] HTTP Basic authentication — local htpasswd (bcrypt)
-- [x] HTTP Basic authentication — LDAP (cargo feature `ldap`)
+- [x] HTTP Basic authentication — LDAP (opt-in cargo feature `ldap`, not in `full`)
 - [x] HTTP Bearer token authentication (external token server; ES256/RS256 verification, per-request scope binding)
 - [x] Identity-Based Access Control (glob patterns, specificity matching, admin/group support)
 - [x] Live modification of authorization configuration while running
