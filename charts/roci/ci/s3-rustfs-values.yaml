@@ -10,6 +10,9 @@ auth:
     existingSecret: roci-ci-htpasswd
 persistence:
   size: 1Gi
+# scripts/k0s-e2e.sh reaches the registry through its NodePort.
+service:
+  type: NodePort
 config:
   storage:
     # Forces every blob read to hit RustFS, so the pod-loss test is real.

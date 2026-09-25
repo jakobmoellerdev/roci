@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end test of charts/roci on a live Kubernetes cluster (the `k0s` job
 # of the CI `helm` workflow). Installs the chart into a PSS-restricted
-# namespace, runs helm test and the OCI conformance suite through a
-# port-forward, and for the s3-rustfs scenario proves the blob lands in RustFS,
+# namespace, runs helm test and the OCI conformance suite through the
+# registry's NodePort, and for the s3-rustfs scenario proves the blob lands in RustFS,
 # survives the loss of one RustFS pod, and that RustFS is NetworkPolicy-fenced.
 # Both scenarios assert graceful SIGTERM shutdown and restart persistence.
 #
@@ -27,7 +27,7 @@ REL=roci-ci
 # Keep in sync with hooks.image in charts/roci/values.yaml.
 CURL_IMAGE=curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
 EMPTY_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-REG=http://127.0.0.1:5000
+REG="" # http://<node>:<nodePort>, set after install
 WORK="$(mktemp -d)"
 PF_PIDS=()
 
@@ -167,8 +167,15 @@ fi
 # 6. Chart test pod (the upstream RustFS test pod is not PSS-restricted).
 helm test "$REL" -n "$NS" --filter "name=$REL-test" --logs --timeout 5m
 
-# 7. Registry port-forward.
-pf "$REL" 5000:5000
+# 7. Registry endpoint: the CI values expose it as a NodePort. Not `kubectl
+# port-forward`: it exits on the first reset forwarded connection, and roci
+# closes a connection whose upload it rejects with 401 (the conformance
+# suite's unauthenticated first attempt) before reading the body.
+node_ip="$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')"
+node_port="$(kubectl -n "$NS" get svc "$REL" -o jsonpath='{.spec.ports[0].nodePort}')"
+[ -n "$node_ip" ] && [ -n "$node_port" ] || die "registry NodePort not found (service.type must be NodePort)"
+REG="http://$node_ip:$node_port"
+log "registry at $REG"
 retry 30 2 curl -sf ${AUTH[@]+"${AUTH[@]}"} -o /dev/null "$REG/v2/" || die "GET /v2/ never returned 200"
 
 # 8. OCI conformance (mirrors scripts/conformance.sh).
@@ -209,10 +216,9 @@ if [ "$SCENARIO" = s3-rustfs ]; then
   # 11. Lose one of four RustFS pods: reads (2 of 4 needed) and writes (write
   # quorum 3) must keep working.
   log "RustFS pod loss: scaling $REL-rustfs to 3"
-  kill_port_forwards
+  kill_port_forwards # RustFS port-forward; its pod set is about to change
   kubectl -n "$NS" scale "statefulset/$REL-rustfs" --replicas=3
   kubectl -n "$NS" wait --for=delete "pod/$REL-rustfs-3" --timeout=180s
-  pf "$REL" 5000:5000
   retry 18 10 get_blob e2e/blob "$WORK/blob-a" || die "read with one RustFS pod down"
   head -c 2097152 /dev/urandom >"$WORK/blob-b"
   retry 18 10 push_blob e2e/blob "$WORK/blob-b" || die "write with one RustFS pod down"
@@ -230,7 +236,6 @@ if [ "$SCENARIO" = s3-rustfs ]; then
 fi
 
 # 13. Graceful SIGTERM shutdown (grace period 30s) and persistence.
-kill_port_forwards
 start="$(date +%s)"
 kubectl -n "$NS" delete pod "$REL-0" --wait=true --timeout=60s
 elapsed=$(($(date +%s) - start))
@@ -238,7 +243,6 @@ elapsed=$(($(date +%s) - start))
 log "pod $REL-0 stopped in ${elapsed}s"
 retry 60 2 kubectl -n "$NS" get pod "$REL-0" -o name >/dev/null || die "pod $REL-0 not recreated"
 kubectl -n "$NS" wait --for=condition=Ready "pod/$REL-0" --timeout=180s
-pf "$REL" 5000:5000
 retry 30 2 get_blob e2e/blob "$WORK/blob-a" || die "blob-a lost across restart"
 if [ "$SCENARIO" = s3-rustfs ]; then
   get_blob e2e/blob "$WORK/blob-b" || die "blob-b lost across restart"

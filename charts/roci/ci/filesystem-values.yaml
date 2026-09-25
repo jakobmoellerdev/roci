@@ -8,3 +8,6 @@ auth:
   allowAnonymous: true
 persistence:
   size: 1Gi
+# scripts/k0s-e2e.sh reaches the registry through its NodePort.
+service:
+  type: NodePort
