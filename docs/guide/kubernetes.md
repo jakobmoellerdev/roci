@@ -69,7 +69,7 @@ The chart forces `redirect_min_size = 0` in the roci config. Clients cannot reac
 
 ### External S3
 
-External S3 endpoints are out of scope. The roci scratch image has no CA bundle, so TLS-terminated external S3 would require injecting certificates. Only the bundled RustFS subchart is supported.
+External S3 endpoints are out of scope for the chart: it templates, fences and e2e-tests only the bundled RustFS subchart.
 
 ## Hardening summary
 
@@ -102,6 +102,6 @@ The upstream RustFS chart's test pod lacks the security context required by PSS 
 ## Limitations
 
 - **Single replica.** roci runs as exactly one replica (ARCHITECTURE invariant 7: each repository has one writing instance). The S3 backend keeps metadata and upload staging on a local PVC, so a second replica would diverge. Clustering is planned for Phase 8.
-- **Bundled RustFS only.** External S3 endpoints are unsupported because the scratch image has no CA bundle.
+- **Bundled RustFS only.** The chart does not template external S3 endpoints.
 - **RustFS mTLS unsupported.** roci's S3 client cannot trust a private RustFS CA; in-cluster traffic is plaintext and confined by NetworkPolicy.
-- **Chart appVersion 0.2.0.** This predates the SIGTERM graceful-shutdown fix. Until the next release, pod stop waits for the full grace period before SIGKILL.
+- **Chart appVersion 0.2.0.** The 0.2.0 image predates two fixes: SIGTERM handling (pod stop waits for the full grace period before SIGKILL) and the image's CA bundle, without which the S3 client cannot be built (roci exits with `building S3 client: Generic HTTP client error: builder error`, even for the plaintext in-cluster endpoint). Until the next release, S3 mode needs an image built from `main` (`image.tag: main`, or pin it with `image.digest`).
