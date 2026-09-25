@@ -1969,6 +1969,7 @@ dependencies = [
  "roci-storage",
  "roci-storage-s3",
  "roci-telemetry",
+ "rustix",
  "rustls",
  "tempfile",
  "tokio",

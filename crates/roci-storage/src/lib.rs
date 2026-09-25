@@ -10,6 +10,7 @@ mod fault;
 /// Beneath-root, no-follow filesystem primitives (SECURITY inv. 8) shared
 /// with other backends' local state (e.g. S3 upload staging).
 pub mod beneath;
+mod bufpool;
 mod cache;
 mod dedupe;
 mod digest;

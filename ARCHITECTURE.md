@@ -280,6 +280,8 @@ A single roci instance must exploit a bigger box efficiently before any clusteri
 | Metadata write-ahead log | — | **0 steady RSS** (append-only file; group-commit batches in a small bounded queue) | Compacted when it exceeds a threshold. |
 | OTel spans/metrics | request rate × sampling; label cardinality | bounded by sampling + cardinality caps (RESEARCH: Dapper, OTelCard) | Low default sampling; no per-digest/per-repo labels. |
 
+**[measured — `just bench`, 2026-09] Allocator/runtime traps that dominated RSS under load** (8 concurrent 10 MB pushes/pulls went 10 → ~210 MiB anon, vs zot ~70): (1) **transparent huge pages** under THP `always` back each first-touched allocator region with a 2 MiB page — roci now opts out at startup (`prctl(PR_SET_THP_DISABLE)`, Linux); (2) tokio's default 512-thread **blocking pool** grew to ~100 threads under bursts, each keeping its own allocator heap — capped at 8× the worker count, idle threads exit after 2 s; (3) **cross-thread buffer churn** (read chunks allocated on blocking threads and freed on workers, upload batches the reverse) — recycled through small bounded pools. Together: idle 10 → 2 MiB, loaded peak ~210 → ~57 MiB.
+
 **Three tiers of memory posture, one binary:**
 
 1. **Constrained / embedded (Raspberry Pi, edge):** enable the **rkyv mmap snapshot** so the metadata index is demand-paged (RSS ≈ working set, not total refs) and cap the small-blob cache low (or off). Steady RSS for a small registry: tens of MB. `commit=true` for durability on flaky power. This is the "local minimal" target.

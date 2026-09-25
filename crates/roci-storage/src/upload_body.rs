@@ -3,7 +3,7 @@
 //! 4) — optionally hashing as they are written so finalize need not re-read.
 
 use crate::{Digest, StorageError};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 #[allow(unused_imports)]
@@ -71,6 +71,31 @@ impl Default for StagedHash {
     }
 }
 
+/// Recycled upload batch buffers: at most 16 idle (16 MiB).
+static UPLOAD_POOL: crate::bufpool::BufPool = crate::bufpool::BufPool::new(WRITE_BATCH, 16);
+
+/// Write `batch` (and extend `hash` over it) on the blocking pool, returning
+/// the emptied buffer for the next batch.
+async fn write_batch(
+    file: &Arc<std::fs::File>,
+    batch: Vec<u8>,
+    hash: Option<StagedHash>,
+) -> io::Result<(Vec<u8>, Option<StagedHash>)> {
+    let f = Arc::clone(file);
+    tokio::task::spawn_blocking(move || {
+        let (mut batch, mut hash) = (batch, hash);
+        (&*f).write_all(&batch)?;
+        if let Some(h) = hash.as_mut() {
+            h.update(&batch);
+        }
+        batch.clear();
+        Ok((batch, hash))
+    })
+    .await
+    .map_err(io::Error::other)
+    .and_then(|r| r)
+}
+
 /// Append `body` (at most `limit` bytes) to `file`, an append-mode handle whose
 /// current length is `start`, extending `hash` when it covers exactly `start`
 /// bytes. On any failure — body error, over `limit`, IO — the file is truncated
@@ -86,7 +111,7 @@ pub async fn append_body(
     let file = Arc::new(file.into_std().await);
     let mut hash = hash.filter(|h| h.len == start);
     let mut written = 0u64;
-    let mut batch = BytesMut::new();
+    let mut batch = UPLOAD_POOL.get();
     let result: Result<(), StorageError> = async {
         loop {
             let next = body.next().await.transpose()?;
@@ -99,31 +124,33 @@ pub async fn append_body(
                         actual: received,
                     });
                 }
-                batch.extend_from_slice(&chunk);
-            }
-            if batch.len() >= WRITE_BATCH || (done && !batch.is_empty()) {
-                let buf = batch.split().freeze();
-                let n = buf.len() as u64;
-                let f = Arc::clone(&file);
-                let mut h = hash.take();
-                hash = tokio::task::spawn_blocking(move || {
-                    (&*f).write_all(&buf)?;
-                    if let Some(h) = h.as_mut() {
-                        h.update(&buf);
+                // Fill the batch to exactly WRITE_BATCH (never growing the
+                // pooled buffer), writing each full batch as it completes.
+                let mut rest = &chunk[..];
+                while !rest.is_empty() {
+                    let take = rest.len().min(WRITE_BATCH - batch.len());
+                    batch.extend_from_slice(&rest[..take]);
+                    rest = &rest[take..];
+                    if batch.len() == WRITE_BATCH {
+                        (batch, hash) =
+                            write_batch(&file, std::mem::take(&mut batch), hash.take()).await?;
+                        written += WRITE_BATCH as u64;
                     }
-                    Ok::<_, io::Error>(h)
-                })
-                .await
-                .map_err(io::Error::other)
-                .and_then(|r| r)?;
-                written += n;
+                }
             }
             if done {
+                if !batch.is_empty() {
+                    let n = batch.len() as u64;
+                    (batch, hash) =
+                        write_batch(&file, std::mem::take(&mut batch), hash.take()).await?;
+                    written += n;
+                }
                 return Ok(());
             }
         }
     }
     .await;
+    UPLOAD_POOL.put(batch);
     match result {
         Ok(()) => Ok((start + written, hash)),
         Err(e) => {

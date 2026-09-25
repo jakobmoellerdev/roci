@@ -18,6 +18,9 @@ use std::io;
 /// two chunks (the one being sent + one read ahead).
 const FILE_CHUNK: u64 = 256 * 1024;
 
+/// Recycled full-size read chunks: at most 64 idle (16 MiB).
+static READ_POOL: crate::bufpool::BufPool = crate::bufpool::BufPool::new(FILE_CHUNK as usize, 64);
+
 type ChunkRead = tokio::task::JoinHandle<io::Result<(std::fs::File, Bytes)>>;
 
 /// Read exactly `n` bytes (after seeking to `seek`, if given) on the blocking
@@ -30,7 +33,15 @@ fn read_chunk(file: std::fs::File, seek: Option<u64>, n: u64) -> ChunkRead {
         if let Some(start) = seek {
             file.seek(io::SeekFrom::Start(start))?;
         }
-        let mut buf = Vec::with_capacity(n as usize);
+        // Full-size chunks recycle through a bounded pool (steady RSS under
+        // load); a small tail/blob gets an exact allocation instead of pinning
+        // a pooled chunk.
+        let pooled = n >= FILE_CHUNK / 4;
+        let mut buf = if pooled {
+            READ_POOL.get()
+        } else {
+            Vec::with_capacity(n as usize)
+        };
         (&mut file).take(n).read_to_end(&mut buf)?;
         if (buf.len() as u64) < n {
             return Err(io::Error::new(
@@ -38,7 +49,12 @@ fn read_chunk(file: std::fs::File, seek: Option<u64>, n: u64) -> ChunkRead {
                 "blob file is shorter than its recorded size",
             ));
         }
-        Ok((file, Bytes::from(buf)))
+        let bytes = if pooled {
+            READ_POOL.freeze(buf)
+        } else {
+            Bytes::from(buf)
+        };
+        Ok((file, bytes))
     })
 }
 

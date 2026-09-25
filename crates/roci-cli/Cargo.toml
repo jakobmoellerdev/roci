@@ -40,6 +40,9 @@ roci-ext-scan = { workspace = true, optional = true }
 roci-ext-sync = { workspace = true, optional = true }
 roci-cluster = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["thread"] }
+
 [features]
 default = []
 s3 = ["dep:roci-storage-s3"]
