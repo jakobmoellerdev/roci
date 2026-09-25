@@ -82,6 +82,7 @@ impl FsStorage {
             quota,
             dedupe: Arc::new(DedupeIndex::new(config.dedupe)),
             upload_locks: Arc::new(StdMutex::new(HashMap::new())),
+            pending_uploads: Arc::new(StdMutex::new(HashMap::new())),
             blob_admit_locks: Arc::new(StdMutex::new(HashMap::new())),
             index_dirty: Arc::new(StdMutex::new(HashMap::new())),
             index_notify: Arc::new(Notify::new()),
@@ -147,6 +148,23 @@ impl FsStorage {
                 .entry((repo.to_string(), id.to_string()))
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None))),
         ))
+    }
+
+    /// Whether `(repo, id)` is a begun session with no staging file yet.
+    fn is_pending(&self, repo: &str, id: &str) -> bool {
+        self.pending_uploads
+            .lock()
+            .expect("pending-uploads poisoned")
+            .contains_key(&(repo.to_string(), id.to_string()))
+    }
+
+    /// Forget a pending session; `true` if it was pending.
+    fn take_pending(&self, repo: &str, id: &str) -> bool {
+        self.pending_uploads
+            .lock()
+            .expect("pending-uploads poisoned")
+            .remove(&(repo.to_string(), id.to_string()))
+            .is_some()
     }
 
     /// Drop a finished/aborted session's lock entry so the map does not grow

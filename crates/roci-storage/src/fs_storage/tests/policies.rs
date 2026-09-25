@@ -142,6 +142,10 @@ async fn upload_session_cap_counts_open_sessions_across_restart() {
     let (dir, s) = store_with(limits, false);
     let first = s.begin_upload("r").await.unwrap();
     let second = s.begin_upload("r").await.unwrap();
+    // `second` gets data, so it has a staging file that survives a restart.
+    s.append_upload("r", &second, crate::upload_body(b"s"), None, u64::MAX)
+        .await
+        .unwrap();
     assert!(matches!(
         s.begin_upload("r").await,
         Err(StorageError::TooManySessions { limit: 2 })
@@ -469,6 +473,41 @@ async fn lifecycle_blob_left_clears_everything() {
     assert!(!s.presence.maybe_present("r", &d.as_string()));
     // Checksum should be gone.
     assert!(s.meta.checksum("r", &d.as_string()).is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn manifest_rejects_a_recorded_blob_swapped_for_a_symlink() {
+    // `blob_exists` answers from the metadata record for blobs roci wrote, so
+    // it still says "present" after the CAS file is swapped for a symlink; the
+    // manifest commit's no-follow re-check must reject it regardless.
+    let (dir, s) = store_with(QuotaLimits::default(), false);
+    let layer = b"layer";
+    let ld = sha256_of(layer);
+    s.put_blob("r", &ld, layer).await.unwrap();
+    let path = dir.path().join("r/blobs/sha256").join(ld.hex());
+    std::fs::rename(&path, dir.path().join("outside")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("outside"), &path).unwrap();
+    assert!(s.blob_exists("r", &ld).await.unwrap());
+    let body = br#"{"schemaVersion":2,"z":1}"#;
+    let d = sha256_of(body);
+    let err = s
+        .put_manifest(
+            "r",
+            Some("v1"),
+            &d,
+            "application/json",
+            body,
+            ManifestLinks {
+                references: std::slice::from_ref(&ld),
+                required: std::slice::from_ref(&ld),
+                subject: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::MissingReference(ref m) if *m == ld.as_string()));
+    assert!(s.meta.resolve_tag("r", "v1").is_none());
 }
 
 #[tokio::test]

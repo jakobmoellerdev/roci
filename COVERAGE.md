@@ -7,7 +7,7 @@ shim over the fully-covered library). Any uncovered lines are listed at gate
 time for triage; the few that remain are unreachable-in-CI defensive
 syscall-error arms in the beneath-root storage path.
 
-Current line coverage: **97.38%** (19981/20518 lines).
+Current line coverage: **97.44%** (20515/21055 lines).
 
 Regenerate with `just coverage` (or on every commit via the pre-commit hook).
 Inspect region-level gaps with `just coverage-report`.
@@ -48,21 +48,21 @@ roci-storage-s3/src/lib.rs                          143                 6    95.
 roci-storage-s3/src/storage_impl.rs                7117              1544    78.31%         426                91    78.64%        3837               788    79.46%           0                 0         -
 roci-storage-s3/src/tests.rs                      12218                89    99.27%         546                 2    99.63%        7265                18    99.75%           0                 0         -
 roci-storage-s3/src/uploads.rs                      635                76    88.03%          48                 3    93.75%         355                27    92.39%           0                 0         -
-roci-storage/src/beneath.rs                        1094                97    91.13%          75                 0   100.00%         633                30    95.26%           0                 0         -
+roci-storage/src/beneath.rs                        1109               101    90.89%          79                 0   100.00%         662                30    95.47%           0                 0         -
 roci-storage/src/bufpool.rs                          96                 6    93.75%           9                 1    88.89%          55                 7    87.27%           0                 0         -
 roci-storage/src/cache.rs                           304                 0   100.00%          15                 0   100.00%         112                 0   100.00%           0                 0         -
 roci-storage/src/dedupe.rs                          114                 0   100.00%          10                 0   100.00%          54                 0   100.00%           0                 0         -
-roci-storage/src/digest.rs                          142                 1    99.30%          19                 0   100.00%          99                 0   100.00%           0                 0         -
+roci-storage/src/digest.rs                          233                 6    97.42%          26                 0   100.00%         156                 1    99.36%           0                 0         -
 roci-storage/src/error.rs                            12                 0   100.00%           2                 0   100.00%          10                 0   100.00%           0                 0         -
 roci-storage/src/filter.rs                          169                 0   100.00%          12                 0   100.00%          83                 0   100.00%           0                 0         -
-roci-storage/src/fs_storage/gc.rs                   601                67    88.85%          26                 1    96.15%         318                40    87.42%           0                 0         -
+roci-storage/src/fs_storage/gc.rs                   692                73    89.45%          32                 1    96.88%         366                43    88.25%           0                 0         -
 roci-storage/src/fs_storage/index.rs                833               108    87.03%          74                14    81.08%         447                38    91.50%           0                 0         -
 roci-storage/src/fs_storage/lifecycle.rs             98                 7    92.86%           6                 0   100.00%          61                 3    95.08%           0                 0         -
 roci-storage/src/fs_storage/maintenance.rs           79                21    73.42%           9                 3    66.67%          57                14    75.44%           0                 0         -
-roci-storage/src/fs_storage/mod.rs                  441                17    96.15%          36                 0   100.00%         240                 7    97.08%           0                 0         -
+roci-storage/src/fs_storage/mod.rs                  634                25    96.06%          51                 0   100.00%         351                 9    97.44%           0                 0         -
 roci-storage/src/fs_storage/paths.rs                100                 8    92.00%          12                 0   100.00%          44                 0   100.00%           0                 0         -
-roci-storage/src/fs_storage/scrub.rs               1364                47    96.55%          85                 1    98.82%         763                29    96.20%           0                 0         -
-roci-storage/src/fs_storage/storage_impl.rs        2482               260    89.52%         108                 4    96.30%        1208                87    92.80%           0                 0         -
+roci-storage/src/fs_storage/scrub.rs               1397                51    96.35%          87                 1    98.85%         776                29    96.26%           0                 0         -
+roci-storage/src/fs_storage/storage_impl.rs        4149               425    89.76%         179                 5    97.21%        2102               157    92.53%           0                 0         -
 roci-storage/src/gc.rs                              341                 2    99.41%          35                 0   100.00%         179                 1    99.44%           0                 0         -
 roci-storage/src/layout.rs                          585                24    95.90%          46                 0   100.00%         305                11    96.39%           0                 0         -
 roci-storage/src/metadata/log.rs                   5301               108    97.96%         173                 1    99.42%        2447                25    98.98%           0                 0         -
@@ -70,13 +70,13 @@ roci-storage/src/metadata/mod.rs                   1239                 2    99.
 roci-storage/src/metadata/redb.rs                  1974               137    93.06%          54                 1    98.15%         922                24    97.40%           0                 0         -
 roci-storage/src/metadata/snapshot.rs               601                10    98.34%          24                 0   100.00%         255                 1    99.61%           0                 0         -
 roci-storage/src/metadata/wal_hmac.rs               210                 1    99.52%          13                 0   100.00%         105                 0   100.00%           0                 0         -
-roci-storage/src/publish.rs                         628               214    65.92%          26                 2    92.31%         382               104    72.77%           0                 0         -
+roci-storage/src/publish.rs                         936               324    65.38%          37                 3    91.89%         581               158    72.81%           0                 0         -
 roci-storage/src/quota.rs                           341                 3    99.12%          24                 0   100.00%         177                 0   100.00%           0                 0         -
 roci-storage/src/routing.rs                        2231                 0   100.00%         134                 0   100.00%        1021                 0   100.00%           0                 0         -
-roci-storage/src/storage.rs                         221                12    94.57%          26                 0   100.00%         152                 4    97.37%           0                 0         -
-roci-storage/src/upload_body.rs                     160                10    93.75%          16                 2    87.50%         109                 6    94.50%           0                 0         -
+roci-storage/src/storage.rs                         335                18    94.63%          38                 0   100.00%         229                 6    97.38%           0                 0         -
+roci-storage/src/upload_body.rs                     331                18    94.56%          27                 2    92.59%         222                 8    96.40%           0                 0         -
 roci-telemetry/src/lib.rs                           488                36    92.62%          28                 2    92.86%         302                 2    99.34%           0                 0         -
-roci-telemetry/src/metrics.rs                       771                 4    99.48%          53                 0   100.00%         491                 0   100.00%           0                 0         -
+roci-telemetry/src/metrics.rs                       774                 4    99.48%          55                 0   100.00%         499                 0   100.00%           0                 0         -
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-TOTAL                                             56672              3324    94.13%        3165               176    94.44%       31910              1514    95.26%           0                 0         -
+TOTAL                                             59358              3640    93.87%        3306               178    94.62%       33459              1648    95.07%           0                 0         -
 ```

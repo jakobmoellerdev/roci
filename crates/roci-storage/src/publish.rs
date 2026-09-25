@@ -314,7 +314,7 @@ pub(crate) fn stream_copy(input: &mut std::fs::File, output: &mut std::fs::File)
 /// and the fallback the Linux `O_TMPFILE` path degrades to. A rename onto an
 /// existing blob is harmless (content-addressed: identical bytes).
 #[cfg(unix)]
-pub(crate) async fn publish_bytes_rename(
+pub(crate) fn publish_bytes_rename_sync(
     root: &Path,
     alg_rel: &Path,
     leaf: &str,
@@ -323,47 +323,41 @@ pub(crate) async fn publish_bytes_rename(
 ) -> io::Result<()> {
     use rustix::fs::{Mode, OFlags};
     use std::io::Write as _;
-    let root = root.to_path_buf();
-    let alg_rel = alg_rel.to_path_buf();
-    let leaf = leaf.to_string();
-    let data = data.to_vec();
-    run_blocking("publish_bytes_rename", move || -> io::Result<()> {
-        let dirfd = dir_beneath(&root, &alg_rel, true)?;
-        let mut tmp = [0u8; 8];
-        getrandom::fill(&mut tmp).map_err(io::Error::other)?;
-        let tmp_name = format!(".{}.{}.tmp", leaf, hex::encode(tmp));
-        let fd = rustix::fs::openat(
-            &dirfd,
-            tmp_name.as_str(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o644),
-        )
-        .map_err(io::Error::from)?;
-        let mut f = std::fs::File::from(fd);
-        f.write_all(&data)?;
-        if sync {
-            f.sync_data()?;
-        }
-        drop(f);
-        // No-replace promotion: a raced symlink/file at `leaf` is not silently
-        // overwritten; an `EEXIST` is a dedup hit only if the existing entry is a
-        // regular file (matches the Linux O_TMPFILE+linkat path's contract).
-        promote_temp_noreplace(&dirfd, tmp_name.as_str(), leaf.as_str(), sync)
-    })
-    .await
+    let dirfd = dir_beneath(root, alg_rel, true)?;
+    let mut tmp = [0u8; 8];
+    getrandom::fill(&mut tmp).map_err(io::Error::other)?;
+    let tmp_name = format!(".{}.{}.tmp", leaf, hex::encode(tmp));
+    let fd = rustix::fs::openat(
+        &dirfd,
+        tmp_name.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o644),
+    )
+    .map_err(io::Error::from)?;
+    let mut f = std::fs::File::from(fd);
+    f.write_all(data)?;
+    if sync {
+        f.sync_data()?;
+    }
+    drop(f);
+    // No-replace promotion: a raced symlink/file at `leaf` is not silently
+    // overwritten; an `EEXIST` is a dedup hit only if the existing entry is a
+    // regular file (matches the Linux O_TMPFILE+linkat path's contract).
+    promote_temp_noreplace(&dirfd, tmp_name.as_str(), leaf, sync)
 }
 
 /// Publish `data` as the CAS blob `leaf` inside `alg_rel` crash-atomically,
 /// anchored to a dirfd walked no-follow beneath `root`. On Linux this opens an
 /// anonymous `O_TMPFILE` inode in the (beneath-root) directory, writes (and,
-/// when `sync`, fsyncs) it, then `linkat`s it into place: a partial blob is never visible under its
-/// digest name and no orphan temp survives a crash. A filesystem without
-/// `O_TMPFILE` degrades to the portable temp+rename path. `linkat` `EEXIST`
-/// means a blob already exists at the name; it is dedup success only if that
-/// entry is a *regular file* (validated no-follow via the dirfd) — a planted
-/// symlink/dir is rejected. Non-Linux platforms use the temp+rename path.
+/// when `sync`, fsyncs) it, then `linkat`s it into place: a partial blob is
+/// never visible under its digest name and no orphan temp survives a crash. A
+/// filesystem without `O_TMPFILE` degrades to the portable temp+rename path.
+/// `linkat` `EEXIST` means a blob already exists at the name; it is dedup
+/// success only if that entry is a *regular file* (validated no-follow via the
+/// dirfd) — a planted symlink/dir is rejected. Non-Linux platforms use the
+/// temp+rename path. Blocking: call on the blocking pool (see [`publish_bytes`]).
 #[cfg(target_os = "linux")]
-pub(crate) async fn publish_bytes(
+pub(crate) fn publish_bytes_sync(
     root: &Path,
     alg_rel: &Path,
     leaf: &str,
@@ -374,81 +368,76 @@ pub(crate) async fn publish_bytes(
     use rustix::io::Errno;
     use std::io::Write as _;
     use std::os::fd::AsRawFd;
-    let root_buf = root.to_path_buf();
-    let alg_rel_buf = alg_rel.to_path_buf();
-    let leaf_buf = leaf.to_string();
-    let data_vec = data.to_vec();
-    let outcome = run_blocking("publish_bytes", move || -> io::Result<bool> {
-        let dirfd = dir_beneath(&root_buf, &alg_rel_buf, true)?;
-        // Anonymous inode in the (beneath-root) target directory. In test,
-        // `FORCE_TMPFILE_UNSUPPORTED` simulates a filesystem without O_TMPFILE so
-        // the fallback arm runs deterministically (ext4 in CI always supports it).
-        let opened = if fault!(FORCE_TMPFILE_UNSUPPORTED) {
-            Err(Errno::OPNOTSUPP)
-        } else {
-            rustix::fs::openat(
-                &dirfd,
-                ".",
-                OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
-                Mode::from_raw_mode(0o644),
-            )
-        };
-        let fd = match opened {
-            Ok(fd) => fd,
-            // O_TMPFILE unavailable → signal the portable temp+rename fallback.
-            Err(_) => return Ok(false),
-        };
-        let mut f = std::fs::File::from(fd);
-        f.write_all(&data_vec)?;
-        if sync {
-            f.sync_data()?;
-        }
-        // Link the anonymous inode into place via its /proc/self/fd magic link,
-        // relative to the beneath-root dirfd (AT_EMPTY_PATH would need
-        // CAP_DAC_READ_SEARCH).
-        let proc_path = format!("/proc/self/fd/{}", f.as_raw_fd());
-        match rustix::fs::linkat(
-            rustix::fs::CWD,
-            proc_path,
+    let dirfd = dir_beneath(root, alg_rel, true)?;
+    // Anonymous inode in the (beneath-root) target directory. In test,
+    // `FORCE_TMPFILE_UNSUPPORTED` simulates a filesystem without O_TMPFILE so
+    // the fallback arm runs deterministically (ext4 in CI always supports it).
+    let opened = if fault!(FORCE_TMPFILE_UNSUPPORTED) {
+        Err(Errno::OPNOTSUPP)
+    } else {
+        rustix::fs::openat(
             &dirfd,
-            leaf_buf.as_str(),
-            AtFlags::SYMLINK_FOLLOW,
-        ) {
-            Ok(()) => {}
-            // A blob already exists at the name: dedup success only if it is a
-            // regular file (no-follow, via the dirfd). A planted symlink/dir is
-            // rejected — never reported present nor later followed on read.
-            Err(Errno::EXIST) => {
-                let st = rustix::fs::statat(&dirfd, leaf_buf.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-                    .map_err(io::Error::from)?;
-                if !FileType::from_raw_mode(st.st_mode).is_file() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "CAS destination exists and is not a regular file",
-                    ));
-                }
+            ".",
+            OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )
+    };
+    let Ok(fd) = opened else {
+        // O_TMPFILE unavailable → the portable temp+rename fallback.
+        return publish_bytes_rename_sync(root, alg_rel, leaf, data, sync);
+    };
+    let mut f = std::fs::File::from(fd);
+    f.write_all(data)?;
+    if sync {
+        f.sync_data()?;
+    }
+    // Link the anonymous inode into place via its /proc/self/fd magic link,
+    // relative to the beneath-root dirfd (AT_EMPTY_PATH would need
+    // CAP_DAC_READ_SEARCH).
+    let proc_path = format!("/proc/self/fd/{}", f.as_raw_fd());
+    match rustix::fs::linkat(
+        rustix::fs::CWD,
+        proc_path,
+        &dirfd,
+        leaf,
+        AtFlags::SYMLINK_FOLLOW,
+    ) {
+        Ok(()) => {}
+        // A blob already exists at the name: dedup success only if it is a
+        // regular file (no-follow, via the dirfd). A planted symlink/dir is
+        // rejected — never reported present nor later followed on read.
+        Err(Errno::EXIST) => {
+            let st = rustix::fs::statat(&dirfd, leaf, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(io::Error::from)?;
+            if !FileType::from_raw_mode(st.st_mode).is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "CAS destination exists and is not a regular file",
+                ));
             }
-            Err(e) => return Err(io::Error::from(e)),
         }
-        if sync {
-            rustix::fs::fsync(&dirfd).map_err(io::Error::from)?;
-        }
-        Ok(true)
-    })
-    .await?;
-    if !outcome {
-        return publish_bytes_rename(root, alg_rel, leaf, data, sync).await;
+        Err(e) => return Err(io::Error::from(e)),
+    }
+    if sync {
+        rustix::fs::fsync(&dirfd).map_err(io::Error::from)?;
     }
     Ok(())
 }
 
 /// Non-Linux **Unix** publish (macOS/BSD): portable dirfd-anchored temp+rename.
-/// Gated `all(unix, not(linux))` to match `publish_bytes_rename`/`try_reflink`
-/// and the rest of the dirfd machinery — the whole `FsStorage` storage path is
-/// Unix-only (no Windows target; see the Unix-gated `resolve_beneath`/dirfd
-/// helpers), so this must not claim to cover a non-Unix `not(linux)` platform
-/// where its `#[cfg(unix)]` callee `publish_bytes_rename` does not exist.
 #[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn publish_bytes_sync(
+    root: &Path,
+    alg_rel: &Path,
+    leaf: &str,
+    data: &[u8],
+    sync: bool,
+) -> io::Result<()> {
+    publish_bytes_rename_sync(root, alg_rel, leaf, data, sync)
+}
+
+/// [`publish_bytes_sync`] as one blocking-pool hop.
+#[cfg(unix)]
 pub(crate) async fn publish_bytes(
     root: &Path,
     alg_rel: &Path,
@@ -456,5 +445,14 @@ pub(crate) async fn publish_bytes(
     data: &[u8],
     sync: bool,
 ) -> io::Result<()> {
-    publish_bytes_rename(root, alg_rel, leaf, data, sync).await
+    let (root, alg_rel, leaf, data) = (
+        root.to_path_buf(),
+        alg_rel.to_path_buf(),
+        leaf.to_string(),
+        data.to_vec(),
+    );
+    run_blocking("publish_bytes", move || {
+        publish_bytes_sync(&root, &alg_rel, &leaf, &data, sync)
+    })
+    .await
 }
