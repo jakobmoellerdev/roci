@@ -7,7 +7,7 @@ shim over the fully-covered library). Any uncovered lines are listed at gate
 time for triage; the few that remain are unreachable-in-CI defensive
 syscall-error arms in the beneath-root storage path.
 
-Current line coverage: **97.56%** (20039/20540 lines).
+Current line coverage: **97.55%** (19968/20469 lines).
 
 Regenerate with `just coverage` (or on every commit via the pre-commit hook).
 Inspect region-level gaps with `just coverage-report`.
@@ -21,12 +21,12 @@ roci-cli/src/main.rs                                 68                 9    86.
 roci-cluster/src/lib.rs                               3                 0   100.00%           1                 0   100.00%           3                 0   100.00%           0                 0         -
 roci-config/src/lib.rs                             1707                15    99.12%         122                 1    99.18%        1647                 4    99.76%           0                 0         -
 roci-core/src/auth/bearer.rs                        619                 7    98.87%          26                 0   100.00%         320                 1    99.69%           0                 0         -
-roci-core/src/auth/cache.rs                         169                 0   100.00%           6                 0   100.00%          83                 0   100.00%           0                 0         -
-roci-core/src/auth/htpasswd.rs                      179                 4    97.77%          15                 0   100.00%          94                 0   100.00%           0                 0         -
+roci-core/src/auth/cache.rs                          81                 0   100.00%           4                 0   100.00%          60                 0   100.00%           0                 0         -
+roci-core/src/auth/htpasswd.rs                      110                 1    99.09%          12                 0   100.00%          59                 0   100.00%           0                 0         -
 roci-core/src/auth/identity.rs                      110                 0   100.00%           9                 0   100.00%          56                 0   100.00%           0                 0         -
 roci-core/src/auth/ldap.rs                          170                 5    97.06%          11                 0   100.00%         105                 0   100.00%           0                 0         -
 roci-core/src/auth/middleware.rs                     47                 0   100.00%           5                 0   100.00%          29                 0   100.00%           0                 0         -
-roci-core/src/auth/mod.rs                           471                 5    98.94%          43                 1    97.67%         310                 1    99.68%           0                 0         -
+roci-core/src/auth/mod.rs                           436                 5    98.85%          41                 1    97.56%         295                 1    99.66%           0                 0         -
 roci-core/src/auth/policy.rs                        411                 0   100.00%          23                 0   100.00%         245                 0   100.00%           0                 0         -
 roci-core/src/blobs.rs                              168                 0   100.00%          14                 0   100.00%         134                 0   100.00%           0                 0         -
 roci-core/src/error.rs                              790                13    98.35%          68                 0   100.00%         537                 6    98.88%           0                 0         -
@@ -79,5 +79,5 @@ roci-storage/src/upload_body.rs                     160                10    93.
 roci-telemetry/src/lib.rs                           732                54    92.62%          42                 3    92.86%         453                 3    99.34%           0                 0         -
 roci-telemetry/src/metrics.rs                      1065                31    97.09%          71                 1    98.59%         658                16    97.57%           0                 0         -
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-TOTAL                                             47929              2432    94.93%        2772               115    95.85%       26646               943    96.46%           0                 0         -
+TOTAL                                             47737              2429    94.91%        2765               115    95.84%       26573               943    96.45%           0                 0         -
 ```
