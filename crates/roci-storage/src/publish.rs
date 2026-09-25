@@ -55,10 +55,20 @@ pub(crate) async fn mount_promote_beneath(
     let from_alg_rel = from_alg_rel.to_path_buf();
     let to_alg_rel = to_alg_rel.to_path_buf();
     let leaf = leaf.to_string();
-    run_blocking("mount_promote_beneath", move || {
-        mount_promote_beneath_sync(root, from_alg_rel, to_alg_rel, leaf, allow_copy, sync)
+    let span = tracing::info_span!("cas.link", mechanism = tracing::field::Empty);
+    let result = run_blocking("mount_promote_beneath", {
+        let span = span.clone();
+        move || {
+            let _guard = span.enter();
+            mount_promote_beneath_sync(root, from_alg_rel, to_alg_rel, leaf, allow_copy, sync)
+        }
     })
-    .await
+    .await;
+    // Record the mechanism on the span after the blocking work completes.
+    if let Ok(promo) = &result {
+        span.record("mechanism", promo.label());
+    }
+    result
 }
 
 /// Synchronous body of [`mount_promote_beneath`], for callers already on a blocking

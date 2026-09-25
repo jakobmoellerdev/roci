@@ -141,9 +141,17 @@ impl FsStorage {
     /// differs from disk. Closes the window where a WAL record was durable but
     /// the process died before the background rename. Also imports tags from
     /// any pre-existing (externally written) `index.json` the log has not seen,
-    /// so the first rebuild never drops them. Run once before serving.
+    /// so the first rebuild never drops them. Sweeps stale `.index.json.*.tmp`
+    /// orphans left by a crash during the named-temp fallback write path (the
+    /// `O_TMPFILE` path cannot leave orphans because the inode is anonymous
+    /// until `linkat`). Run once before serving.
     pub async fn reconcile_index_json(&self) {
         for repo in discover_repos(&self.root) {
+            // Sweep stale `.index.json.<rand>.tmp` orphans in this repo dir.
+            // Only regular files matching that exact pattern are removed
+            // (never follow symlinks, never remove directories).
+            Self::sweep_index_tmp_orphans(&self.root, &repo);
+
             let Ok(Some(existing)) = Self::read_index_beneath(&self.root, &repo).await else {
                 continue;
             };
@@ -163,6 +171,10 @@ impl FsStorage {
             }
         }
         for repo in self.meta.repos() {
+            // Also sweep repos known to the metadata store (they may not
+            // have been discovered above if they lack an index/layout).
+            Self::sweep_index_tmp_orphans(&self.root, &repo);
+
             if Self::read_index_beneath(&self.root, &repo)
                 .await
                 .ok()
@@ -175,11 +187,52 @@ impl FsStorage {
         Self::flush_dirty(&self.root, &*self.meta, &self.index_dirty).await;
     }
 
+    /// Remove stale `.index.json.<rand>.tmp` orphans from a single repo
+    /// directory. Only regular files (no-follow via `symlink_metadata`)
+    /// matching the exact naming pattern are unlinked; symlinks and
+    /// directories are left alone. Bounded to one `read_dir` per repo
+    /// (already visited at startup by `discover_repos`).
+    fn sweep_index_tmp_orphans(root: &Path, repo: &str) {
+        let Ok(repo_rel) = repo_rel(repo) else {
+            return;
+        };
+        let repo_dir = root.join(repo_rel);
+        let Ok(entries) = std::fs::read_dir(&repo_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with(".index.json.") || !name_str.ends_with(".tmp") {
+                continue;
+            }
+            // Only remove regular files (no-follow) — never a symlink or dir.
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
     /// Atomically replace `<repo>/index.json`, anchored to a dirfd walked
     /// no-follow beneath the store root (a symlink planted at any repo
     /// component cannot redirect the write), ensuring the `oci-layout` marker
-    /// first. Unique temp → `fsync` → `rename` → dir `fsync`, so every on-disk
-    /// state is a complete index.
+    /// first.
+    ///
+    /// On Linux: opens an anonymous `O_TMPFILE` inode in the repo dirfd →
+    /// writes + `fsync` → `linkat` via `/proc/self/fd/N` to a unique hidden
+    /// temp name → `renameat` onto `index.json` → dir `fsync`. The inode is
+    /// namespace-invisible until the `linkat` completes, so a crash during the
+    /// write leaves no orphan. Only the tiny `linkat`→`renameat` window can
+    /// leave a *complete* temp (cleaned at startup by
+    /// [`Self::sweep_index_tmp_orphans`]).
+    ///
+    /// On `O_TMPFILE` unsupported (or non-Linux): falls back to the named-temp
+    /// path (unique `.index.json.<rand>.tmp` → write → `fsync` → `renameat`
+    /// → dir `fsync`). Orphans from this path are also cleaned at startup.
     pub(super) async fn write_index_at_root(
         root: &Path,
         repo: &str,
@@ -194,9 +247,19 @@ impl FsStorage {
             use rustix::fs::{Mode, OFlags};
             use std::io::Write as _;
             let dirfd = dir_beneath(&root, &repo_rel, false)?;
+            // Generate a random suffix used by both the O_TMPFILE linkat
+            // target and the named-temp fallback.
             let mut rnd = [0u8; 8];
             getrandom::fill(&mut rnd).map_err(io::Error::other)?;
             let tmp = format!(".index.json.{}.tmp", hex::encode(rnd));
+
+            if Self::try_write_index_otmpfile(&dirfd, &bytes, &tmp)? {
+                // O_TMPFILE path succeeded: the temp has been linkat'd and
+                // renamed onto index.json.
+                return Ok(());
+            }
+
+            // Fallback: named temp (non-Linux or O_TMPFILE unsupported).
             let fd = rustix::fs::openat(
                 &dirfd,
                 tmp.as_str(),
@@ -218,6 +281,74 @@ impl FsStorage {
             rustix::fs::fsync(&dirfd).map_err(io::Error::from)
         })
         .await
+    }
+
+    /// Attempt to write `index.json` via the Linux `O_TMPFILE`+`linkat` path.
+    /// Returns `Ok(true)` if it succeeded (file is committed), `Ok(false)` if
+    /// `O_TMPFILE` is unsupported (caller should fall back to named temp),
+    /// `Err` on a real I/O error.
+    #[cfg(target_os = "linux")]
+    fn try_write_index_otmpfile(
+        dirfd: &std::os::fd::OwnedFd,
+        bytes: &[u8],
+        tmp_name: &str,
+    ) -> io::Result<bool> {
+        use rustix::fs::{AtFlags, Mode, OFlags};
+        use rustix::io::Errno;
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd;
+
+        let opened = if fault!(FORCE_TMPFILE_UNSUPPORTED) {
+            Err(Errno::OPNOTSUPP)
+        } else {
+            rustix::fs::openat(
+                dirfd,
+                ".",
+                OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o644),
+            )
+        };
+        let fd = match opened {
+            Ok(fd) => fd,
+            // O_TMPFILE unavailable → signal the portable fallback.
+            Err(_) => return Ok(false),
+        };
+        let mut f = std::fs::File::from(fd);
+        f.write_all(bytes)?;
+        f.sync_all()?;
+
+        // Link the anonymous inode into place via /proc/self/fd magic link
+        // as a unique hidden temp name (linkat never overwrites, so we
+        // cannot link directly onto index.json).
+        let proc_path = format!("/proc/self/fd/{}", f.as_raw_fd());
+        rustix::fs::linkat(
+            rustix::fs::CWD,
+            proc_path.as_str(),
+            dirfd,
+            tmp_name,
+            AtFlags::SYMLINK_FOLLOW,
+        )
+        .map_err(io::Error::from)?;
+
+        // Now atomically replace index.json with our complete temp.
+        let renamed = rustix::fs::renameat(dirfd, tmp_name, dirfd, "index.json");
+        if renamed.is_err() {
+            // Clean up the linkat'd temp on rename failure.
+            let _ = rustix::fs::unlinkat(dirfd, tmp_name, AtFlags::empty());
+        }
+        renamed.map_err(io::Error::from)?;
+        rustix::fs::fsync(dirfd).map_err(io::Error::from)?;
+        Ok(true)
+    }
+
+    /// Non-Linux: `O_TMPFILE` is not available; always signal fallback.
+    #[cfg(not(target_os = "linux"))]
+    fn try_write_index_otmpfile(
+        _dirfd: &std::os::fd::OwnedFd,
+        _bytes: &[u8],
+        _tmp_name: &str,
+    ) -> io::Result<bool> {
+        Ok(false)
     }
 
     /// Read `<repo>/index.json` as an image index. A missing index yields the

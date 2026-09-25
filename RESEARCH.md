@@ -206,11 +206,11 @@ Full periodic SHA re-hash is the worst strategy by the evidence: sequential, con
 ### 8.5 Existence filters — SWITCH static to BinaryFuse8; keep cuckoo, track Morton
 For **static** per-snapshot referrer sets, **binary-fuse-8** strictly dominates xor and ribbon: **9.0 bits/key, ~55 ns lookup, 2× faster construction** than xor (RESEARCH: BinaryFuse) — and ships in the `xorf` crate as `BinaryFuse8`. Verdict: **SWITCH static filter from ribbon/xor → BinaryFuse8.** For the **mutable** blob-presence set, **KEEP cuckoo** (only production-Rust deletable filter); **track Morton filter** (1.3–2.5× faster lookups, 3–15× faster inserts at high load, 0.5–1.0 bits/key smaller; RESEARCH: Morton) as an upgrade once a Rust impl exists — candidate `roci-filter` module (~500 LoC). Counting-quotient filter noted but slower + no Rust crate.
 
-### 8.6 Index engine — HYBRID: redb (pure-Rust) vs heed/LMDB (faster reads); benchmark to decide
-redb's own published benchmarks show **LMDB is 1.8–3.0× faster on random reads (3× at 16 threads) and 35% smaller on disk** — LMDB's mmap single-level-store returns zero-copy read pointers (RESEARCH: redb-bench, LMDB-bench). For roci's read-heavy hot path this is material. Verdict: **HYBRID** — **heed (LMDB) is the stronger default where C FFI/libc is acceptable; redb is retained for pure-Rust/`no_std`/musl builds.** LMDB is 1.74× slower on individual writes, acceptable given roci's I/O-bound push rate. **This is a Phase-1 benchmark deliverable** (measure roci's actual tag-lookup + referrer-range-scan pattern before committing). LSM (RocksDB/sled/fjall) **KEEP-rejected** (2–5× worse reads, compaction threads violate footprint). ART/Bε-tree = FUTURE (no durable Rust impl; roci lacks the microwrite pattern that motivates Bε-tree).
+### 8.6 Index engine — **[implemented — redb]** measured bake-off confirms LMDB faster but redb justified
+redb's own published benchmarks show **LMDB is 1.8–3.0× faster on random reads (3× at 16 threads) and 35% smaller on disk** — LMDB's mmap single-level-store returns zero-copy read pointers (RESEARCH: redb-bench, LMDB-bench). For roci's read-heavy hot path this is material. **[measured — §9.8 first-party bake-off, RESEARCH: RociIndexBench]** The bake-off confirms LMDB's read advantage (**1.3–4.0× on point lookups, up to 4× on referrer range scans, dramatically better multi-thread scaling**) and disk advantage (**26–35% smaller**), but redb is **3–6× faster on writes**. Verdict: **KEEP redb as the shipped engine.** The read gap matters less than the architectural constraints: (1) the in-RAM `LogMetadataStore` handles the common local single-node case (§9.6: faster than *either* KV below ~2–4M refs); (2) the redb engine serves only the out-of-RAM / cluster case where disk-resident reads dominate and LMDB's advantage is real but the pure-Rust / `forbid(unsafe_code)` / static-musl story is decisive; (3) heed/LMDB's C FFI would break the musl release, deps-guard, and CodeQL scope. **Adoption threshold for heed:** if a future deployment needs >10M refs with sub-microsecond p50 reads *and* cannot use the in-RAM backend (hard RAM cap), adding heed behind the `MetadataStore` trait seam is justified — the trait is ready, the table layout is identical (§9.8), and the work is ~500 LoC. LSM (RocksDB/sled/fjall) **KEEP-rejected** (2–5× worse reads, compaction threads violate footprint). ART/Bε-tree = FUTURE (no durable Rust crate).
 
-### 8.7 On-disk layout — KEEP flat CAS; HYBRID 2-level fanout at scale; accept tar+zstd
-Flat `blobs/<alg>/<hex>` is correct for roci's random-`open()`-by-digest access; EXT4/XFS HTree handle tens of millions of entries with stable ~62 µs reads (RESEARCH: BfFS, GIGA+). The only risk is linear `readdir` during GC/scrub at scale — already avoided because GC marks via the in-memory index, not directory walks. **HYBRID:** engage git-style **2-level fanout (`ab/cdef…`) above ~100K blobs** to keep subdirectories dcache-friendly (one extra warm dentry lookup, negligible). **REJECT** Venti-arena/packfile single-file stores — they optimize sequential throughput at the cost of the O(1) random access that is roci's primary SLA. **Compression at rest: KEEP no-recompression** (recompressing changes the digest → OCI-contract violation); instead **accept and serve `tar+zstd` layers natively** (OCI v1.1) — zstd's 4× faster decompress benefits the client, and gzip decompression is already the pull bottleneck (RESEARCH: zstd-bench, containerd-gzip, OCI-1.1).
+### 8.7 On-disk layout — KEEP flat CAS; ~~HYBRID 2-level fanout at scale~~ (rejected, spec conflict); accept tar+zstd
+Flat `blobs/<alg>/<hex>` is correct for roci's random-`open()`-by-digest access; EXT4/XFS HTree handle tens of millions of entries with stable ~62 µs reads (RESEARCH: BfFS, GIGA+). The only risk is linear `readdir` during GC/scrub at scale — already avoided because GC marks via the in-memory index, not directory walks. ~~**HYBRID:** engage git-style **2-level fanout (`ab/cdef…`) above ~100K blobs** to keep subdirectories dcache-friendly (one extra warm dentry lookup, negligible).~~ **[corrected 2026-09-25] Fanout REJECTED:** the image-layout spec defines blob content at `blobs/<alg>/<encoded>` (`spec/image-spec/image-layout.md` §Blobs), so an `ab/cdef…` tree is no longer an OCI layout external tools can read — it breaks roci's interop invariant for a `readdir` benefit this section already shows is unused (the HTree evidence above means lookups by digest do not need it). **REJECT** Venti-arena/packfile single-file stores — they optimize sequential throughput at the cost of the O(1) random access that is roci's primary SLA. **Compression at rest: KEEP no-recompression** (recompressing changes the digest → OCI-contract violation); instead **accept and serve `tar+zstd` layers natively** (OCI v1.1) — zstd's 4× faster decompress benefits the client, and gzip decompression is already the pull bottleneck (RESEARCH: zstd-bench, containerd-gzip, OCI-1.1).
 
 ### 8.8 I/O path — SWITCH: kTLS+SSL_sendfile, fadvise, O_TMPFILE+linkat, copy_file_range
 - **Zero-copy under TLS is a fiction without kTLS.** Plain `sendfile` cannot serve encrypted HTTPS — the TLS library bounces data through userspace. **kTLS + `SSL_sendfile`** restores in-kernel zero-copy under TLS: **+13–28% throughput** (nginx real test; RESEARCH: NginxKTLS, KTLSKernel). **SWITCH:** add an opt-in `ktls` feature (OpenSSL ≥ 3.0, Linux ≥ 5.2; runtime-detected, silent rustls fallback). Correct the "zero-copy blob serving" claim to "plaintext HTTP or kTLS-enabled HTTPS." **[corrected in §9]** io_uring `IORING_OP_SPLICE` is not ~8% but **10–25% *slower* than sendfile** for file→socket (confirmed by io_uring author Axboe + Netty #15747, Linux 6.15; no `IORING_OP_SENDFILE` exists/planned) — sendfile+kTLS is the read-path answer; io_uring is a **write-path** win only (see §9). Also **kTLS and io_uring `SEND_ZC` are mutually exclusive** on one socket.
@@ -220,7 +220,7 @@ Flat `blobs/<alg>/<hex>` is correct for roci's random-`open()`-by-digest access;
 - **Object store: KEEP 307 redirect but add a `redirect_min_size` (~1 MB) threshold** — <100 KB blobs lose up to 50% throughput to the extra handshake; manifests never redirected (RESEARCH: AlluxioRedirect, S3ECRBench). Server-side copies use **parallel S3 multipart** (115–190 vs 24–28 MB/s; client-facing push stays sequential per spec). S3 Express One Zone / local-NVMe LRU cache = **HYBRID hot-tier** (single-AZ → not primary durable store).
 
 ### 8.9 Net changes applied to the architecture
-SHA-512 default + internal BLAKE3; reflink-primary dedup; backref-index O(garbage) GC; CRC32C+staggered scrub with FS offload; BinaryFuse8 static filter; heed/LMDB↔redb benchmark-decided index; 2-level fanout at scale; native tar+zstd; kTLS/fadvise/O_TMPFILE/copy_file_range on the I/O path. All are folded into [`ARCHITECTURE.md`](ARCHITECTURE.md) with `[refined from RESEARCH §8]` markers.
+SHA-512 default + internal BLAKE3; reflink-primary dedup; backref-index O(garbage) GC; CRC32C+staggered scrub with FS offload; BinaryFuse8 static filter; **redb index engine (measured — §9.8 bake-off settled the heed/LMDB vs redb question: KEEP redb)**; ~~2-level fanout at scale~~ (rejected — §8.7); native tar+zstd; kTLS/fadvise/O_TMPFILE/copy_file_range on the I/O path. All are folded into [`ARCHITECTURE.md`](ARCHITECTURE.md) with `[refined from RESEARCH §8]` markers.
 
 ## 9. Local-store efficiency — is there an even more efficient design?
 
@@ -244,7 +244,7 @@ Log replay costs ~20–40 ms at 1M records on NVMe (negligible) but **300–500 
 
 ### 9.5 Corrections & FUTURE
 - **io_uring read path: KEEP `sendfile`** — `IORING_OP_SPLICE` is **10–25% slower** (Axboe/Netty #15747), not ~8%; no `IORING_OP_SENDFILE` planned; `SEND_ZC` ⊗ kTLS. io_uring is **ADOPT on the write path only**, **FUTURE** as a full thread-per-core redesign — **compio** is the named carrier runtime (only actively-maintained TPC Rust runtime with an HTTP-compat bridge; tokio-uring's `!Send` futures can't host hyper), worth **−46% P95 / +18% throughput at high load** (Apache Iggy TPC migration) but **zero gain at light load** and ~18–36 months from production HTTP maturity (RESEARCH: NettyAxboe25, Jasny-PVLDB26, IggyTPC, CompioTPC).
-- **Small-object packing (Haystack/f4/Venti-arenas): KEEP-CURRENT / FUTURE.** roci's content-addressed path already achieves Haystack's O(1)-IOP goal without an offset map; 2-level fanout already solves dcache (GIGA+: 99.99% of dirs <8k entries); `roci-meta.log` already *is* the Venti arena applied to metadata. Packing would save the 30–60% small-file block-alignment waste (BfFS) but regress GC O(garbage)→O(live), break the `blobs/<alg>/<hex>` MUST rule for external tools, and violate minimal-deps. Only a sealed **`roci-ext-coldstore`** tier for 100M+ dormant manifests (interop explicitly out of scope) justifies it — **FUTURE**. Deployment mitigation now: **ext4 `bigalloc`** cuts alignment waste 30%→~5–15% with zero code (RESEARCH: Haystack, f4, BfFS, GIGA+).
+- **Small-object packing (Haystack/f4/Venti-arenas): KEEP-CURRENT / FUTURE.** roci's content-addressed path already achieves Haystack's O(1)-IOP goal without an offset map; the flat CAS directory is dcache-safe on HTree/B-tree filesystems (GIGA+: 99.99% of dirs <8k entries; fanout was rejected in §8.7); `roci-meta.log` already *is* the Venti arena applied to metadata. Packing would save the 30–60% small-file block-alignment waste (BfFS) but regress GC O(garbage)→O(live), break the `blobs/<alg>/<hex>` MUST rule for external tools, and violate minimal-deps. Only a sealed **`roci-ext-coldstore`** tier for 100M+ dormant manifests (interop explicitly out of scope) justifies it — **FUTURE**. Deployment mitigation now: **ext4 `bigalloc`** cuts alignment waste 30%→~5–15% with zero code (RESEARCH: Haystack, f4, BfFS, GIGA+).
 
 ### 9.6 MEASURED — metadata residency crossover (in-RAM maps vs redb KV vs cuckoo filter)
 A first-party benchmark (M4 Pro, 48 GB, APFS/NVMe, `--release`+LTO; each structure isolated for clean peak-RSS attribution; keys mirror roci's repo-qualified `(repo,tag)→sha256:<hex>`, ~276 B/ref; 1M random hot lookups per point — RESEARCH: RociScaleBench) turns §8.6/§9.4's "benchmark-first" guidance into numbers:
@@ -269,6 +269,52 @@ A first-party benchmark (M4 Pro, 48 GB, APFS/NVMe, `--release`+LTO; each structu
 - **Open:** hot-path p99 at 1000 rps is ~2× zot (p50 equal or better). Controlled A/B runs ruled out handler time, the tokio scheduler flavour, allocator purging and hyper-util auto-detection; the VM's run-to-run p99 swing (2–10 ms) blocks further diagnosis — needs off-CPU/scheduler tracing on bare Linux.
 - **Tooling finding:** zb cannot push to distribution (it drops the upload `Location` query carrying `_state`); distribution's zb cells are `n/a`.
 - **`sendfile` under hyper is not possible**: hyper owns every socket write (its own `send_file` example streams a 4 KiB `ReaderStream`), so the residual pull-copy cost needs a roci-owned HTTP/1.1 writer — deferred (ARCHITECTURE §Vertical scale).
+
+### 9.8 MEASURED — index engine bake-off (heed/LMDB vs redb)
+`just bench-index` (`bench/index-engines/`, standalone Cargo project with `[workspace]` — NOT a root workspace member; heed/LMDB C FFI never enters the product dep graph) runs roci's real metadata schema against both engines: tags `(repo, tag) → (digest, media_type)`, referrers `(repo, subject, referrer) → descriptor`, media-types `(repo, digest) → media_type`, filtered-referrer and backref tables — identical composite-key layout to `crates/roci-storage/src/metadata/redb.rs`. Keys use the ~276 B/ref repo-qualified format from §9.6 (RESEARCH: RociIndexBench).
+
+**NON-AUTHORITATIVE: Apple Silicon macOS (M-series), APFS/NVMe, `--release` + LTO (fat), single host.** Both engines use NoSync for population and read benchmarks (equal durability); write-throughput bench also NoSync (fair). 100K random hot lookups per data point.
+
+**Read latency (1 thread, ns/op p50 / p99):**
+
+| N refs | workload | redb p50/p99 | heed p50/p99 | redb/heed p50 |
+|--------|----------|--------------|--------------|---------------|
+| 100K | tag lookup | 1125/1625 | 875/1917 | 1.3× |
+| 100K | existence (hit) | 1125/1708 | 875/1958 | 1.3× |
+| 100K | existence (miss) | 1000/1500 | 708/1292 | 1.4× |
+| 100K | referrer scan (p100) | 1541/2167 | 1209/2333 | 1.3× |
+| 1M | tag lookup | 2750/4666 | 1708/3542 | 1.6× |
+| 1M | existence (hit) | 2625/5375 | 1958/3834 | 1.3× |
+| 1M | existence (miss) | 1750/4084 | 1375/2125 | 1.3× |
+| 1M | referrer scan (p100) | 8916/21375 | 2208/4584 | 4.0× |
+
+**Multi-threaded read scaling (8 threads, ns/op p50 / p99):**
+
+| N refs | workload | redb p50/p99 | heed p50/p99 | redb/heed p50 |
+|--------|----------|--------------|--------------|---------------|
+| 100K | tag lookup | 5916/49166 | 834/2166 | 7.1× |
+| 100K | existence (hit) | 5709/50958 | 958/2417 | 6.0× |
+| 1M | tag lookup | 6667/48417 | 1500/3334 | 4.4× |
+| 1M | referrer scan (p100) | 7084/52709 | 2125/4417 | 3.3× |
+
+**On-disk size:**
+
+| N refs | redb | heed (LMDB) | heed/redb |
+|--------|------|-------------|-----------|
+| 100K | 514 MB | 429 MB | 0.83× (17% smaller) |
+| 1M | 4.02 GB | 2.97 GB | 0.74× (26% smaller) |
+
+**Write throughput (NoSync, batch 1000):**
+
+| N refs | redb ops/s | heed ops/s | redb/heed |
+|--------|-----------|-----------|-----------|
+| 100K | 154,070 | 50,652 | 3.0× faster |
+| 1M | 141,146 | 22,870 | 6.2× faster |
+
+- **heed/LMDB wins reads at every size and every thread count** — p50 1.3–1.6× faster single-threaded, widening to **4–7× at 8 threads** (redb's single-writer lock serializes readers through a `begin_read` guard; LMDB's MVCC mmap allows true concurrent readers with no coordination). Referrer range scans show the largest gap (4.0× at 1M single-threaded) because LMDB's B-tree page layout keeps adjacent keys physically contiguous in the mmap.
+- **redb wins writes 3–6×** — its copy-on-write B-tree amortizes writes better than LMDB's COW page split; population time confirms (69s vs 117s at 1M).
+- **heed/LMDB is 17–26% smaller on disk**, consistent with redb-bench's published ~35% figure (smaller here because the benchmark's composite keys are longer than the micro-benchmark).
+- **Verdict: KEEP redb.** The read advantage is real but masked by three factors: (1) the in-RAM `LogMetadataStore` is the hot path for the majority of deployments (§9.6: faster than *either* KV), so the redb engine only matters when metadata exceeds RAM; (2) redb's write advantage matches roci's push-storm workload profile; (3) heed/LMDB requires C FFI (liblmdb.a), which would break `forbid(unsafe_code)`, the static-musl release (`scratch` container, no libc), `deps-guard`, and CodeQL scope. The `MetadataStore` trait seam is ready for heed if a future deployment crosses the adoption threshold (>10M refs, hard RAM cap, sub-µs read SLA).
 
 ## Sources
 
@@ -353,5 +399,6 @@ A first-party benchmark (M4 Pro, 48 GB, APFS/NVMe, `--release`+LTO; each structu
 | CompioTPC | compio async runtime | compio-rs | GitHub 2025 | Most-maintained TPC Rust runtime; compio-compat bridges hyper; tokio-uring !Send can't host hyper. FUTURE carrier. |
 | RociScaleBench | roci metadata-residency scale benchmark (first-party) | roci | 2026-09-20, M4 Pro/48 GB/APFS-NVMe | in-RAM map 273 B/ref linear (2.76 GB @ 10M), 62–417 ns lookup; redb 3–6.5× slower reads, evictable ~430 B/ref on disk; cuckoo 1.74 B/ref (18.9 MB @ 10M), saves ~800 ns/miss vs stat(ENOENT), ~1.9% FP. → in-RAM maps to ~2–4M refs; KV at ≥~10M / RAM-cap / cluster. Backs §9.6. |
 | RociCompareBench | roci vs CNCF distribution 3.1.2 vs zot 2.1.21 comparative benchmark (first-party) | roci | 2026-09-25, Docker Desktop (Apple M-series, 6 CPUs, linuxkit 7.0.12), quick/1 rep — non-authoritative | Before fixes roci lost pull 4–24×, push 2–5×, RSS ~6×; after streamed reads/uploads, hardware SHA-256, HEAD-from-metadata, THP opt-out etc. it leads startup, idle/corpus RSS, push storm, 10 MB c=8 pull/push, CPU/GiB; hot-path p99 ~2× zot open. Backs §9.7. |
+| RociIndexBench | roci index-engine bake-off: heed (LMDB) vs redb (first-party) | roci | 2026-09-25, Apple Silicon macOS (M-series)/APFS-NVMe, --release + LTO | heed/LMDB 1.3–4× faster reads (4–7× at 8 threads), 17–26% smaller disk; redb 3–6× faster writes. KEEP redb: in-RAM backend covers hot path, pure-Rust/musl/forbid(unsafe) decisive; heed ready behind trait seam at >10M-ref threshold. Backs §8.6/§9.8. |
 
 *Compiled 2026-09-19. §1–7 from the first scout wave + CHBL/Venti primary reads; §8 from LayoutHashCAS/IndexEngineFilters/DedupGCScrub/IOServingObjStore + BLAKE3/binary-fuse reads; §9 from IoUringE2E/SmallObjectPacking/ZeroCopyIndexMem/WholeRegistryEngine + Haystack/AIStore reads. All §8–9 scouts delivered briefs in yield text (local:// write avoided per prior lesson); one §9 scout wedged on a yield-schema mismatch and was harvested via recovered result.*

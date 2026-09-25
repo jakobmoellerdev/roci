@@ -220,6 +220,13 @@ impl<B: StorageBackend + Clone> StorageBackend for Routed<B> {
             backend.start_maintenance(shutdown.clone());
         }
     }
+
+    fn on_shutdown(&self) {
+        self.default.on_shutdown();
+        for (_, backend) in &self.routes {
+            backend.on_shutdown();
+        }
+    }
 }
 
 #[cfg(test)]

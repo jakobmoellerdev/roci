@@ -2,6 +2,7 @@
 //! reach private items (path builders, beneath-root helpers, fault seams), so
 //! they live here rather than in the public integration suite.
 
+mod fast_restart;
 mod faults;
 mod gc;
 mod hardening;

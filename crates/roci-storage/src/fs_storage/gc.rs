@@ -49,16 +49,25 @@ impl FsStorage {
         let store = self.clone();
         let interval = Duration::from_secs(self.config.gc.interval_secs);
         tokio::spawn(async move {
-            // 1. Startup consistency check (non-blocking — serving proceeds).
-            store
-                .gc_consistency_check()
-                .instrument(tracing::info_span!("gc.consistency_check"))
-                .await;
-            store.gc.set_ready();
-            tracing::info!(
-                candidates = store.gc.len(),
-                "GC ready: consistency check complete"
-            );
+            if store.gc.is_ready() {
+                // Fast restart already restored the GC state and marked it
+                // ready; skip the consistency check.
+                tracing::info!(
+                    candidates = store.gc.len(),
+                    "GC ready: fast restart (consistency check skipped)"
+                );
+            } else {
+                // 1. Startup consistency check (non-blocking — serving proceeds).
+                store
+                    .gc_consistency_check()
+                    .instrument(tracing::info_span!("gc.consistency_check"))
+                    .await;
+                store.gc.set_ready();
+                tracing::info!(
+                    candidates = store.gc.len(),
+                    "GC ready: consistency check complete"
+                );
+            }
             // 2. Periodic sweeps.
             store.spawn_periodic("gc.sweep", interval, shutdown, |s| async move {
                 s.sweep_at(Instant::now()).await;

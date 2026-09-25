@@ -76,3 +76,47 @@ Read `profile_report.md` top-down: **Findings** (threshold-based hints such as "
 ## Limitations
 
 Plain HTTP only (no TLS, no auth), a single node, the local filesystem backend, and synthetic content (random layers; a fixed-shape many-tag corpus).
+
+## Index-engine bake-off (heed/LMDB vs redb)
+
+`just bench-index` runs a standalone benchmark comparing heed (LMDB) and redb on roci's real metadata access pattern — tag point lookups, referrer range-scans, existence checks, and write throughput. The benchmark lives in `bench/index-engines/` with its own `Cargo.toml` and `[workspace]` table so heed's C FFI dependency never enters the product dependency graph.
+
+### Reproduce
+
+```sh
+just bench-index                     # default: 100K + 1M refs (~5 min)
+just bench-index 100000,1000000,5000000   # include 5M (longer, more disk)
+```
+
+The benchmark binary is built with `--release` and LTO (fat). Pass `--smoke` for a quick 10K-ref validation.
+
+### What is measured
+
+| workload | description |
+|----------|-------------|
+| Tag point lookup | `(repo, tag) → (digest, media_type)` random hot read |
+| Existence check (hit/miss) | `(repo, digest)` presence in media_types table |
+| Referrer range-scan | First 100 referrers for a random subject via prefix range |
+| Write throughput | Batched inserts (batch 1000) across tags + media_types + referrers |
+
+All keys use roci's repo-qualified ~276 B/ref format ([RESEARCH §9.6](https://github.com/jakobmoellerdev/roci/blob/main/RESEARCH.md)). Both engines use identical durability settings (NoSync for reads and writes, equal batch sizes). Multi-threaded read scaling is measured at 1 and 8 threads.
+
+### Reference run
+
+> **NON-AUTHORITATIVE: Apple Silicon macOS (M-series), APFS/NVMe, single host.**
+
+| N refs | workload | redb p50/p99 (ns) | heed p50/p99 (ns) | redb/heed p50 |
+|--------|----------|-------------------|-------------------|---------------|
+| 100K | tag lookup | 1125/1625 | 875/1917 | 1.3× |
+| 100K | existence (hit) | 1125/1708 | 875/1958 | 1.3× |
+| 1M | tag lookup | 2750/4666 | 1708/3542 | 1.6× |
+| 1M | referrer scan (p100) | 8916/21375 | 2208/4584 | 4.0× |
+
+At 8 threads: redb degrades to 5–7 µs p50 (write-lock contention); heed stays near single-thread latency (LMDB MVCC readers).
+
+| N refs | redb disk | heed disk | redb write ops/s | heed write ops/s |
+|--------|-----------|-----------|-----------------|-----------------|
+| 100K | 514 MB | 429 MB | 154,070 | 50,652 |
+| 1M | 4.02 GB | 2.97 GB | 141,146 | 22,870 |
+
+**Verdict:** heed/LMDB wins reads (1.3–4× single-thread, up to 7× multi-thread) and disk size (17–26% smaller); redb wins writes (3–6×). roci ships redb because (1) the in-RAM backend is the hot path for most deployments, (2) redb's write speed matches push-storm profiles, and (3) heed's C FFI would break the static-musl/`forbid(unsafe_code)` release story. The `MetadataStore` trait is ready for heed if future deployments need it. See [RESEARCH §8.6 / §9.8](https://github.com/jakobmoellerdev/roci/blob/main/RESEARCH.md) for the full analysis.

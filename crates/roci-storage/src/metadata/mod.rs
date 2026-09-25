@@ -11,7 +11,7 @@
 
 mod log;
 mod snapshot;
-mod wal_hmac;
+pub(crate) mod wal_hmac;
 
 #[cfg(feature = "redb")]
 mod redb;
@@ -132,6 +132,15 @@ pub trait MetadataStore: Send + Sync + 'static {
     /// Background upkeep (log compaction / snapshot cut) the maintenance
     /// scheduler calls periodically; a no-op when nothing is due.
     fn maintain(&self) -> io::Result<()>;
+    /// The WAL/snapshot generation — monotonically increasing on each
+    /// compaction/snapshot. Used by the fast-restart stamp to verify that the
+    /// metadata state matches the stamp. Engines without a WAL return 0.
+    fn generation(&self) -> u64;
+    /// Size of the metadata WAL file on disk (bytes). Used by the fast-restart
+    /// stamp to detect whether metadata state changed since the stamp was
+    /// written (any append changes the file size). Engines without a WAL
+    /// return 0.
+    fn log_len(&self) -> u64;
 }
 
 /// One referrer: `(referrer_digest, descriptor_bytes)`; the digest de-dups.

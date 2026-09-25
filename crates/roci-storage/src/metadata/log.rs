@@ -921,6 +921,16 @@ impl MetadataStore for LogMetadataStore {
     fn maintain(&self) -> io::Result<()> {
         self.do_maintain()
     }
+
+    fn generation(&self) -> u64 {
+        *self.generation.lock().expect("gen lock poisoned")
+    }
+
+    fn log_len(&self) -> u64 {
+        std::fs::metadata(&self.log_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
 }
 
 // ============================================================================
@@ -961,6 +971,7 @@ impl LogMetadataStore {
             self.sync.lock().expect("sync lock poisoned").handle = Some(clone);
             let seq = self.appended.fetch_add(1, Ordering::AcqRel) + 1;
             Self::apply_in_ram(&mut state, op);
+            roci_telemetry::record_meta_wal_append();
             return Ok(seq);
         }
         let log = state.log.as_mut().expect("log opened above");
@@ -968,6 +979,7 @@ impl LogMetadataStore {
         log.flush()?;
         let seq = self.appended.fetch_add(1, Ordering::AcqRel) + 1;
         Self::apply_in_ram(&mut state, op);
+        roci_telemetry::record_meta_wal_append();
         Ok(seq)
     }
 
@@ -981,7 +993,9 @@ impl LogMetadataStore {
             .as_ref()
             .expect("log handle set on first append")
             .sync_data()?;
+        let batch = covered.saturating_sub(sync.synced);
         sync.synced = sync.synced.max(covered);
+        roci_telemetry::record_meta_wal_batch_size(batch);
         Ok(())
     }
 
@@ -1029,10 +1043,13 @@ impl LogMetadataStore {
             state.checksums.clear();
             state.deleted_digests.clear();
             state.deleted_checksums.clear();
+            roci_telemetry::record_meta_compaction("ok");
+            roci_telemetry::record_meta_snapshot("ok");
         } else {
             let (tmp, len) = self.write_log_image(&full, None)?;
             self.install_log(&mut state, &tmp)?;
             self.image_len.store(len, Ordering::Release);
+            roci_telemetry::record_meta_compaction("ok");
         }
         Ok(())
     }

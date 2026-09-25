@@ -123,7 +123,7 @@ impl Principal {
         }
     }
 
-    fn subject(&self) -> Option<&str> {
+    pub(crate) fn subject(&self) -> Option<&str> {
         match self {
             Principal::Anonymous => None,
             Principal::User { name, .. } => Some(name),

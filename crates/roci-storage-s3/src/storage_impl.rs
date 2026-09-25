@@ -218,6 +218,7 @@ impl Storage for S3Storage {
         let staged_size = self.staging_size(repo, id).await?;
         if staged_size > max_size {
             self.discard_session(repo, id).await;
+            roci_telemetry::record_upload_finalize("too_large");
             return Err(StorageError::TooLarge {
                 limit: max_size,
                 actual: staged_size,
@@ -228,6 +229,7 @@ impl Storage for S3Storage {
         let (actual, crc32c, size) = self.hash_staging(repo, id, expected.algorithm()).await?;
         if !actual.ct_eq(expected) {
             self.discard_session(repo, id).await;
+            roci_telemetry::record_upload_finalize("digest_mismatch");
             return Err(StorageError::DigestMismatch {
                 expected: expected.as_string(),
                 actual: actual.as_string(),
@@ -284,6 +286,7 @@ impl Storage for S3Storage {
         self.blob_entered(repo, &digest_str, Some(BlobChecksum { crc32c, size }));
         drop(pin);
         self.drop_admit_lock(repo, &digest_str);
+        roci_telemetry::record_upload_finalize("ok");
         Ok(())
     }
 

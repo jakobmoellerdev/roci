@@ -8,7 +8,7 @@
 //! `ManualReader` + `ResourceMetrics`, avoiding third-party exporter crates
 //! (supply-chain minimisation).
 
-use opentelemetry::metrics::{Counter, Histogram, Meter};
+use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
 use opentelemetry_sdk::metrics::reader::MetricReader;
@@ -72,6 +72,15 @@ struct StorageInstruments {
     quota_rejections: Counter<u64>,
     auth_decisions: Counter<u64>,
     blocking_hops: Counter<u64>,
+    // MetadataStore instruments
+    meta_wal_appends: Counter<u64>,
+    meta_wal_batch_size: Histogram<u64>,
+    meta_compaction: Counter<u64>,
+    meta_snapshot: Counter<u64>,
+    // Upload session instruments
+    upload_active: UpDownCounter<i64>,
+    upload_bytes: Counter<u64>,
+    upload_finalize: Counter<u64>,
 }
 
 pub(crate) fn set_reader(reader: SharedReader) {
@@ -125,6 +134,37 @@ pub(crate) fn install(provider: opentelemetry_sdk::metrics::SdkMeterProvider) {
         blocking_hops: counter(
             "registry.blocking.hops",
             "Filesystem work handed to the blocking thread pool, by operation",
+        ),
+        // MetadataStore instruments
+        meta_wal_appends: counter(
+            "registry.meta.wal.appends",
+            "WAL records appended to the metadata log",
+        ),
+        meta_wal_batch_size: meter
+            .u64_histogram("registry.meta.wal.batch_size")
+            .with_description("Group-commit batch size (records coalesced per fsync)")
+            .with_boundaries(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0])
+            .build(),
+        meta_compaction: counter(
+            "registry.meta.compaction",
+            "Metadata log compactions by result",
+        ),
+        meta_snapshot: counter(
+            "registry.meta.snapshot",
+            "Metadata snapshots written by result",
+        ),
+        // Upload session instruments
+        upload_active: meter
+            .i64_up_down_counter("registry.upload.active")
+            .with_description("Currently active upload sessions")
+            .build(),
+        upload_bytes: counter(
+            "registry.upload.bytes",
+            "Total bytes received across all upload sessions",
+        ),
+        upload_finalize: counter(
+            "registry.upload.finalize",
+            "Upload finalization outcomes by result",
         ),
     });
 }
@@ -222,6 +262,62 @@ pub fn record_auth_decision(method: &str, result: &str) {
     }
 }
 
+// ── MetadataStore recording API ─────────────────────────────────────────
+
+/// Count one WAL record appended to the metadata log.
+pub fn record_meta_wal_append() {
+    if let Some(s) = STORAGE.get() {
+        s.meta_wal_appends.add(1, &[]);
+    }
+}
+
+/// Record a group-commit batch size (records coalesced per fsync).
+pub fn record_meta_wal_batch_size(batch: u64) {
+    if let Some(s) = STORAGE.get() {
+        s.meta_wal_batch_size.record(batch, &[]);
+    }
+}
+
+/// Count one metadata compaction by `result` (`ok`/`error`).
+pub fn record_meta_compaction(result: &str) {
+    if let Some(s) = STORAGE.get() {
+        s.meta_compaction
+            .add(1, &[KeyValue::new("result", result.to_string())]);
+    }
+}
+
+/// Count one metadata snapshot by `result` (`ok`/`error`).
+pub fn record_meta_snapshot(result: &str) {
+    if let Some(s) = STORAGE.get() {
+        s.meta_snapshot
+            .add(1, &[KeyValue::new("result", result.to_string())]);
+    }
+}
+
+// ── Upload session recording API ────────────────────────────────────────
+
+/// Adjust the active upload session gauge (+1 on begin, −1 on end).
+pub fn record_upload_active(delta: i64) {
+    if let Some(s) = STORAGE.get() {
+        s.upload_active.add(delta, &[]);
+    }
+}
+
+/// Count bytes received into an upload session.
+pub fn record_upload_bytes(bytes: u64) {
+    if let Some(s) = STORAGE.get() {
+        s.upload_bytes.add(bytes, &[]);
+    }
+}
+
+/// Count one upload finalization by `result` (`ok`/`digest_mismatch`/`too_large`/`error`).
+pub fn record_upload_finalize(result: &str) {
+    if let Some(s) = STORAGE.get() {
+        s.upload_finalize
+            .add(1, &[KeyValue::new("result", result.to_string())]);
+    }
+}
+
 // ── Prometheus text exposition ──────────────────────────────────────────
 
 /// Axum handler: collects metrics from the `ManualReader` and encodes them in
@@ -259,7 +355,6 @@ fn encode_prometheus(rm: &ResourceMetrics) -> String {
 }
 
 fn encode_metric(out: &mut String, prom_name: &str, desc: &str, data: &AggregatedMetrics) {
-    // roci emits only f64 histograms and u64 monotonic counters.
     if let AggregatedMetrics::F64(MetricData::Histogram(hist)) = data {
         write_help_type(out, prom_name, desc, "histogram");
         for dp in hist.data_points() {
@@ -283,6 +378,35 @@ fn encode_metric(out: &mut String, prom_name: &str, desc: &str, data: &Aggregate
         }
     } else if let AggregatedMetrics::U64(MetricData::Sum(sum)) = data {
         encode_u64_sum(out, prom_name, desc, sum);
+    } else if let AggregatedMetrics::I64(MetricData::Sum(sum)) = data {
+        // UpDownCounter (non-monotonic): Prometheus gauge type.
+        write_help_type(out, prom_name, desc, "gauge");
+        for dp in sum.data_points() {
+            let labels = format_labels(dp.attributes());
+            let _ = writeln!(out, "{prom_name}{labels} {}", dp.value());
+        }
+    } else if let AggregatedMetrics::U64(MetricData::Histogram(hist)) = data {
+        // u64 histogram (e.g. batch-size counts).
+        write_help_type(out, prom_name, desc, "histogram");
+        for dp in hist.data_points() {
+            let base_labels = collect_labels(dp.attributes());
+            let mut cumulative: u64 = 0;
+            let bounds: Vec<f64> = dp.bounds().collect();
+            let counts: Vec<u64> = dp.bucket_counts().collect();
+            for (i, count) in counts.iter().enumerate() {
+                cumulative += count;
+                let le = if i < bounds.len() {
+                    format!("{}", bounds[i])
+                } else {
+                    "+Inf".to_string()
+                };
+                let labels = format_labels_with(&base_labels, "le", &le);
+                let _ = writeln!(out, "{prom_name}_bucket{labels} {cumulative}");
+            }
+            let labels = format_labels(dp.attributes());
+            let _ = writeln!(out, "{prom_name}_sum{labels} {}", dp.sum());
+            let _ = writeln!(out, "{prom_name}_count{labels} {}", dp.count());
+        }
     }
 }
 

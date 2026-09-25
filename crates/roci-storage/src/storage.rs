@@ -25,10 +25,13 @@ type ChunkRead = tokio::task::JoinHandle<io::Result<(std::fs::File, Bytes)>>;
 
 /// Read exactly `n` bytes (after seeking to `seek`, if given) on the blocking
 /// pool. The file is moved in and handed back, so no lock is needed and only
-/// one read per stream is ever in flight.
-fn read_chunk(file: std::fs::File, seek: Option<u64>, n: u64) -> ChunkRead {
+/// one read per stream is ever in flight. The caller's `span` is entered on
+/// the blocking thread so the work is attributed to the request trace
+/// (storage-internal propagation).
+fn read_chunk(file: std::fs::File, seek: Option<u64>, n: u64, span: tracing::Span) -> ChunkRead {
     roci_telemetry::record_blocking_hop("read_chunk");
     tokio::task::spawn_blocking(move || {
+        let _guard = span.enter();
         use std::io::{Read, Seek};
         let mut file = file;
         if let Some(start) = seek {
@@ -63,19 +66,20 @@ fn read_chunk(file: std::fs::File, seek: Option<u64>, n: u64) -> ChunkRead {
 /// one chunk of read-ahead: the next read runs while the current chunk is being
 /// written to the socket. Backpressure is async (an unpolled stream holds a
 /// finished chunk, never a blocking-pool thread), so slow clients cannot pin
-/// the pool. A read error ends the stream after yielding it.
-fn file_stream(file: std::fs::File, start: u64, len: u64) -> BlobStream {
+/// the pool. A read error ends the stream after yielding it. Each read-chunk
+/// hop enters `span` so storage I/O is attributed to the request trace.
+fn file_stream(file: std::fs::File, start: u64, len: u64, span: tracing::Span) -> BlobStream {
     let first = FILE_CHUNK.min(len);
-    let pending = read_chunk(file, (start > 0).then_some(start), first);
-    futures::stream::unfold(Some((pending, len - first)), |state| async move {
-        let (pending, remaining) = state?;
+    let pending = read_chunk(file, (start > 0).then_some(start), first, span.clone());
+    futures::stream::unfold(Some((pending, len - first, span)), |state| async move {
+        let (pending, remaining, span) = state?;
         let (file, bytes) = match pending.await.map_err(io::Error::other).and_then(|r| r) {
             Ok(read) => read,
             Err(e) => return Some((Err(e), None)),
         };
         let next = (remaining > 0).then(|| {
             let n = FILE_CHUNK.min(remaining);
-            (read_chunk(file, None, n), remaining - n)
+            (read_chunk(file, None, n, span.clone()), remaining - n, span)
         });
         Some((Ok(bytes), next))
     })
@@ -153,9 +157,24 @@ impl BlobRead {
 
     /// Stream `len` bytes starting at `start` (`start + len <= size`). A
     /// redirect has no local body: [`io::ErrorKind::Unsupported`].
+    ///
+    /// On Linux/FreeBSD, issues `posix_fadvise` hints before streaming:
+    /// `Sequential` for a full-blob read, `WillNeed` over the requested window
+    /// for a range read. Errors from fadvise are advisory and silently ignored.
+    /// `DONTNEED` is intentionally *not* issued after a full read: a registry
+    /// repeatedly serves the same hot layers, and evicting their pages would
+    /// penalise concurrent and subsequent readers.
     pub async fn into_stream(self, start: u64, len: u64) -> io::Result<BlobStream> {
+        // Create a child span of the current (request) span for the blob body
+        // stream. The span is propagated into every blocking-pool read-chunk
+        // hop so storage I/O is attributed to the request trace.
+        let span = tracing::info_span!("blob.stream", bytes = len, range.start = start,);
         match self.source {
-            BlobSource::File(f) => Ok(file_stream(f.into_std().await, start, len)),
+            BlobSource::File(f) => {
+                let file = f.into_std().await;
+                advise_blob(&file, start, len, self.size);
+                Ok(file_stream(file, start, len, span))
+            }
             BlobSource::Ranged(open) => open(start, len).await,
             BlobSource::Redirect(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -164,6 +183,41 @@ impl BlobRead {
         }
     }
 }
+
+/// Issue `posix_fadvise` hints for a blob about to be streamed.
+///
+/// Full-blob reads: `Sequential` — the kernel doubles its readahead window,
+/// reducing syscalls per stream.
+///
+/// Range reads (e.g. lazy-pull clients): `WillNeed` over the requested window,
+/// which initiates a background readahead for those pages without disturbing
+/// the default strategy for the rest of the file.
+///
+/// Errors from fadvise are advisory and silently ignored.
+/// `DONTNEED` is intentionally not issued: a registry repeatedly serves the
+/// same hot image layers, and evicting their pages would penalise concurrent
+/// and subsequent readers sharing the page cache.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn advise_blob(file: &std::fs::File, start: u64, len: u64, total_size: u64) {
+    use rustix::fs::{fadvise, Advice};
+    use std::num::NonZeroU64;
+
+    let is_full = start == 0 && len == total_size;
+    if is_full {
+        // Sequential: kernel doubles readahead, optimal for a linear stream.
+        let _ = fadvise(file, 0, None, Advice::Sequential);
+    } else {
+        // Range read: advise WillNeed over the requested window so the kernel
+        // initiates readahead for those pages.
+        if let Some(nz) = NonZeroU64::new(len) {
+            let _ = fadvise(file, start, Some(nz), Advice::WillNeed);
+        }
+    }
+}
+
+/// No-op on platforms without `posix_fadvise`.
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn advise_blob(_file: &std::fs::File, _start: u64, _len: u64, _total_size: u64) {}
 
 /// The derived links one manifest push commits **atomically with the manifest
 /// itself** (one WAL record — SECURITY §Storage boundary "GC as an integrity
@@ -350,4 +404,8 @@ pub trait StorageBackend: Storage {
     /// Start the enabled background subsystems (GC, scrub, metadata upkeep);
     /// every task stops when `shutdown` becomes `true`.
     fn start_maintenance(&self, shutdown: tokio::sync::watch::Receiver<bool>);
+    /// Graceful-shutdown hook: persist state that speeds up the next start
+    /// (e.g. the fast-restart stamp). Best-effort: a failure is logged but
+    /// does not prevent the process from exiting.
+    fn on_shutdown(&self) {}
 }

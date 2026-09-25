@@ -46,6 +46,16 @@ async fn metrics_full_lifecycle() {
     roci_telemetry::record_dedupe_link("dedupe", "hardlink");
     roci_telemetry::record_quota_rejection("total");
     roci_telemetry::record_auth_decision("htpasswd", "denied");
+    // MetadataStore instruments.
+    roci_telemetry::record_meta_wal_append();
+    roci_telemetry::record_meta_wal_append();
+    roci_telemetry::record_meta_wal_batch_size(3);
+    roci_telemetry::record_meta_compaction("ok");
+    roci_telemetry::record_meta_snapshot("ok");
+    // Upload session instruments.
+    roci_telemetry::record_upload_active(1);
+    roci_telemetry::record_upload_bytes(65536);
+    roci_telemetry::record_upload_finalize("ok");
 
     let router = roci_telemetry::metrics_router(&config);
     let resp = router
@@ -79,6 +89,13 @@ async fn metrics_full_lifecycle() {
         "registry_scrub_checked_total{result=\"corrupt\"} 1",
         "registry_scrub_bytes_total{} 512",
         "registry_quota_rejections_total{scope=\"total\"} 1",
+        // MetadataStore counters.
+        "registry_meta_wal_appends_total{} 2",
+        "registry_meta_compaction_total{result=\"ok\"} 1",
+        "registry_meta_snapshot_total{result=\"ok\"} 1",
+        // Upload session counters.
+        "registry_upload_bytes_total{} 65536",
+        "registry_upload_finalize_total{result=\"ok\"} 1",
     ] {
         assert!(text.contains(series), "missing `{series}` in: {text}");
     }
@@ -91,5 +108,15 @@ async fn metrics_full_lifecycle() {
             && text.contains("method=\"htpasswd\"")
             && text.contains("result=\"denied\""),
         "missing auth decision series in: {text}"
+    );
+    // Upload active: UpDownCounter → Prometheus gauge.
+    assert!(
+        text.contains("registry_upload_active{} 1"),
+        "missing upload active gauge in: {text}"
+    );
+    // WAL batch-size: u64 histogram.
+    assert!(
+        text.contains("registry_meta_wal_batch_size_count{} 1"),
+        "missing WAL batch-size histogram in: {text}"
     );
 }

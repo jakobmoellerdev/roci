@@ -787,3 +787,174 @@ async fn index_from_meta_uses_existing_top_level_as_base_object() {
             .unwrap();
     assert_eq!(rebuilt["schemaVersion"], 2);
 }
+
+/// write_index_at_root produces a valid index with no `.tmp` leftovers on the
+/// portable (named-temp) fallback path. On macOS this is the only path; on
+/// Linux with FORCE_TMPFILE_UNSUPPORTED it exercises the same branch.
+#[tokio::test]
+async fn write_index_no_tmp_leftovers_fallback() {
+    #[cfg(target_os = "linux")]
+    let _serialize = FAULT_TEST_LOCK.lock().await;
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::atomic::Ordering;
+        crate::fault::FORCE_TMPFILE_UNSUPPORTED.store(true, Ordering::Relaxed);
+    }
+
+    let (dir, s) = store();
+    let body = br#"{"schemaVersion":2}"#;
+    let d = sha256_of(body);
+    s.put_manifest(
+        "r",
+        Some("v1"),
+        &d,
+        "application/json",
+        body,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
+    s.reconcile_index_json().await;
+
+    // Wait for the background writer to settle so its concurrent write (if
+    // any) has finished its rename before we check for leftovers.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+    while s.index_dirty.lock().unwrap().contains_key("r") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "repo never became clean"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Small additional sleep for any in-flight rename to land.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Verify the written index is valid.
+    let index_bytes = std::fs::read(dir.path().join("r/index.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&index_bytes).unwrap();
+    assert!(v["manifests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| descriptor_tag(e) == Some("v1")));
+
+    // No `.tmp` leftovers in the repo dir.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("r"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftover tmp files: {leftovers:?}");
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::atomic::Ordering;
+        crate::fault::FORCE_TMPFILE_UNSUPPORTED.store(false, Ordering::Relaxed);
+    }
+}
+
+/// On Linux, the O_TMPFILE path produces a valid index with no `.tmp`
+/// leftovers (the anonymous inode is invisible until linkat→rename).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn write_index_no_tmp_leftovers_otmpfile() {
+    let _serialize = FAULT_TEST_LOCK.lock().await;
+    // Ensure FORCE_TMPFILE_UNSUPPORTED is *off* so the O_TMPFILE path runs.
+    use std::sync::atomic::Ordering;
+    crate::fault::FORCE_TMPFILE_UNSUPPORTED.store(false, Ordering::Relaxed);
+
+    let (dir, s) = store();
+    let body = br#"{"schemaVersion":2}"#;
+    let d = sha256_of(body);
+    s.put_manifest(
+        "r",
+        Some("v1"),
+        &d,
+        "application/json",
+        body,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
+    s.reconcile_index_json().await;
+
+    // Wait for the background writer to settle.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+    while s.index_dirty.lock().unwrap().contains_key("r") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "repo never became clean"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let index_bytes = std::fs::read(dir.path().join("r/index.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&index_bytes).unwrap();
+    assert!(v["manifests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| descriptor_tag(e) == Some("v1")));
+
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("r"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftover tmp files: {leftovers:?}");
+}
+
+/// A planted stale `.index.json.<x>.tmp` regular file is removed at startup
+/// reconcile, while a symlink or directory named like that is not
+/// followed/removed.
+#[cfg(unix)]
+#[tokio::test]
+async fn reconcile_sweeps_stale_tmp_but_not_symlinks_or_dirs() {
+    let (dir, s) = store();
+    // Create a repo dir with a valid oci-layout so discover_repos finds it.
+    let repo_dir = dir.path().join("r");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("oci-layout"),
+        r#"{"imageLayoutVersion":"1.0.0"}"#,
+    )
+    .unwrap();
+    // Empty index so reconcile can read it.
+    std::fs::write(
+        repo_dir.join("index.json"),
+        r#"{"schemaVersion":2,"manifests":[]}"#,
+    )
+    .unwrap();
+
+    // Plant a stale regular-file orphan.
+    let orphan_path = repo_dir.join(".index.json.deadbeef01234567.tmp");
+    std::fs::write(&orphan_path, b"stale leftover").unwrap();
+
+    // Plant a symlink matching the pattern — must NOT be removed.
+    let symlink_path = repo_dir.join(".index.json.cafebabe00000000.tmp");
+    std::os::unix::fs::symlink("/dev/null", &symlink_path).unwrap();
+
+    // Plant a directory matching the pattern — must NOT be removed.
+    let dir_path = repo_dir.join(".index.json.0000000000000000.tmp");
+    std::fs::create_dir(&dir_path).unwrap();
+
+    s.reconcile_index_json().await;
+
+    // The regular-file orphan was swept.
+    assert!(
+        !orphan_path.exists(),
+        "stale regular-file .tmp should be removed"
+    );
+    // The symlink is untouched (symlink_metadata still finds it).
+    assert!(
+        std::fs::symlink_metadata(&symlink_path).is_ok(),
+        "symlink matching .tmp pattern should NOT be removed"
+    );
+    // The directory is untouched.
+    assert!(
+        dir_path.is_dir(),
+        "directory matching .tmp pattern should NOT be removed"
+    );
+}

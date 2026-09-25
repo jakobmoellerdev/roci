@@ -16,7 +16,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use roci_config::{ClientAuth, Config, ConfigError};
 use roci_core::auth::{Auth, ClientCertIdentity};
-use roci_core::{build_router, AppState};
+use roci_core::{build_router, AppState, PeerAddr};
 use roci_storage::quota::{QuotaLimits, QuotaTracker};
 use roci_storage::routing::Routed;
 use roci_storage::{
@@ -140,6 +140,14 @@ impl StorageBackend for AnyBackend {
             AnyBackend::S3(inner) => inner.start_maintenance(shutdown),
         }
     }
+
+    fn on_shutdown(&self) {
+        match self {
+            AnyBackend::Fs(inner) => inner.on_shutdown(),
+            #[cfg(feature = "s3")]
+            AnyBackend::S3(inner) => inner.on_shutdown(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +269,7 @@ pub async fn serve(
         }
     }
 
+    let storage_for_shutdown = storage.clone();
     let app = build_router(AppState::new_with(storage, config.clone()).with_auth(auth))
         .merge(roci_telemetry::metrics_router(&config));
 
@@ -301,7 +310,7 @@ pub async fn serve(
             accept = listener.accept() => {
                 // OS accept errors (EMFILE, ECONNABORTED, …) are transient:
                 // skip and keep serving.
-                let Some((tcp, _peer)) = accept.ok() else { continue };
+                let Some((tcp, peer)) = accept.ok() else { continue };
                 let _ = tcp.set_nodelay(true);
 
                 let builder = Arc::clone(&builder);
@@ -311,7 +320,7 @@ pub async fn serve(
 
                 tokio::spawn(async move {
                     if let Err(e) = handle_conn(
-                        tcp, builder, tls_acceptor, app, &mut shutdown_rx, idle_timeout,
+                        tcp, peer, builder, tls_acceptor, app, &mut shutdown_rx, idle_timeout,
                     )
                     .await
                     {
@@ -326,6 +335,9 @@ pub async fn serve(
         }
     }
 
+    // Persist fast-restart stamp (and any other shutdown hooks).
+    storage_for_shutdown.on_shutdown();
+
     Ok(())
 }
 
@@ -333,12 +345,14 @@ pub async fn serve(
 /// hyper-util auto-builder until it completes, is shut down, or idles out.
 async fn handle_conn(
     tcp: tokio::net::TcpStream,
+    peer: SocketAddr,
     builder: Arc<AutoBuilder<TokioExecutor>>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     app: axum::Router,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     idle_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let peer_addr = PeerAddr(peer.ip());
     match tls_acceptor {
         Some(acceptor) => {
             let tls_stream = acceptor.accept(tcp).await.map_err(
@@ -359,12 +373,24 @@ async fn handle_conn(
                 &builder,
                 app,
                 identity,
+                peer_addr,
                 shutdown_rx,
                 idle_timeout,
             )
             .await
         }
-        None => serve_io(tcp, &builder, app, None, shutdown_rx, idle_timeout).await,
+        None => {
+            serve_io(
+                tcp,
+                &builder,
+                app,
+                None,
+                peer_addr,
+                shutdown_rx,
+                idle_timeout,
+            )
+            .await
+        }
     }
 }
 
@@ -372,12 +398,14 @@ async fn handle_conn(
 /// either direction for `idle_timeout` — an idle keep-alive or a stalled peer —
 /// never merely because it has been open that long (an active long transfer or
 /// busy keep-alive connection is not cut). `client_identity` (a verified mTLS
-/// certificate's name) is attached to every request on the connection.
+/// certificate's name) and `peer_addr` (the TCP peer IP for per-client rate
+/// limiting) are attached to every request on the connection.
 async fn serve_io<T>(
     io: T,
     builder: &AutoBuilder<TokioExecutor>,
     app: axum::Router,
     client_identity: Option<ClientCertIdentity>,
+    peer_addr: PeerAddr,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     idle_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
@@ -391,6 +419,7 @@ where
         TowerToHyperService {
             service: app,
             client_identity,
+            peer_addr,
         },
     );
     tokio::pin!(conn);
@@ -764,6 +793,7 @@ impl rustls::server::danger::ClientCertVerifier for PinnedClientVerifier {
 struct TowerToHyperService<S> {
     service: S,
     client_identity: Option<ClientCertIdentity>,
+    peer_addr: PeerAddr,
 }
 
 impl<S> hyper::service::Service<hyper::Request<Incoming>> for TowerToHyperService<S>
@@ -784,6 +814,7 @@ where
         if let Some(id) = &self.client_identity {
             req.extensions_mut().insert(id.clone());
         }
+        req.extensions_mut().insert(self.peer_addr.clone());
         self.service.clone().call(req)
     }
 }

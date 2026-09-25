@@ -26,6 +26,7 @@ ring.workspace = true
 x509-parser.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+lru.workspace = true
 
 # LDAP bind authentication; off unless the `ldap` feature is enabled.
 ldap3 = { workspace = true, optional = true }
