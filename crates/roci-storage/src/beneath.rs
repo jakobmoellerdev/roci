@@ -52,7 +52,13 @@ fn openat2_beneath(
         return None;
     }
     let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
-    match rustix::fs::openat2(dir, rel, flags, Mode::from_raw_mode(0o644), resolve) {
+    // Unlike `openat`, `openat2` rejects a non-zero mode without O_CREAT/O_TMPFILE.
+    let mode = if flags.intersects(rustix::fs::OFlags::CREATE | rustix::fs::OFlags::TMPFILE) {
+        Mode::from_raw_mode(0o644)
+    } else {
+        Mode::empty()
+    };
+    match rustix::fs::openat2(dir, rel, flags, mode, resolve) {
         Ok(fd) => Some(Ok(fd)),
         Err(Errno::NOSYS | Errno::PERM) => None,
         Err(Errno::LOOP | Errno::NOTDIR | Errno::XDEV) => {
