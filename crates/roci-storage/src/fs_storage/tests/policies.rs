@@ -142,6 +142,10 @@ async fn upload_session_cap_counts_open_sessions_across_restart() {
     let (dir, s) = store_with(limits, false);
     let first = s.begin_upload("r").await.unwrap();
     let second = s.begin_upload("r").await.unwrap();
+    // `second` gets data, so it has a staging file that survives a restart.
+    s.append_upload("r", &second, crate::upload_body(b"s"), None, u64::MAX)
+        .await
+        .unwrap();
     assert!(matches!(
         s.begin_upload("r").await,
         Err(StorageError::TooManySessions { limit: 2 })

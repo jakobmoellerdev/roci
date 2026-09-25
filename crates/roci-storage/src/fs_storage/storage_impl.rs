@@ -11,7 +11,9 @@ use crate::layout::*;
 use crate::metadata::{BlobChecksum, MetaOp, Page, Referrer};
 use crate::publish::*;
 use crate::storage::{BlobRead, ManifestLinks, ManifestRef, Storage};
-use crate::upload_body::{append_body, StagedHash, UploadBody};
+use crate::upload_body::{
+    append_body, append_body_deferring_tail, Deferred, StagedHash, UploadBody,
+};
 use std::io;
 use std::path::Path;
 use tokio::io::AsyncReadExt;
@@ -117,17 +119,16 @@ impl Storage for FsStorage {
         let mut buf = [0u8; 16];
         getrandom::fill(&mut buf).map_err(|e| StorageError::Io(io::Error::other(e)))?;
         let id = hex::encode(buf);
-        // Create the staging file anchored to a dirfd walked no-follow beneath
-        // the store root (creating `<repo…>/uploads`), so a symlink planted at a
-        // repo/`uploads` component cannot redirect the create outside the store
-        // the way a path-based `create_dir_all`+`File::create` would.
-        let (up_dir, up_leaf) = upload_dir_rel(repo, &id)?;
-        // The concurrent-session cap is checked before anything is created.
+        // Validate the staging path now; the file itself is created (beneath
+        // the store root, no-follow, `O_EXCL`) by the session's first
+        // append/finalize, inside the blocking hop it makes anyway.
+        upload_dir_rel(repo, &id)?;
+        // The concurrent-session cap counts pending sessions too.
         self.quota.begin_session()?;
-        if let Err(e) = create_empty_beneath(&self.root, &up_dir, &up_leaf).await {
-            self.quota.end_session();
-            return Err(e.into());
-        }
+        self.pending_uploads
+            .lock()
+            .expect("pending-uploads poisoned")
+            .insert((repo.to_string(), id.clone()), std::time::Instant::now());
         Ok(id)
     }
 
@@ -146,19 +147,22 @@ impl Storage for FsStorage {
         // also carries the session's hash-on-write state.
         let lock = self.session_lock(repo, id)?;
         let mut hash = lock.lock().await;
-        let rel = upload_rel(repo, id)?;
-        let f = match open_append_beneath(&self.root, &rel).await {
-            Ok(f) => f,
-            Err(e) => {
+        let (f, current) = match self.prepare_session(repo, id).await? {
+            Staging::Ready { file, len, .. } => (tokio::fs::File::from_std(file), len),
+            Staging::Missing => {
                 // No such session: drop the just-created lock entry so a stream
                 // of unknown ids cannot leak lock-map entries.
                 self.drop_session_lock(repo, id);
-                return Err(map_not_found(e));
+                return Err(StorageError::NotFound);
+            }
+            Staging::NotRegular => {
+                return Err(StorageError::Io(io::Error::other(format!(
+                    "upload {id} is not a regular file"
+                ))))
             }
         };
         // Enforce the Content-Range precondition under the lock: the current
         // committed size must equal the client-declared start offset.
-        let current = f.metadata().await?.len();
         if let Some(offset) = expected_offset.filter(|&o| o != current) {
             return Err(StorageError::RangeNotSatisfiable {
                 expected: current,
@@ -175,6 +179,9 @@ impl Storage for FsStorage {
         // Stat the staging file no-follow beneath the store root: a symlinked
         // `uploads`/`<id>` component cannot redirect the size read outside the
         // store. A missing or non-regular entry is NotFound (no such session).
+        if self.is_pending(repo, id) {
+            return Ok(0);
+        }
         let rel = upload_rel(repo, id)?;
         match stat_beneath(&self.root, &rel)
             .await
@@ -210,13 +217,7 @@ impl Storage for FsStorage {
         // `uploads/<id>` symlink is not a valid staging file, so it is never
         // hashed-through and promoted), open it for the trailing append, and
         // capture its size and inode.
-        let prepared = {
-            let (root, rel) = (self.root.to_path_buf(), staging_rel.clone());
-            run_blocking("finish_prepare", move || prepare_staging(root, rel))
-                .await
-                .map_err(map_not_found)?
-        };
-        let (file, current, staging_ino) = match prepared {
+        let (file, current, staging_ino) = match self.prepare_session(repo, id).await? {
             Staging::Ready { file, len, ino } => (file, len, ino),
             Staging::Missing => {
                 self.drop_session_lock(repo, id);
@@ -229,12 +230,13 @@ impl Storage for FsStorage {
                 )));
             }
         };
-        // Hop 2 (per 1 MiB batch) — stream the monolithic PUT's trailing body
-        // onto the staging file under the same lock, before hashing.
+        // Body — stream the monolithic PUT's trailing body onto the staging
+        // file under the same lock (one hop per full 1 MiB batch). The final
+        // partial batch is written inside the next hop instead of its own.
         let seed = guard
             .take()
             .or_else(|| (current == 0).then(StagedHash::new));
-        let (staged_size, hashed) = append_body(
+        let body = append_body_deferring_tail(
             tokio::fs::File::from_std(file),
             current,
             trailing,
@@ -242,6 +244,7 @@ impl Storage for FsStorage {
             seed,
         )
         .await?;
+        let staged_size = body.len;
         // Re-check the per-session cap *under the lock*: a PATCH that appended
         // past the cap and was preempted before aborting cannot be promoted by a
         // racing empty-body PUT, because finalize itself rejects an oversized
@@ -253,40 +256,42 @@ impl Storage for FsStorage {
                 actual: staged_size,
             });
         }
-        // Hash-on-write covered every staged byte (sha256) through the handle
-        // opened in hop 1, so the verified inode is `staging_ino`. Otherwise —
-        // a session from before a restart, or sha512 — re-hash in one pass; and
-        // `storage.commit` syncs the staged data before it is promoted (a crash
-        // after the rename must not leave a named blob with torn contents).
-        let covered = hashed.filter(|h| h.len() == staged_size && expected.algorithm() == "sha256");
-        let (actual, crc32c, staging_ino) = match covered {
-            Some(h) if !self.config.commit => {
-                let (d, crc) = h.finish();
-                (d, crc, staging_ino)
-            }
-            covered => {
-                let (root, rel) = (self.root.to_path_buf(), staging_rel.clone());
-                let alg = expected.algorithm().to_string();
-                let commit = self.config.commit;
-                run_blocking("finish_verify", move || {
-                    use rustix::fs::OFlags;
-                    let f = resolve_beneath(&root, &rel, OFlags::RDONLY)?;
-                    if commit {
-                        f.sync_data()?;
-                    }
-                    let st = rustix::fs::fstat(&f)?;
-                    let ino = (st.st_dev as u64, st.st_ino as u64);
-                    let (d, crc) = match covered {
-                        Some(h) => h.finish(),
-                        None => hash_std(f, &alg)?,
-                    };
-                    Ok((d, crc, ino))
-                })
-                .await
-                .map_err(map_not_found)?
-            }
+        // Hash-on-write covers every staged byte (sha256) through the handle
+        // opened in hop 1, so the verified inode is `staging_ino`, and the
+        // landing hop writes the tail, finishes the hash and verifies it.
+        // Otherwise — a session from before a restart, sha512, or
+        // `storage.commit` (sync the staged data before it is promoted, so a
+        // crash after the rename cannot leave a named blob with torn contents)
+        // — a verify hop writes the tail and re-hashes (or finishes) first.
+        let covers = body.hash.as_ref().is_some_and(|h| h.len() == body.tail_at)
+            && expected.algorithm() == "sha256";
+        let (verify, verified) = if covers && !self.config.commit {
+            (Some((body, expected.clone())), None)
+        } else {
+            let (root, rel) = (self.root.to_path_buf(), staging_rel.clone());
+            let alg = expected.algorithm().to_string();
+            let commit = self.config.commit;
+            let checked = run_blocking("finish_verify", move || {
+                use rustix::fs::OFlags;
+                let hash = body.write_tail()?.filter(|_| covers);
+                let f = resolve_beneath(&root, &rel, OFlags::RDONLY)?;
+                if commit {
+                    f.sync_data()?;
+                }
+                let st = rustix::fs::fstat(&f)?;
+                let ino = (st.st_dev as u64, st.st_ino as u64);
+                let (d, crc) = match hash {
+                    Some(h) => h.finish(),
+                    None => hash_std(f, &alg)?,
+                };
+                Ok((d, crc, ino))
+            })
+            .await
+            .map_err(map_not_found)?;
+            (None, Some(checked))
         };
-        if !actual.ct_eq(expected) {
+        let staging_ino = verified.as_ref().map_or(staging_ino, |v| v.2);
+        if let Some((actual, _, _)) = verified.as_ref().filter(|v| !v.0.ct_eq(expected)) {
             // Reject and drop the staging file so a bad upload leaves nothing.
             self.discard_session(repo, id).await?;
             return Err(StorageError::DigestMismatch {
@@ -328,11 +333,22 @@ impl Storage for FsStorage {
                 quota: std::sync::Arc::clone(&self.quota),
                 dedupe: std::sync::Arc::clone(&self.dedupe),
                 warm_limit: self.cache.threshold().min(WARM_CAP),
+                verify,
             };
             run_blocking("finish_land", move || Ok(land_blob(ctx))).await?
         };
-        let (charged, warm) = match landed {
-            Landed::Done { charged, warm } => (charged, warm),
+        let (warm, landed_crc) = match landed {
+            Landed::Done { warm, crc } => (warm, crc),
+            Landed::Mismatch(actual) => {
+                drop(pin);
+                drop(_admit_guard);
+                self.drop_blob_admit_lock(repo, &digest_str);
+                self.discard_session(repo, id).await?;
+                return Err(StorageError::DigestMismatch {
+                    expected: expected.as_string(),
+                    actual: actual.as_string(),
+                });
+            }
             Landed::Rejected(e) => {
                 // Over quota: the session can never complete, so drop it.
                 drop(pin);
@@ -349,7 +365,7 @@ impl Storage for FsStorage {
                 return Err(error);
             }
         };
-        let _ = charged;
+        let crc32c = landed_crc.or(verified.map(|v| v.1)).unwrap_or_default();
         self.quota.end_session();
         self.drop_session_lock(repo, id);
         self.blob_entered(
@@ -378,11 +394,12 @@ impl Storage for FsStorage {
         // `uploads`/`<id>` component cannot redirect the deletion outside the
         // store; a missing entry / symlinked parent maps to NotFound → false.
         let (up_dir, up_leaf) = upload_dir_rel(repo, id)?;
-        let removed = match unlink_beneath(&self.root, &up_dir, &up_leaf).await {
-            Ok(()) => true,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-            Err(e) => return Err(StorageError::Io(e)),
-        };
+        let removed = self.take_pending(repo, id)
+            || match unlink_beneath(&self.root, &up_dir, &up_leaf).await {
+                Ok(()) => true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                Err(e) => return Err(StorageError::Io(e)),
+            };
         if removed {
             self.quota.end_session();
         }
@@ -924,7 +941,9 @@ impl FsStorage {
     /// still there), its session count, and its lock entry.
     async fn discard_session(&self, repo: &str, id: &str) -> Result<(), StorageError> {
         let (up_dir, up_leaf) = upload_dir_rel(repo, id)?;
-        if unlink_beneath(&self.root, &up_dir, &up_leaf).await.is_ok() {
+        if self.take_pending(repo, id)
+            || unlink_beneath(&self.root, &up_dir, &up_leaf).await.is_ok()
+        {
             self.quota.end_session();
         }
         self.drop_session_lock(repo, id);
@@ -949,8 +968,37 @@ enum Staging {
 
 /// Blocking: resolve the staging file beneath `root` (no symlink at any
 /// component), require a regular file, and open it for appending.
-fn prepare_staging(root: std::path::PathBuf, rel: std::path::PathBuf) -> io::Result<Staging> {
-    use rustix::fs::OFlags;
+fn prepare_staging(
+    root: std::path::PathBuf,
+    rel: std::path::PathBuf,
+    create: bool,
+) -> io::Result<Staging> {
+    use rustix::fs::{Mode, OFlags};
+    if create {
+        // First write to a pending session: create the staging file beneath
+        // the root (creating `<repo…>/uploads`), no-follow, exclusive — a
+        // symlink planted at any component cannot redirect the create.
+        let dir = rel.parent().unwrap_or(Path::new(""));
+        let leaf = rel.file_name().unwrap_or_default();
+        let dirfd = dir_beneath(&root, dir, true)?;
+        let fd = rustix::fs::openat(
+            &dirfd,
+            leaf,
+            OFlags::WRONLY
+                | OFlags::APPEND
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::NOFOLLOW
+                | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )?;
+        let st = rustix::fs::fstat(&fd)?;
+        return Ok(Staging::Ready {
+            file: std::fs::File::from(fd),
+            len: 0,
+            ino: (st.st_dev as u64, st.st_ino as u64),
+        });
+    }
     match stat_beneath_sync(root.clone(), rel.clone())? {
         None => return Ok(Staging::Missing),
         Some((false, _)) => return Ok(Staging::NotRegular),
@@ -981,11 +1029,20 @@ struct LandCtx {
     quota: std::sync::Arc<crate::quota::QuotaTracker>,
     dedupe: std::sync::Arc<crate::DedupeIndex>,
     warm_limit: usize,
+    /// The deferred body tail plus its hash-on-write state, when the landing
+    /// hop itself writes the tail and verifies the digest.
+    verify: Option<(Deferred, Digest)>,
 }
 
 enum Landed {
-    /// Landed; `charged` quota bytes, and the bytes to warm the cache with.
-    Done { charged: u64, warm: Option<Vec<u8>> },
+    /// Landed, with the bytes to warm the cache with and — when this hop
+    /// verified the digest — the blob's CRC32C.
+    Done {
+        warm: Option<Vec<u8>>,
+        crc: Option<u32>,
+    },
+    /// The deferred-tail digest did not match (nothing admitted or moved).
+    Mismatch(Digest),
     /// Admission refused (quota): nothing was charged.
     Rejected(StorageError),
     /// A filesystem step failed after `charged` bytes were admitted.
@@ -993,8 +1050,30 @@ enum Landed {
 }
 
 /// Blocking: the landing half of `finish_upload` in one hop.
-fn land_blob(c: LandCtx) -> Landed {
+fn land_blob(mut c: LandCtx) -> Landed {
     use std::io::Read;
+    // Deferred tail: write it, finish the hash-on-write digest and verify it
+    // before anything is admitted or moved.
+    let crc = match c.verify.take() {
+        None => None,
+        Some((body, expected)) => match body.write_tail() {
+            Ok(Some(h)) => {
+                let (actual, crc) = h.finish();
+                if !actual.ct_eq(&expected) {
+                    return Landed::Mismatch(actual);
+                }
+                Some(crc)
+            }
+            // `verify` is only set when the hash covers the staged bytes.
+            Ok(None) => return Landed::Mismatch(expected),
+            Err(e) => {
+                return Landed::Failed {
+                    charged: 0,
+                    error: map_not_found(e),
+                }
+            }
+        },
+    };
     let charged = match layout_and_admit(
         &c.root,
         &c.repo_rel,
@@ -1040,7 +1119,8 @@ fn land_blob(c: LandCtx) -> Landed {
             (bytes.len() <= c.warm_limit).then_some(bytes)
         })
         .flatten();
-    Landed::Done { charged, warm }
+    let _ = charged;
+    Landed::Done { warm, crc }
 }
 
 /// Blocking twin of `FsStorage::dedupe_link` for the landing hops.
@@ -1201,5 +1281,23 @@ fn land_manifest(c: ManifestCtx) -> ManifestLanded {
     ManifestLanded::Stored {
         missing: None,
         error: None,
+    }
+}
+
+impl FsStorage {
+    /// One blocking hop: open a session's staging file for appending (creating
+    /// it for a pending session), with its size and inode. Call holding the
+    /// session lock.
+    async fn prepare_session(&self, repo: &str, id: &str) -> Result<Staging, StorageError> {
+        let rel = upload_rel(repo, id)?;
+        let create = self.is_pending(repo, id);
+        let root = self.root.to_path_buf();
+        let staging = run_blocking("upload_prepare", move || prepare_staging(root, rel, create))
+            .await
+            .map_err(map_not_found)?;
+        if create {
+            self.take_pending(repo, id);
+        }
+        Ok(staging)
     }
 }

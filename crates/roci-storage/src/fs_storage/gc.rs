@@ -448,6 +448,31 @@ impl FsStorage {
         .unwrap_or_default();
         let mut count: u64 = 0;
         let mut bytes: u64 = 0;
+        // Pending sessions (begun, never written — no staging file) expire the
+        // same way, unless an append/finalize holds their lock right now.
+        let expired: Vec<(String, String)> = self
+            .pending_uploads
+            .lock()
+            .expect("pending-uploads poisoned")
+            .iter()
+            .filter(|(_, began)| began.elapsed() >= delay)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for (repo, id) in expired {
+            let Ok(lock) = self.session_lock(&repo, &id) else {
+                continue;
+            };
+            let Ok(guard) = lock.try_lock() else {
+                continue;
+            };
+            if self.take_pending(&repo, &id) {
+                self.quota.end_session();
+                roci_telemetry::record_gc_collected("upload", 0);
+                count += 1;
+            }
+            drop(guard);
+            self.drop_session_lock(&repo, &id);
+        }
         for (repo, upload_dir, name, _initial_size) in stale {
             // Acquire the per-session lock (non-blocking). If the session is
             // currently held by an append/finalize/abort, skip it — a PATCH
