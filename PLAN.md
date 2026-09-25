@@ -151,7 +151,7 @@ Rules:
 **Goal:** the full auth matrix.
 
 - [x] **HTTP Basic** — local htpasswd (bcrypt).
-- [x] **HTTP Basic** — LDAP bind (cargo feature `ldap`, in `full`; `auth.ldap` without the feature fails startup).
+- [x] **HTTP Basic** — LDAP bind (opt-in cargo feature `ldap`, not in `full`; `auth.ldap` without the feature fails startup).
 - [x] **HTTP Bearer token** (Docker v2 token scheme — WWW-Authenticate challenge → repo-scoped token; see [`spec/docker-registry-api-v2.md`](spec/docker-registry-api-v2.md)). External token server verification only (ES256/RS256 over `ring`); roci does not issue tokens.
 - [x] **TLS mutual authentication** (client cert verification, optional CA pinning via `client_cert_sha256` leaf fingerprints).
 - [x] **Identity-Based Access Control** — per-identity repo/action policies with glob patterns, specificity-based rule matching, admin override, and group support (config + LDAP directory groups).

@@ -120,7 +120,7 @@ cache_ttl_secs = 60         # credential cache TTL; max 3600, 0 disables caching
 [auth.htpasswd]
 path = "/etc/roci/htpasswd"
 
-# --- HTTP Basic: LDAP (requires the `ldap` cargo feature / `full` build) ---
+# --- HTTP Basic: LDAP (requires the opt-in `ldap` cargo feature, e.g. `--features full,ldap`) ---
 # [auth.ldap]
 # url = "ldaps://ldap.example.com"          # ldaps:// or ldap:// with start_tls = true
 # start_tls = false
@@ -188,7 +188,10 @@ authenticated = ["pull", "push"]
 roci compiles in two flavors (see [Architecture](/design/architecture)):
 
 - **minimal** — the core distribution API only, with the smallest possible dependency graph.
-- **full** — the core plus the optional extensions (`roci-ext-*`) for signatures, search, sync, and scanning, the S3 storage backend (`s3`), the embedded redb metadata engine (`redb`), LDAP authentication (`ldap`), OpenTelemetry export, and the `mimalloc` allocator. Release binaries and the container image are built with `full`. Configuring `s3`, `engine = "redb"`, or `auth.ldap` in a build without the corresponding feature aborts startup with a field-qualified error.
+- **full** — the core plus the optional extensions (`roci-ext-*`) for signatures, search, sync, and scanning, the S3 storage backend (`s3`), the embedded redb metadata engine (`redb`), OpenTelemetry export, and the `mimalloc` allocator. Release binaries and the container image are built with `full`.
+- **`ldap`** — LDAP authentication (`[auth.ldap]`) is opt-in and **not** part of `full`, so release binaries and the container image do not include it; build with `--features full,ldap` to enable it.
+
+Configuring `s3`, `engine = "redb"`, or `auth.ldap` in a build without the corresponding feature aborts startup with a field-qualified error.
 
 Every extension is reachable from the CLI **only** behind a cargo feature, never as an unconditional dependency. Behavior is then selected at runtime through configuration.
 

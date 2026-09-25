@@ -55,9 +55,11 @@ cluster = ["dep:roci-cluster"]
 mimalloc = ["dep:mimalloc"]
 # Embedded B-tree KV metadata engine (`storage.metadata.engine = "redb"`).
 redb = ["roci-storage/redb"]
-# LDAP bind authentication (`[auth.ldap]`).
+# LDAP bind authentication (`[auth.ldap]`). Opt-in only — deliberately NOT
+# part of `full`: enable explicitly, e.g. `--features full,ldap`.
 ldap = ["roci-core/ldap"]
-# Convenience aggregate enabling every extension + the OTel telemetry spine.
+# Convenience aggregate enabling every extension + the OTel telemetry spine
+# (everything except the opt-in `ldap` feature).
 full = [
     "s3",
     "search",
@@ -68,7 +70,6 @@ full = [
     "otel",
     "mimalloc",
     "redb",
-    "ldap",
 ]
 otel = ["roci-telemetry/otel", "roci-core/otel"]
 
