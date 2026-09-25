@@ -190,7 +190,7 @@ impl FsStorage {
         let bytes =
             serde_json::to_vec(index).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let root = root.to_path_buf();
-        run_blocking(move || -> io::Result<()> {
+        run_blocking("write_index_at_root", move || -> io::Result<()> {
             use rustix::fs::{Mode, OFlags};
             use std::io::Write as _;
             let dirfd = dir_beneath(&root, &repo_rel, false)?;

@@ -71,6 +71,7 @@ struct StorageInstruments {
     dedupe_links: Counter<u64>,
     quota_rejections: Counter<u64>,
     auth_decisions: Counter<u64>,
+    blocking_hops: Counter<u64>,
 }
 
 pub(crate) fn set_reader(reader: SharedReader) {
@@ -120,6 +121,10 @@ pub(crate) fn install(provider: opentelemetry_sdk::metrics::SdkMeterProvider) {
         auth_decisions: counter(
             "registry.auth.decisions",
             "Authentication/authorization decisions by method and result",
+        ),
+        blocking_hops: counter(
+            "registry.blocking.hops",
+            "Filesystem work handed to the blocking thread pool, by operation",
         ),
     });
 }
@@ -191,6 +196,14 @@ pub fn record_quota_rejection(scope: &str) {
     if let Some(s) = STORAGE.get() {
         s.quota_rejections
             .add(1, &[KeyValue::new("scope", scope.to_string())]);
+    }
+}
+
+/// Count one hand-off of filesystem work to the blocking pool by `op` (a
+/// static function name: bounded cardinality, no allocation).
+pub fn record_blocking_hop(op: &'static str) {
+    if let Some(s) = STORAGE.get() {
+        s.blocking_hops.add(1, &[KeyValue::new("op", op)]);
     }
 }
 

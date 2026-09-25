@@ -82,6 +82,7 @@ async fn write_batch(
     hash: Option<StagedHash>,
 ) -> io::Result<(Vec<u8>, Option<StagedHash>)> {
     let f = Arc::clone(file);
+    roci_telemetry::record_blocking_hop("write_batch");
     tokio::task::spawn_blocking(move || {
         let (mut batch, mut hash) = (batch, hash);
         (&*f).write_all(&batch)?;

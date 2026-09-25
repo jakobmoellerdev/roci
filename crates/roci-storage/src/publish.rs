@@ -51,134 +51,147 @@ pub(crate) async fn mount_promote_beneath(
     allow_copy: bool,
     sync: bool,
 ) -> io::Result<Promotion> {
-    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     let root = root.to_path_buf();
     let from_alg_rel = from_alg_rel.to_path_buf();
     let to_alg_rel = to_alg_rel.to_path_buf();
     let leaf = leaf.to_string();
-    run_blocking(move || -> io::Result<Promotion> {
-        let from_dir = dir_beneath(&root, &from_alg_rel, false)?;
-        let to_dir = dir_beneath(&root, &to_alg_rel, true)?;
-        // Open the source no-follow (the caller already verified via blob_exists
-        // that it is a present regular file beneath the root).
-        let src = rustix::fs::openat(
-            &from_dir,
-            leaf.as_str(),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(io::Error::from)?;
-        let mut src_file = std::fs::File::from(src);
-        // Prove the opened source is a *regular file* on the fd we hold — not the
-        // path. `O_NOFOLLOW` refuses a symlink leaf, but a FIFO/socket/device
-        // planted at the source name is still openable (`O_NONBLOCK` keeps the
-        // open from blocking) and would otherwise be reflink/copy-read or, worse,
-        // hard-linked into the CAS as a non-regular inode. Bind the check to the
-        // inode we will actually promote by fstat'ing the descriptor.
-        {
-            let st = rustix::fs::fstat(&src_file).map_err(io::Error::from)?;
-            if !FileType::from_raw_mode(st.st_mode).is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "mount source is not a regular file",
-                ));
-            }
+    run_blocking("mount_promote_beneath", move || {
+        mount_promote_beneath_sync(root, from_alg_rel, to_alg_rel, leaf, allow_copy, sync)
+    })
+    .await
+}
+
+/// Synchronous body of [`mount_promote_beneath`], for callers already on a blocking
+/// thread (one hop for a whole operation).
+#[cfg(unix)]
+pub(crate) fn mount_promote_beneath_sync(
+    root: std::path::PathBuf,
+    from_alg_rel: std::path::PathBuf,
+    to_alg_rel: std::path::PathBuf,
+    leaf: String,
+    allow_copy: bool,
+    sync: bool,
+) -> io::Result<Promotion> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+
+    let from_dir = dir_beneath(&root, &from_alg_rel, false)?;
+    let to_dir = dir_beneath(&root, &to_alg_rel, true)?;
+    // Open the source no-follow (the caller already verified via blob_exists
+    // that it is a present regular file beneath the root).
+    let src = rustix::fs::openat(
+        &from_dir,
+        leaf.as_str(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let mut src_file = std::fs::File::from(src);
+    // Prove the opened source is a *regular file* on the fd we hold — not the
+    // path. `O_NOFOLLOW` refuses a symlink leaf, but a FIFO/socket/device
+    // planted at the source name is still openable (`O_NONBLOCK` keeps the
+    // open from blocking) and would otherwise be reflink/copy-read or, worse,
+    // hard-linked into the CAS as a non-regular inode. Bind the check to the
+    // inode we will actually promote by fstat'ing the descriptor.
+    {
+        let st = rustix::fs::fstat(&src_file).map_err(io::Error::from)?;
+        if !FileType::from_raw_mode(st.st_mode).is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mount source is not a regular file",
+            ));
         }
-        // Treat a pre-existing regular-file destination as idempotent success; a
-        // symlink/dir/other there is rejected (re-checked here, not only in the
-        // caller's earlier stat, to close the check→promote race). A missing dest
-        // (NOENT) proceeds to promotion; any other stat error propagates.
-        match rustix::fs::statat(&to_dir, leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => {
-                return Ok(Promotion::Existing)
+    }
+    // Treat a pre-existing regular-file destination as idempotent success; a
+    // symlink/dir/other there is rejected (re-checked here, not only in the
+    // caller's earlier stat, to close the check→promote race). A missing dest
+    // (NOENT) proceeds to promotion; any other stat error propagates.
+    match rustix::fs::statat(&to_dir, leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => return Ok(Promotion::Existing),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "mount destination exists and is not a regular file",
+            ))
+        }
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(e) => return Err(io::Error::from(e)),
+    }
+    // Write into a unique temp in the destination dir (no-follow), by
+    // reflink where possible else a streaming copy, then renameat into place.
+    let mut rnd = [0u8; 8];
+    getrandom::fill(&mut rnd).map_err(io::Error::other)?;
+    let tmp = format!(".{}.{}.tmp", leaf, hex::encode(rnd));
+    let promote_via_temp = |flags: OFlags| -> io::Result<std::fs::File> {
+        rustix::fs::openat(
+            &to_dir,
+            tmp.as_str(),
+            OFlags::WRONLY
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::NOFOLLOW
+                | OFlags::CLOEXEC
+                | flags,
+            Mode::from_raw_mode(0o644),
+        )
+        .map(std::fs::File::from)
+        .map_err(io::Error::from)
+    };
+    // First try a hard link (O(1), no temp) — skipped when a reflink is
+    // preferred and available. Reflink is the contract primary, so attempt it
+    // into the temp; if the filesystem cannot reflink, hard-link directly;
+    // if that also fails (cross-device), stream-copy into the temp.
+    let mut out = promote_via_temp(OFlags::empty())?;
+    if try_reflink(&mut out, &mut src_file) {
+        if sync {
+            out.sync_data()?;
+        }
+        drop(out);
+        promote_temp_noreplace(&to_dir, tmp.as_str(), leaf.as_str(), sync)?;
+        return Ok(Promotion::Reflink);
+    }
+    // Reflink unavailable: drop the temp and try a direct hard link.
+    drop(out);
+    let _ = rustix::fs::unlinkat(&to_dir, tmp.as_str(), AtFlags::empty());
+    match try_hardlink_at(&from_dir, leaf.as_str(), &to_dir, leaf.as_str()) {
+        Ok(()) => {
+            if sync {
+                rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
             }
-            Ok(_) => {
-                return Err(io::Error::new(
+            Ok(Promotion::Hardlink)
+        }
+        // Destination raced in between our earlier stat and this link. Accept
+        // it as idempotent success ONLY if it is now a regular file, re-checked
+        // no-follow — `EEXIST` alone also fires for a symlink/dir/other planted
+        // in the race, which must not count as a valid CAS blob (would 201 a
+        // bogus entry). Mirrors the pre-link destination check above.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            match rustix::fs::statat(&to_dir, leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => {
+                    if sync {
+                        rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
+                    }
+                    Ok(Promotion::Existing)
+                }
+                Ok(_) => Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "mount destination exists and is not a regular file",
-                ))
+                )),
+                Err(e) => Err(io::Error::from(e)),
             }
-            Err(rustix::io::Errno::NOENT) => {}
-            Err(e) => return Err(io::Error::from(e)),
         }
-        // Write into a unique temp in the destination dir (no-follow), by
-        // reflink where possible else a streaming copy, then renameat into place.
-        let mut rnd = [0u8; 8];
-        getrandom::fill(&mut rnd).map_err(io::Error::other)?;
-        let tmp = format!(".{}.{}.tmp", leaf, hex::encode(rnd));
-        let promote_via_temp = |flags: OFlags| -> io::Result<std::fs::File> {
-            rustix::fs::openat(
-                &to_dir,
-                tmp.as_str(),
-                OFlags::WRONLY
-                    | OFlags::CREATE
-                    | OFlags::EXCL
-                    | OFlags::NOFOLLOW
-                    | OFlags::CLOEXEC
-                    | flags,
-                Mode::from_raw_mode(0o644),
-            )
-            .map(std::fs::File::from)
-            .map_err(io::Error::from)
-        };
-        // First try a hard link (O(1), no temp) — skipped when a reflink is
-        // preferred and available. Reflink is the contract primary, so attempt it
-        // into the temp; if the filesystem cannot reflink, hard-link directly;
-        // if that also fails (cross-device), stream-copy into the temp.
-        let mut out = promote_via_temp(OFlags::empty())?;
-        if try_reflink(&mut out, &mut src_file) {
+        // Cross-device / no-hardlink: stream-copy into a fresh temp + rename.
+        Err(_) if allow_copy => {
+            let mut out = promote_via_temp(OFlags::empty())?;
+            stream_copy(&mut src_file, &mut out)?;
             if sync {
                 out.sync_data()?;
             }
             drop(out);
             promote_temp_noreplace(&to_dir, tmp.as_str(), leaf.as_str(), sync)?;
-            return Ok(Promotion::Reflink);
+            Ok(Promotion::Copy)
         }
-        // Reflink unavailable: drop the temp and try a direct hard link.
-        drop(out);
-        let _ = rustix::fs::unlinkat(&to_dir, tmp.as_str(), AtFlags::empty());
-        match try_hardlink_at(&from_dir, leaf.as_str(), &to_dir, leaf.as_str()) {
-            Ok(()) => {
-                if sync {
-                    rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
-                }
-                Ok(Promotion::Hardlink)
-            }
-            // Destination raced in between our earlier stat and this link. Accept
-            // it as idempotent success ONLY if it is now a regular file, re-checked
-            // no-follow — `EEXIST` alone also fires for a symlink/dir/other planted
-            // in the race, which must not count as a valid CAS blob (would 201 a
-            // bogus entry). Mirrors the pre-link destination check above.
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                match rustix::fs::statat(&to_dir, leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
-                    Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => {
-                        if sync {
-                            rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
-                        }
-                        Ok(Promotion::Existing)
-                    }
-                    Ok(_) => Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "mount destination exists and is not a regular file",
-                    )),
-                    Err(e) => Err(io::Error::from(e)),
-                }
-            }
-            // Cross-device / no-hardlink: stream-copy into a fresh temp + rename.
-            Err(_) if allow_copy => {
-                let mut out = promote_via_temp(OFlags::empty())?;
-                stream_copy(&mut src_file, &mut out)?;
-                if sync {
-                    out.sync_data()?;
-                }
-                drop(out);
-                promote_temp_noreplace(&to_dir, tmp.as_str(), leaf.as_str(), sync)?;
-                Ok(Promotion::Copy)
-            }
-            Err(e) => Err(e),
-        }
-    })
-    .await
+        Err(e) => Err(e),
+    }
 }
 
 /// Atomically move the temp `tmp` onto `leaf` in `to_dir` with **no-replace**
@@ -314,7 +327,7 @@ pub(crate) async fn publish_bytes_rename(
     let alg_rel = alg_rel.to_path_buf();
     let leaf = leaf.to_string();
     let data = data.to_vec();
-    run_blocking(move || -> io::Result<()> {
+    run_blocking("publish_bytes_rename", move || -> io::Result<()> {
         let dirfd = dir_beneath(&root, &alg_rel, true)?;
         let mut tmp = [0u8; 8];
         getrandom::fill(&mut tmp).map_err(io::Error::other)?;
@@ -365,7 +378,7 @@ pub(crate) async fn publish_bytes(
     let alg_rel_buf = alg_rel.to_path_buf();
     let leaf_buf = leaf.to_string();
     let data_vec = data.to_vec();
-    let outcome = run_blocking(move || -> io::Result<bool> {
+    let outcome = run_blocking("publish_bytes", move || -> io::Result<bool> {
         let dirfd = dir_beneath(&root_buf, &alg_rel_buf, true)?;
         // Anonymous inode in the (beneath-root) target directory. In test,
         // `FORCE_TMPFILE_UNSUPPORTED` simulates a filesystem without O_TMPFILE so

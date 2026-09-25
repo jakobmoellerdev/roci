@@ -29,7 +29,6 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 
 impl FsStorage {
@@ -228,37 +227,6 @@ impl FsStorage {
         let applied = self.meta.apply(op).map_err(StorageError::Io);
         self.mark_index_dirty(repo);
         applied
-    }
-
-    /// Best-effort: if the just-promoted blob is small enough, read it back
-    /// (no-follow, beneath-root) and warm the small-blob cache. Any IO hiccup
-    /// simply skips the warm — the loose CAS file is always the source of truth.
-    async fn warm_small_blob_cache(&self, repo: &str, rel: &Path, digest_str: &str) {
-        // The blob was just promoted, so it is present and regular. Read it back
-        // (no-follow, beneath-root) and cache it only if small; any IO hiccup on
-        // this optional warm is simply skipped (the loose CAS file is truth).
-        let Ok(f) = open_beneath(&self.root, rel).await else {
-            return;
-        };
-        // The small-blob cache only ever holds blobs up to its configured
-        // threshold, and the cache itself enforces an absolute ceiling. Bound the
-        // warm read by a compile-time constant (never by the operator threshold
-        // alone) so this buffer's size is a fixed constant, not derived from
-        // config/user-influenced state: read at most CAP+1 bytes through a capped
-        // reader; if the blob exceeds the effective limit it is simply not cached.
-        const WARM_CAP: usize = 8 * 1024 * 1024; // absolute ceiling for a warm-cache read
-        let threshold = self.cache.threshold();
-        // Effective limit is the smaller of the operator threshold and the
-        // constant ceiling — so the allocation can never exceed WARM_CAP.
-        let limit = threshold.min(WARM_CAP);
-        // `take(limit as u64 + 1)`: read one past the limit to detect an
-        // over-limit blob without ever buffering more than limit+1 bytes.
-        let mut bytes = Vec::new();
-        let read = f.take(limit as u64 + 1).read_to_end(&mut bytes).await;
-        if read.is_err() || bytes.len() > limit {
-            return; // IO hiccup, or too large to cache — skip the optional warm
-        }
-        self.cache.put(repo, digest_str, &bytes);
     }
 
     async fn ensure_layout(&self, repo: &str) -> Result<(), StorageError> {

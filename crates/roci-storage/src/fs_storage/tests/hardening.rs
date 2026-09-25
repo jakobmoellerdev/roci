@@ -278,16 +278,15 @@ async fn rename_beneath_rejects_inode_mismatch() {
     let root = dir.path();
     std::fs::create_dir_all(root.join("from")).unwrap();
     std::fs::write(root.join("from/leaf"), b"data").unwrap();
-    let err = crate::beneath::rename_beneath(
-        root,
-        Path::new("from"),
-        "leaf",
-        Path::new("to"),
-        "leaf",
+    let err = crate::beneath::rename_beneath_sync(
+        root.to_path_buf(),
+        "from".into(),
+        "leaf".into(),
+        "to".into(),
+        "leaf".into(),
         (0, 0), // wrong inode
         true,
     )
-    .await
     .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }
@@ -307,16 +306,15 @@ async fn rename_beneath_eexist_regular_file_is_idempotent() {
     let st = std::fs::metadata(root.join("src/blob")).unwrap();
     let ino = (st.dev(), st.ino());
     // Destination already exists as a regular file → Ok (idempotent).
-    crate::beneath::rename_beneath(
-        root,
-        Path::new("src"),
-        "blob",
-        Path::new("dst"),
-        "blob",
+    crate::beneath::rename_beneath_sync(
+        root.to_path_buf(),
+        "src".into(),
+        "blob".into(),
+        "dst".into(),
+        "blob".into(),
         ino,
         true,
     )
-    .await
     .unwrap();
 }
 
@@ -335,16 +333,15 @@ async fn rename_beneath_eexist_symlink_is_rejected() {
     std::os::unix::fs::symlink(root.join("outside"), root.join("dst/blob")).unwrap();
     let st = std::fs::metadata(root.join("src/blob")).unwrap();
     let ino = (st.dev(), st.ino());
-    let err = crate::beneath::rename_beneath(
-        root,
-        Path::new("src"),
-        "blob",
-        Path::new("dst"),
-        "blob",
+    let err = crate::beneath::rename_beneath_sync(
+        root.to_path_buf(),
+        "src".into(),
+        "blob".into(),
+        "dst".into(),
+        "blob".into(),
         ino,
         true,
     )
-    .await
     .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
 }

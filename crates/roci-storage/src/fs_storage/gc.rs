@@ -95,7 +95,7 @@ impl FsStorage {
         let root = self.root.clone();
         let meta = self.meta.clone();
         let gc = self.gc.clone();
-        run_blocking(move || {
+        run_blocking("gc_consistency_check", move || {
             for_each_cas_blob(&root, |repo, digest, _entry| {
                 let ds = digest.as_string();
                 // Skip manifests and roots.
@@ -419,7 +419,7 @@ impl FsStorage {
         let delay = self.gc.delay();
         // Enumerate stale staging files off the async workers.
         let root = self.root.clone();
-        let stale = run_blocking(move || {
+        let stale = run_blocking("sweep_stale_uploads", move || {
             let mut stale = Vec::new();
             for repo in discover_repos(&root) {
                 let Ok(upload_dir) = repo_rel(&repo).map(|r| r.join("uploads")) else {

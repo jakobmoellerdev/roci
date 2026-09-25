@@ -249,7 +249,7 @@ async fn quarantine_blob(
     let to_leaf = quarantine_leaf(repo, digest_str);
 
     let root = root.to_path_buf();
-    run_blocking(move || -> io::Result<()> {
+    run_blocking("quarantine_blob", move || -> io::Result<()> {
         let from_fd = dir_beneath(&root, &from_dir_rel, false)?;
         let to_fd = dir_beneath(&root, &to_dir_rel, true)?;
         rustix::fs::renameat(&from_fd, from_leaf.as_str(), &to_fd, to_leaf.as_str())
@@ -464,7 +464,7 @@ impl FsStorage {
         let linked: Vec<(String, u64)> = {
             let root = root.clone();
             let digest_c = digest_clone.clone();
-            run_blocking(move || {
+            run_blocking("quarantine_hard_linked_copies", move || {
                 let mut hits = Vec::new();
                 for_each_cas_blob(&root, |r, d, entry| {
                     if d.as_string() != digest_c.as_string() {

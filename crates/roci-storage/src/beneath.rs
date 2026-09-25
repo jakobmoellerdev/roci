@@ -9,12 +9,15 @@ use std::path::Path;
 use crate::publish::promote_temp_noreplace;
 
 /// Run blocking filesystem work on tokio's blocking pool, mapping a join
-/// failure to `io::Error`.
-pub(crate) async fn run_blocking<T, F>(f: F) -> io::Result<T>
+/// failure to `io::Error`. Each call is one "hop" (queue, wake a pool thread,
+/// wake the task back), counted as `registry.blocking.hops{op}` so the hops per
+/// request are visible.
+pub(crate) async fn run_blocking<T, F>(op: &'static str, f: F) -> io::Result<T>
 where
     F: FnOnce() -> io::Result<T> + Send + 'static,
     T: Send + 'static,
 {
+    roci_telemetry::record_blocking_hop(op);
     tokio::task::spawn_blocking(f)
         .await
         .map_err(io::Error::other)?
@@ -248,66 +251,59 @@ pub(crate) fn dir_beneath(
 /// (the leaf was swapped) is rejected as `NotFound` so the upload is not
 /// finalized against foreign content.
 #[cfg(unix)]
-pub(crate) async fn rename_beneath(
-    root: &Path,
-    from_dir_rel: &Path,
-    from_leaf: &str,
-    to_dir_rel: &Path,
-    to_leaf: &str,
+pub(crate) fn rename_beneath_sync(
+    root: std::path::PathBuf,
+    from_dir_rel: std::path::PathBuf,
+    from_leaf: String,
+    to_dir_rel: std::path::PathBuf,
+    to_leaf: String,
     expected_ino: (u64, u64),
     sync: bool,
 ) -> io::Result<()> {
     use rustix::fs::AtFlags;
-    let root = root.to_path_buf();
-    let from_dir_rel = from_dir_rel.to_path_buf();
-    let from_leaf = from_leaf.to_string();
-    let to_dir_rel = to_dir_rel.to_path_buf();
-    let to_leaf = to_leaf.to_string();
-    run_blocking(move || -> io::Result<()> {
-        let from_fd = dir_beneath(&root, &from_dir_rel, false)?;
-        let to_fd = dir_beneath(&root, &to_dir_rel, true)?;
-        // Prove the source leaf is still the exact inode we hashed (no-follow):
-        // reject a raced swap rather than promote foreign bytes under the digest.
-        let st = rustix::fs::statat(&from_fd, from_leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(io::Error::from)?;
-        if (st.st_dev as u64, st.st_ino as u64) != expected_ino {
-            return Err(io::Error::from(io::ErrorKind::NotFound));
+
+    let from_fd = dir_beneath(&root, &from_dir_rel, false)?;
+    let to_fd = dir_beneath(&root, &to_dir_rel, true)?;
+    // Prove the source leaf is still the exact inode we hashed (no-follow):
+    // reject a raced swap rather than promote foreign bytes under the digest.
+    let st = rustix::fs::statat(&from_fd, from_leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(io::Error::from)?;
+    if (st.st_dev as u64, st.st_ino as u64) != expected_ino {
+        return Err(io::Error::from(io::ErrorKind::NotFound));
+    }
+    // No-replace rename onto the CAS leaf: a racer that installs a
+    // symlink/file at `to_leaf` is not overwritten. `EEXIST` means the digest
+    // already exists — idempotent success only if it is a regular file
+    // (content-addressed, identical bytes), else rejected; our verified
+    // staging inode is discarded on the dedup path.
+    use rustix::fs::{FileType, RenameFlags};
+    match rustix::fs::renameat_with(
+        &from_fd,
+        from_leaf.as_str(),
+        &to_fd,
+        to_leaf.as_str(),
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {
+            if sync {
+                rustix::fs::fsync(&to_fd).map_err(io::Error::from)?;
+            }
+            Ok(())
         }
-        // No-replace rename onto the CAS leaf: a racer that installs a
-        // symlink/file at `to_leaf` is not overwritten. `EEXIST` means the digest
-        // already exists — idempotent success only if it is a regular file
-        // (content-addressed, identical bytes), else rejected; our verified
-        // staging inode is discarded on the dedup path.
-        use rustix::fs::{FileType, RenameFlags};
-        match rustix::fs::renameat_with(
-            &from_fd,
-            from_leaf.as_str(),
-            &to_fd,
-            to_leaf.as_str(),
-            RenameFlags::NOREPLACE,
-        ) {
-            Ok(()) => {
-                if sync {
-                    rustix::fs::fsync(&to_fd).map_err(io::Error::from)?;
-                }
+        Err(rustix::io::Errno::EXIST) => {
+            let dst = rustix::fs::statat(&to_fd, to_leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(io::Error::from)?;
+            if FileType::from_raw_mode(dst.st_mode).is_file() {
                 Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "CAS destination exists and is not a regular file",
+                ))
             }
-            Err(rustix::io::Errno::EXIST) => {
-                let dst = rustix::fs::statat(&to_fd, to_leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-                    .map_err(io::Error::from)?;
-                if FileType::from_raw_mode(dst.st_mode).is_file() {
-                    Ok(())
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "CAS destination exists and is not a regular file",
-                    ))
-                }
-            }
-            Err(e) => Err(io::Error::from(e)),
         }
-    })
-    .await
+        Err(e) => Err(io::Error::from(e)),
+    }
 }
 
 /// Remove `leaf` from directory `dir_rel` (relative to `root`) via `unlinkat`
@@ -318,12 +314,23 @@ pub async fn unlink_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io::Resu
     let root = root.to_path_buf();
     let dir_rel = dir_rel.to_path_buf();
     let leaf = leaf.to_string();
-    run_blocking(move || -> io::Result<()> {
-        let dirfd = dir_beneath(&root, &dir_rel, false)?;
-        rustix::fs::unlinkat(&dirfd, leaf.as_str(), rustix::fs::AtFlags::empty())
-            .map_err(io::Error::from)
+    run_blocking("unlink_beneath", move || {
+        unlink_beneath_sync(root, dir_rel, leaf)
     })
     .await
+}
+
+/// Synchronous body of [`unlink_beneath`], for callers already on a blocking
+/// thread (one hop for a whole operation).
+#[cfg(unix)]
+pub(crate) fn unlink_beneath_sync(
+    root: std::path::PathBuf,
+    dir_rel: std::path::PathBuf,
+    leaf: String,
+) -> io::Result<()> {
+    let dirfd = dir_beneath(&root, &dir_rel, false)?;
+    rustix::fs::unlinkat(&dirfd, leaf.as_str(), rustix::fs::AtFlags::empty())
+        .map_err(io::Error::from)
 }
 
 /// Create an empty file `leaf` inside `dir_rel` (relative to `root`), creating
@@ -338,7 +345,7 @@ pub async fn create_empty_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io
     let root = root.to_path_buf();
     let dir_rel = dir_rel.to_path_buf();
     let leaf = leaf.to_string();
-    run_blocking(move || -> io::Result<()> {
+    run_blocking("create_empty_beneath", move || -> io::Result<()> {
         let dirfd = dir_beneath(&root, &dir_rel, true)?;
         let fd = rustix::fs::openat(
             &dirfd,
@@ -365,45 +372,57 @@ pub(crate) async fn ensure_layout_beneath(
     repo_rel: &Path,
     marker: &str,
 ) -> io::Result<bool> {
-    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     let root = root.to_path_buf();
     let repo_rel = repo_rel.to_path_buf();
     let marker = marker.to_string();
-    run_blocking(move || -> io::Result<bool> {
-        use std::io::Write as _;
-        let dirfd = dir_beneath(&root, &repo_rel, true)?;
-        // Idempotent: a pre-existing regular `oci-layout` is the steady state.
-        match rustix::fs::statat(&dirfd, "oci-layout", AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => return Ok(false),
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "oci-layout exists and is not a regular file",
-                ))
-            }
-            Err(rustix::io::Errno::NOENT) => {}
-            Err(e) => return Err(io::Error::from(e)),
-        }
-        // Write the marker to a temp in the repo dirfd, fsync, then no-replace
-        // rename into place (a racer creating it first is an idempotent win).
-        let mut rnd = [0u8; 8];
-        getrandom::fill(&mut rnd).map_err(io::Error::other)?;
-        let tmp = format!(".oci-layout.{}.tmp", hex::encode(rnd));
-        let fd = rustix::fs::openat(
-            &dirfd,
-            tmp.as_str(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o644),
-        )
-        .map_err(io::Error::from)?;
-        let mut f = std::fs::File::from(fd);
-        f.write_all(marker.as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        // A concurrent creator winning the race is still success (idempotent).
-        promote_temp_noreplace(&dirfd, tmp.as_str(), "oci-layout", true).map(|()| true)
+    run_blocking("ensure_layout_beneath", move || {
+        ensure_layout_beneath_sync(root, repo_rel, marker)
     })
     .await
+}
+
+/// Synchronous body of [`ensure_layout_beneath`], for callers already on a blocking
+/// thread (one hop for a whole operation).
+#[cfg(unix)]
+pub(crate) fn ensure_layout_beneath_sync(
+    root: std::path::PathBuf,
+    repo_rel: std::path::PathBuf,
+    marker: String,
+) -> io::Result<bool> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+
+    use std::io::Write as _;
+    let dirfd = dir_beneath(&root, &repo_rel, true)?;
+    // Idempotent: a pre-existing regular `oci-layout` is the steady state.
+    match rustix::fs::statat(&dirfd, "oci-layout", AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => return Ok(false),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "oci-layout exists and is not a regular file",
+            ))
+        }
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(e) => return Err(io::Error::from(e)),
+    }
+    // Write the marker to a temp in the repo dirfd, fsync, then no-replace
+    // rename into place (a racer creating it first is an idempotent win).
+    let mut rnd = [0u8; 8];
+    getrandom::fill(&mut rnd).map_err(io::Error::other)?;
+    let tmp = format!(".oci-layout.{}.tmp", hex::encode(rnd));
+    let fd = rustix::fs::openat(
+        &dirfd,
+        tmp.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o644),
+    )
+    .map_err(io::Error::from)?;
+    let mut f = std::fs::File::from(fd);
+    f.write_all(marker.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    // A concurrent creator winning the race is still success (idempotent).
+    promote_temp_noreplace(&dirfd, tmp.as_str(), "oci-layout", true).map(|()| true)
 }
 
 /// Async wrapper: open `rel` beneath `root` read-only, no-follow at every
@@ -413,7 +432,10 @@ pub async fn open_beneath(root: &Path, rel: &Path) -> io::Result<tokio::fs::File
     use rustix::fs::OFlags;
     let root = root.to_path_buf();
     let rel = rel.to_path_buf();
-    let f = run_blocking(move || resolve_beneath(&root, &rel, OFlags::RDONLY)).await?;
+    let f = run_blocking("open_beneath", move || {
+        resolve_beneath(&root, &rel, OFlags::RDONLY)
+    })
+    .await?;
     Ok(tokio::fs::File::from_std(f))
 }
 
@@ -425,8 +447,10 @@ pub async fn open_append_beneath(root: &Path, rel: &Path) -> io::Result<tokio::f
     use rustix::fs::OFlags;
     let root = root.to_path_buf();
     let rel = rel.to_path_buf();
-    let f =
-        run_blocking(move || resolve_beneath(&root, &rel, OFlags::WRONLY | OFlags::APPEND)).await?;
+    let f = run_blocking("open_append_beneath", move || {
+        resolve_beneath(&root, &rel, OFlags::WRONLY | OFlags::APPEND)
+    })
+    .await?;
     Ok(tokio::fs::File::from_std(f))
 }
 
@@ -436,52 +460,60 @@ pub async fn open_append_beneath(root: &Path, rel: &Path) -> io::Result<tokio::f
 /// path component.
 #[cfg(unix)]
 pub async fn stat_beneath(root: &Path, rel: &Path) -> io::Result<Option<(bool, u64)>> {
-    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     let root = root.to_path_buf();
     let rel = rel.to_path_buf();
-    run_blocking(move || -> io::Result<Option<(bool, u64)>> {
-        // Walk to the parent no-follow, then no-follow-stat the final component.
-        let comps: Vec<&std::ffi::OsStr> = rel.iter().collect();
-        let Some((last, parents)) = comps.split_last() else {
-            return Ok(None);
-        };
-        let mut dir = open_root(&root)?;
-        for comp in parents {
-            match rustix::fs::openat(
-                &dir,
-                *comp,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            ) {
-                Ok(next) => dir = next,
-                // A missing, symlinked, or non-directory parent means the entry
-                // is not a valid CAS blob: report absent rather than error.
-                // (`O_NOFOLLOW` on a symlink yields `ELOOP` on Linux, `ENOTDIR`
-                // on macOS/BSD.) A genuine permission error (`EACCES`) is NOT
-                // swallowed — it surfaces as a 500, not a false 404.
-                Err(
-                    rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR,
-                ) => return Ok(None),
-                Err(e) => return Err(io::Error::from(e)),
+    run_blocking("stat_beneath", move || stat_beneath_sync(root, rel)).await
+}
+
+/// Synchronous body of [`stat_beneath`], for callers already on a blocking
+/// thread (one hop for a whole operation).
+#[cfg(unix)]
+pub(crate) fn stat_beneath_sync(
+    root: std::path::PathBuf,
+    rel: std::path::PathBuf,
+) -> io::Result<Option<(bool, u64)>> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+
+    // Walk to the parent no-follow, then no-follow-stat the final component.
+    let comps: Vec<&std::ffi::OsStr> = rel.iter().collect();
+    let Some((last, parents)) = comps.split_last() else {
+        return Ok(None);
+    };
+    let mut dir = open_root(&root)?;
+    for comp in parents {
+        match rustix::fs::openat(
+            &dir,
+            *comp,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(next) => dir = next,
+            // A missing, symlinked, or non-directory parent means the entry
+            // is not a valid CAS blob: report absent rather than error.
+            // (`O_NOFOLLOW` on a symlink yields `ELOOP` on Linux, `ENOTDIR`
+            // on macOS/BSD.) A genuine permission error (`EACCES`) is NOT
+            // swallowed — it surfaces as a 500, not a false 404.
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+                return Ok(None)
             }
+            Err(e) => return Err(io::Error::from(e)),
         }
-        // Stat the leaf no-follow. A missing/symlinked leaf is absent; a genuine
-        // IO error propagates. In test, `FORCE_STAT_ERROR` injects a synthetic
-        // errno so this error arm is covered deterministically (a real leaf stat
-        // failure needs a fault a single-fs test cannot otherwise produce).
-        let statted = if fault!(FORCE_STAT_ERROR) {
-            Err(rustix::io::Errno::IO)
-        } else {
-            rustix::fs::statat(&dir, *last, AtFlags::SYMLINK_NOFOLLOW)
-        };
-        match statted {
-            Ok(st) => Ok(Some((
-                FileType::from_raw_mode(st.st_mode).is_file(),
-                st.st_size as u64,
-            ))),
-            Err(rustix::io::Errno::NOENT) => Ok(None),
-            Err(e) => Err(io::Error::from(e)),
-        }
-    })
-    .await
+    }
+    // Stat the leaf no-follow. A missing/symlinked leaf is absent; a genuine
+    // IO error propagates. In test, `FORCE_STAT_ERROR` injects a synthetic
+    // errno so this error arm is covered deterministically (a real leaf stat
+    // failure needs a fault a single-fs test cannot otherwise produce).
+    let statted = if fault!(FORCE_STAT_ERROR) {
+        Err(rustix::io::Errno::IO)
+    } else {
+        rustix::fs::statat(&dir, *last, AtFlags::SYMLINK_NOFOLLOW)
+    };
+    match statted {
+        Ok(st) => Ok(Some((
+            FileType::from_raw_mode(st.st_mode).is_file(),
+            st.st_size as u64,
+        ))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(e) => Err(io::Error::from(e)),
+    }
 }
