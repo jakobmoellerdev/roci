@@ -46,8 +46,23 @@ if [[ -z "${BENCH_SERVER_CPUS:-}" || -z "${BENCH_CLIENT_CPUS:-}" ]]; then
 fi
 
 echo "bench: run $run_id (server cpus $BENCH_SERVER_CPUS, client cpus $BENCH_CLIENT_CPUS)"
-docker build -t roci-bench/roci:local -f Containerfile .
-docker build -t roci-bench/runner:local -f bench/Containerfile.runner bench
+# BENCH_ROCI_PREBUILT=<ref>: benchmark a published roci image (e.g. the GHCR
+# build of this commit) instead of building one. It is retagged locally so the
+# harness is unchanged; its digest is recorded in env.json.
+if [[ -n "${BENCH_ROCI_PREBUILT:-}" ]]; then
+  if ! docker pull "$BENCH_ROCI_PREBUILT"; then
+    echo "bench: cannot pull $BENCH_ROCI_PREBUILT (not published yet? container.yml pushes main commits)" >&2
+    exit 1
+  fi
+  docker tag "$BENCH_ROCI_PREBUILT" roci-bench/roci:local
+else
+  docker build -t roci-bench/roci:local -f Containerfile .
+fi
+# BENCH_RUNNER_PREBUILT=1: roci-bench/runner:local is already loaded (CI builds
+# it with a layer cache).
+if [[ "${BENCH_RUNNER_PREBUILT:-0}" != 1 ]]; then
+  docker build -t roci-bench/runner:local -f bench/Containerfile.runner bench
+fi
 if [[ $mode == perf ]]; then
   docker build -t roci-bench/roci:perf -f bench/Containerfile.roci-perf .
 fi

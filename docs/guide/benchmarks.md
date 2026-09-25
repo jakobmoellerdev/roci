@@ -36,6 +36,8 @@ just bench quick   # ~10 min smoke
 just bench full    # 5 reps; authoritative only on a dedicated Linux host
 ```
 
+To benchmark a published image instead of building one, set `BENCH_ROCI_PREBUILT=<ref>` (e.g. `ghcr.io/jakobmoellerdev/roci:<commit-sha>` — every `main` commit is published); `BENCH_RUNNER_PREBUILT=1` skips building the runner image when `roci-bench/runner:local` is already loaded. The manual `bench` workflow does both: it pulls the GHCR image of the dispatched commit (or the `roci_image` input) and builds the runner image with a GitHub Actions layer cache.
+
 Prerequisites: rootful Docker, ≥ 4 CPUs visible to Docker, ≥ 20 GB free disk for `full`. Results land in `bench/results/<run-id>/` (`report.md`, `summary.json`, `env.json`, and `raw/<rep>/<registry>/` with every tool's output, stderr of failed phases, the cgroup time series and container logs). Only a dedicated Linux host is authoritative; a Docker Desktop run is labelled `NON-AUTHORITATIVE`. The manual `bench` GitHub workflow runs either mode on a shared arm64 runner — compare ratios within one run only.
 
 ## Profiling roci
