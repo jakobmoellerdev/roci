@@ -11,16 +11,22 @@ use crate::publish::promote_temp_noreplace;
 /// Run blocking filesystem work on tokio's blocking pool, mapping a join
 /// failure to `io::Error`. Each call is one "hop" (queue, wake a pool thread,
 /// wake the task back), counted as `registry.blocking.hops{op}` so the hops per
-/// request are visible.
+/// request are visible. The caller's current `tracing::Span` is entered on the
+/// blocking thread so the work is attributed to the request trace
+/// (storage-internal propagation).
 pub(crate) async fn run_blocking<T, F>(op: &'static str, f: F) -> io::Result<T>
 where
     F: FnOnce() -> io::Result<T> + Send + 'static,
     T: Send + 'static,
 {
     roci_telemetry::record_blocking_hop(op);
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(io::Error::other)?
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || {
+        let _guard = span.enter();
+        f()
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// Open the (trusted, roci-created) store root as a directory fd; followed,

@@ -43,11 +43,20 @@ enabled = false
 # per_method.PUT   = { rate = 20, burst = 40 } # GET HEAD POST PUT PATCH DELETE
 # Exhausted → 429 TOOMANYREQUESTS with Retry-After. A method with no bucket and no default is unlimited.
 
+# Per-client rate limit (optional). Keyed by authenticated principal (htpasswd/LDAP
+# username, bearer `sub`, mTLS cert identity) when authenticated, else the TCP peer IP.
+# Behind a reverse proxy, anonymous clients share the proxy IP — use auth or configure
+# the proxy to inject identities. Absent → no per-client limiting (backward compatible).
+# per_client = { rate = 50, burst = 100, max_clients = 10000 }
+# max_clients caps the LRU bucket map; an evicted client restarts with a full bucket.
+
 [storage]
 root = "./roci-data"
 cache_max_bytes = 268435456   # small-blob LRU cache budget; 0 disables it
+small_blob_threshold = 102400 # max blob size eligible for the cache (bytes); 0 < t ≤ 8 MiB, t ≤ cache_max_bytes
 dedupe = true                 # link (reflink → hard link) a blob another repo already stores
 commit = false                # fsync blob data before acknowledging (zot's `commit`); manifests/WAL/index are always synced
+fast_restart = false           # persist a stamp on shutdown and skip the startup CAS walk on restart (zot's `fastRestart`)
 
 [storage.gc]                  # online, O(garbage) garbage collection
 enabled = true
@@ -182,6 +191,13 @@ authenticated = ["pull", "push"]
 - Metric labels are bounded (`endpoint`, `method`, `status_class`, `error_code`); digests, tags, and repository names appear only on spans and logs.
 - Keep every error or slow trace with the OTel Collector's `tail_sampling` processor; roci only head-samples.
 - A minimal build (no `otel` feature) logs a warning and ignores `telemetry.otlp` / `telemetry.metrics.enabled`.
+- **Instruments** (Prometheus `/metrics` names, all behind the `otel` feature):
+  - Request: `http_server_request_duration_seconds` (histogram), `registry_request_errors_total` (counter by `error_code`).
+  - Storage: `registry_gc_collected_total` / `_bytes_total` (by `kind`), `registry_scrub_checked_total` / `_bytes_total` (by `result`), `registry_dedupe_links_total` (by `op`, `mechanism`), `registry_quota_rejections_total` (by `scope`).
+  - Auth: `registry_auth_decisions_total` (by `method`, `result`).
+  - MetadataStore: `registry_meta_wal_appends_total`, `registry_meta_wal_batch_size` (histogram), `registry_meta_compaction_total` / `registry_meta_snapshot_total` (by `result`).
+  - Upload sessions: `registry_upload_active` (gauge), `registry_upload_bytes_total`, `registry_upload_finalize_total` (by `result`).
+- **Spans** (child of the per-request `http.request` root span): `blob.stream` (bytes, range), `cas.link` (mechanism), `blob.open`, `meta.resolve`, `meta.append`, `upload.session`, `digest.verify`, `authn.authorize`. Storage-internal `spawn_blocking` work propagates the request span context.
 
 ## Build flavors
 
@@ -201,6 +217,7 @@ Every extension is reachable from the CLI **only** behind a cargo feature, never
 - **Quotas** count logical bytes: a blob counts once per repository that holds it, even when deduplicated on disk.
 - **Scrub** verifies each blob against the CRC32C recorded when it was written and re-hashes with the full digest only on a mismatch; a blob whose content no longer matches its digest is moved to `<root>/.roci-quarantine/` so it reads as absent and can be pushed again.
 - **HMAC keys** and **S3 secrets** are read from separate files so they can carry stricter permissions or be mounted as Kubernetes Secrets.
+- **Fast restart** (`storage.fast_restart = true`) writes an atomic stamp file on graceful shutdown containing the full in-memory state (presence, dedupe, quotas, GC candidates). On the next startup the stamp is consumed and the expensive CAS walk is skipped. If the stamp is missing, corrupted, version-mismatched, config-changed, or HMAC-tampered, the server falls back to the full walk automatically. Out-of-band edits to the layout directory while roci is stopped are **not** observed on a fast restart. Not applicable to S3 backends.
 
 ## Filesystem guidance
 

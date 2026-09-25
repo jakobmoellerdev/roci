@@ -45,6 +45,7 @@ async fn burst_n_pass_then_429() {
         enabled: true,
         default: Some(bucket(1, 3)),
         per_method: BTreeMap::new(),
+        per_client: None,
     };
     let (app, _d) = app_with_rl(rl);
 
@@ -80,6 +81,7 @@ async fn tokens_refill_after_time_advance() {
         enabled: true,
         default: Some(bucket(1, 1)),
         per_method: BTreeMap::new(),
+        per_client: None,
     };
     let (app, _d) = app_with_rl(rl);
 
@@ -106,6 +108,7 @@ async fn per_method_independent_of_default() {
         enabled: true,
         default: Some(bucket(100, 100)),
         per_method,
+        per_client: None,
     };
     let (app, _d) = app_with_rl(rl);
 
@@ -144,6 +147,7 @@ async fn unlisted_method_no_default_unlimited() {
         enabled: true,
         default: None,
         per_method,
+        per_client: None,
     };
     let (app, _d) = app_with_rl(rl);
 
@@ -160,12 +164,102 @@ async fn disabled_config_never_429s() {
         enabled: false,
         default: Some(bucket(1, 1)),
         per_method: BTreeMap::new(),
+        per_client: None,
     };
     let (app, _d) = app_with_rl(rl);
 
     // Even with burst=1, disabled means no rate limiting
     for _ in 0..50 {
         let resp = app.clone().oneshot(get_v2()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
+
+fn get_v2_with_peer(ip: std::net::IpAddr) -> Request<Body> {
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri("/v2/")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut().insert(roci_core::PeerAddr(ip));
+    req
+}
+
+#[tokio::test(start_paused = true)]
+async fn per_client_independent_buckets() {
+    let rl = RateLimitConfig {
+        enabled: true,
+        default: None,
+        per_method: BTreeMap::new(),
+        per_client: Some(roci_config::PerClientConfig {
+            rate: 1,
+            burst: 1,
+            max_clients: 100,
+        }),
+    };
+    let (app, _d) = app_with_rl(rl);
+    let ip_a: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+    let ip_b: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+
+    // Client A exhausts its burst.
+    let resp = app.clone().oneshot(get_v2_with_peer(ip_a)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app.clone().oneshot(get_v2_with_peer(ip_a)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Client B still has its own full bucket.
+    let resp = app.clone().oneshot(get_v2_with_peer(ip_b)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test(start_paused = true)]
+async fn per_client_lru_eviction_resets_bucket() {
+    let rl = RateLimitConfig {
+        enabled: true,
+        default: None,
+        per_method: BTreeMap::new(),
+        per_client: Some(roci_config::PerClientConfig {
+            rate: 1,
+            burst: 1,
+            max_clients: 2,
+        }),
+    };
+    let (app, _d) = app_with_rl(rl);
+    let ip_a: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+    let ip_b: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+    let ip_c: std::net::IpAddr = "10.0.0.3".parse().unwrap();
+
+    // Exhaust A and B.
+    let resp = app.clone().oneshot(get_v2_with_peer(ip_a)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app.clone().oneshot(get_v2_with_peer(ip_a)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let resp = app.clone().oneshot(get_v2_with_peer(ip_b)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // C enters → evicts A (LRU, A was least recently used).
+    let resp = app.clone().oneshot(get_v2_with_peer(ip_c)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A was evicted — gets a fresh bucket.
+    let resp = app.clone().oneshot(get_v2_with_peer(ip_a)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test(start_paused = true)]
+async fn per_client_absent_means_no_per_client_limiting() {
+    let rl = RateLimitConfig {
+        enabled: true,
+        default: None,
+        per_method: BTreeMap::new(),
+        per_client: None,
+    };
+    let (app, _d) = app_with_rl(rl);
+    let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+
+    // No per-client limiting means unlimited (global unlimited too since no default).
+    for _ in 0..50 {
+        let resp = app.clone().oneshot(get_v2_with_peer(ip)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }

@@ -28,6 +28,16 @@ impl StorageBackend for FsStorage {
     fn start_maintenance(&self, shutdown: watch::Receiver<bool>) {
         FsStorage::start_maintenance(self, shutdown);
     }
+
+    fn on_shutdown(&self) {
+        if self.config.fast_restart {
+            if let Err(e) = self.write_fast_restart_stamp() {
+                tracing::warn!(error = %e, "fast restart: failed to write stamp");
+            } else {
+                tracing::info!("fast restart: stamp written");
+            }
+        }
+    }
 }
 
 impl FsStorage {
@@ -48,7 +58,13 @@ impl FsStorage {
             shutdown.clone(),
             |s| async move {
                 let meta = s.meta.clone();
-                match tokio::task::spawn_blocking(move || meta.maintain()).await {
+                let span = tracing::Span::current();
+                match tokio::task::spawn_blocking(move || {
+                    let _guard = span.enter();
+                    meta.maintain()
+                })
+                .await
+                {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => tracing::warn!(error = %e, "metadata upkeep failed"),
                     Err(e) => tracing::warn!(error = %e, "metadata upkeep panicked"),

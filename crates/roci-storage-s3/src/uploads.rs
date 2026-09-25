@@ -77,7 +77,12 @@ impl S3Storage {
             });
         }
         // The S3 finalize re-hashes the staged file, so no hash-on-write here.
-        Ok(append_body(f, current, body, limit, None).await?.0)
+        let (total, _) = append_body(f, current, body, limit, None).await?;
+        let appended = total.saturating_sub(current);
+        if appended > 0 {
+            roci_telemetry::record_upload_bytes(appended);
+        }
+        Ok(total)
     }
 
     /// Get the current size of a staging file.

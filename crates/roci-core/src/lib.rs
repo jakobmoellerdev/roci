@@ -24,6 +24,7 @@ use axum::routing::get;
 use axum::Router;
 pub use error::{ApiError, ErrorCode};
 pub use names::RepositoryName;
+pub use ratelimit::PeerAddr;
 use roci_config::Config;
 use roci_storage::Storage;
 use std::sync::Arc;
@@ -103,6 +104,7 @@ impl<S: Storage> AppState<S> {
 /// Build the registry [`Router`] for the given storage backend.
 pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
     let limiter = ratelimit::RateLimiter::from_config(&state.config.http.rate_limit);
+    let per_client = ratelimit::PerClientLimiter::from_config(&state.config.http.rate_limit);
 
     let mut router = Router::new()
         .route("/v2/", get(routes::get_base))
@@ -118,6 +120,16 @@ pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
                 .delete(routes::dispatch::<S>),
         );
 
+    // Per-client rate limit: runs after authn resolved the principal but
+    // before any handler/storage access. Added first so it is the innermost
+    // layer (wraps the handler directly).
+    if let Some(pcl) = per_client {
+        router = router.layer(axum::middleware::from_fn_with_state(
+            Arc::new(pcl),
+            ratelimit::per_client_rate_limit_middleware,
+        ));
+    }
+
     // Authentication: resolves the principal for `dispatch` to authorize.
     // Only installed when auth is configured (byte-identical otherwise).
     if let Some(auth) = state.auth.clone() {
@@ -127,7 +139,8 @@ pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
         ));
     }
 
-    // Rate-limit layer: only installed when enabled (zero overhead otherwise).
+    // Global rate-limit layer: only installed when enabled (zero overhead
+    // otherwise). Runs before authn to protect the server unconditionally.
     if let Some(rl) = limiter {
         router = router.layer(axum::middleware::from_fn_with_state(
             Arc::new(rl),
@@ -136,7 +149,7 @@ pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
     }
 
     // Layers wrap outward: at runtime a request passes span → early-data →
-    // rate limit → authn → handler.
+    // global rate limit → authn → per-client rate limit → handler.
     router
         .layer(axum::middleware::from_fn(
             auth::middleware::early_data_middleware,

@@ -83,7 +83,9 @@ async fn write_batch(
 ) -> io::Result<(Vec<u8>, Option<StagedHash>)> {
     let f = Arc::clone(file);
     roci_telemetry::record_blocking_hop("write_batch");
+    let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
+        let _guard = span.enter();
         let (mut batch, mut hash) = (batch, hash);
         (&*f).write_all(&batch)?;
         if let Some(h) = hash.as_mut() {
@@ -219,10 +221,14 @@ async fn append_inner(
         Err(e) => {
             UPLOAD_POOL.put(batch);
             let f = Arc::clone(&file);
-            tokio::task::spawn_blocking(move || f.set_len(start))
-                .await
-                .map_err(io::Error::other)
-                .and_then(|r| r)?;
+            let span = tracing::Span::current();
+            tokio::task::spawn_blocking(move || {
+                let _guard = span.enter();
+                f.set_len(start)
+            })
+            .await
+            .map_err(io::Error::other)
+            .and_then(|r| r)?;
             Err(e)
         }
     }

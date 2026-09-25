@@ -22,7 +22,9 @@ mod metrics;
 #[cfg(feature = "otel")]
 pub use metrics::{
     record_auth_decision, record_blocking_hop, record_dedupe_link, record_error,
-    record_gc_collected, record_quota_rejection, record_request, record_scrub,
+    record_gc_collected, record_meta_compaction, record_meta_snapshot, record_meta_wal_append,
+    record_meta_wal_batch_size, record_quota_rejection, record_request, record_scrub,
+    record_upload_active, record_upload_bytes, record_upload_finalize,
 };
 
 /// Record a completed request (duration histogram + error counter).
@@ -76,6 +78,41 @@ pub fn record_blocking_hop(_op: &'static str) {}
 #[cfg(not(feature = "otel"))]
 #[inline(always)]
 pub fn record_auth_decision(_method: &str, _result: &str) {}
+
+/// Count one WAL record appended. No-op in minimal builds.
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+pub fn record_meta_wal_append() {}
+
+/// Record a group-commit batch size. No-op in minimal builds.
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+pub fn record_meta_wal_batch_size(_batch: u64) {}
+
+/// Count one metadata compaction by result. No-op in minimal builds.
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+pub fn record_meta_compaction(_result: &str) {}
+
+/// Count one metadata snapshot by result. No-op in minimal builds.
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+pub fn record_meta_snapshot(_result: &str) {}
+
+/// Adjust the active upload session gauge. No-op in minimal builds.
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+pub fn record_upload_active(_delta: i64) {}
+
+/// Count bytes received into an upload session. No-op in minimal builds.
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+pub fn record_upload_bytes(_bytes: u64) {}
+
+/// Count one upload finalization by result. No-op in minimal builds.
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+pub fn record_upload_finalize(_result: &str) {}
 
 // ── Guard ───────────────────────────────────────────────────────────────
 

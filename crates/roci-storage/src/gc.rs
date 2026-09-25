@@ -201,6 +201,31 @@ impl GcTracker {
     pub fn roots_len(&self) -> usize {
         self.roots.lock().expect("gc roots lock poisoned").len()
     }
+
+    /// Snapshot of candidate keys for fast-restart stamp serialization.
+    pub fn candidate_keys(&self) -> Vec<(String, String)> {
+        self.lock().keys().cloned().collect()
+    }
+
+    /// Snapshot of root keys for fast-restart stamp serialization.
+    pub fn root_keys(&self) -> Vec<(String, String)> {
+        self.roots
+            .lock()
+            .expect("gc roots lock poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Snapshot of unsafe repo names for fast-restart stamp serialization.
+    pub fn unsafe_repo_names(&self) -> Vec<String> {
+        self.unsafe_repos
+            .lock()
+            .expect("gc unsafe lock poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
 }
 
 #[cfg(test)]

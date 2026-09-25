@@ -218,6 +218,19 @@ bench profile="quick":
 bench-perf profile="quick" compare="":
     bash bench/run.sh perf {{profile}} {{compare}}
 
+
+# Index-engine bake-off: heed (LMDB) vs redb on roci's real access pattern.
+# Default runs 100K + 1M refs (~5 min); pass sizes for larger (e.g. `just bench-index 100000,1000000,5000000`).
+bench-index sizes="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --manifest-path bench/index-engines/Cargo.toml
+    if [ -n "{{sizes}}" ]; then
+        bench/index-engines/target/release/roci-bench-index-engines --sizes "{{sizes}}"
+    else
+        bench/index-engines/target/release/roci-bench-index-engines
+    fi
+
 # Build a release binary with all features (allocator, OTel, extensions).
 release-build:
     cargo build --release -p roci-cli --features full

@@ -2,6 +2,7 @@
 //! itself is defined at the crate root (the CodeQL path-barrier model keys on
 //! `roci_storage::FsStorage`); this module and its children carry the impls.
 
+mod fast_restart;
 mod gc;
 mod index;
 mod lifecycle;
@@ -44,8 +45,10 @@ impl FsStorage {
 
     /// Create a store rooted at `root` (created if absent) running the given
     /// `[storage]` policy, charging writes to the shared `quota` tracker.
-    /// Opens (replaying) the metadata engine, then walks the CAS once to seed
-    /// the blob-presence filter (complete, never false-negative), the dedupe
+    /// Opens (replaying) the metadata engine, then either restores in-memory
+    /// state from a valid fast-restart stamp (when `storage.fast_restart` is
+    /// true and a matching stamp exists) or walks the CAS once to seed the
+    /// blob-presence filter (complete, never false-negative), the dedupe
     /// index, quota byte usage and the open upload-session count.
     /// Tags/media-types/referrers are NOT walked at startup — a pre-existing
     /// layout resolves via the `index.json` read-path fallbacks and the
@@ -64,10 +67,7 @@ impl FsStorage {
         let cache = if config.cache_max_bytes == 0 {
             SmallBlobCache::with_limits(0, 0)
         } else {
-            SmallBlobCache::with_limits(
-                crate::cache::DEFAULT_SMALL_BLOB_THRESHOLD,
-                config.cache_max_bytes,
-            )
+            SmallBlobCache::with_limits(config.small_blob_threshold, config.cache_max_bytes)
         };
         let store = Self {
             root: Arc::new(root),
@@ -88,7 +88,42 @@ impl FsStorage {
             index_notify: Arc::new(Notify::new()),
             _index_cancel: Arc::new(cancel_tx),
         };
-        store.seed_from_cas();
+
+        // Try the fast-restart path: consume a valid stamp and skip the CAS
+        // walk + GC consistency check. On any mismatch, fall back to the full
+        // walk (the stamp is already consumed, so a crash here forces a full
+        // walk next time).
+        let fast_restored = if config.fast_restart {
+            let hmac_key = config
+                .metadata
+                .hmac_key_file
+                .as_ref()
+                .map(|p| crate::metadata::wal_hmac::HmacKey::load(p))
+                .transpose()?;
+            match Self::try_consume_stamp(
+                &store.root,
+                config,
+                hmac_key.as_ref(),
+                store.meta.generation(),
+                store.meta.log_len(),
+            ) {
+                Ok(stamp) => {
+                    tracing::info!("fast restart: valid stamp consumed, skipping CAS walk");
+                    store.apply_stamp(stamp);
+                    true
+                }
+                Err(reason) => {
+                    tracing::info!(%reason, "fast restart: falling back to full CAS walk");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        if !fast_restored {
+            store.seed_from_cas();
+        }
         store.spawn_index_writer(cancel_rx);
         Ok(store)
     }

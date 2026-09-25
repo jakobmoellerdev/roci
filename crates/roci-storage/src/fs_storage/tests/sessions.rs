@@ -116,3 +116,41 @@ async fn finalize_warms_cache_for_small_blobs_only() {
         assert_eq!(s.read_blob("r", &d).await.unwrap(), data);
     }
 }
+
+/// A blob just above a custom `small_blob_threshold` is not cached; one at
+/// the threshold is.
+#[cfg(unix)]
+#[tokio::test]
+async fn custom_small_blob_threshold_controls_caching() {
+    use crate::quota::QuotaTracker;
+    use roci_config::StorageConfig;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Threshold = 16 bytes: blobs ≤ 16 are cached, > 16 are not.
+    let cfg = StorageConfig {
+        small_blob_threshold: 16,
+        ..StorageConfig::default()
+    };
+    let s = FsStorage::with_config(dir.path(), &cfg, Arc::new(QuotaTracker::default())).unwrap();
+
+    // 17-byte blob: above threshold → not cached on warm.
+    let big_data = b"0123456789abcdefX"; // 17 bytes
+    let big_d = sha256_of(big_data);
+    s.put_blob("r", &big_d, big_data).await.unwrap();
+    // put_blob warms the cache internally; check it was not cached.
+    assert!(
+        s.cache.get("r", &big_d.as_string()).is_none(),
+        "17-byte blob should not be cached with threshold=16"
+    );
+
+    // 16-byte blob: at threshold → cached on warm.
+    let small_data = b"0123456789abcdef"; // 16 bytes
+    let small_d = sha256_of(small_data);
+    s.put_blob("r", &small_d, small_data).await.unwrap();
+    assert_eq!(
+        s.cache.get("r", &small_d.as_string()).map(|b| b.to_vec()),
+        Some(small_data.to_vec()),
+        "16-byte blob should be cached with threshold=16"
+    );
+}

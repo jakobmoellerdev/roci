@@ -136,6 +136,7 @@ impl RedbMetadataStore {
             .map_err(|e| io::Error::other(format!("redb set_durability: {e}")))?;
         self.apply_op(&txn, &op)?;
         txn.commit().map_err(map_commit_err)?;
+        roci_telemetry::record_meta_wal_append();
         Ok(())
     }
 
@@ -721,6 +722,14 @@ impl MetadataStore for RedbMetadataStore {
         // way an LSM would — the file grows modestly and space is reclaimed
         // on write. This is a documented no-op.
         Ok(())
+    }
+
+    fn generation(&self) -> u64 {
+        0
+    }
+
+    fn log_len(&self) -> u64 {
+        0
     }
 }
 

@@ -128,7 +128,10 @@ impl QuotaTracker {
                 (limit == 0 || n < limit).then_some(n + 1)
             });
         match admitted {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                roci_telemetry::record_upload_active(1);
+                Ok(())
+            }
             Err(_) => {
                 roci_telemetry::record_quota_rejection("sessions");
                 Err(StorageError::TooManySessions { limit })
@@ -139,18 +142,32 @@ impl QuotaTracker {
     /// Count sessions found staged at startup: no cap check.
     pub fn seed_sessions(&self, n: usize) {
         self.sessions.fetch_add(n, Ordering::AcqRel);
+        roci_telemetry::record_upload_active(i64::try_from(n).unwrap_or(i64::MAX));
     }
 
     /// Close one upload session (its staging file is gone).
     pub fn end_session(&self) {
-        let _ = self
+        let closed = self
             .sessions
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        if closed.is_ok() {
+            roci_telemetry::record_upload_active(-1);
+        }
     }
 
     /// Upload sessions currently open.
     pub fn sessions(&self) -> usize {
         self.sessions.load(Ordering::Acquire)
+    }
+    /// Per-repo byte usage snapshot for fast-restart stamp serialization.
+    pub fn per_repo_bytes(&self) -> Vec<(String, u64)> {
+        self.bytes
+            .lock()
+            .expect("quota lock poisoned")
+            .per_repo
+            .iter()
+            .map(|(r, b)| (r.clone(), *b))
+            .collect()
     }
 }
 

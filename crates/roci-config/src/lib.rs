@@ -111,6 +111,31 @@ pub struct RateLimitConfig {
     pub default: Option<Bucket>,
     /// Per-HTTP-method buckets keyed by upper-case method (`GET`, `PUT`, …).
     pub per_method: BTreeMap<String, Bucket>,
+    /// Per-client buckets (keyed by authenticated principal or peer IP).
+    /// Absent → no per-client limiting (backward compatible).
+    pub per_client: Option<PerClientConfig>,
+}
+
+/// `[http.rate_limit.per_client]` — per-client token bucket. The client key
+/// is the authenticated principal identity when auth succeeded, else the TCP
+/// peer IP (socket address, **not** `X-Forwarded-For`; behind a proxy all
+/// anonymous clients collapse onto the proxy IP). An LRU map with at most
+/// `max_clients` entries bounds memory; an evicted client restarts with a full
+/// bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerClientConfig {
+    /// Sustained requests per second per client.
+    pub rate: u32,
+    /// Maximum burst capacity per client.
+    pub burst: u32,
+    /// Maximum number of tracked clients (LRU eviction above this cap).
+    #[serde(default = "default_max_clients")]
+    pub max_clients: u32,
+}
+
+fn default_max_clients() -> u32 {
+    10_000
 }
 
 /// One token bucket: sustained `rate` requests/second, `burst` capacity.
@@ -130,6 +155,10 @@ pub struct StorageConfig {
     pub root: PathBuf,
     /// Byte budget of the small-blob LRU content cache (0 disables it).
     pub cache_max_bytes: usize,
+    /// Maximum blob size (bytes) eligible for the small-blob content cache.
+    /// Blobs at or below this are cached in RAM on first read/write; larger
+    /// blobs go straight to streaming I/O and are never cached.
+    pub small_blob_threshold: usize,
     /// Cross-repo dedupe of uploaded blobs: a blob already stored in another
     /// repo is linked (reflink → hard link) instead of kept as a second copy.
     pub dedupe: bool,
@@ -140,6 +169,14 @@ pub struct StorageConfig {
     /// client re-pushes). Manifests, the metadata WAL, `index.json` and the
     /// layout marker are always synced regardless.
     pub commit: bool,
+    /// Skip the startup CAS walk when a valid stamp file from the previous
+    /// graceful shutdown is found. The stamp records the binary version,
+    /// config hash, metadata identity and all derived in-memory state
+    /// (presence filter, dedupe index, quota, GC candidates); a mismatch,
+    /// corruption or absence falls back to the full walk. Opt-in (zot
+    /// `fastRestart`). Filesystem backend only; S3's recovery is async and
+    /// lists remote objects, so this flag has no effect on the S3 backend.
+    pub fast_restart: bool,
     /// Remote object-store backend for this root (needs the `s3` build).
     pub s3: Option<S3Config>,
     /// Repo-name prefix → backend routing (zot `subPaths`); the longest
@@ -156,8 +193,10 @@ impl Default for StorageConfig {
         Self {
             root: PathBuf::from("./roci-data"),
             cache_max_bytes: 256 * 1024 * 1024,
+            small_blob_threshold: 100 * 1024,
             dedupe: true,
             commit: false,
+            fast_restart: false,
             s3: None,
             subpaths: BTreeMap::new(),
             gc: GcConfig::default(),
@@ -694,6 +733,20 @@ impl Config {
                 format!("unknown method; expected one of {METHODS:?}"),
             ));
         }
+        if let Some(pc) = &rl.per_client {
+            if pc.rate == 0 || pc.burst == 0 {
+                return Err(invalid(
+                    "http.rate_limit.per_client",
+                    "rate and burst must be > 0",
+                ));
+            }
+            if pc.max_clients == 0 {
+                return Err(invalid(
+                    "http.rate_limit.per_client.max_clients",
+                    "must be > 0",
+                ));
+            }
+        }
         let t = &self.telemetry;
         if !(0.0..=1.0).contains(&t.sample_ratio) {
             return Err(invalid("telemetry.sample_ratio", "must be within [0, 1]"));
@@ -947,6 +1000,24 @@ impl StorageConfig {
                 }
             }
         }
+        // small_blob_threshold: must be in (0, 8 MiB].
+        const MAX_THRESHOLD: usize = 8 * 1024 * 1024;
+        if self.small_blob_threshold == 0 {
+            return Err(invalid("storage.small_blob_threshold", "must be > 0"));
+        }
+        if self.small_blob_threshold > MAX_THRESHOLD {
+            return Err(invalid(
+                "storage.small_blob_threshold",
+                format!("must be <= {MAX_THRESHOLD} (8 MiB)"),
+            ));
+        }
+        // When the cache is enabled, the threshold must not exceed the cache budget.
+        if self.cache_max_bytes > 0 && self.small_blob_threshold > self.cache_max_bytes {
+            return Err(invalid(
+                "storage.small_blob_threshold",
+                "must be <= cache_max_bytes when the cache is enabled",
+            ));
+        }
         if self.scrub.enabled {
             for (field, v) in [
                 ("storage.scrub.interval_secs", self.scrub.interval_secs),
@@ -1131,11 +1202,14 @@ mod tests {
             enabled = true
             default = { rate = 100, burst = 200 }
             per_method.PUT = { rate = 10, burst = 20 }
+            per_client = { rate = 50, burst = 100, max_clients = 5000 }
             [storage]
             root = "/var/lib/roci"
             cache_max_bytes = 0
+            small_blob_threshold = 51200
             dedupe = false
             commit = true
+            fast_restart = true
             gc = { enabled = true, delay_secs = 60, interval_secs = 30 }
             scrub = { enabled = true, interval_secs = 600, max_bytes_per_sec = 1024, mode = "app" }
             quota = { max_repo_bytes = 10, max_total_bytes = 100, max_upload_sessions = 0 }
@@ -1187,6 +1261,8 @@ mod tests {
         .unwrap();
         assert_eq!(c.http.listen.port(), 8443);
         assert_eq!(c.http.rate_limit.per_method["PUT"].rate, 10);
+        let pc = c.http.rate_limit.per_client.as_ref().unwrap();
+        assert_eq!((pc.rate, pc.burst, pc.max_clients), (50, 100, 5000));
         assert_eq!(c.limits.max_page, 50);
         assert_eq!(c.limits.max_body, LimitsConfig::default().max_body);
         assert_eq!(c.log.format, LogFormat::Json);
@@ -1198,6 +1274,8 @@ mod tests {
         let s = &c.storage;
         assert!(!s.dedupe);
         assert!(s.commit);
+        assert_eq!(s.small_blob_threshold, 51200);
+        assert!(s.fast_restart);
         assert_eq!(s.gc.delay_secs, 60);
         assert_eq!(s.scrub.mode, ScrubMode::App);
         assert_eq!(s.quota.max_upload_sessions, 0);
@@ -1227,11 +1305,12 @@ mod tests {
     #[test]
     fn storage_defaults_match_zot_policy() {
         let s = StorageConfig::default();
-        assert!(s.dedupe && s.gc.enabled && !s.scrub.enabled);
+        assert!(s.dedupe && s.gc.enabled && !s.scrub.enabled && !s.fast_restart);
         assert_eq!((s.gc.delay_secs, s.gc.interval_secs), (3600, 3600));
         assert_eq!((s.quota.max_repo_bytes, s.quota.max_total_bytes), (0, 0));
         assert_eq!(s.quota.max_upload_sessions, 1024);
         assert!(s.subpaths.is_empty() && s.s3.is_none());
+        assert_eq!(s.small_blob_threshold, 100 * 1024);
     }
 
     #[test]
@@ -1280,11 +1359,35 @@ mod tests {
                 "[http.rate_limit]\ndefault = { rate = 0, burst = 1 }",
                 "http.rate_limit.default",
             ),
+            (
+                "[http.rate_limit]\nper_client = { rate = 0, burst = 1 }",
+                "http.rate_limit.per_client",
+            ),
+            (
+                "[http.rate_limit]\nper_client = { rate = 1, burst = 0 }",
+                "http.rate_limit.per_client",
+            ),
+            (
+                "[http.rate_limit]\nper_client = { rate = 1, burst = 1, max_clients = 0 }",
+                "http.rate_limit.per_client.max_clients",
+            ),
             ("[telemetry]\nsample_ratio = 1.5", "sample_ratio"),
             ("[telemetry.metrics]\npath = \"/v2/m\"", "metrics.path"),
             ("[telemetry.otlp]\nendpoint = \"\"", "otlp.endpoint"),
             ("[log]\nlevel = \" \"", "log.level"),
             ("[http.timeouts]\nread_header_secs = 0", "read_header_secs"),
+            (
+                "[storage]\nsmall_blob_threshold = 0",
+                "storage.small_blob_threshold",
+            ),
+            (
+                "[storage]\nsmall_blob_threshold = 8388609",
+                "storage.small_blob_threshold",
+            ),
+            (
+                "[storage]\ncache_max_bytes = 1024\nsmall_blob_threshold = 2048",
+                "storage.small_blob_threshold",
+            ),
             ("[storage.gc]\ndelay_secs = 0", "storage.gc.delay_secs"),
             (
                 "[storage.gc]\ninterval_secs = 0",
@@ -1448,6 +1551,21 @@ mod tests {
     #[test]
     fn internal_endpoints_allowed_when_redirects_disabled() {
         parse("[storage.s3]\nbucket = \"b\"\nendpoint = \"http://127.0.0.1:9000\"\nallow_http = true\nredirect_min_size = 0").unwrap();
+    }
+
+    #[test]
+    fn per_client_rate_limit_defaults_and_absent() {
+        // Absent per_client is backward compatible (no per-client limiting).
+        let c = parse("[http.rate_limit]\nenabled = true\ndefault = { rate = 10, burst = 20 }")
+            .unwrap();
+        assert!(c.http.rate_limit.per_client.is_none());
+
+        // max_clients defaults to 10_000 when omitted.
+        let c = parse("[http.rate_limit]\nper_client = { rate = 5, burst = 10 }").unwrap();
+        let pc = c.http.rate_limit.per_client.unwrap();
+        assert_eq!(pc.rate, 5);
+        assert_eq!(pc.burst, 10);
+        assert_eq!(pc.max_clients, 10_000);
     }
 
     #[test]

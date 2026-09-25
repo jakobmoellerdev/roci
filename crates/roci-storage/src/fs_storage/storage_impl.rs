@@ -171,6 +171,10 @@ impl Storage for FsStorage {
         }
         let seed = hash.take().or_else(|| (current == 0).then(StagedHash::new));
         let (total, extended) = append_body(f, current, body, limit, seed).await?;
+        let appended = total.saturating_sub(current);
+        if appended > 0 {
+            roci_telemetry::record_upload_bytes(appended);
+        }
         *hash = extended;
         Ok(total)
     }
@@ -251,6 +255,7 @@ impl Storage for FsStorage {
         // staging file (and drops it) here.
         if staged_size > max_size {
             self.discard_session(repo, id).await?;
+            roci_telemetry::record_upload_finalize("too_large");
             return Err(StorageError::TooLarge {
                 limit: max_size,
                 actual: staged_size,
@@ -294,6 +299,7 @@ impl Storage for FsStorage {
         if let Some((actual, _, _)) = verified.as_ref().filter(|v| !v.0.ct_eq(expected)) {
             // Reject and drop the staging file so a bad upload leaves nothing.
             self.discard_session(repo, id).await?;
+            roci_telemetry::record_upload_finalize("digest_mismatch");
             return Err(StorageError::DigestMismatch {
                 expected: expected.as_string(),
                 actual: actual.as_string(),
@@ -382,6 +388,7 @@ impl Storage for FsStorage {
         if let Some(bytes) = warm {
             self.cache.put(repo, &digest_str, &bytes);
         }
+        roci_telemetry::record_upload_finalize("ok");
         Ok(())
     }
 

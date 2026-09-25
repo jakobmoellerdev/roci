@@ -60,6 +60,17 @@ impl DedupeIndex {
         let map = self.by_digest.lock().expect("dedupe lock poisoned");
         map.get(digest).filter(|r| *r != repo).cloned()
     }
+
+    /// Snapshot of the dedupe index for fast-restart stamp serialization.
+    /// Returns `(digest, repo)` pairs.
+    pub fn entries(&self) -> Vec<(String, String)> {
+        self.by_digest
+            .lock()
+            .expect("dedupe lock poisoned")
+            .iter()
+            .map(|(d, r)| (d.clone(), r.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]

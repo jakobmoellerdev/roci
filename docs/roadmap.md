@@ -58,7 +58,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [x] Data scrubbing (CRC32C staggered + adaptive, FS-scrub offload, digest re-hash escalation, quarantine)
 - [x] Serve multiple storage paths (and backends, incl. S3-compatible object storage) from a single server
 - [x] Per-repo / per-total storage quotas and a concurrent upload-session cap
-- [ ] In-memory small-blob content cache; 2-level fanout at scale
+- [x] In-memory small-blob content cache (byte-capped LRU, configurable `small_blob_threshold`)
 - [x] Embedded metadata index — append-log + in-RAM maps default (compaction, rkyv mmap snapshot, optional HMAC), redb B-tree KV upgrade
 
 ## Replication
@@ -73,9 +73,9 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 
 ## Operability
 
-- [x] Rate limiting, including per-HTTP-method limits
+- [x] Rate limiting — per-HTTP-method and per-client (authenticated identity or peer IP, LRU-bounded)
 - [x] Prometheus metrics
 - [x] OpenTelemetry observability (OTLP traces, metrics, and logs)
 - [ ] Node exporter for minimal builds
 - [ ] Swagger-based API documentation
-- [~] O(1) cold start (rkyv mmap snapshot / fast-restart) and low-fragmentation allocator
+- [x] Fast cold start (rkyv mmap snapshot, opt-in `fast_restart` stamp) and low-fragmentation allocator
