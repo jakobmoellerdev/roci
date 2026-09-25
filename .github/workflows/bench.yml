@@ -20,6 +20,10 @@ on:
         type: choice
         options: [quick, full]
         default: quick
+      roci_image:
+        description: roci image to benchmark (default ghcr.io/<repo>:<commit sha>; must be published — main commits are)
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -35,10 +39,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The runner image is built with a GitHub Actions layer cache (no write
+      # token); the roci image is pulled from GHCR instead of rebuilt.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build runner image (cached)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: bench
+          file: bench/Containerfile.runner
+          tags: roci-bench/runner:local
+          load: true
+          cache-from: type=gha,scope=bench-runner
+          cache-to: type=gha,scope=bench-runner,mode=max
       - name: Run benchmark
         env:
           MODE: ${{ inputs.mode }}
           PROFILE: ${{ inputs.profile }}
+          BENCH_ROCI_PREBUILT: ${{ inputs.roci_image || format('ghcr.io/{0}:{1}', github.repository, github.sha) }}
+          BENCH_RUNNER_PREBUILT: "1"
         run: bash bench/run.sh "$MODE" "$PROFILE"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
