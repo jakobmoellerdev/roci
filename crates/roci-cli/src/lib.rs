@@ -318,35 +318,147 @@ async fn handle_conn(
                     format!("TLS handshake failed: {e}").into()
                 },
             )?;
-            let io = TokioIo::new(tls_stream);
-            let conn =
-                builder.serve_connection_with_upgrades(io, TowerToHyperService { service: app });
-            tokio::pin!(conn);
-            tokio::select! {
-                res = &mut conn => res?,
-                _ = shutdown_rx.changed() => {
-                    conn.as_mut().graceful_shutdown();
-                    conn.await?
-                }
-                _ = tokio::time::sleep(idle_timeout) => {}
-            }
+            serve_io(tls_stream, &builder, app, shutdown_rx, idle_timeout).await
         }
-        None => {
-            let io = TokioIo::new(tcp);
-            let conn =
-                builder.serve_connection_with_upgrades(io, TowerToHyperService { service: app });
-            tokio::pin!(conn);
-            tokio::select! {
-                res = &mut conn => res?,
-                _ = shutdown_rx.changed() => {
-                    conn.as_mut().graceful_shutdown();
-                    conn.await?
-                }
-                _ = tokio::time::sleep(idle_timeout) => {}
-            }
+        None => serve_io(tcp, &builder, app, shutdown_rx, idle_timeout).await,
+    }
+}
+
+/// Serve one (plain or TLS) connection. It is closed once no byte has moved in
+/// either direction for `idle_timeout` — an idle keep-alive or a stalled peer —
+/// never merely because it has been open that long (an active long transfer or
+/// busy keep-alive connection is not cut).
+async fn serve_io<T>(
+    io: T,
+    builder: &AutoBuilder<TokioExecutor>,
+    app: axum::Router,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    idle_timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let io = ActivityIo::new(io);
+    let activity = io.activity();
+    let conn = builder
+        .serve_connection_with_upgrades(TokioIo::new(io), TowerToHyperService { service: app });
+    tokio::pin!(conn);
+    tokio::select! {
+        res = &mut conn => res?,
+        _ = shutdown_rx.changed() => {
+            conn.as_mut().graceful_shutdown();
+            conn.await?
         }
+        _ = activity.idle_for(idle_timeout) => {}
     }
     Ok(())
+}
+
+/// Last-activity clock shared between a connection's IO and its idle watcher.
+#[derive(Clone)]
+struct Activity {
+    start: tokio::time::Instant,
+    last_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Activity {
+    fn touch(&self) {
+        let ms = self.start.elapsed().as_millis() as u64;
+        self.last_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Resolves once nothing has been read or written for `idle`.
+    async fn idle_for(&self, idle: Duration) {
+        loop {
+            let last =
+                Duration::from_millis(self.last_ms.load(std::sync::atomic::Ordering::Relaxed));
+            let quiet = self.start.elapsed().saturating_sub(last);
+            if quiet >= idle {
+                return;
+            }
+            tokio::time::sleep(idle - quiet).await;
+        }
+    }
+}
+
+/// Transparent IO wrapper stamping [`Activity`] on every successful read/write.
+struct ActivityIo<T> {
+    inner: T,
+    activity: Activity,
+}
+
+impl<T> ActivityIo<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            activity: Activity {
+                start: tokio::time::Instant::now(),
+                last_ms: Arc::default(),
+            },
+        }
+    }
+
+    fn activity(&self) -> Activity {
+        self.activity.clone()
+    }
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ActivityIo<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let res = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if res.is_ready() {
+            self.activity.touch();
+        }
+        res
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ActivityIo<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let res = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if res.is_ready() {
+            self.activity.touch();
+        }
+        res
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let res = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if res.is_ready() {
+            self.activity.touch();
+        }
+        res
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -988,6 +1100,52 @@ max_body = 0
             err.contains("no certificates"),
             "expected 'no certificates' error, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_spares_an_active_keep_alive_connection() {
+        // The idle timeout counts *inactivity*: a keep-alive connection that
+        // keeps sending requests must outlive `idle_secs` (it used to be cut
+        // `idle_secs` after it opened, mid-traffic).
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.http.listen = "127.0.0.1:0".parse().unwrap();
+        config.storage.root = dir.path().to_path_buf();
+        config.http.timeouts.idle_secs = 1;
+        let (bind_tx, bind_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            serve(
+                config,
+                move |addr| {
+                    let _ = bind_tx.send(addr);
+                },
+                async move {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+        });
+        let addr = bind_rx.await.unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        for _ in 0..8 {
+            let req = hyper::Request::get("/v2/")
+                .header("host", "localhost")
+                .body(http_body_util::Empty::<bytes::Bytes>::new())
+                .unwrap();
+            let resp = sender
+                .send_request(req)
+                .await
+                .expect("connection still open");
+            assert_eq!(resp.status(), 200);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        let _ = stop_tx.send(());
+        handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
