@@ -378,7 +378,7 @@ Defined once as OTel instruments; exported via OTLP push and a Prometheus `/metr
 - **Upload sessions:** `registry.upload.active` (gauge), `registry.upload.duration`, `registry.upload.mount_hits` (cross-repo mount avoided a transfer).
 - **Auth [added — Phase 6]:** `registry.auth.decisions` (counter, labels `method`=`anonymous`|`htpasswd`|`ldap`|`bearer`|`mtls`, `result`=`allowed`|`denied`|`unauthenticated`|`invalid`).
 - **Cluster (feature):** `registry.cluster.proxied` (`local`/`forwarded`), `registry.cluster.owner_load` (per-shard load vs the CHBL cap), `registry.cluster.peer_errors`.
-- **Process:** RSS/heap (allocator stats), FD count, open upload sessions, tokio runtime task/poll metrics, build info (`service.version`, features enabled).
+- **Process:** RSS/heap (allocator stats), FD count, open upload sessions, tokio runtime task/poll metrics, build info (`service.version`, features enabled). **[implemented]** `registry.blocking.hops{op}` counts every hand-off of filesystem work to the blocking pool (queue + two thread wake-ups, which outweigh a cached `stat`/`open`); storage operations batch their syscalls into as few hops as possible (an upload finalize is prepare → body batches → land).
 
 ### Traces & spans
 

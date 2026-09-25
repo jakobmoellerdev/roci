@@ -27,6 +27,7 @@ type ChunkRead = tokio::task::JoinHandle<io::Result<(std::fs::File, Bytes)>>;
 /// pool. The file is moved in and handed back, so no lock is needed and only
 /// one read per stream is ever in flight.
 fn read_chunk(file: std::fs::File, seek: Option<u64>, n: u64) -> ChunkRead {
+    roci_telemetry::record_blocking_hop("read_chunk");
     tokio::task::spawn_blocking(move || {
         use std::io::{Read, Seek};
         let mut file = file;

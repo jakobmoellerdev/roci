@@ -1,4 +1,3 @@
-use super::super::paths::blob_dir_rel;
 use super::*;
 
 #[tokio::test]
@@ -96,25 +95,24 @@ async fn upload_ops_reject_invalid_id_and_do_not_leak_locks() {
         .is_none());
 }
 
-// Directly exercise the best-effort cache warm: an absent blob path is a
-// no-op (open fails → skipped), and a present small blob is cached.
-#[cfg(unix)]
+// A finalized small blob is warmed into the small-blob cache in the landing
+// hop; one above the cache threshold is not.
 #[tokio::test]
-async fn warm_small_blob_cache_open_error_is_noop_and_small_blob_caches() {
+async fn finalize_warms_cache_for_small_blobs_only() {
     let (_dir, s) = store();
-    let d = sha256_of(b"warmable");
-    let (alg_rel, hex) = blob_dir_rel("r", &d).unwrap();
-    let mut rel = alg_rel.clone();
-    rel.push(&hex);
-    // (a) No blob at rel yet → open fails → warm is a no-op (nothing cached).
-    s.warm_small_blob_cache("r", &rel, &d.as_string()).await;
-    assert!(s.cache.get("r", &d.as_string()).is_none());
-    // (b) Materialise the blob, then warm → it is read back and cached.
-    s.put_blob("r", &d, b"warmable").await.unwrap();
-    s.cache.invalidate("r", &d.as_string());
-    s.warm_small_blob_cache("r", &rel, &d.as_string()).await;
-    assert_eq!(
-        s.cache.get("r", &d.as_string()).map(|b| b.to_vec()),
-        Some(b"warmable".to_vec())
-    );
+    for (data, cached) in [
+        (b"warmable".to_vec(), true),
+        (
+            vec![9u8; crate::cache::DEFAULT_SMALL_BLOB_THRESHOLD + 1],
+            false,
+        ),
+    ] {
+        let d = sha256_of(&data);
+        let id = s.begin_upload("r").await.unwrap();
+        s.finish_upload("r", &id, &d, u64::MAX, crate::upload_body(&data), u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(s.cache.get("r", &d.as_string()).is_some(), cached);
+        assert_eq!(s.read_blob("r", &d).await.unwrap(), data);
+    }
 }

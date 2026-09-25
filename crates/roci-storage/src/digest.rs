@@ -77,6 +77,38 @@ fn hash_bytes<H: sha2::Digest>(algorithm: &str, data: &[u8]) -> Digest {
     }
 }
 
+/// Blocking-thread twin of [`hash_reader`]: digest (sha256/sha512 by
+/// `algorithm`) and CRC32C of `f` in one pass, for callers already on the
+/// blocking pool.
+pub(crate) fn hash_std(mut f: std::fs::File, algorithm: &str) -> io::Result<(Digest, u32)> {
+    fn run<H: sha2::Digest>(alg: &str, f: &mut std::fs::File) -> io::Result<(Digest, u32)> {
+        use std::io::Read;
+        let mut h = H::new();
+        let mut crc = 0u32;
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+            crc = crc32c::crc32c_append(crc, &buf[..n]);
+        }
+        Ok((
+            Digest {
+                algorithm: alg.to_owned(),
+                hex: hex::encode(h.finalize()),
+            },
+            crc,
+        ))
+    }
+    if algorithm == "sha512" {
+        run::<Sha512>("sha512", &mut f)
+    } else {
+        run::<Sha256>("sha256", &mut f)
+    }
+}
+
 /// Stream `f` through `H` in 64 KiB reads without buffering the whole file,
 /// tagging the result with its wire `algorithm`; the same single pass also
 /// folds every byte into a CRC32C (the scrub's fast checksum).
