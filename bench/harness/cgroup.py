@@ -41,7 +41,7 @@ class Sampler:
     def __init__(self, cgroup_dir: str, interval: float = 0.1):
         self.dir = cgroup_dir
         self.interval = interval
-        self.samples: list[tuple[float, int, int, int]] = []
+        self.samples: list[tuple[float, int, int, int, int]] = []
         self.phases: dict[str, list[float]] = {}
         self._stop = threading.Event()
         stat = _kv(os.path.join(cgroup_dir, "memory.stat"))
@@ -56,7 +56,12 @@ class Sampler:
             cpu = _kv(os.path.join(self.dir, "cpu.stat"))
         except OSError:
             return None  # container stopped / cgroup removed
-        s = (time.monotonic(), mem.get("anon", 0), mem.get("file", 0), cpu.get("usage_usec", 0))
+        try:
+            with open(os.path.join(self.dir, "pids.current")) as f:
+                tasks = int(f.read())
+        except (OSError, ValueError):
+            tasks = 0
+        s = (time.monotonic(), mem.get("anon", 0), mem.get("file", 0), cpu.get("usage_usec", 0), tasks)
         self.samples.append(s)
         return s
 
@@ -102,6 +107,6 @@ class Sampler:
 
     def dump_csv(self, path: str, t0: float = 0.0):
         with open(path, "w") as f:
-            f.write("t_s,anon_bytes,file_bytes,usage_usec\n")
-            for t, a, fb, u in self.samples:
-                f.write(f"{t - t0:.3f},{a},{fb},{u}\n")
+            f.write("t_s,anon_bytes,file_bytes,usage_usec,tasks\n")
+            for t, a, fb, u, n in self.samples:
+                f.write(f"{t - t0:.3f},{a},{fb},{u},{n}\n")
