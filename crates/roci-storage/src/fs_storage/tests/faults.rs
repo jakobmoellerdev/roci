@@ -124,7 +124,7 @@ async fn stat_beneath_propagates_io_error() {
     let data = b"present-blob";
     let d = sha256_of(data);
     s.put_blob("r", &d, data).await.unwrap();
-    let rel = blob_rel("r", &d).unwrap();
+    let rel = super::super::paths::blob_rel("r", &d).unwrap();
     FORCE_STAT_ERROR.store(true, Ordering::Relaxed);
     let res = crate::beneath::stat_beneath(&s.root, &rel).await;
     FORCE_STAT_ERROR.store(false, Ordering::Relaxed);
