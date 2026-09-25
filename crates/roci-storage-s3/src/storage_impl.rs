@@ -8,7 +8,7 @@ use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
 use roci_storage::{
     BlobChecksum, BlobRead, BlobStream, Digest, ManifestLinks, ManifestRef, MetaOp, Page,
-    RangeOpener, Referrer, Storage, StorageBackend, StorageError,
+    RangeOpener, Referrer, Storage, StorageBackend, StorageError, UploadBody,
 };
 use std::collections::HashSet;
 use std::future::Future;
@@ -146,13 +146,14 @@ impl Storage for S3Storage {
         &self,
         repo: &str,
         id: &str,
-        chunk: &[u8],
+        body: UploadBody,
         expected_offset: Option<u64>,
+        limit: u64,
     ) -> Result<u64, StorageError> {
         validate_repo(repo)?;
         let lock = self.session_lock(repo, id);
         let _guard = lock.lock().await;
-        self.append_to_staging(repo, id, chunk, expected_offset)
+        self.append_to_staging(repo, id, body, expected_offset, limit)
             .await
     }
 
@@ -196,16 +197,16 @@ impl Storage for S3Storage {
         id: &str,
         expected: &Digest,
         max_size: u64,
-        trailing: &[u8],
+        trailing: UploadBody,
+        limit: u64,
     ) -> Result<(), StorageError> {
         validate_repo(repo)?;
         let lock = self.session_lock(repo, id);
         let _guard = lock.lock().await;
 
-        // Append trailing bytes (monolithic PUT body).
-        if !trailing.is_empty() {
-            self.append_to_staging(repo, id, trailing, None).await?;
-        }
+        // Stream trailing bytes (monolithic PUT body) onto the staging file.
+        self.append_to_staging(repo, id, trailing, None, limit)
+            .await?;
 
         // Check size under the lock.
         let staged_size = self.staging_size(repo, id).await?;

@@ -3,6 +3,7 @@
 //! the atomically-committed [`ManifestLinks`].
 
 use crate::metadata::{Page, Referrer};
+use crate::upload_body::UploadBody;
 use crate::{Digest, StorageError};
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -201,17 +202,20 @@ pub trait Storage: Send + Sync + 'static {
     /// Begin a chunked upload session, returning its id.
     fn begin_upload(&self, repo: &str)
         -> impl Future<Output = Result<String, StorageError>> + Send;
-    /// Append bytes to an upload session, returning the new total size. When
+    /// Stream `body` onto an upload session, returning the new total size. When
     /// `expected_offset` is `Some(n)`, the current committed size MUST equal
     /// `n` (a `Content-Range` precondition checked *inside* the session lock so
     /// two concurrent PATCHes cannot both pass an out-of-lock check) — a
-    /// mismatch yields [`StorageError::RangeNotSatisfiable`].
+    /// mismatch yields [`StorageError::RangeNotSatisfiable`]. A body over
+    /// `limit` bytes is [`StorageError::TooLarge`]; any failure leaves the
+    /// session exactly as it was (never whole-blob buffered, invariant 4).
     fn append_upload(
         &self,
         repo: &str,
         id: &str,
-        chunk: &[u8],
+        body: UploadBody,
         expected_offset: Option<u64>,
+        limit: u64,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send;
     /// Current size of an in-progress upload.
     fn upload_size(
@@ -239,8 +243,9 @@ pub trait Storage: Send + Sync + 'static {
         to_repo: &str,
         digest: &Digest,
     ) -> impl Future<Output = Result<bool, StorageError>> + Send;
-    /// Finalize an upload: under the session lock, append `trailing` (a
-    /// monolithic PUT's body, empty for a plain finalize) atomically with the
+    /// Finalize an upload: under the session lock, stream `trailing` (a
+    /// monolithic PUT's body — at most `limit` bytes — empty for a plain
+    /// finalize) atomically with the
     /// verify+promote so a concurrent PATCH cannot inject bytes between the
     /// trailing append and the finalize hash; verify it hashes to `expected` and
     /// does not exceed `max_size` bytes (the per-session cap, re-checked here
@@ -251,7 +256,8 @@ pub trait Storage: Send + Sync + 'static {
         id: &str,
         expected: &Digest,
         max_size: u64,
-        trailing: &[u8],
+        trailing: UploadBody,
+        limit: u64,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
     /// Store a blob given its bytes (verifies digest), used by monolithic/mount paths.
     fn put_blob(

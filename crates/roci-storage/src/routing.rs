@@ -106,11 +106,12 @@ impl<B: StorageBackend + Clone> Storage for Routed<B> {
         &self,
         repo: &str,
         id: &str,
-        chunk: &[u8],
+        body: crate::UploadBody,
         expected_offset: Option<u64>,
+        limit: u64,
     ) -> Result<u64, StorageError> {
         self.backend_for(repo)
-            .append_upload(repo, id, chunk, expected_offset)
+            .append_upload(repo, id, body, expected_offset, limit)
             .await
     }
 
@@ -144,10 +145,11 @@ impl<B: StorageBackend + Clone> Storage for Routed<B> {
         id: &str,
         expected: &Digest,
         max_size: u64,
-        trailing: &[u8],
+        trailing: crate::UploadBody,
+        limit: u64,
     ) -> Result<(), StorageError> {
         self.backend_for(repo)
-            .finish_upload(repo, id, expected, max_size, trailing)
+            .finish_upload(repo, id, expected, max_size, trailing, limit)
             .await
     }
 
@@ -571,14 +573,21 @@ mod tests {
         // begin_upload, append_upload, upload_size, finish_upload
         let id = routed.begin_upload("team/up").await.unwrap();
         let offset = routed
-            .append_upload("team/up", &id, data, None)
+            .append_upload("team/up", &id, crate::upload_body(data), None, u64::MAX)
             .await
             .unwrap();
         assert_eq!(offset, data.len() as u64);
         let size = routed.upload_size("team/up", &id).await.unwrap();
         assert_eq!(size, data.len() as u64);
         routed
-            .finish_upload("team/up", &id, &digest, u64::MAX, b"")
+            .finish_upload(
+                "team/up",
+                &id,
+                &digest,
+                u64::MAX,
+                crate::upload_body(b""),
+                u64::MAX,
+            )
             .await
             .unwrap();
         assert_eq!(routed.read_blob("team/up", &digest).await.unwrap(), data);
@@ -586,7 +595,13 @@ mod tests {
         // abort_upload through the default backend
         let id2 = routed.begin_upload("other/up").await.unwrap();
         routed
-            .append_upload("other/up", &id2, b"junk", None)
+            .append_upload(
+                "other/up",
+                &id2,
+                crate::upload_body(b"junk"),
+                None,
+                u64::MAX,
+            )
             .await
             .unwrap();
         assert!(routed.abort_upload("other/up", &id2).await.unwrap());

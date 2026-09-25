@@ -49,6 +49,7 @@ pub(crate) async fn mount_promote_beneath(
     to_alg_rel: &Path,
     leaf: &str,
     allow_copy: bool,
+    sync: bool,
 ) -> io::Result<Promotion> {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     let root = root.to_path_buf();
@@ -126,9 +127,11 @@ pub(crate) async fn mount_promote_beneath(
         // if that also fails (cross-device), stream-copy into the temp.
         let mut out = promote_via_temp(OFlags::empty())?;
         if try_reflink(&mut out, &mut src_file) {
-            out.sync_all()?;
+            if sync {
+                out.sync_data()?;
+            }
             drop(out);
-            promote_temp_noreplace(&to_dir, tmp.as_str(), leaf.as_str())?;
+            promote_temp_noreplace(&to_dir, tmp.as_str(), leaf.as_str(), sync)?;
             return Ok(Promotion::Reflink);
         }
         // Reflink unavailable: drop the temp and try a direct hard link.
@@ -136,7 +139,9 @@ pub(crate) async fn mount_promote_beneath(
         let _ = rustix::fs::unlinkat(&to_dir, tmp.as_str(), AtFlags::empty());
         match try_hardlink_at(&from_dir, leaf.as_str(), &to_dir, leaf.as_str()) {
             Ok(()) => {
-                rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
+                if sync {
+                    rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
+                }
                 Ok(Promotion::Hardlink)
             }
             // Destination raced in between our earlier stat and this link. Accept
@@ -147,7 +152,9 @@ pub(crate) async fn mount_promote_beneath(
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 match rustix::fs::statat(&to_dir, leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
                     Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => {
-                        rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
+                        if sync {
+                            rustix::fs::fsync(&to_dir).map_err(io::Error::from)?;
+                        }
                         Ok(Promotion::Existing)
                     }
                     Ok(_) => Err(io::Error::new(
@@ -161,9 +168,11 @@ pub(crate) async fn mount_promote_beneath(
             Err(_) if allow_copy => {
                 let mut out = promote_via_temp(OFlags::empty())?;
                 stream_copy(&mut src_file, &mut out)?;
-                out.sync_all()?;
+                if sync {
+                    out.sync_data()?;
+                }
                 drop(out);
-                promote_temp_noreplace(&to_dir, tmp.as_str(), leaf.as_str())?;
+                promote_temp_noreplace(&to_dir, tmp.as_str(), leaf.as_str(), sync)?;
                 Ok(Promotion::Copy)
             }
             Err(e) => Err(e),
@@ -174,7 +183,7 @@ pub(crate) async fn mount_promote_beneath(
 
 /// Atomically move the temp `tmp` onto `leaf` in `to_dir` with **no-replace**
 /// semantics (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)`
-/// on Apple), then fsync the dir. Plain `renameat` has replace semantics: a
+/// on Apple), then (when `sync`) fsync the dir. Plain `renameat` has replace semantics: a
 /// racer that installs a symlink or a different file at `leaf` between the
 /// caller's no-follow check and the rename would be silently overwritten (or the
 /// symlink followed on a later replace). NOREPLACE closes that window — the
@@ -187,11 +196,14 @@ pub(crate) fn promote_temp_noreplace(
     to_dir: &std::os::fd::OwnedFd,
     tmp: &str,
     leaf: &str,
+    sync: bool,
 ) -> io::Result<()> {
     use rustix::fs::{AtFlags, FileType, RenameFlags};
     match rustix::fs::renameat_with(to_dir, tmp, to_dir, leaf, RenameFlags::NOREPLACE) {
         Ok(()) => {
-            rustix::fs::fsync(to_dir).map_err(io::Error::from)?;
+            if sync {
+                rustix::fs::fsync(to_dir).map_err(io::Error::from)?;
+            }
             Ok(())
         }
         // Something is already at `leaf`. Accept only a regular file (idempotent
@@ -283,7 +295,7 @@ pub(crate) fn stream_copy(input: &mut std::fs::File, output: &mut std::fs::File)
 
 /// Publish `data` as the CAS blob named `leaf` inside the directory `alg_rel`
 /// (relative to `root`, e.g. `<repo…>/blobs/<alg>`) with a per-operation unique
-/// temp sibling, fsync, and atomic rename — all **relative to a dirfd walked
+/// temp sibling, fsync (when `sync`), and atomic rename — all **relative to a dirfd walked
 /// no-follow beneath `root`**, so a symlinked `repo`/`blobs`/`<alg>` parent
 /// cannot redirect the write outside the store. Portable across every platform
 /// and the fallback the Linux `O_TMPFILE` path degrades to. A rename onto an
@@ -294,6 +306,7 @@ pub(crate) async fn publish_bytes_rename(
     alg_rel: &Path,
     leaf: &str,
     data: &[u8],
+    sync: bool,
 ) -> io::Result<()> {
     use rustix::fs::{Mode, OFlags};
     use std::io::Write as _;
@@ -315,20 +328,22 @@ pub(crate) async fn publish_bytes_rename(
         .map_err(io::Error::from)?;
         let mut f = std::fs::File::from(fd);
         f.write_all(&data)?;
-        f.sync_all()?;
+        if sync {
+            f.sync_data()?;
+        }
         drop(f);
         // No-replace promotion: a raced symlink/file at `leaf` is not silently
         // overwritten; an `EEXIST` is a dedup hit only if the existing entry is a
         // regular file (matches the Linux O_TMPFILE+linkat path's contract).
-        promote_temp_noreplace(&dirfd, tmp_name.as_str(), leaf.as_str())
+        promote_temp_noreplace(&dirfd, tmp_name.as_str(), leaf.as_str(), sync)
     })
     .await
 }
 
 /// Publish `data` as the CAS blob `leaf` inside `alg_rel` crash-atomically,
 /// anchored to a dirfd walked no-follow beneath `root`. On Linux this opens an
-/// anonymous `O_TMPFILE` inode in the (beneath-root) directory, writes+fsyncs
-/// it, then `linkat`s it into place: a partial blob is never visible under its
+/// anonymous `O_TMPFILE` inode in the (beneath-root) directory, writes (and,
+/// when `sync`, fsyncs) it, then `linkat`s it into place: a partial blob is never visible under its
 /// digest name and no orphan temp survives a crash. A filesystem without
 /// `O_TMPFILE` degrades to the portable temp+rename path. `linkat` `EEXIST`
 /// means a blob already exists at the name; it is dedup success only if that
@@ -340,6 +355,7 @@ pub(crate) async fn publish_bytes(
     alg_rel: &Path,
     leaf: &str,
     data: &[u8],
+    sync: bool,
 ) -> io::Result<()> {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     use rustix::io::Errno;
@@ -371,7 +387,9 @@ pub(crate) async fn publish_bytes(
         };
         let mut f = std::fs::File::from(fd);
         f.write_all(&data_vec)?;
-        f.sync_all()?;
+        if sync {
+            f.sync_data()?;
+        }
         // Link the anonymous inode into place via its /proc/self/fd magic link,
         // relative to the beneath-root dirfd (AT_EMPTY_PATH would need
         // CAP_DAC_READ_SEARCH).
@@ -399,12 +417,14 @@ pub(crate) async fn publish_bytes(
             }
             Err(e) => return Err(io::Error::from(e)),
         }
-        rustix::fs::fsync(&dirfd).map_err(io::Error::from)?;
+        if sync {
+            rustix::fs::fsync(&dirfd).map_err(io::Error::from)?;
+        }
         Ok(true)
     })
     .await?;
     if !outcome {
-        return publish_bytes_rename(root, alg_rel, leaf, data).await;
+        return publish_bytes_rename(root, alg_rel, leaf, data, sync).await;
     }
     Ok(())
 }
@@ -421,6 +441,7 @@ pub(crate) async fn publish_bytes(
     alg_rel: &Path,
     leaf: &str,
     data: &[u8],
+    sync: bool,
 ) -> io::Result<()> {
-    publish_bytes_rename(root, alg_rel, leaf, data).await
+    publish_bytes_rename(root, alg_rel, leaf, data, sync).await
 }

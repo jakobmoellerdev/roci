@@ -17,7 +17,14 @@ async fn path_backstop_rejects_traversal_components() {
         Err(StorageError::NotFound)
     ));
     assert!(matches!(
-        s.append_upload("r", "../evil", b"x", None).await,
+        s.append_upload(
+            "r",
+            "../evil",
+            roci_storage::upload_body(b"x"),
+            None,
+            u64::MAX
+        )
+        .await,
         Err(StorageError::BadPath(_))
     ));
     // BadPath renders a message.

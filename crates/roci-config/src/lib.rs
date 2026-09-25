@@ -105,6 +105,13 @@ pub struct StorageConfig {
     /// Cross-repo dedupe of uploaded blobs: a blob already stored in another
     /// repo is linked (reflink → hard link) instead of kept as a second copy.
     pub dedupe: bool,
+    /// `fsync` blob data (and the directory entry that publishes it) before an
+    /// upload/mount is acknowledged. `false` (default, zot's `commit` default)
+    /// leaves blob bytes to the kernel's writeback: a power loss can leave a
+    /// blob torn under its digest name (the scrub's CRC32C catches it; the
+    /// client re-pushes). Manifests, the metadata WAL, `index.json` and the
+    /// layout marker are always synced regardless.
+    pub commit: bool,
     /// Remote object-store backend for this root (needs the `s3` build).
     pub s3: Option<S3Config>,
     /// Repo-name prefix → backend routing (zot `subPaths`); the longest
@@ -122,6 +129,7 @@ impl Default for StorageConfig {
             root: PathBuf::from("./roci-data"),
             cache_max_bytes: 256 * 1024 * 1024,
             dedupe: true,
+            commit: false,
             s3: None,
             subpaths: BTreeMap::new(),
             gc: GcConfig::default(),
@@ -743,6 +751,7 @@ mod tests {
             root = "/var/lib/roci"
             cache_max_bytes = 0
             dedupe = false
+            commit = true
             gc = { enabled = true, delay_secs = 60, interval_secs = 30 }
             scrub = { enabled = true, interval_secs = 600, max_bytes_per_sec = 1024, mode = "app" }
             quota = { max_repo_bytes = 10, max_total_bytes = 100, max_upload_sessions = 0 }
@@ -778,6 +787,7 @@ mod tests {
         assert_eq!(c.telemetry.metrics.path, "/metrics");
         let s = &c.storage;
         assert!(!s.dedupe);
+        assert!(s.commit);
         assert_eq!(s.gc.delay_secs, 60);
         assert_eq!(s.scrub.mode, ScrubMode::App);
         assert_eq!(s.quota.max_upload_sessions, 0);

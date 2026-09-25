@@ -104,6 +104,14 @@ async fn hash_file<H: sha2::Digest>(
     ))
 }
 
+/// The sha256 [`Digest`] of an incrementally fed hasher.
+pub(crate) fn finish_sha256(h: Sha256) -> Digest {
+    Digest {
+        algorithm: "sha256".to_owned(),
+        hex: hex::encode(sha2::Digest::finalize(h)),
+    }
+}
+
 /// Compute the sha256 digest of `data`.
 pub fn sha256_of(data: &[u8]) -> Digest {
     hash_bytes::<Sha256>("sha256", data)

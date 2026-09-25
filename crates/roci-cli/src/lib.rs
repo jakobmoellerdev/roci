@@ -109,11 +109,11 @@ impl Storage for AnyBackend {
     delegate_storage!(read_blob(&self, repo: &str, digest: &Digest) -> Result<Vec<u8>, StorageError>);
     delegate_storage!(open_blob(&self, repo: &str, digest: &Digest) -> Result<BlobRead, StorageError>);
     delegate_storage!(begin_upload(&self, repo: &str) -> Result<String, StorageError>);
-    delegate_storage!(append_upload(&self, repo: &str, id: &str, chunk: &[u8], expected_offset: Option<u64>) -> Result<u64, StorageError>);
+    delegate_storage!(append_upload(&self, repo: &str, id: &str, body: roci_storage::UploadBody, expected_offset: Option<u64>, limit: u64) -> Result<u64, StorageError>);
     delegate_storage!(upload_size(&self, repo: &str, id: &str) -> Result<u64, StorageError>);
     delegate_storage!(abort_upload(&self, repo: &str, id: &str) -> Result<bool, StorageError>);
     delegate_storage!(mount_blob(&self, from_repo: &str, to_repo: &str, digest: &Digest) -> Result<bool, StorageError>);
-    delegate_storage!(finish_upload(&self, repo: &str, id: &str, expected: &Digest, max_size: u64, trailing: &[u8]) -> Result<(), StorageError>);
+    delegate_storage!(finish_upload(&self, repo: &str, id: &str, expected: &Digest, max_size: u64, trailing: roci_storage::UploadBody, limit: u64) -> Result<(), StorageError>);
     delegate_storage!(put_blob(&self, repo: &str, digest: &Digest, data: &[u8]) -> Result<(), StorageError>);
     delegate_storage!(delete_blob(&self, repo: &str, digest: &Digest) -> Result<(), StorageError>);
     delegate_storage!(put_manifest(&self, repo: &str, tag: Option<&str>, digest: &Digest, media_type: &str, data: &[u8], links: ManifestLinks<'_>) -> Result<(), StorageError>);
