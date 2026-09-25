@@ -1,0 +1,33 @@
+seed = 42
+
+[images.zot]   # zot full image, no extensions configured (shipped default image; zot-minimal is not benchmarked)
+amd64 = "ghcr.io/project-zot/zot-linux-amd64:v2.1.21@sha256:8258443838e95989c13c891f78a02bc1c391b5a00591ffef24cb8c17cde28038"
+arm64 = "ghcr.io/project-zot/zot-linux-arm64:v2.1.21@sha256:0270db3550faf4de3b4a1c6e2fe0a638abbf588769f673d2a4bb0bccaaaa50e8"
+
+[images.distribution]   # upstream multi-arch index digest (Docker Hub `registry:3.1.2` does not exist yet)
+amd64 = "ghcr.io/distribution/distribution:3.1.2@sha256:d106962e6fe3fa69c178cec77eeeee5edb626b8df6535b7bd6b95e658a0a5ca9"
+arm64 = "ghcr.io/distribution/distribution:3.1.2@sha256:d106962e6fe3fa69c178cec77eeeee5edb626b8df6535b7bd6b95e658a0a5ca9"
+
+[profiles.quick]
+reps = 1
+zb_concurrency = [1, 8]
+zb_requests = { "1MB" = 64, "10MB" = 16 }
+corpus_repos = 10
+corpus_tags = 50
+storm_concurrency = 16
+ladder_rps = [1000, 4000]
+step_secs = 5
+warmup_secs = 2
+fleet = 4
+
+[profiles.full]
+reps = 5
+zb_concurrency = [1, 16]
+zb_requests = { "1MB" = 256, "10MB" = 64, "100MB" = 16 }
+corpus_repos = 50
+corpus_tags = 200
+storm_concurrency = 32
+ladder_rps = [1000, 2000, 4000, 8000, 16000, 32000]
+step_secs = 10
+warmup_secs = 3
+fleet = 16

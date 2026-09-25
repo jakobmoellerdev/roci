@@ -73,33 +73,44 @@ async fn mount_and_put_fallback_paths() {
     let _serialize = FAULT_TEST_LOCK.lock().await;
     let data = b"fallback-blob";
     let d = sha256_of(data);
+    // Every fallback lands the same bytes whether or not blob writes are
+    // synced (`storage.commit`).
+    for commit in [false, true] {
+        let store = |dir: &tempfile::TempDir| {
+            let cfg = roci_config::StorageConfig {
+                commit,
+                ..Default::default()
+            };
+            FsStorage::with_config(dir.path(), &cfg, Default::default()).unwrap()
+        };
 
-    // (1) Reflink + hard link forced off → mount takes the streaming copy.
-    FORCE_COPY_FALLBACK.store(true, Ordering::Relaxed);
-    let d1 = tempfile::tempdir().unwrap();
-    let s1 = FsStorage::new(d1.path()).unwrap();
-    s1.put_blob("srcrepo", &d, data).await.unwrap();
-    assert!(s1.mount_blob("srcrepo", "dstrepo", &d).await.unwrap());
-    assert_eq!(s1.read_blob("dstrepo", &d).await.unwrap(), data);
-    FORCE_COPY_FALLBACK.store(false, Ordering::Relaxed);
+        // (1) Reflink + hard link forced off → mount takes the streaming copy.
+        FORCE_COPY_FALLBACK.store(true, Ordering::Relaxed);
+        let d1 = tempfile::tempdir().unwrap();
+        let s1 = store(&d1);
+        s1.put_blob("srcrepo", &d, data).await.unwrap();
+        assert!(s1.mount_blob("srcrepo", "dstrepo", &d).await.unwrap());
+        assert_eq!(s1.read_blob("dstrepo", &d).await.unwrap(), data);
+        FORCE_COPY_FALLBACK.store(false, Ordering::Relaxed);
 
-    // (2) Reflink forced to succeed → mount takes the reflink primary.
-    FORCE_REFLINK_OK.store(true, Ordering::Relaxed);
-    let d2 = tempfile::tempdir().unwrap();
-    let s2 = FsStorage::new(d2.path()).unwrap();
-    s2.put_blob("srcrepo", &d, data).await.unwrap();
-    assert!(s2.mount_blob("srcrepo", "dstrepo", &d).await.unwrap());
-    assert_eq!(s2.read_blob("dstrepo", &d).await.unwrap(), data);
-    FORCE_REFLINK_OK.store(false, Ordering::Relaxed);
+        // (2) Reflink forced to succeed → mount takes the reflink primary.
+        FORCE_REFLINK_OK.store(true, Ordering::Relaxed);
+        let d2 = tempfile::tempdir().unwrap();
+        let s2 = store(&d2);
+        s2.put_blob("srcrepo", &d, data).await.unwrap();
+        assert!(s2.mount_blob("srcrepo", "dstrepo", &d).await.unwrap());
+        assert_eq!(s2.read_blob("dstrepo", &d).await.unwrap(), data);
+        FORCE_REFLINK_OK.store(false, Ordering::Relaxed);
 
-    // (3) O_TMPFILE unsupported → put_blob takes the temp+rename fallback.
-    FORCE_TMPFILE_UNSUPPORTED.store(true, Ordering::Relaxed);
-    let d3 = tempfile::tempdir().unwrap();
-    let s3 = FsStorage::new(d3.path()).unwrap();
-    let td = sha256_of(b"no-tmpfile-here");
-    s3.put_blob("r", &td, b"no-tmpfile-here").await.unwrap();
-    assert_eq!(s3.read_blob("r", &td).await.unwrap(), b"no-tmpfile-here");
-    FORCE_TMPFILE_UNSUPPORTED.store(false, Ordering::Relaxed);
+        // (3) O_TMPFILE unsupported → put_blob takes the temp+rename fallback.
+        FORCE_TMPFILE_UNSUPPORTED.store(true, Ordering::Relaxed);
+        let d3 = tempfile::tempdir().unwrap();
+        let s3 = store(&d3);
+        let td = sha256_of(b"no-tmpfile-here");
+        s3.put_blob("r", &td, b"no-tmpfile-here").await.unwrap();
+        assert_eq!(s3.read_blob("r", &td).await.unwrap(), b"no-tmpfile-here");
+        FORCE_TMPFILE_UNSUPPORTED.store(false, Ordering::Relaxed);
+    }
 }
 
 // stat_beneath propagates a genuine leaf-stat IO error (not NOENT) as an

@@ -8,13 +8,27 @@ async fn finish_upload_promotes_staging_without_leftover() {
     let data = vec![0x5au8; 1024 * 1024];
     let d = sha256_of(&data);
     let id = s.begin_upload("r").await.unwrap();
-    s.append_upload("r", &id, &data[..512 * 1024], None)
+    s.append_upload(
+        "r",
+        &id,
+        crate::upload_body(&data[..512 * 1024]),
+        None,
+        u64::MAX,
+    )
+    .await
+    .unwrap();
+    s.append_upload(
+        "r",
+        &id,
+        crate::upload_body(&data[512 * 1024..]),
+        None,
+        u64::MAX,
+    )
+    .await
+    .unwrap();
+    s.finish_upload("r", &id, &d, u64::MAX, crate::upload_body(b""), u64::MAX)
         .await
         .unwrap();
-    s.append_upload("r", &id, &data[512 * 1024..], None)
-        .await
-        .unwrap();
-    s.finish_upload("r", &id, &d, u64::MAX, b"").await.unwrap();
     // Content is retrievable byte-identical, the staging file is gone, and
     // the CAS file exists (promotion happened in place, no buffering leak).
     assert_eq!(s.read_blob("r", &d).await.unwrap(), data);
@@ -27,9 +41,12 @@ async fn finish_upload_promotes_staging_without_leftover() {
     // A finish whose bytes do not hash to the declared digest is rejected
     // and drops the staging file.
     let id2 = s.begin_upload("r").await.unwrap();
-    s.append_upload("r", &id2, b"mismatch", None).await.unwrap();
+    s.append_upload("r", &id2, crate::upload_body(b"mismatch"), None, u64::MAX)
+        .await
+        .unwrap();
     assert!(matches!(
-        s.finish_upload("r", &id2, &d, u64::MAX, b"").await,
+        s.finish_upload("r", &id2, &d, u64::MAX, crate::upload_body(b""), u64::MAX)
+            .await,
         Err(StorageError::DigestMismatch { .. })
     ));
     assert!(!tokio::fs::try_exists(s.upload_path("r", &id2).unwrap())
@@ -43,12 +60,21 @@ async fn upload_ops_reject_invalid_id_and_do_not_leak_locks() {
     // A traversal id is rejected by session_lock's validation on every op,
     // before any lock-map entry is created.
     assert!(matches!(
-        s.append_upload("r", "../evil", b"x", None).await,
+        s.append_upload("r", "../evil", crate::upload_body(b"x"), None, u64::MAX)
+            .await,
         Err(StorageError::BadPath(_))
     ));
     let d = sha256_of(b"x");
     assert!(matches!(
-        s.finish_upload("r", "../evil", &d, u64::MAX, b"").await,
+        s.finish_upload(
+            "r",
+            "../evil",
+            &d,
+            u64::MAX,
+            crate::upload_body(b""),
+            u64::MAX
+        )
+        .await,
         Err(StorageError::BadPath(_))
     ));
     assert!(matches!(
@@ -58,7 +84,8 @@ async fn upload_ops_reject_invalid_id_and_do_not_leak_locks() {
     // A valid-but-unknown session id: append errors NotFound and drops the
     // lock entry it created, so the map does not grow per unknown id.
     assert!(matches!(
-        s.append_upload("r", "deadbeef", b"x", None).await,
+        s.append_upload("r", "deadbeef", crate::upload_body(b"x"), None, u64::MAX)
+            .await,
         Err(StorageError::NotFound)
     ));
     assert!(s

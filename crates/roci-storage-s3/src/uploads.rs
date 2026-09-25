@@ -13,10 +13,10 @@ use crate::S3Storage;
 use roci_storage::beneath::{
     create_empty_beneath, open_append_beneath, open_beneath, stat_beneath, unlink_beneath,
 };
-use roci_storage::StorageError;
+use roci_storage::{append_body, StorageError, UploadBody};
 use std::io;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 impl S3Storage {
     /// Relative path from root to the staging directory for a repo:
@@ -61,25 +61,23 @@ impl S3Storage {
         &self,
         repo: &str,
         id: &str,
-        chunk: &[u8],
+        body: UploadBody,
         expected_offset: Option<u64>,
+        limit: u64,
     ) -> Result<u64, StorageError> {
         let rel = self.staging_rel(repo, id)?;
-        let mut f = open_append_beneath(&self.root, &rel)
+        let f = open_append_beneath(&self.root, &rel)
             .await
             .map_err(map_not_found)?;
-        if let Some(offset) = expected_offset {
-            let current = f.metadata().await?.len();
-            if current != offset {
-                return Err(StorageError::RangeNotSatisfiable {
-                    expected: current,
-                    got: offset,
-                });
-            }
+        let current = f.metadata().await?.len();
+        if let Some(offset) = expected_offset.filter(|&o| o != current) {
+            return Err(StorageError::RangeNotSatisfiable {
+                expected: current,
+                got: offset,
+            });
         }
-        f.write_all(chunk).await?;
-        f.flush().await?;
-        Ok(f.metadata().await?.len())
+        // The S3 finalize re-hashes the staged file, so no hash-on-write here.
+        Ok(append_body(f, current, body, limit, None).await?.0)
     }
 
     /// Get the current size of a staging file.

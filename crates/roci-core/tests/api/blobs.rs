@@ -161,12 +161,13 @@ async fn blob_and_manifest_io_errors_map_to_500() {
         let alg_dir = dir.path().join("r").join("blobs").join("sha256");
         std::fs::set_permissions(&alg_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
         let uri = format!("/v2/r/blobs/{d}");
-        for req in [get(&uri), head(&uri)] {
-            assert_eq!(
-                status_of(&app, req).await,
-                StatusCode::INTERNAL_SERVER_ERROR
-            );
-        }
+        assert_eq!(
+            status_of(&app, get(&uri)).await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        // HEAD of a blob roci wrote is answered from its recorded size without
+        // touching the filesystem (invariant 14), so the broken dir is unseen.
+        assert_eq!(status_of(&app, head(&uri)).await, StatusCode::OK);
         // Restore perms so the tempdir cleans up.
         std::fs::set_permissions(&alg_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }

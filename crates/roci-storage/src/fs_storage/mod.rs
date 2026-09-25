@@ -140,17 +140,13 @@ impl FsStorage {
     /// The id is validated *before* an entry is created, so a stream of
     /// syntactically-invalid ids cannot leak lock-map entries; a caller that
     /// then finds no session drops the entry on its error path.
-    fn session_lock(
-        &self,
-        repo: &str,
-        id: &str,
-    ) -> Result<Arc<tokio::sync::Mutex<()>>, StorageError> {
+    fn session_lock(&self, repo: &str, id: &str) -> Result<crate::SessionLock, StorageError> {
         SafeComponent::new(id)?;
         let mut locks = self.upload_locks.lock().expect("upload-locks poisoned");
         Ok(Arc::clone(
             locks
                 .entry((repo.to_string(), id.to_string()))
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None))),
         ))
     }
 

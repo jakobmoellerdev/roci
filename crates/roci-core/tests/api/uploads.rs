@@ -192,22 +192,6 @@ async fn patch_with_valid_content_range_appends() {
 }
 
 #[tokio::test]
-async fn finish_upload_append_error_on_directory_session() {
-    // Drive the finish (PUT) path with a body against a directory session so
-    // the append inside finish_upload errors (covers that error arm).
-    let (app, dir) = app();
-    let session = dir.path().join("r").join("uploads").join("dsess");
-    std::fs::create_dir_all(&session).unwrap();
-    let d = sha256_of(b"payload");
-    let resp = send(
-        &app,
-        put(format!("/v2/r/blobs/uploads/dsess?digest={d}"), "payload"),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
 async fn oversized_bodies_are_413() {
     let mut cfg = Config::default();
     cfg.limits.max_body = 4;
@@ -286,9 +270,11 @@ async fn patch_upload_missing_session_is_404() {
 }
 
 #[tokio::test]
-async fn monolithic_finish_error_is_500() {
-    // `<repo>/blobs` is a file so finish_upload's put into the CAS fails
-    // after the body is appended, covering the monolithic error arms.
+async fn monolithic_finish_error_is_404_and_leaves_no_session() {
+    // `<repo>/blobs` is a file, so promoting the streamed monolithic body into
+    // the CAS fails after it was staged. Like a chunked finalize, the no-follow
+    // resolver reports an unwalkable CAS path as absent (it cannot tell a broken
+    // store from a symlink attack), and the short-lived session is aborted.
     let (app, dir) = app();
     let repo = dir.path().join("r");
     std::fs::create_dir_all(&repo).unwrap();
@@ -297,7 +283,10 @@ async fn monolithic_finish_error_is_500() {
     let d = sha256_of(data);
     let uri = format!("/v2/r/blobs/uploads/?digest={d}");
     let resp = send(&app, post(&uri, data.to_vec())).await;
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let uploads = repo.join("uploads");
+    let left = std::fs::read_dir(&uploads).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(left, 0, "aborted monolithic session must not linger");
 }
 
 #[tokio::test]

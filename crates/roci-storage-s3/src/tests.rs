@@ -219,20 +219,39 @@ async fn chunked_upload_flow() {
 
     let id = s.begin_upload("repo").await.unwrap();
     let size_a = s
-        .append_upload("repo", &id, b"chunk-a-", Some(0))
+        .append_upload(
+            "repo",
+            &id,
+            roci_storage::upload_body(b"chunk-a-"),
+            Some(0),
+            u64::MAX,
+        )
         .await
         .unwrap();
     assert_eq!(size_a, 8);
     let size_b = s
-        .append_upload("repo", &id, b"chunk-b", Some(8))
+        .append_upload(
+            "repo",
+            &id,
+            roci_storage::upload_body(b"chunk-b"),
+            Some(8),
+            u64::MAX,
+        )
         .await
         .unwrap();
     assert_eq!(size_b, 15);
     assert_eq!(s.upload_size("repo", &id).await.unwrap(), 15);
 
-    s.finish_upload("repo", &id, &digest, 1024 * 1024, b"")
-        .await
-        .unwrap();
+    s.finish_upload(
+        "repo",
+        &id,
+        &digest,
+        1024 * 1024,
+        roci_storage::upload_body(b""),
+        u64::MAX,
+    )
+    .await
+    .unwrap();
     let read = s.read_blob("repo", &digest).await.unwrap();
     assert_eq!(read, data);
 }
@@ -244,9 +263,16 @@ async fn monolithic_upload() {
     let digest = sha256_digest(data);
 
     let id = s.begin_upload("repo").await.unwrap();
-    s.finish_upload("repo", &id, &digest, 1024 * 1024, data)
-        .await
-        .unwrap();
+    s.finish_upload(
+        "repo",
+        &id,
+        &digest,
+        1024 * 1024,
+        roci_storage::upload_body(data),
+        u64::MAX,
+    )
+    .await
+    .unwrap();
     let read = s.read_blob("repo", &digest).await.unwrap();
     assert_eq!(read, data);
 }
@@ -255,9 +281,23 @@ async fn monolithic_upload() {
 async fn upload_range_mismatch() {
     let (_dir, s) = test_store();
     let id = s.begin_upload("repo").await.unwrap();
-    s.append_upload("repo", &id, b"abc", Some(0)).await.unwrap();
+    s.append_upload(
+        "repo",
+        &id,
+        roci_storage::upload_body(b"abc"),
+        Some(0),
+        u64::MAX,
+    )
+    .await
+    .unwrap();
     let err = s
-        .append_upload("repo", &id, b"def", Some(0))
+        .append_upload(
+            "repo",
+            &id,
+            roci_storage::upload_body(b"def"),
+            Some(0),
+            u64::MAX,
+        )
         .await
         .unwrap_err();
     assert!(matches!(
@@ -272,9 +312,18 @@ async fn upload_too_large() {
     let data = b"some data here!!!"; // 17 bytes
     let digest = sha256_digest(data);
     let id = s.begin_upload("repo").await.unwrap();
-    s.append_upload("repo", &id, data, None).await.unwrap();
+    s.append_upload("repo", &id, roci_storage::upload_body(data), None, u64::MAX)
+        .await
+        .unwrap();
     let err = s
-        .finish_upload("repo", &id, &digest, 10, b"")
+        .finish_upload(
+            "repo",
+            &id,
+            &digest,
+            10,
+            roci_storage::upload_body(b""),
+            u64::MAX,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, roci_storage::StorageError::TooLarge { .. }));
@@ -284,10 +333,25 @@ async fn upload_too_large() {
 async fn upload_digest_mismatch() {
     let (_dir, s) = test_store();
     let id = s.begin_upload("repo").await.unwrap();
-    s.append_upload("repo", &id, b"real", None).await.unwrap();
+    s.append_upload(
+        "repo",
+        &id,
+        roci_storage::upload_body(b"real"),
+        None,
+        u64::MAX,
+    )
+    .await
+    .unwrap();
     let wrong = sha256_digest(b"wrong");
     let err = s
-        .finish_upload("repo", &id, &wrong, 1024 * 1024, b"")
+        .finish_upload(
+            "repo",
+            &id,
+            &wrong,
+            1024 * 1024,
+            roci_storage::upload_body(b""),
+            u64::MAX,
+        )
         .await
         .unwrap_err();
     assert!(matches!(
@@ -300,7 +364,15 @@ async fn upload_digest_mismatch() {
 async fn abort_upload() {
     let (_dir, s) = test_store();
     let id = s.begin_upload("repo").await.unwrap();
-    s.append_upload("repo", &id, b"data", None).await.unwrap();
+    s.append_upload(
+        "repo",
+        &id,
+        roci_storage::upload_body(b"data"),
+        None,
+        u64::MAX,
+    )
+    .await
+    .unwrap();
     assert!(s.abort_upload("repo", &id).await.unwrap());
     // Double abort is idempotent.
     assert!(!s.abort_upload("repo", &id).await.unwrap());
@@ -1261,9 +1333,15 @@ async fn sweep_stale_uploads_keeps_fresh_files() {
     let (_dir, s) = test_store_with_config(config, QuotaTracker::default());
 
     let id = s.begin_upload("repo").await.unwrap();
-    s.append_upload("repo", &id, b"fresh-data", None)
-        .await
-        .unwrap();
+    s.append_upload(
+        "repo",
+        &id,
+        roci_storage::upload_body(b"fresh-data"),
+        None,
+        u64::MAX,
+    )
+    .await
+    .unwrap();
 
     let (count, _) = s.sweep_stale_uploads().await;
     assert_eq!(count, 0);
@@ -1586,19 +1664,38 @@ async fn finish_upload_multipart_above_part_size() {
     let id = s.begin_upload("repo").await.unwrap();
     let half = data.len() / 2;
     let off1 = s
-        .append_upload("repo", &id, &data[..half], Some(0))
+        .append_upload(
+            "repo",
+            &id,
+            roci_storage::upload_body(&data[..half]),
+            Some(0),
+            u64::MAX,
+        )
         .await
         .unwrap();
     assert_eq!(off1, half as u64);
     let off2 = s
-        .append_upload("repo", &id, &data[half..], Some(half as u64))
+        .append_upload(
+            "repo",
+            &id,
+            roci_storage::upload_body(&data[half..]),
+            Some(half as u64),
+            u64::MAX,
+        )
         .await
         .unwrap();
     assert_eq!(off2, data.len() as u64);
 
-    s.finish_upload("repo", &id, &digest, data.len() as u64 + 1, &[])
-        .await
-        .unwrap();
+    s.finish_upload(
+        "repo",
+        &id,
+        &digest,
+        data.len() as u64 + 1,
+        roci_storage::upload_body([]),
+        u64::MAX,
+    )
+    .await
+    .unwrap();
 
     // Read back and verify.
     let read_back = s.read_blob("repo", &digest).await.unwrap();
@@ -1633,10 +1730,19 @@ async fn put_blob_below_part_size_single_put() {
     let data = b"small-blob";
     let digest = sha256_digest(data);
     let id = s.begin_upload("repo").await.unwrap();
-    s.append_upload("repo", &id, data, None).await.unwrap();
-    s.finish_upload("repo", &id, &digest, 1024, &[])
+    s.append_upload("repo", &id, roci_storage::upload_body(data), None, u64::MAX)
         .await
         .unwrap();
+    s.finish_upload(
+        "repo",
+        &id,
+        &digest,
+        1024,
+        roci_storage::upload_body([]),
+        u64::MAX,
+    )
+    .await
+    .unwrap();
     assert_eq!(s.read_blob("repo", &digest).await.unwrap(), data);
 }
 
@@ -2144,11 +2250,25 @@ async fn staging_path_rejects_bad_id() {
 async fn enumerate_staging_files_lists_sessions() {
     let (_dir, s) = test_store();
     let id1 = s.begin_upload("repo").await.unwrap();
-    s.append_upload("repo", &id1, b"data1", None).await.unwrap();
+    s.append_upload(
+        "repo",
+        &id1,
+        roci_storage::upload_body(b"data1"),
+        None,
+        u64::MAX,
+    )
+    .await
+    .unwrap();
     let id2 = s.begin_upload("repo/nested").await.unwrap();
-    s.append_upload("repo/nested", &id2, b"data2", None)
-        .await
-        .unwrap();
+    s.append_upload(
+        "repo/nested",
+        &id2,
+        roci_storage::upload_body(b"data2"),
+        None,
+        u64::MAX,
+    )
+    .await
+    .unwrap();
 
     let files = s.enumerate_staging_files();
     assert_eq!(files.len(), 2);
@@ -2175,7 +2295,15 @@ async fn staging_size_not_found() {
 async fn hash_staging_bad_algorithm() {
     let (_dir, s) = test_store();
     let id = s.begin_upload("repo").await.unwrap();
-    s.append_upload("repo", &id, b"hello", None).await.unwrap();
+    s.append_upload(
+        "repo",
+        &id,
+        roci_storage::upload_body(b"hello"),
+        None,
+        u64::MAX,
+    )
+    .await
+    .unwrap();
     let result = s.hash_staging("repo", &id, "md5").await;
     assert!(matches!(
         result,

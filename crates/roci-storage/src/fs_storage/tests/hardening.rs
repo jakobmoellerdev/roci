@@ -98,7 +98,10 @@ async fn append_refuses_symlinked_session() {
     std::os::unix::fs::symlink(&target, uploads.join("evil")).unwrap();
     // Appending to the symlinked session fails (O_NOFOLLOW → ELOOP), and the
     // redirect target is left untouched.
-    assert!(s.append_upload("r", "evil", b"x", None).await.is_err());
+    assert!(s
+        .append_upload("r", "evil", crate::upload_body(b"x"), None, u64::MAX)
+        .await
+        .is_err());
     assert_eq!(std::fs::read(&target).unwrap(), b"");
 }
 
@@ -260,7 +263,7 @@ async fn publish_bytes_rejects_non_regular_eexist() {
     let alg_abs = dir.path().join(&alg_rel);
     std::fs::create_dir_all(&alg_abs).unwrap();
     std::os::unix::fs::symlink(dir.path().join("elsewhere"), alg_abs.join(&leaf)).unwrap();
-    let err = publish_bytes(&s.root, &alg_rel, &leaf, data)
+    let err = publish_bytes(&s.root, &alg_rel, &leaf, data, true)
         .await
         .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
@@ -282,6 +285,7 @@ async fn rename_beneath_rejects_inode_mismatch() {
         Path::new("to"),
         "leaf",
         (0, 0), // wrong inode
+        true,
     )
     .await
     .unwrap_err();
@@ -310,6 +314,7 @@ async fn rename_beneath_eexist_regular_file_is_idempotent() {
         Path::new("dst"),
         "blob",
         ino,
+        true,
     )
     .await
     .unwrap();
@@ -337,6 +342,7 @@ async fn rename_beneath_eexist_symlink_is_rejected() {
         Path::new("dst"),
         "blob",
         ino,
+        true,
     )
     .await
     .unwrap_err();

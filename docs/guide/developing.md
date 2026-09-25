@@ -55,6 +55,8 @@ just hooks   # or, with the pre-commit framework: pre-commit install
 | `just conformance` | Run the OCI dist-spec conformance suite against a local roci |
 | `just container` | Build the hardened scratch image and smoke-test it |
 | `just container-multiarch` | Build the multi-arch image (linux/amd64, linux/arm64) |
+| `just bench` | Benchmark roci vs distribution vs zot in pinned containers (`quick` smoke / `full` 5-rep) — see docs/guide/benchmarks.md |
+| `just bench-perf` | Profile roci (flamegraphs, syscalls, per-route latency, gaps vs a prior `just bench` run) |
 
 ## CI parity
 

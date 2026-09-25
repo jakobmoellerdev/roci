@@ -169,8 +169,8 @@ pub(crate) fn dir_beneath(
 /// Rename `from_leaf` in directory `from_dir_rel` to `to_leaf` in directory
 /// `to_dir_rel` (both relative to `root`), via `renameat` on dirfds walked
 /// no-follow beneath `root` (the destination dir is created). A symlinked parent
-/// on either side cannot redirect the rename outside the store. Then fsyncs the
-/// destination directory so the new entry is durable.
+/// on either side cannot redirect the rename outside the store. When `sync`,
+/// then fsyncs the destination directory so the new entry is durable.
 ///
 /// `expected_ino` is the `(st_dev, st_ino)` of the inode the caller already
 /// hashed+verified. Because `renameat` is name-based, a hostile local
@@ -188,6 +188,7 @@ pub(crate) async fn rename_beneath(
     to_dir_rel: &Path,
     to_leaf: &str,
     expected_ino: (u64, u64),
+    sync: bool,
 ) -> io::Result<()> {
     use rustix::fs::AtFlags;
     let root = root.to_path_buf();
@@ -219,7 +220,9 @@ pub(crate) async fn rename_beneath(
             RenameFlags::NOREPLACE,
         ) {
             Ok(()) => {
-                rustix::fs::fsync(&to_fd).map_err(io::Error::from)?;
+                if sync {
+                    rustix::fs::fsync(&to_fd).map_err(io::Error::from)?;
+                }
                 Ok(())
             }
             Err(rustix::io::Errno::EXIST) => {
@@ -330,7 +333,7 @@ pub(crate) async fn ensure_layout_beneath(
         f.write_all(marker.as_bytes())?;
         f.sync_all()?;
         drop(f);
-        match promote_temp_noreplace(&dirfd, tmp.as_str(), "oci-layout") {
+        match promote_temp_noreplace(&dirfd, tmp.as_str(), "oci-layout", true) {
             // A concurrent creator won the race: still success (idempotent).
             Ok(()) => Ok(()),
             Err(e) => Err(e),

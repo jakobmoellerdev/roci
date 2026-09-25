@@ -47,6 +47,7 @@ enabled = false
 root = "./roci-data"
 cache_max_bytes = 268435456   # small-blob LRU cache budget; 0 disables it
 dedupe = true                 # link (reflink → hard link) a blob another repo already stores
+commit = false                # fsync blob data before acknowledging (zot's `commit`); manifests/WAL/index are always synced
 
 [storage.gc]                  # online, O(garbage) garbage collection
 enabled = true

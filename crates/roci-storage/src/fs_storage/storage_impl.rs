@@ -11,9 +11,10 @@ use crate::layout::*;
 use crate::metadata::{BlobChecksum, MetaOp, Page, Referrer};
 use crate::publish::*;
 use crate::storage::{BlobRead, ManifestLinks, ManifestRef, Storage};
+use crate::upload_body::{append_body, StagedHash, UploadBody};
 use std::io;
 use std::path::Path;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 impl Storage for FsStorage {
     async fn blob_size(&self, repo: &str, digest: &Digest) -> Result<u64, StorageError> {
@@ -29,6 +30,13 @@ impl Storage for FsStorage {
         }
         // A HEAD usually precedes a push that skips this layer: keep it alive.
         self.want_blob(repo, &digest_str).await;
+        // Every blob roci wrote has its size recorded with its checksum (kept in
+        // lockstep with the CAS by the lifecycle hooks, invariant 15): answer
+        // HEAD from RAM with no syscall or blocking-pool hop (invariant 14).
+        // Blobs only found on disk (an imported layout) fall back to a stat.
+        if let Some(recorded) = self.meta.checksum(repo, &digest_str) {
+            return Ok(recorded.size);
+        }
         match stat_beneath(&self.root, &rel).await? {
             Some((true, size)) => Ok(size),
             _ => Err(StorageError::NotFound),
@@ -119,17 +127,19 @@ impl Storage for FsStorage {
         &self,
         repo: &str,
         id: &str,
-        chunk: &[u8],
+        body: UploadBody,
         expected_offset: Option<u64>,
+        limit: u64,
     ) -> Result<u64, StorageError> {
         // Serialize with any concurrent append/finish/abort on this session so
         // bytes cannot be appended between a finish's hash-verify and its
         // promote, and so the Content-Range offset check below is atomic with
-        // the append (two concurrent PATCHes cannot both pass it).
+        // the append (two concurrent PATCHes cannot both pass it). The guard
+        // also carries the session's hash-on-write state.
         let lock = self.session_lock(repo, id)?;
-        let _guard = lock.lock().await;
+        let mut hash = lock.lock().await;
         let rel = upload_rel(repo, id)?;
-        let mut f = match open_append_beneath(&self.root, &rel).await {
+        let f = match open_append_beneath(&self.root, &rel).await {
             Ok(f) => f,
             Err(e) => {
                 // No such session: drop the just-created lock entry so a stream
@@ -140,18 +150,17 @@ impl Storage for FsStorage {
         };
         // Enforce the Content-Range precondition under the lock: the current
         // committed size must equal the client-declared start offset.
-        if let Some(offset) = expected_offset {
-            let current = f.metadata().await?.len();
-            if current != offset {
-                return Err(StorageError::RangeNotSatisfiable {
-                    expected: current,
-                    got: offset,
-                });
-            }
+        let current = f.metadata().await?.len();
+        if let Some(offset) = expected_offset.filter(|&o| o != current) {
+            return Err(StorageError::RangeNotSatisfiable {
+                expected: current,
+                got: offset,
+            });
         }
-        f.write_all(chunk).await?;
-        f.flush().await?;
-        Ok(f.metadata().await?.len())
+        let seed = hash.take().or_else(|| (current == 0).then(StagedHash::new));
+        let (total, extended) = append_body(f, current, body, limit, seed).await?;
+        *hash = extended;
+        Ok(total)
     }
 
     async fn upload_size(&self, repo: &str, id: &str) -> Result<u64, StorageError> {
@@ -174,34 +183,22 @@ impl Storage for FsStorage {
         id: &str,
         expected: &Digest,
         max_size: u64,
-        trailing: &[u8],
+        trailing: UploadBody,
+        limit: u64,
     ) -> Result<(), StorageError> {
         // Hold the session lock across the trailing append AND the verify+promote
         // so a concurrent PATCH cannot inject bytes between the append and the
         // hash (which would make the digest cover unverified data, or fail a
         // valid completion).
         let lock = self.session_lock(repo, id)?;
-        let _guard = lock.lock().await;
+        let mut guard = lock.lock().await;
         let staging_rel = upload_rel(repo, id)?;
-        // Append the monolithic PUT's trailing body (if any) to the staging file
-        // under the same lock, no-follow, before hashing.
-        if !trailing.is_empty() {
-            let mut f = match open_append_beneath(&self.root, &staging_rel).await {
-                Ok(f) => f,
-                Err(e) => {
-                    self.drop_session_lock(repo, id);
-                    return Err(map_not_found(e));
-                }
-            };
-            f.write_all(trailing).await?;
-            f.flush().await?;
-        }
         // Resolve the staging entry beneath the store root with no symlink
         // traversal at any component: a planted `uploads` parent or `uploads/<id>`
         // leaf symlink is not a valid staging file, so it never gets
         // hashed-through and promoted into the CAS.
-        let (is_file, staged_size) = match stat_beneath(&self.root, &staging_rel).await? {
-            Some(m) => m,
+        let is_file = match stat_beneath(&self.root, &staging_rel).await? {
+            Some((is_file, _)) => is_file,
             None => {
                 self.drop_session_lock(repo, id);
                 return Err(StorageError::NotFound);
@@ -213,6 +210,16 @@ impl Storage for FsStorage {
                 "upload {id} is not a regular file"
             )));
         }
+        // Stream the monolithic PUT's trailing body (if any) onto the staging
+        // file under the same lock, no-follow, before hashing.
+        let f = open_append_beneath(&self.root, &staging_rel)
+            .await
+            .map_err(map_not_found)?;
+        let current = f.metadata().await?.len();
+        let seed = guard
+            .take()
+            .or_else(|| (current == 0).then(StagedHash::new));
+        let (staged_size, hashed) = append_body(f, current, trailing, limit, seed).await?;
         // Re-check the per-session cap *under the lock*: a PATCH that appended
         // past the cap and was preempted before aborting cannot be promoted by a
         // racing empty-body PUT, because finalize itself rejects an oversized
@@ -231,12 +238,14 @@ impl Storage for FsStorage {
         let staging_fd = open_beneath(&self.root, &staging_rel)
             .await
             .map_err(map_not_found)?;
-        // Durability: fsync the staging file's *data* before it is promoted. The
-        // trailing append above only `flush`ed to the kernel, and PATCH bodies
-        // may sit in page cache; a crash after `rename_beneath` would otherwise
-        // leave a named CAS blob with torn/unwritten contents, breaking the
-        // atomic-finalize guarantee. Sync on the same fd we hash+promote.
-        staging_fd.sync_all().await.map_err(map_not_found)?;
+        // Durability (`storage.commit`): fsync the staging file's *data* before
+        // it is promoted. The trailing append above only `flush`ed to the
+        // kernel, and PATCH bodies may sit in page cache; a crash after
+        // `rename_beneath` would otherwise leave a named CAS blob with
+        // torn/unwritten contents. Sync on the same fd we hash+promote.
+        if self.config.commit {
+            staging_fd.sync_data().await.map_err(map_not_found)?;
+        }
         // Capture the hashed inode's identity so the later name-based
         // `renameat` can prove it is promoting *this* verified inode, not a leaf
         // a hostile local filesystem actor swapped in after the hash.
@@ -244,10 +253,16 @@ impl Storage for FsStorage {
             let st = rustix::fs::fstat(&staging_fd).map_err(|e| map_not_found(e.into()))?;
             (st.st_dev as u64, st.st_ino as u64)
         };
-        // One pass yields both the digest to verify and the scrub's CRC32C.
-        let (actual, crc32c) = hash_reader(staging_fd, expected.algorithm())
-            .await
-            .map_err(map_not_found)?;
+        // Hash-on-write covered every staged byte (sha256): no re-read. Else —
+        // a session from before a restart, or sha512 — one pass over the file
+        // yields both the digest to verify and the scrub's CRC32C.
+        let (actual, crc32c) =
+            match hashed.filter(|h| h.len() == staged_size && expected.algorithm() == "sha256") {
+                Some(h) => h.finish(),
+                None => hash_reader(staging_fd, expected.algorithm())
+                    .await
+                    .map_err(map_not_found)?,
+            };
         if !actual.ct_eq(expected) {
             // Reject and drop the staging file so a bad upload leaves nothing.
             self.discard_session(repo, id).await?;
@@ -291,9 +306,17 @@ impl Storage for FsStorage {
                 .await
                 .map_err(map_not_found)
         } else {
-            rename_beneath(&self.root, &up_dir, &up_leaf, &alg_rel, &hex, staging_ino)
-                .await
-                .map_err(map_not_found)
+            rename_beneath(
+                &self.root,
+                &up_dir,
+                &up_leaf,
+                &alg_rel,
+                &hex,
+                staging_ino,
+                self.config.commit,
+            )
+            .await
+            .map_err(map_not_found)
         };
         if let Err(e) = landed {
             drop(pin);
@@ -377,7 +400,9 @@ impl Storage for FsStorage {
         // and an `EEXIST` at the digest name is dedup only if it is a regular
         // file. Non-Linux / no-`O_TMPFILE` uses a temp+`renameat` in that dirfd.
         if !self.dedupe_link(repo, &alg_rel, &leaf, &digest_str).await {
-            if let Err(e) = publish_bytes(&self.root, &alg_rel, &leaf, data).await {
+            if let Err(e) =
+                publish_bytes(&self.root, &alg_rel, &leaf, data, self.config.commit).await
+            {
                 drop(pin);
                 self.quota.release(repo, charged);
                 drop(_admit_guard);
@@ -460,7 +485,7 @@ impl Storage for FsStorage {
         // delete a referenced blob between put_blob and PutManifest.
         let pin = self.gc.pin().await;
         if !self.dedupe_link(repo, &alg_rel, &leaf, &digest_str).await {
-            if let Err(e) = publish_bytes(&self.root, &alg_rel, &leaf, data).await {
+            if let Err(e) = publish_bytes(&self.root, &alg_rel, &leaf, data, true).await {
                 drop(pin);
                 self.quota.release(repo, charged);
                 return Err(e.into());
@@ -733,8 +758,15 @@ impl Storage for FsStorage {
         // pre-existing regular-file destination is idempotent success; a planted
         // symlink/dir parent or destination is rejected (re-validated inside the
         // promotion, closing the check→promote race).
-        let promoted =
-            mount_promote_beneath(&self.root, &from_alg_rel, &to_alg_rel, &leaf, true).await;
+        let promoted = mount_promote_beneath(
+            &self.root,
+            &from_alg_rel,
+            &to_alg_rel,
+            &leaf,
+            true,
+            self.config.commit,
+        )
+        .await;
         let how = match promoted {
             Ok(how) => how,
             Err(e) => {
@@ -809,7 +841,16 @@ impl FsStorage {
         let Ok((src_alg_rel, _)) = blob_dir_rel(&src_repo, &d) else {
             return false;
         };
-        match mount_promote_beneath(&self.root, &src_alg_rel, alg_rel, leaf, false).await {
+        match mount_promote_beneath(
+            &self.root,
+            &src_alg_rel,
+            alg_rel,
+            leaf,
+            false,
+            self.config.commit,
+        )
+        .await
+        {
             Ok(how) => {
                 record_promotion("dedupe", how, repo, digest);
                 true

@@ -830,7 +830,9 @@ async fn stale_upload_locked_session_survives_sweep() {
 
     let id = s.begin_upload("r").await.unwrap();
     // Append some data to create a lock entry (session_lock is called).
-    s.append_upload("r", &id, b"partial", None).await.unwrap();
+    s.append_upload("r", &id, crate::upload_body(b"partial"), None, u64::MAX)
+        .await
+        .unwrap();
 
     // Touch the staging file mtime to the past.
     let upload_path = _dir.path().join("r").join("uploads").join(&id);

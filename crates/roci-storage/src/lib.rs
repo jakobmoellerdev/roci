@@ -10,6 +10,7 @@ mod fault;
 /// Beneath-root, no-follow filesystem primitives (SECURITY inv. 8) shared
 /// with other backends' local state (e.g. S3 upload staging).
 pub mod beneath;
+mod bufpool;
 mod cache;
 mod dedupe;
 mod digest;
@@ -23,6 +24,7 @@ mod publish;
 pub mod quota;
 pub mod routing;
 mod storage;
+mod upload_body;
 
 pub use dedupe::DedupeIndex;
 pub use digest::{digest_of, sha256_of, Digest};
@@ -37,6 +39,7 @@ pub use metadata::{
 pub use storage::{
     BlobRead, BlobStream, ManifestLinks, ManifestRef, RangeOpener, Storage, StorageBackend,
 };
+pub use upload_body::{append_body, upload_body, StagedHash, UploadBody};
 
 use cache::SmallBlobCache;
 use filter::BlobPresenceFilter;
@@ -51,7 +54,11 @@ use tokio::sync::Notify;
 
 /// Per-session upload locks: `(repo, id) → async lock` serializing an upload's
 /// append/finish/abort so they never interleave (see [`FsStorage::session_lock`]).
-type UploadLocks = Arc<StdMutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>>;
+/// Per-session lock; its payload is the session's hash-on-write state (so it
+/// is dropped with the session).
+type SessionLock = Arc<tokio::sync::Mutex<Option<StagedHash>>>;
+type UploadLocks = Arc<StdMutex<HashMap<(String, String), SessionLock>>>;
+type AdmitLocks = Arc<StdMutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>>;
 
 /// Filesystem-backed [`Storage`]. Each repository is a self-contained OCI
 /// image layout under `<root>/<repo>/`: `oci-layout` (marker), `index.json`
@@ -93,7 +100,7 @@ pub struct FsStorage {
     /// so concurrent uploads of the same absent blob cannot both charge quota
     /// while only one actually lands (quota double-count). Entries are transient:
     /// created on first admission for a key, dropped after publication.
-    blob_admit_locks: UploadLocks,
+    blob_admit_locks: AdmitLocks,
     /// Background index write-behind: repos whose `index.json` lags the
     /// metadata store, with a per-repo mutation generation. Mutations bump the
     /// generation and wake the writer; the writer clears an entry only if its

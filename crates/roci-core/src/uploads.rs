@@ -2,12 +2,13 @@
 //! PATCH (append), PUT (finish), and status.
 
 use crate::error::ApiError;
-use crate::http_util::{blob_location, created, read_body_limited};
+use crate::http_util::{blob_location, created};
 use crate::AppState;
 use axum::extract::Request;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use roci_storage::{Digest, Storage, StorageError};
+use futures::TryStreamExt;
+use roci_storage::{upload_body, Digest, Storage, StorageError, UploadBody};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Default)]
@@ -44,6 +45,16 @@ fn upload_progress(status: StatusCode, repo: &str, id: &str, received: u64) -> R
     (status, headers).into_response()
 }
 
+/// The request body as a stream, so upload bytes go to storage frame by frame
+/// and are never buffered whole (invariant 4).
+fn body_stream(req: Request) -> UploadBody {
+    Box::pin(
+        req.into_body()
+            .into_data_stream()
+            .map_err(std::io::Error::other),
+    )
+}
+
 #[tracing::instrument(skip_all, name = "upload.session")]
 pub(crate) async fn start<S: Storage>(
     st: &AppState<S>,
@@ -64,19 +75,27 @@ pub(crate) async fn start<S: Storage>(
         // Fall through to a normal upload session if the mount source is absent.
     }
 
-    // end-4b: monolithic upload — the whole blob is in this request, so store it
-    // directly (put_blob verifies the digest); no session is needed.
+    // end-4b: monolithic upload — the whole blob is in this request. Stream it
+    // through a short-lived session (staged, hashed on write, verified, then
+    // promoted) so it is never buffered whole. The per-session cap applies here
+    // too (e.g. when max_upload is configured below max_body).
     if let Some(digest) = q.digest {
         let d = Digest::parse(&digest)?;
-        let body = read_body_limited(req, st.max_body()).await?;
-        // A monolithic body is a complete upload, so the per-session cap applies
-        // here too (e.g. when max_upload is configured below max_body).
-        if body.len() as u64 > st.max_upload() {
-            return Err(ApiError::payload_too_large(
-                "upload exceeds maximum blob size",
-            ));
+        let id = st.storage.begin_upload(repo).await?;
+        let limit = (st.max_body() as u64).min(st.max_upload());
+        let stored = async {
+            st.storage
+                .append_upload(repo, &id, body_stream(req), None, limit)
+                .await?;
+            st.storage
+                .finish_upload(repo, &id, &d, st.max_upload(), upload_body([]), 0)
+                .await
         }
-        st.storage.put_blob(repo, &d, &body).await?;
+        .await;
+        if let Err(e) = stored {
+            let _ = st.storage.abort_upload(repo, &id).await;
+            return Err(e.into());
+        }
         return Ok(created(&blob_location(repo, &d), &d));
     }
 
@@ -101,8 +120,12 @@ pub(crate) async fn patch<S: Storage>(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split('-').next())
         .and_then(|s| s.trim().parse::<u64>().ok());
-    let body = read_body_limited(req, st.max_body()).await?;
-    let total = match st.storage.append_upload(repo, id, &body, range_start).await {
+    let limit = st.max_body() as u64;
+    let total = match st
+        .storage
+        .append_upload(repo, id, body_stream(req), range_start, limit)
+        .await
+    {
         Ok(t) => t,
         // The atomic under-lock offset check rejects a concurrent/duplicate
         // chunk the pre-check above raced past → 416 with the current range.
@@ -139,12 +162,18 @@ pub(crate) async fn finish<S: Storage>(
         .digest
         .ok_or_else(|| ApiError::digest_invalid("missing digest on upload completion"))?;
     let d = Digest::parse(&digest)?;
-    let body = read_body_limited(req, st.max_body()).await?;
     // Hand the trailing body to finish_upload so the append and the
     // verify+promote happen under one session-lock hold — a concurrent PATCH
     // cannot inject bytes between them. The per-session cap is enforced there.
     st.storage
-        .finish_upload(repo, id, &d, st.max_upload(), &body)
+        .finish_upload(
+            repo,
+            id,
+            &d,
+            st.max_upload(),
+            body_stream(req),
+            st.max_body() as u64,
+        )
         .await?;
     Ok(created(&blob_location(repo, &d), &d))
 }

@@ -3,6 +3,7 @@
 //! the atomically-committed [`ManifestLinks`].
 
 use crate::metadata::{Page, Referrer};
+use crate::upload_body::UploadBody;
 use crate::{Digest, StorageError};
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -10,7 +11,75 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use std::future::Future;
 use std::io;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+/// Bytes read per blocking-pool hop when streaming a local blob. Each hop is a
+/// thread hand-off costing tens of µs, so `ReaderStream`'s 4 KiB default made
+/// pulls hop-bound; 256 KiB amortizes it while bounding per-stream memory to
+/// two chunks (the one being sent + one read ahead).
+const FILE_CHUNK: u64 = 256 * 1024;
+
+/// Recycled full-size read chunks: at most 64 idle (16 MiB).
+static READ_POOL: crate::bufpool::BufPool = crate::bufpool::BufPool::new(FILE_CHUNK as usize, 64);
+
+type ChunkRead = tokio::task::JoinHandle<io::Result<(std::fs::File, Bytes)>>;
+
+/// Read exactly `n` bytes (after seeking to `seek`, if given) on the blocking
+/// pool. The file is moved in and handed back, so no lock is needed and only
+/// one read per stream is ever in flight.
+fn read_chunk(file: std::fs::File, seek: Option<u64>, n: u64) -> ChunkRead {
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek};
+        let mut file = file;
+        if let Some(start) = seek {
+            file.seek(io::SeekFrom::Start(start))?;
+        }
+        // Full-size chunks recycle through a bounded pool (steady RSS under
+        // load); a small tail/blob gets an exact allocation instead of pinning
+        // a pooled chunk.
+        let pooled = n >= FILE_CHUNK / 4;
+        let mut buf = if pooled {
+            READ_POOL.get()
+        } else {
+            Vec::with_capacity(n as usize)
+        };
+        (&mut file).take(n).read_to_end(&mut buf)?;
+        if (buf.len() as u64) < n {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "blob file is shorter than its recorded size",
+            ));
+        }
+        let bytes = if pooled {
+            READ_POOL.freeze(buf)
+        } else {
+            Bytes::from(buf)
+        };
+        Ok((file, bytes))
+    })
+}
+
+/// Stream `[start, start + len)` of a local file in [`FILE_CHUNK`] pieces with
+/// one chunk of read-ahead: the next read runs while the current chunk is being
+/// written to the socket. Backpressure is async (an unpolled stream holds a
+/// finished chunk, never a blocking-pool thread), so slow clients cannot pin
+/// the pool. A read error ends the stream after yielding it.
+fn file_stream(file: std::fs::File, start: u64, len: u64) -> BlobStream {
+    let first = FILE_CHUNK.min(len);
+    let pending = read_chunk(file, (start > 0).then_some(start), first);
+    futures::stream::unfold(Some((pending, len - first)), |state| async move {
+        let (pending, remaining) = state?;
+        let (file, bytes) = match pending.await.map_err(io::Error::other).and_then(|r| r) {
+            Ok(read) => read,
+            Err(e) => return Some((Err(e), None)),
+        };
+        let next = (remaining > 0).then(|| {
+            let n = FILE_CHUNK.min(remaining);
+            (read_chunk(file, None, n), remaining - n)
+        });
+        Some((Ok(bytes), next))
+    })
+    .boxed()
+}
 
 /// A resolved reference target: either a tag pointing at a manifest digest, or
 /// a direct manifest digest.
@@ -85,12 +154,7 @@ impl BlobRead {
     /// redirect has no local body: [`io::ErrorKind::Unsupported`].
     pub async fn into_stream(self, start: u64, len: u64) -> io::Result<BlobStream> {
         match self.source {
-            BlobSource::File(mut f) => {
-                if start > 0 {
-                    f.seek(io::SeekFrom::Start(start)).await?;
-                }
-                Ok(tokio_util::io::ReaderStream::new(f.take(len)).boxed())
-            }
+            BlobSource::File(f) => Ok(file_stream(f.into_std().await, start, len)),
             BlobSource::Ranged(open) => open(start, len).await,
             BlobSource::Redirect(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -154,17 +218,20 @@ pub trait Storage: Send + Sync + 'static {
     /// Begin a chunked upload session, returning its id.
     fn begin_upload(&self, repo: &str)
         -> impl Future<Output = Result<String, StorageError>> + Send;
-    /// Append bytes to an upload session, returning the new total size. When
+    /// Stream `body` onto an upload session, returning the new total size. When
     /// `expected_offset` is `Some(n)`, the current committed size MUST equal
     /// `n` (a `Content-Range` precondition checked *inside* the session lock so
     /// two concurrent PATCHes cannot both pass an out-of-lock check) — a
-    /// mismatch yields [`StorageError::RangeNotSatisfiable`].
+    /// mismatch yields [`StorageError::RangeNotSatisfiable`]. A body over
+    /// `limit` bytes is [`StorageError::TooLarge`]; any failure leaves the
+    /// session exactly as it was (never whole-blob buffered, invariant 4).
     fn append_upload(
         &self,
         repo: &str,
         id: &str,
-        chunk: &[u8],
+        body: UploadBody,
         expected_offset: Option<u64>,
+        limit: u64,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send;
     /// Current size of an in-progress upload.
     fn upload_size(
@@ -192,8 +259,9 @@ pub trait Storage: Send + Sync + 'static {
         to_repo: &str,
         digest: &Digest,
     ) -> impl Future<Output = Result<bool, StorageError>> + Send;
-    /// Finalize an upload: under the session lock, append `trailing` (a
-    /// monolithic PUT's body, empty for a plain finalize) atomically with the
+    /// Finalize an upload: under the session lock, stream `trailing` (a
+    /// monolithic PUT's body — at most `limit` bytes — empty for a plain
+    /// finalize) atomically with the
     /// verify+promote so a concurrent PATCH cannot inject bytes between the
     /// trailing append and the finalize hash; verify it hashes to `expected` and
     /// does not exceed `max_size` bytes (the per-session cap, re-checked here
@@ -204,7 +272,8 @@ pub trait Storage: Send + Sync + 'static {
         id: &str,
         expected: &Digest,
         max_size: u64,
-        trailing: &[u8],
+        trailing: UploadBody,
+        limit: u64,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
     /// Store a blob given its bytes (verifies digest), used by monolithic/mount paths.
     fn put_blob(

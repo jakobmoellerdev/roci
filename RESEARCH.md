@@ -262,6 +262,14 @@ A first-party benchmark (M4 Pro, 48 GB, APFS/NVMe, `--release`+LTO; each structu
 
 
 
+### 9.7 MEASURED — roci vs distribution vs zot (first-party comparative benchmark)
+`just bench` (docs/guide/benchmarks.md) runs roci, CNCF distribution 3.1.2 and zot 2.1.21 at their defaults (logging at `warn`) in pinned containers with disjoint cpusets, driving them with zb, vegeta, crane and a push-storm loadgen, and sampling cgroup v2 CPU and anonymous RSS (RESEARCH: RociCompareBench). **NON-AUTHORITATIVE: Docker Desktop VM, `quick` (1 rep)** — authoritative numbers need `just bench full` on a dedicated Linux host. What it changed:
+- **The first run found roci losing most throughput metrics** (pull 4–24× below zot, push 2–5×, peak RSS 400 MiB vs 70). `just bench-perf` flamegraphs + syscall tables attributed each gap: 4 KiB `ReaderStream` blocking-pool hops on every blob GET (futex-bound), **software SHA-256 on arm64** (`sha2` compiles its ARMv8 backend only with feature `asm`: 0.55 vs 2.5 GiB/s), whole-body buffering of every upload (`to_bytes` + `to_vec`, violating invariant 4), a `stat` per blob HEAD, per-blob `fsync` where zot's default `commit=false` does none, and — for memory — transparent huge pages, an unbounded blocking pool and cross-thread buffer churn.
+- **After the fixes** (ARCHITECTURE §Vertical scale, §RAM consumption): roci leads on startup (66 vs 187 ms zot), idle/corpus RSS (1.9/14.7 vs 49.8/65.6 MiB), push storm (1398 vs 334 images/s), 10 MB c=8 zb pull/push (2752/1914 vs 2451/1511 MiB/s) and server CPU/GiB (1.12 vs 1.66); peak RSS is ~at parity (80 vs 70 MiB); small c=1 push and crane gaps are within single-rep noise.
+- **Open:** hot-path p99 at 1000 rps is ~2× zot (p50 equal or better). Controlled A/B runs ruled out handler time, the tokio scheduler flavour, allocator purging and hyper-util auto-detection; the VM's run-to-run p99 swing (2–10 ms) blocks further diagnosis — needs off-CPU/scheduler tracing on bare Linux.
+- **Tooling finding:** zb cannot push to distribution (it drops the upload `Location` query carrying `_state`); distribution's zb cells are `n/a`.
+- **`sendfile` under hyper is not possible**: hyper owns every socket write (its own `send_file` example streams a 4 KiB `ReaderStream`), so the residual pull-copy cost needs a roci-owned HTTP/1.1 writer — deferred (ARCHITECTURE §Vertical scale).
+
 ## Sources
 
 | # | Title | Authors / Org | Venue / Year | Relevance to roci |
@@ -344,5 +352,6 @@ A first-party benchmark (M4 Pro, 48 GB, APFS/NVMe, `--release`+LTO; each structu
 | IggyTPC | Thread-per-Core io_uring migration (tokio→compio) | Apache Iggy | blog 2026 | TPC+compio: +18% throughput, −46% P95 at high load; zero gain at light load. compio = named future TPC runtime. |
 | CompioTPC | compio async runtime | compio-rs | GitHub 2025 | Most-maintained TPC Rust runtime; compio-compat bridges hyper; tokio-uring !Send can't host hyper. FUTURE carrier. |
 | RociScaleBench | roci metadata-residency scale benchmark (first-party) | roci | 2026-09-20, M4 Pro/48 GB/APFS-NVMe | in-RAM map 273 B/ref linear (2.76 GB @ 10M), 62–417 ns lookup; redb 3–6.5× slower reads, evictable ~430 B/ref on disk; cuckoo 1.74 B/ref (18.9 MB @ 10M), saves ~800 ns/miss vs stat(ENOENT), ~1.9% FP. → in-RAM maps to ~2–4M refs; KV at ≥~10M / RAM-cap / cluster. Backs §9.6. |
+| RociCompareBench | roci vs CNCF distribution 3.1.2 vs zot 2.1.21 comparative benchmark (first-party) | roci | 2026-09-25, Docker Desktop (Apple M-series, 6 CPUs, linuxkit 7.0.12), quick/1 rep — non-authoritative | Before fixes roci lost pull 4–24×, push 2–5×, RSS ~6×; after streamed reads/uploads, hardware SHA-256, HEAD-from-metadata, THP opt-out etc. it leads startup, idle/corpus RSS, push storm, 10 MB c=8 pull/push, CPU/GiB; hot-path p99 ~2× zot open. Backs §9.7. |
 
 *Compiled 2026-09-19. §1–7 from the first scout wave + CHBL/Venti primary reads; §8 from LayoutHashCAS/IndexEngineFilters/DedupGCScrub/IOServingObjStore + BLAKE3/binary-fuse reads; §9 from IoUringE2E/SmallObjectPacking/ZeroCopyIndexMem/WholeRegistryEngine + Haystack/AIStore reads. All §8–9 scouts delivered briefs in yield text (local:// write avoided per prior lesson); one §9 scout wedged on a yield-schema mismatch and was harvested via recovered result.*

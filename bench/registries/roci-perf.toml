@@ -1,0 +1,5 @@
+[log]
+level = "warn"
+[telemetry.metrics]
+enabled = true
+path = "/metrics"

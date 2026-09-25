@@ -26,9 +26,17 @@ fn repo_cap(bytes: u64) -> QuotaLimits {
 
 async fn chunked(s: &FsStorage, repo: &str, data: &[u8]) -> Result<(), StorageError> {
     let id = s.begin_upload(repo).await?;
-    s.append_upload(repo, &id, data, None).await?;
-    s.finish_upload(repo, &id, &sha256_of(data), u64::MAX, &[])
-        .await
+    s.append_upload(repo, &id, crate::upload_body(data), None, u64::MAX)
+        .await?;
+    s.finish_upload(
+        repo,
+        &id,
+        &sha256_of(data),
+        u64::MAX,
+        crate::upload_body([]),
+        u64::MAX,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -49,10 +57,19 @@ async fn repository_quota_rejects_at_finalize_and_frees_on_delete() {
     ));
     // A chunked upload over the cap fails at finalize and its session is gone.
     let id = s.begin_upload("r").await.unwrap();
-    s.append_upload("r", &id, b, None).await.unwrap();
+    s.append_upload("r", &id, crate::upload_body(b), None, u64::MAX)
+        .await
+        .unwrap();
     assert!(matches!(
-        s.finish_upload("r", &id, &sha256_of(b), u64::MAX, &[])
-            .await,
+        s.finish_upload(
+            "r",
+            &id,
+            &sha256_of(b),
+            u64::MAX,
+            crate::upload_body([]),
+            u64::MAX
+        )
+        .await,
         Err(StorageError::QuotaExceeded { .. })
     ));
     assert!(matches!(
@@ -132,14 +149,30 @@ async fn upload_session_cap_counts_open_sessions_across_restart() {
     // Abort and a completed finalize both release their slot.
     assert!(s.abort_upload("r", &first).await.unwrap());
     let third = s.begin_upload("r").await.unwrap();
-    s.append_upload("r", &third, b"x", None).await.unwrap();
-    s.finish_upload("r", &third, &sha256_of(b"x"), u64::MAX, &[])
+    s.append_upload("r", &third, crate::upload_body(b"x"), None, u64::MAX)
         .await
         .unwrap();
+    s.finish_upload(
+        "r",
+        &third,
+        &sha256_of(b"x"),
+        u64::MAX,
+        crate::upload_body([]),
+        u64::MAX,
+    )
+    .await
+    .unwrap();
     // A rejected finalize (digest mismatch) drops the session too.
     let fourth = s.begin_upload("r").await.unwrap();
     assert!(s
-        .finish_upload("r", &fourth, &sha256_of(b"y"), u64::MAX, b"z")
+        .finish_upload(
+            "r",
+            &fourth,
+            &sha256_of(b"y"),
+            u64::MAX,
+            crate::upload_body(b"z"),
+            u64::MAX
+        )
         .await
         .is_err());
     assert_eq!(s.quota.sessions(), 1);
@@ -217,6 +250,30 @@ async fn dedupe_falls_back_to_a_copy_when_the_located_blob_vanished() {
     assert_eq!(s.read_blob("b", &d).await.unwrap(), data);
     // The stale location was forgotten; "b" is now the canonical holder.
     assert_eq!(s.dedupe.locate(&d.as_string(), "z").as_deref(), Some("b"));
+}
+
+#[tokio::test]
+async fn commit_store_lands_every_write_path() {
+    // `storage.commit = true` syncs blob data and publishing dir entries; every
+    // path must still land byte-identical blobs: monolithic put, chunked
+    // finalize (staging sync + rename), mount (hard link) and dedupe on upload.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = StorageConfig {
+        commit: true,
+        ..StorageConfig::default()
+    };
+    let s = FsStorage::with_config(dir.path(), &cfg, Arc::default()).unwrap();
+    let data = b"durable";
+    let d = sha256_of(data);
+    s.put_blob("a", &d, data).await.unwrap();
+    chunked(&s, "b", data).await.unwrap();
+    assert!(s.mount_blob("a", "c", &d).await.unwrap());
+    let other = b"chunked-first";
+    chunked(&s, "d", other).await.unwrap();
+    for repo in ["a", "b", "c"] {
+        assert_eq!(s.read_blob(repo, &d).await.unwrap(), data);
+    }
+    assert_eq!(s.read_blob("d", &sha256_of(other)).await.unwrap(), other);
 }
 
 #[cfg(target_os = "linux")]
