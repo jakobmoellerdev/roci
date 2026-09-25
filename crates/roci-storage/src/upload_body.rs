@@ -43,7 +43,7 @@ impl StagedHash {
         }
     }
 
-    fn update(&mut self, buf: &[u8]) {
+    pub(crate) fn update(&mut self, buf: &[u8]) {
         self.sha.update(buf);
         self.crc = crc32c::crc32c_append(self.crc, buf);
         self.len += buf.len() as u64;
@@ -105,10 +105,63 @@ async fn write_batch(
 pub async fn append_body(
     file: tokio::fs::File,
     start: u64,
-    mut body: UploadBody,
+    body: UploadBody,
     limit: u64,
     hash: Option<StagedHash>,
 ) -> Result<(u64, Option<StagedHash>), StorageError> {
+    let d = append_inner(file, start, body, limit, hash, false).await?;
+    UPLOAD_POOL.put(d.tail);
+    Ok((d.len, d.hash))
+}
+
+/// A streamed body whose last (< 1 MiB) batch is not yet written, so the
+/// caller can write it inside the blocking hop it makes next anyway. `hash`
+/// covers `tail_at` bytes (everything but `tail`); `len` includes the tail.
+pub(crate) struct Deferred {
+    pub len: u64,
+    pub hash: Option<StagedHash>,
+    pub tail: Vec<u8>,
+    pub tail_at: u64,
+    pub file: Arc<std::fs::File>,
+}
+
+impl Deferred {
+    /// Blocking: write the tail (truncating back to `tail_at` on failure) and
+    /// fold it into the hash; returns the hash covering `len` bytes, if any.
+    pub(crate) fn write_tail(mut self) -> io::Result<Option<StagedHash>> {
+        if !self.tail.is_empty() {
+            if let Err(e) = (&*self.file).write_all(&self.tail) {
+                let _ = self.file.set_len(self.tail_at);
+                return Err(e);
+            }
+            if let Some(h) = self.hash.as_mut() {
+                h.update(&self.tail);
+            }
+        }
+        UPLOAD_POOL.put(std::mem::take(&mut self.tail));
+        Ok(self.hash)
+    }
+}
+
+/// [`append_body`] without writing the final partial batch (see [`Deferred`]).
+pub(crate) async fn append_body_deferring_tail(
+    file: tokio::fs::File,
+    start: u64,
+    body: UploadBody,
+    limit: u64,
+    hash: Option<StagedHash>,
+) -> Result<Deferred, StorageError> {
+    append_inner(file, start, body, limit, hash, true).await
+}
+
+async fn append_inner(
+    file: tokio::fs::File,
+    start: u64,
+    mut body: UploadBody,
+    limit: u64,
+    hash: Option<StagedHash>,
+    defer_tail: bool,
+) -> Result<Deferred, StorageError> {
     let file = Arc::new(file.into_std().await);
     let mut hash = hash.filter(|h| h.len == start);
     let mut written = 0u64;
@@ -140,7 +193,7 @@ pub async fn append_body(
                 }
             }
             if done {
-                if !batch.is_empty() {
+                if !defer_tail && !batch.is_empty() {
                     let n = batch.len() as u64;
                     (batch, hash) =
                         write_batch(&file, std::mem::take(&mut batch), hash.take()).await?;
@@ -151,10 +204,20 @@ pub async fn append_body(
         }
     }
     .await;
-    UPLOAD_POOL.put(batch);
     match result {
-        Ok(()) => Ok((start + written, hash)),
+        Ok(()) => {
+            let tail_at = start + written;
+            let len = tail_at + batch.len() as u64;
+            Ok(Deferred {
+                len,
+                hash,
+                tail: batch,
+                tail_at,
+                file,
+            })
+        }
         Err(e) => {
+            UPLOAD_POOL.put(batch);
             let f = Arc::clone(&file);
             tokio::task::spawn_blocking(move || f.set_len(start))
                 .await

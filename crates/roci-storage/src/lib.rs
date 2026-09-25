@@ -96,6 +96,13 @@ pub struct FsStorage {
     /// or bypass the size cap). Keyed by `(repo, id)`; entries are dropped when
     /// a session finishes or aborts.
     upload_locks: UploadLocks,
+    /// Upload sessions begun but not yet written to: their staging file is
+    /// created by the first append/finalize, inside the blocking hop that
+    /// request makes anyway (so `POST` costs no filesystem work). Value: when
+    /// the session began, for stale-session expiry. Not persisted — an empty
+    /// session does not survive a restart (the client gets
+    /// `BLOB_UPLOAD_UNKNOWN` and starts over, as for any expired session).
+    pending_uploads: Arc<StdMutex<HashMap<(String, String), std::time::Instant>>>,
     /// Per-`(repo, digest)` async locks serializing blob admission + publication,
     /// so concurrent uploads of the same absent blob cannot both charge quota
     /// while only one actually lands (quota double-count). Entries are transient:

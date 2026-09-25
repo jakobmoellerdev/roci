@@ -474,8 +474,12 @@ async fn stale_uploads_expire() {
     let blob = sha256_of(b"anchor");
     s.put_blob("r", &blob, b"anchor").await.unwrap();
 
-    // Begin an upload and abandon it (no append_upload, so no session lock entry).
+    // Begin an upload, write to it (creating its staging file) and abandon it.
     let id = s.begin_upload("r").await.unwrap();
+    s.append_upload("r", &id, crate::upload_body(b"x"), None, u64::MAX)
+        .await
+        .unwrap();
+    s.drop_session_lock("r", &id);
     assert_eq!(s.quota.sessions(), 1);
 
     // Touch the staging file mtime to the past to make it stale.
@@ -488,6 +492,25 @@ async fn stale_uploads_expire() {
     s.sweep_at(Instant::now()).await;
     assert!(!upload_path.exists(), "stale upload should be removed");
     assert_eq!(s.quota.sessions(), 0, "session count should drop");
+}
+
+#[tokio::test]
+async fn never_written_sessions_expire_and_release_their_slot() {
+    // A begun session with no data has no staging file; the sweep expires it
+    // after the delay and frees its upload-session slot. Afterwards the id is
+    // unknown (a later PATCH is BLOB_UPLOAD_UNKNOWN).
+    let (_dir, s) = gc_store_with_quota(0);
+    s.put_blob("r", &sha256_of(b"anchor"), b"anchor").await.unwrap();
+    let id = s.begin_upload("r").await.unwrap();
+    assert_eq!(s.quota.sessions(), 1);
+    assert_eq!(s.upload_size("r", &id).await.unwrap(), 0);
+    s.sweep_at(Instant::now()).await;
+    assert_eq!(s.quota.sessions(), 0);
+    assert!(matches!(
+        s.append_upload("r", &id, crate::upload_body(b"x"), None, u64::MAX)
+            .await,
+        Err(StorageError::NotFound)
+    ));
 }
 
 #[tokio::test]

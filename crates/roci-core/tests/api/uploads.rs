@@ -247,11 +247,17 @@ async fn oversized_bodies_are_413() {
 }
 
 #[tokio::test]
-async fn begin_upload_storage_error_is_500() {
+async fn broken_uploads_dir_surfaces_on_first_write() {
+    // `POST` does no filesystem work (the staging file is created by the
+    // session's first write), so a broken `<repo>/uploads` is only hit then:
+    // the no-follow resolver cannot create the file → no valid session (404).
     let (app, _d) = app_broken_uploads();
+    let resp = send(&app, post("/v2/r/blobs/uploads/", Body::empty())).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let loc = resp.headers()[header::LOCATION].to_str().unwrap().to_string();
     assert_eq!(
-        status_of(&app, post("/v2/r/blobs/uploads/", Body::empty())).await,
-        StatusCode::INTERNAL_SERVER_ERROR
+        status_of(&app, patch(&loc, "x")).await,
+        StatusCode::NOT_FOUND
     );
 }
 
