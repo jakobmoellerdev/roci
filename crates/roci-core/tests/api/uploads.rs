@@ -254,7 +254,10 @@ async fn broken_uploads_dir_surfaces_on_first_write() {
     let (app, _d) = app_broken_uploads();
     let resp = send(&app, post("/v2/r/blobs/uploads/", Body::empty())).await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
-    let loc = resp.headers()[header::LOCATION].to_str().unwrap().to_string();
+    let loc = resp.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .to_string();
     assert_eq!(
         status_of(&app, patch(&loc, "x")).await,
         StatusCode::NOT_FOUND

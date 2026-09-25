@@ -500,7 +500,9 @@ async fn never_written_sessions_expire_and_release_their_slot() {
     // after the delay and frees its upload-session slot. Afterwards the id is
     // unknown (a later PATCH is BLOB_UPLOAD_UNKNOWN).
     let (_dir, s) = gc_store_with_quota(0);
-    s.put_blob("r", &sha256_of(b"anchor"), b"anchor").await.unwrap();
+    s.put_blob("r", &sha256_of(b"anchor"), b"anchor")
+        .await
+        .unwrap();
     let id = s.begin_upload("r").await.unwrap();
     assert_eq!(s.quota.sessions(), 1);
     assert_eq!(s.upload_size("r", &id).await.unwrap(), 0);
