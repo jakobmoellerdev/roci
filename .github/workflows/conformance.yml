@@ -23,8 +23,18 @@ env:
 
 jobs:
   conformance:
-    name: OCI distribution conformance
+    name: OCI distribution conformance (${{ matrix.profile }})
     runs-on: ubuntu-latest
+    # Mirrors scripts/conformance.sh: the suite runs once anonymous and once
+    # behind htpasswd Basic auth + an access-control policy.
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [anonymous, htpasswd]
+    env:
+      ROCI_ARGS: ${{ matrix.profile == 'htpasswd' && '--config scripts/conformance/auth.toml' || '' }}
+      OCI_USERNAME: ${{ matrix.profile == 'htpasswd' && 'conformance' || '' }}
+      OCI_PASSWORD: ${{ matrix.profile == 'htpasswd' && 'conformance' || '' }}
     steps:
       # Needs spec/distribution-spec/conformance/ from the pinned submodule.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -50,10 +60,11 @@ jobs:
         shell: bash
         run: |
           storage="$(mktemp -d)"
-          ./target/ci/roci --storage-root "$storage" --listen 127.0.0.1:5000 &
+          # shellcheck disable=SC2086 # ROCI_ARGS is a deliberate word list.
+          ./target/ci/roci --storage-root "$storage" --listen 127.0.0.1:5000 $ROCI_ARGS &
           echo "ROCI_PID=$!" >> "$GITHUB_ENV"
           for _ in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:5000/v2/ >/dev/null; then
+            if curl -sf ${OCI_USERNAME:+-u "$OCI_USERNAME:$OCI_PASSWORD"} http://127.0.0.1:5000/v2/ >/dev/null; then
               echo "roci is up"; exit 0
             fi
             sleep 1
@@ -77,7 +88,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: conformance-report
+          name: conformance-report-${{ matrix.profile }}
           path: |
             spec/distribution-spec/conformance/report.html
             spec/distribution-spec/conformance/junit.xml

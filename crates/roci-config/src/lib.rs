@@ -5,8 +5,8 @@
 //! bad file fails fast with a field-qualified message.
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::collections::{BTreeMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,10 @@ pub struct Config {
     pub delete: DeleteConfig,
     pub log: LogConfig,
     pub telemetry: TelemetryConfig,
+    pub auth: AuthConfig,
+    /// `[access_control]` — identity-based repository policy; absent →
+    /// every authenticated identity may do everything, anonymous nothing.
+    pub access_control: Option<AccessControlConfig>,
 }
 
 /// `[http]` — listener, TLS, timeouts, rate limits.
@@ -46,12 +50,36 @@ impl Default for HttpConfig {
     }
 }
 
-/// `[http.tls]` — PEM server certificate chain + private key.
+/// `[http.tls]` — PEM server certificate chain + private key, plus optional
+/// mTLS client-certificate authentication.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     pub cert: PathBuf,
     pub key: PathBuf,
+    /// Request/require a client certificate chaining to `client_ca`.
+    #[serde(default)]
+    pub client_auth: ClientAuth,
+    /// PEM bundle of CAs trusted to issue client certificates.
+    #[serde(default)]
+    pub client_ca: Option<PathBuf>,
+    /// Optional pin list: SHA-256 fingerprints (hex) of accepted client leaf
+    /// certificates. Empty → any certificate chaining to `client_ca`.
+    #[serde(default)]
+    pub client_cert_sha256: Vec<String>,
+}
+
+/// `http.tls.client_auth` — mTLS mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientAuth {
+    /// No client certificate is requested.
+    #[default]
+    None,
+    /// A certificate is requested; a connection without one is anonymous.
+    Optional,
+    /// The handshake fails without a trusted client certificate.
+    Required,
 }
 
 /// `[http.timeouts]` — slow-loris / stalled-peer bounds (SECURITY inv. 14).
@@ -447,6 +475,139 @@ impl Default for MetricsConfig {
     }
 }
 
+/// `[auth]` — authentication mechanisms. All absent → no authentication
+/// (unless `[access_control]` or mTLS is configured).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Realm advertised in the `Basic` challenge.
+    pub realm: String,
+    pub htpasswd: Option<HtpasswdConfig>,
+    pub ldap: Option<LdapConfig>,
+    pub bearer: Option<BearerConfig>,
+    /// Lifetime of a cached successful Basic authentication; `0` disables.
+    pub cache_ttl_secs: u64,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            realm: "roci".into(),
+            htpasswd: None,
+            ldap: None,
+            bearer: None,
+            cache_ttl_secs: 60,
+        }
+    }
+}
+
+/// `[auth.htpasswd]` — a local bcrypt htpasswd file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HtpasswdConfig {
+    pub path: PathBuf,
+}
+
+/// `[auth.ldap]` — authenticate Basic credentials by LDAP bind.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LdapConfig {
+    /// `ldaps://host:port`, or `ldap://host:port` with `start_tls = true`.
+    pub url: String,
+    #[serde(default)]
+    pub start_tls: bool,
+    /// Service account used to look the user up.
+    pub bind_dn: String,
+    /// File holding the service account password (trimmed).
+    pub bind_password_file: PathBuf,
+    /// Subtree searched for the user entry.
+    pub base_dn: String,
+    /// Attribute matched against the login name.
+    #[serde(default = "default_ldap_user_attribute")]
+    pub user_attribute: String,
+    /// Extra filter ANDed into the user search, e.g. `(objectClass=person)`.
+    #[serde(default)]
+    pub user_filter: Option<String>,
+    /// Attribute of the user entry listing its groups (e.g. `memberOf`).
+    #[serde(default)]
+    pub group_attribute: Option<String>,
+    /// PEM CA bundle trusted for the directory; absent → system roots.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// Bound on one whole authentication exchange.
+    #[serde(default = "default_ldap_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_ldap_user_attribute() -> String {
+    "uid".into()
+}
+fn default_ldap_timeout_secs() -> u64 {
+    5
+}
+
+/// `[auth.bearer]` — verify Docker v2 bearer tokens from an external issuer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BearerConfig {
+    /// Token endpoint advertised in the challenge.
+    pub realm: String,
+    /// Service name: advertised in the challenge, required in `aud`.
+    pub service: String,
+    /// Required `iss` claim.
+    pub issuer: String,
+    /// PEM file with one or more `PUBLIC KEY` / `CERTIFICATE` blocks.
+    pub verify_key_file: PathBuf,
+}
+
+/// `[access_control]` — identity-based access control.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessControlConfig {
+    /// Users granted every action on every repository.
+    #[serde(default)]
+    pub admins: Vec<String>,
+    /// Named groups → member user names.
+    #[serde(default)]
+    pub groups: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub repositories: Vec<RepositoryPolicy>,
+}
+
+/// `[[access_control.repositories]]` — grants for repositories matching a glob.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryPolicy {
+    /// `*` matches within one path component, `**` across components.
+    pub pattern: String,
+    #[serde(default)]
+    pub anonymous: Vec<Action>,
+    #[serde(default)]
+    pub authenticated: Vec<Action>,
+    #[serde(default)]
+    pub policies: Vec<IdentityPolicy>,
+}
+
+/// Grants `actions` to the listed users and groups.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityPolicy {
+    #[serde(default)]
+    pub users: Vec<String>,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    pub actions: Vec<Action>,
+}
+
+/// A repository action subject to authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Action {
+    Pull,
+    Push,
+    Delete,
+}
+
 /// Load/validation failure, carrying the offending field path.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -551,8 +712,225 @@ impl Config {
         if self.log.level.trim().is_empty() {
             return Err(invalid("log.level", "must not be empty"));
         }
+        if let Some(tls) = &self.http.tls {
+            tls.validate()?;
+        }
+        self.auth.validate()?;
+        if let Some(ac) = &self.access_control {
+            ac.validate()?;
+        }
         self.storage.validate()
     }
+}
+
+/// Whether `s` is safe to embed in a quoted `WWW-Authenticate` parameter.
+fn is_quotable(s: &str) -> bool {
+    !s.is_empty() && !s.chars().any(|c| c == '"' || c == '\\' || c.is_control())
+}
+
+impl TlsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.client_auth != ClientAuth::None && self.client_ca.is_none() {
+            return Err(invalid(
+                "http.tls.client_ca",
+                "required when client_auth is optional or required",
+            ));
+        }
+        if self.client_auth == ClientAuth::None
+            && (self.client_ca.is_some() || !self.client_cert_sha256.is_empty())
+        {
+            return Err(invalid(
+                "http.tls.client_auth",
+                "must be optional or required when client_ca/client_cert_sha256 is set",
+            ));
+        }
+        for (i, pin) in self.client_cert_sha256.iter().enumerate() {
+            if pin.len() != 64 || !pin.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(invalid(
+                    format!("http.tls.client_cert_sha256[{i}]"),
+                    "must be 64 hex characters (a SHA-256 fingerprint)",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AuthConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !is_quotable(&self.realm) {
+            return Err(invalid(
+                "auth.realm",
+                "must be non-empty without '\"', '\\' or control characters",
+            ));
+        }
+        if self.cache_ttl_secs > 3600 {
+            return Err(invalid("auth.cache_ttl_secs", "must be <= 3600"));
+        }
+        if let Some(h) = &self.htpasswd {
+            if h.path.as_os_str().is_empty() {
+                return Err(invalid("auth.htpasswd.path", "must not be empty"));
+            }
+        }
+        if let Some(l) = &self.ldap {
+            l.validate()?;
+        }
+        if let Some(b) = &self.bearer {
+            if !(b.realm.starts_with("https://") || b.realm.starts_with("http://")) {
+                return Err(invalid("auth.bearer.realm", "must be an http(s) URL"));
+            }
+            for (field, v) in [
+                ("auth.bearer.realm", &b.realm),
+                ("auth.bearer.service", &b.service),
+                ("auth.bearer.issuer", &b.issuer),
+            ] {
+                if !is_quotable(v) {
+                    return Err(invalid(
+                        field,
+                        "must be non-empty without '\"', '\\' or control characters",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl LdapConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(self.url.starts_with("ldaps://") || self.url.starts_with("ldap://")) {
+            return Err(invalid(
+                "auth.ldap.url",
+                "must be an ldap:// or ldaps:// URL",
+            ));
+        }
+        if self.url.starts_with("ldap://") && !self.start_tls {
+            return Err(invalid(
+                "auth.ldap.url",
+                "plaintext ldap:// requires start_tls = true",
+            ));
+        }
+        for (field, v) in [
+            ("auth.ldap.bind_dn", &self.bind_dn),
+            ("auth.ldap.base_dn", &self.base_dn),
+        ] {
+            if v.trim().is_empty() {
+                return Err(invalid(field, "must not be empty"));
+            }
+        }
+        let a = self.user_attribute.as_bytes();
+        if a.is_empty()
+            || !a[0].is_ascii_alphabetic()
+            || !a.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        {
+            return Err(invalid(
+                "auth.ldap.user_attribute",
+                "must match [A-Za-z][A-Za-z0-9-]*",
+            ));
+        }
+        if let Some(f) = &self.user_filter {
+            if !(f.starts_with('(') && f.ends_with(')')) {
+                return Err(invalid(
+                    "auth.ldap.user_filter",
+                    "must be a parenthesized LDAP filter",
+                ));
+            }
+        }
+        if self.timeout_secs == 0 {
+            return Err(invalid("auth.ldap.timeout_secs", "must be > 0"));
+        }
+        Ok(())
+    }
+}
+
+impl AccessControlConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let mut seen = HashSet::new();
+        for (i, r) in self.repositories.iter().enumerate() {
+            let field = format!("access_control.repositories[{i}]");
+            if !is_repo_pattern(&r.pattern) {
+                return Err(invalid(
+                    format!("{field}.pattern"),
+                    "must be `/`-separated components of [a-z0-9._-*], or `**`",
+                ));
+            }
+            if !seen.insert(r.pattern.as_str()) {
+                return Err(invalid(format!("{field}.pattern"), "duplicate pattern"));
+            }
+            for (j, p) in r.policies.iter().enumerate() {
+                if p.actions.is_empty() || (p.users.is_empty() && p.groups.is_empty()) {
+                    return Err(invalid(
+                        format!("{field}.policies[{j}]"),
+                        "needs non-empty actions and at least one user or group",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether `s` is an access-control glob: `/`-separated components, each
+/// `**` or a non-empty run of `[a-z0-9._-*]` (`**` only as a whole component).
+fn is_repo_pattern(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 255
+        && s.split('/').all(|c| {
+            c == "**"
+                || (!c.is_empty()
+                    && !c.contains("**")
+                    && c.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-*".contains(&b)
+                    }))
+        })
+}
+
+/// Whether `host` (a hostname or IP literal, optionally `[bracketed]`) names
+/// a loopback, private, link-local, or otherwise non-public destination — an
+/// SSRF target a registry must never direct a client or itself to.
+pub fn is_internal_host(host: &str) -> bool {
+    let h = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") {
+        return true;
+    }
+    fn v4(ip: std::net::Ipv4Addr) -> bool {
+        let o = ip.octets();
+        ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            || o[0] == 0
+            || (o[0] == 100 && (o[1] & 0xc0) == 64)
+    }
+    match h.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => v4(ip),
+        Ok(IpAddr::V6(ip)) => {
+            let seg0 = ip.segments()[0];
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || (seg0 & 0xfe00) == 0xfc00
+                || (seg0 & 0xffc0) == 0xfe80
+                || ip.to_ipv4_mapped().is_some_and(v4)
+        }
+        Err(_) => false,
+    }
+}
+
+/// The host of an `scheme://host[:port]/…` URL (brackets kept for IPv6).
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    let host = if authority.starts_with('[') {
+        &authority[..=authority.find(']')?]
+    } else {
+        authority.split(':').next()?
+    };
+    (!host.is_empty()).then_some(host)
 }
 
 impl StorageConfig {
@@ -679,6 +1057,12 @@ impl S3Config {
                     "plaintext http:// requires allow_http = true",
                 ));
             }
+            if self.redirect_min_size > 0 && url_host(ep).is_some_and(is_internal_host) {
+                return Err(invalid(
+                    format!("{field}.endpoint"),
+                    "redirect target is a loopback/private/link-local host; set redirect_min_size = 0 to proxy blobs",
+                ));
+            }
         }
         Ok(())
     }
@@ -741,7 +1125,7 @@ mod tests {
             r#"
             [http]
             listen = "0.0.0.0:8443"
-            tls = { cert = "/c.pem", key = "/k.pem" }
+            tls = { cert = "/c.pem", key = "/k.pem", client_auth = "optional", client_ca = "/ca.pem", client_cert_sha256 = ["AB00000000000000000000000000000000000000000000000000000000000000"] }
             timeouts = { read_header_secs = 5, idle_secs = 30 }
             [http.rate_limit]
             enabled = true
@@ -772,6 +1156,32 @@ mod tests {
             sample_ratio = 0.5
             otlp = { endpoint = "http://otel:4318", protocol = "http" }
             metrics = { enabled = true }
+            [auth]
+            realm = "reg"
+            cache_ttl_secs = 0
+            [auth.htpasswd]
+            path = "/etc/roci/htpasswd"
+            [auth.ldap]
+            url = "ldap://dir:389"
+            start_tls = true
+            bind_dn = "cn=svc,dc=x"
+            bind_password_file = "/pw"
+            base_dn = "dc=x"
+            user_filter = "(objectClass=person)"
+            group_attribute = "memberOf"
+            [auth.bearer]
+            realm = "https://auth.example/token"
+            service = "roci"
+            issuer = "auth.example"
+            verify_key_file = "/jwt.pem"
+            [access_control]
+            admins = ["root"]
+            groups = { devs = ["alice", "bob"] }
+            [[access_control.repositories]]
+            pattern = "team/**"
+            anonymous = ["pull"]
+            authenticated = ["pull"]
+            policies = [{ users = ["alice"], groups = ["devs"], actions = ["push", "delete"] }]
             "#,
         )
         .unwrap();
@@ -797,6 +1207,19 @@ mod tests {
         assert_eq!(mirror.region, "us-east-1");
         assert_eq!(mirror.redirect_ttl_secs, 60);
         assert_eq!(mirror.multipart_part_size, 16 * 1024 * 1024);
+        let tls = c.http.tls.as_ref().unwrap();
+        assert_eq!(tls.client_auth, ClientAuth::Optional);
+        assert_eq!(c.auth.realm, "reg");
+        let ldap = c.auth.ldap.as_ref().unwrap();
+        assert_eq!(
+            (ldap.user_attribute.as_str(), ldap.timeout_secs),
+            ("uid", 5)
+        );
+        let ac = c.access_control.as_ref().unwrap();
+        assert_eq!(
+            ac.repositories[0].policies[0].actions,
+            [Action::Push, Action::Delete]
+        );
         let back: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
     }
@@ -821,6 +1244,7 @@ mod tests {
             "[storage.scrub]\nenabled = false\ninterval_secs = 0",
             "[storage.metadata]\nengine = \"redb\"",
             "[storage.s3]\nbucket = \"b\"\nendpoint = \"https://s3.example\"",
+            "[storage.s3]\nbucket = \"b\"",
         ] {
             parse(ok).unwrap_or_else(|e| panic!("{ok:?} → {e}"));
         }
@@ -923,9 +1347,153 @@ mod tests {
                 "[storage.subpaths.a]\nroot = \"/s\"\n[storage.subpaths.b]\nroot = \"/s\"",
                 "storage.subpaths.b.root",
             ),
+            ("[auth]\nrealm = \"a\\\"b\"", "auth.realm"),
+            ("[auth]\nrealm = \"\"", "auth.realm"),
+            ("[auth]\ncache_ttl_secs = 3601", "auth.cache_ttl_secs"),
+            ("[auth.htpasswd]\npath = \"\"", "auth.htpasswd.path"),
+            (
+                "[auth.ldap]\nurl = \"ldap://d\"\nbind_dn = \"a\"\nbind_password_file = \"/p\"\nbase_dn = \"b\"",
+                "plaintext ldap:// requires start_tls = true",
+            ),
+            (
+                "[auth.ldap]\nurl = \"http://d\"\nbind_dn = \"a\"\nbind_password_file = \"/p\"\nbase_dn = \"b\"",
+                "auth.ldap.url",
+            ),
+            (
+                "[auth.ldap]\nurl = \"ldaps://d\"\nbind_dn = \" \"\nbind_password_file = \"/p\"\nbase_dn = \"b\"",
+                "auth.ldap.bind_dn",
+            ),
+            (
+                "[auth.ldap]\nurl = \"ldaps://d\"\nbind_dn = \"a\"\nbind_password_file = \"/p\"\nbase_dn = \"\"",
+                "auth.ldap.base_dn",
+            ),
+            (
+                "[auth.ldap]\nurl = \"ldaps://d\"\nbind_dn = \"a\"\nbind_password_file = \"/p\"\nbase_dn = \"b\"\nuser_attribute = \"u)(x\"",
+                "auth.ldap.user_attribute",
+            ),
+            (
+                "[auth.ldap]\nurl = \"ldaps://d\"\nbind_dn = \"a\"\nbind_password_file = \"/p\"\nbase_dn = \"b\"\nuser_filter = \"x=y\"",
+                "auth.ldap.user_filter",
+            ),
+            (
+                "[auth.ldap]\nurl = \"ldaps://d\"\nbind_dn = \"a\"\nbind_password_file = \"/p\"\nbase_dn = \"b\"\ntimeout_secs = 0",
+                "auth.ldap.timeout_secs",
+            ),
+            (
+                "[auth.bearer]\nrealm = \"auth.example\"\nservice = \"s\"\nissuer = \"i\"\nverify_key_file = \"/k\"",
+                "auth.bearer.realm",
+            ),
+            (
+                "[auth.bearer]\nrealm = \"https://a\"\nservice = \"s\\\"\"\nissuer = \"i\"\nverify_key_file = \"/k\"",
+                "auth.bearer.service",
+            ),
+            (
+                "[auth.bearer]\nrealm = \"https://a\"\nservice = \"s\"\nissuer = \"\"\nverify_key_file = \"/k\"",
+                "auth.bearer.issuer",
+            ),
+            (
+                "[http.tls]\ncert = \"/c\"\nkey = \"/k\"\nclient_auth = \"required\"",
+                "http.tls.client_ca",
+            ),
+            (
+                "[http.tls]\ncert = \"/c\"\nkey = \"/k\"\nclient_ca = \"/ca\"",
+                "http.tls.client_auth",
+            ),
+            (
+                "[http.tls]\ncert = \"/c\"\nkey = \"/k\"\nclient_cert_sha256 = [\"ab\"]",
+                "http.tls.client_auth",
+            ),
+            (
+                "[http.tls]\ncert = \"/c\"\nkey = \"/k\"\nclient_auth = \"optional\"\nclient_ca = \"/ca\"\nclient_cert_sha256 = [\"zz\"]",
+                "http.tls.client_cert_sha256[0]",
+            ),
+            (
+                "[[access_control.repositories]]\npattern = \"Team\"",
+                "access_control.repositories[0].pattern",
+            ),
+            (
+                "[[access_control.repositories]]\npattern = \"a/**b\"",
+                "access_control.repositories[0].pattern",
+            ),
+            (
+                "[[access_control.repositories]]\npattern = \"a//b\"",
+                "access_control.repositories[0].pattern",
+            ),
+            (
+                "[[access_control.repositories]]\npattern = \"a\"\n[[access_control.repositories]]\npattern = \"a\"",
+                "access_control.repositories[1].pattern",
+            ),
+            (
+                "[[access_control.repositories]]\npattern = \"a\"\npolicies = [{ users = [\"u\"], actions = [] }]",
+                "access_control.repositories[0].policies[0]",
+            ),
+            (
+                "[[access_control.repositories]]\npattern = \"a\"\npolicies = [{ actions = [\"pull\"] }]",
+                "access_control.repositories[0].policies[0]",
+            ),
+            (
+                "[storage.s3]\nbucket = \"b\"\nendpoint = \"https://169.254.169.254\"",
+                "redirect target is a loopback",
+            ),
+            (
+                "[storage.subpaths.a]\nroot = \"/x\"\ns3 = { bucket = \"b\", endpoint = \"http://[::1]:9000\", allow_http = true }",
+                "storage.subpaths.a.s3.endpoint",
+            ),
         ] {
             let err = parse(src).unwrap_err();
             assert!(err.contains(needle), "{src:?} → {err}");
+        }
+    }
+
+    #[test]
+    fn internal_endpoints_allowed_when_redirects_disabled() {
+        parse("[storage.s3]\nbucket = \"b\"\nendpoint = \"http://127.0.0.1:9000\"\nallow_http = true\nredirect_min_size = 0").unwrap();
+    }
+
+    #[test]
+    fn internal_host_classification() {
+        for h in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "[fd00::1]",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+            "localhost",
+            "a.LOCALHOST",
+        ] {
+            assert!(is_internal_host(h), "{h}");
+        }
+        for h in [
+            "s3.us-east-1.amazonaws.com",
+            "8.8.8.8",
+            "100.128.0.1",
+            "2001:db8::1",
+            "::ffff:8.8.8.8",
+            "minio",
+        ] {
+            assert!(!is_internal_host(h), "{h}");
+        }
+    }
+
+    #[test]
+    fn url_host_extraction() {
+        for (url, host) in [
+            ("https://s3.example", Some("s3.example")),
+            ("http://minio:9000/path?q", Some("minio")),
+            ("https://user@h.example:1#f", Some("h.example")),
+            ("http://[::1]:9000", Some("[::1]")),
+            ("https://", None),
+            ("http://[::1", None),
+        ] {
+            assert_eq!(url_host(url), host, "{url}");
         }
     }
 

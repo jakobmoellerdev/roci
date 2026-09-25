@@ -74,24 +74,69 @@ Adopt zot's configurable read/write timeouts (default `60s`) on both the API ser
 
 ## Authentication
 
-All interaction is over HTTP APIs; roci supports the full zot authn matrix (see [`PLAN.md`](PLAN.md) Phase 6). Operators are strongly advised to enable a mechanism suited to their deployment to prevent unauthorized access.
+All interaction is over HTTP APIs; roci supports the full authn matrix (see [`PLAN.md`](PLAN.md) Phase 6). Auth is **opt-in**: enabled only when at least one of `auth.htpasswd`, `auth.ldap`, `auth.bearer`, `access_control`, or `http.tls.client_auth != "none"` is configured; otherwise no auth layer is installed and behavior is byte-identical to a pre-auth build. Operators are strongly advised to enable a mechanism suited to their deployment to prevent unauthorized access.
+
+**Authentication order** (decided once per request):
+
+1. If an `Authorization` header is present, it decides the identity; an invalid header yields `401` and **never falls back to anonymous**. **Exception:** `Basic` with both user and password empty (the `:` pair) is treated as no credentials (proceeds to step 2/3) — container-image clients (skopeo, podman, buildah) send this when they hold no credentials but must answer a Basic challenge to pull from anonymous-pull repos. A non-empty user with empty password, or empty user with a password, is still `401` "invalid credentials".
+   - `Basic`: try htpasswd first. If the user is **absent** from htpasswd, try LDAP. A known htpasswd user with a wrong password fails without trying LDAP.
+   - `Bearer`: verify the JWT against the configured public keys.
+   - Any other scheme: `401`.
+2. Otherwise, if the connection carried a verified client certificate, the identity comes from that certificate (Subject CN, else first DNS SAN; non-empty, ≤255 bytes, no control chars).
+3. Otherwise the request is Anonymous.
 
 | Mechanism | Notes |
 | --- | --- |
-| **HTTP Basic — local htpasswd** | bcrypt-hashed credentials in an htpasswd file. |
-| **HTTP Basic — LDAP** | Bind against a directory; credentials never stored locally. |
-| **HTTP Bearer token** | Docker V2 token scheme: `WWW-Authenticate` challenge → repo-scoped bearer token. Auth reference: [`spec/docker-registry-api-v2.md`](spec/docker-registry-api-v2.md). |
-| **TLS mutual authentication (mTLS)** | Client-certificate verification; identity derived from the cert. |
+| **HTTP Basic — local htpasswd** | bcrypt only (`$2a$`/`$2b$`/`$2y$`); line-numbered load errors; duplicate users or non-bcrypt hashes rejected. Unknown users verified against a dummy hash at the file's max bcrypt cost (timing-safe). Verify on `spawn_blocking`. |
+| **HTTP Basic — LDAP** | Cargo feature `ldap` (roci-core `ldap`, roci-cli `ldap`, in `full`); without it `auth.ldap` fails startup. Search-then-bind with a service account; `ldap_escape`'d filter; empty password rejected (anonymous-bind trap); TLS always verified; bounded by `timeout_secs`. Directory errors → warn + `401`. |
+| **HTTP Bearer token** | External token server only (roci does not issue tokens). Hand-rolled JWS verification over `ring` (no `jsonwebtoken` → avoids `rsa` crate RUSTSEC-2023-0071). ES256 (P-256) and RS256 (2048–8192 bit). `alg` must match key; `jwk`/`jku`/`x5u` headers rejected; `kid`/`x5c` ignored; ≤8192 bytes; `iss`==issuer; `aud` (string or array) contains service; `exp` required (30 s leeway); ≤64 `access` entries; only `type=repository`; constant-time repo-name compare. Keys loaded from PEM `PUBLIC KEY`/`CERTIFICATE` blocks. |
+| **TLS mutual authentication (mTLS)** | rustls `WebPkiClientVerifier` (ring provider); `client_auth = optional` calls `.allow_unauthenticated()`; pins enforced by a wrapping verifier (unpinned cert fails the handshake). |
+
+**Credential cache:** SHA-256(user‖0x00‖password) → identity, TTL `auth.cache_ttl_secs` (default 60, max 3600, 0 disables), 4096 entries (cleared when full); caches successful Basic (htpasswd + LDAP) only. Credentials, tokens, and `Authorization` values are **never logged**.
+
+**Startup warning:** when a header mechanism (htpasswd, LDAP, bearer) is enabled without TLS, a warning is logged ("credentials travel in plaintext").
+
+**Telemetry:** counter `registry.auth.decisions{method=anonymous|htpasswd|ldap|bearer|mtls, result=allowed|denied|unauthenticated|invalid}`; span `authn.authorize` with `auth.method`/`auth.result`.
 
 TLS is supported for transport confidentiality; mTLS additionally authenticates the client. Anonymous access (e.g. public pull) is a policy choice, not a default.
 
 ## Authorization (access control)
 
-After authentication, roci allows or denies a specific **action** by a **user/identity** on a specific **repository** — Identity-Based Access Control (IBAC).
+After authentication, roci allows or denies a specific **action** (`pull`, `push`, `delete`) by a **principal** on a specific **repository** — Identity-Based Access Control (IBAC), configured in `[access_control]`.
 
-- Policies map identity → repository (glob/prefix) → permitted actions (pull, push, delete, …).
+**Token principals** (Bearer) are authorized **only by their `access` claims** — the IBAC policy is never consulted for them.
+
+**IBAC rule matching:** every `[[access_control.repositories]]` entry has a glob `pattern` (`*` within one `/`-component, `**` across components including empty). The **single most-specific rule wins** (most literal bytes → fewest wildcard tokens → earliest declared); a narrow rule can remove grants a broad one gives.
+
+**Grants for an authenticated (non-token) user:** `admins` → all actions. Everyone else gets the **union** of the winning rule's `anonymous`, `authenticated`, matching `users` policies, and matching `groups` policies (config `groups` map + LDAP directory groups).
+
+**Grants for Anonymous:** the winning rule's `anonymous` list only.
+
+**No `[access_control]` section:** every authenticated identity may do everything; Anonymous may do nothing.
+
+**Decision → response:**
+
+| Principal / condition | Response |
+| --- | --- |
+| Action allowed | proceed |
+| Authenticated user, action not granted | `403 DENIED` "access denied" |
+| Anonymous, not granted, a header mechanism configured | `401 UNAUTHORIZED` "authentication required" + challenge |
+| Anonymous, not granted, no header mechanism | `403 DENIED` ("authentication required: present a trusted client certificate" if mTLS configured, else "anonymous access denied by policy") |
+| Token principal missing the grant | `401 UNAUTHORIZED` "insufficient scope" + Bearer challenge with `error="insufficient_scope"` |
+| Invalid credentials | `401 UNAUTHORIZED` "invalid credentials" + challenge without scope |
+
+**Challenge header (`WWW-Authenticate`):** Bearer `realm,service[,scope]` when `auth.bearer` configured (Basic still accepted); else `Basic realm`; absent when no header mechanism. Actions in scope: pull → `pull`; push → `pull,push`; delete → `delete`.
+
+**`GET /v2/`:** anonymous with a header mechanism → `401` challenge (no scope); anonymous without → `200`; any authenticated principal → `200`. The `/metrics` endpoint stays **unauthenticated** (merged after the auth-gated router in roci-cli).
+
+**Endpoint → action:** pull = GET/HEAD blob, GET/HEAD manifest, tags list, referrers; push = POST uploads, PATCH/PUT/GET upload session, PUT manifest; delete = DELETE blob/manifest. Unknown path shapes keep `NAME_UNKNOWN` without authorization (no storage touched).
+
+**Enforcement point:** `routes::dispatch`, after path parsing and before any `Storage` call — a single point satisfying SECURITY invariant 1 / ARCHITECTURE invariant 3.
+
+**Middleware order at runtime:** request span → early-data → rate limit → authn → handler.
+
 - Default-deny where a policy is configured; explicit anonymous-pull opt-in.
-- **Live authorization reload:** authz policy can be modified in the running config and reload without restart or dropping connections (zot supports live modification of authorization config). Only authorization is live-reloadable; other config changes require restart.
+- **Live authorization reload:** only `[access_control]` is reloaded (2 s file poll, full `Config::load` validation on change; invalid → warn, keep old; other sections changed → warn restart required; section removed → `None`: anonymous denied, authenticated unrestricted). htpasswd/LDAP/bearer/TLS changes need restart.
 
 ## Content trust & integrity
 
@@ -107,13 +152,13 @@ The HTTP edge is the primary untrusted-input boundary. Every control below is a 
 
 - **Name / reference / digest validation before any path construction.** `RepositoryName`, `Reference`, and upload-session IDs MUST be parsed against their dist-spec grammars *before* a filesystem path is built from them (`RepositoryName` `[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(\/…)*` ≤255 chars; `Reference` tag `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}` or a digest). The spec name grammar excludes `..` by construction, so enforcing it is both spec-correct and traversal-proof; digest hex is charset-locked (`[a-f0-9]{64|128}`) so `blobs/<alg>/<hex>` can never contain a separator or `..`. Reject invalid input with `NAME_INVALID`/`DIGEST_INVALID`. **Defence-in-depth:** a `Storage`-layer backstop rejects any path component that is `..`, `.`, or contains `NUL`, even if the edge validated. (CVE-2021-21334 / GHSA-hmfx-3pcx-653p containerd path traversal; GHSA-qq97-vm5h-rrhg distribution name sanitisation; Harbor CVE-2019-3990.)
 - **Wire digest algorithm allowlist.** Only `sha256` and `sha512` are accepted as wire digests; SHA-1/MD5/any unregistered algorithm → `DIGEST_INVALID` at parse time. **BLAKE3 is internal-only (scrub, Bao tree) and MUST NEVER appear as a wire/descriptor digest** — the referrers-index update path asserts every stored descriptor digest is in the allowlist (else a BLAKE3-unaware client silently skips verification = integrity bypass). (SHAttered 2017; OCI descriptor grammar.)
-- **Cross-repo mount is double-authorized.** `POST …?mount=<digest>&from=<src>` (`end-11`) requires **pull on `<src>` AND push on the destination repo — two independent checks**, the source check *before* the blob is read. Checking only the destination lets a blob be exfiltrated from a private source into a readable destination. (Harbor GHSA-r4cx-r72v-m728; zot documents this class.)
+- **Cross-repo mount is double-authorized.** **[implemented — Phase 6]** `POST …?mount=<digest>&from=<src>` (`end-11`) requires **pull on `<src>` AND push on the destination repo — two independent checks**, the source check *before* `mount_blob`. If `from` fails `RepositoryName::parse`, or pull on `from` is not allowed, the mount silently falls through to a normal `202` upload session (no existence oracle). (Harbor GHSA-r4cx-r72v-m728; zot documents this class.)
 - **Per-method authorization matrix + scope binding.** GET/HEAD⇒pull, POST/PATCH/PUT⇒push, DELETE⇒delete, checked per endpoint. Bearer-token `repository:<name>:<action>` scope is validated against the actual request path+method (constant-time name compare), never merely "a token is present." Anonymous-pull vs authenticated-push is enforced per endpoint. (CVE-2020-13401 scope confusion; GHSA-phw4-mc57-4hwc JWT signing-key injection; GHSA-3p65-76g6-3w7r pull-through credential exfiltration.)
-- **SSRF / open-redirect containment.** roci never fetches a client- or manifest-supplied URL: `descriptor.urls` is not dereferenced; `subject`/`from` are repo names, not URLs. The 307 signed-URL redirect (remote backend) is emitted only after repo-membership verification, to a host matching a configured allowlist (never `169.254.169.254`/RFC-1918/link-local), with a short (≤60 s) blob-scoped signature. The `sync` extension validates upstream URLs at config load (public `https://` only; reject metadata/loopback/private ranges) and MUST NOT accept invalid TLS certs. (CVE-2022-24878 Flux, CVE-2023-45288 containerd pull-through, Harbor GHSA-jfh8-c2jp-hdph.)
+- **SSRF / open-redirect containment.** roci never fetches a client- or manifest-supplied URL: `descriptor.urls` is not dereferenced; `subject`/`from` are repo names, not URLs. **[implemented — Phase 6]** The 307 signed-URL redirect (remote backend) is emitted only if the scheme is `https` (or `http` with `allow_http`), the host is in a **derived allowlist** (from `endpoint` host, or `s3.<region>.amazonaws.com` + `<bucket>.s3.<region>.amazonaws.com`), and the host is not internal (`roci_config::is_internal_host`); otherwise the blob is proxied (ranged) with a warning. At config load, `redirect_min_size > 0` with an endpoint whose host is internal → error. Repo membership is already enforced by the S3 backend's `head` on the repo-scoped key. The `sync` extension validates upstream URLs at config load (public `https://` only; reject metadata/loopback/private ranges) and MUST NOT accept invalid TLS certs. *(Sync-extension SSRF URL validation is carried to Phase 7 — `roci-ext-sync` is a stub; Phase 6 ships the reusable `is_internal_host`.)* (CVE-2022-24878 Flux, CVE-2023-45288 containerd pull-through, Harbor GHSA-jfh8-c2jp-hdph.)
 - **Request-smuggling / desync hygiene.** HTTP/2 (frame-length framed) is the default and immune to CL/TE confusion; HTTP/1.1 keep-alive follows RFC 7230 (TE wins). Operators are warned that HTTP/1.1 behind a TE/CL-ambiguous proxy is a smuggling risk (prefer HTTP/2-only or a correct proxy). `Location`/response headers are built only from validated repo/id (no CRLF injection); header construction never `unwrap()`s attacker input into a panic. `hyper` is pinned past **CVE-2023-44487 / GHSA-rr69-rxr6-8qwv** (HTTP/2 Rapid Reset) and tracked by `cargo audit`.
 - **DoS bounds (see also §DoS in Storage boundary).** Separate **manifest size cap** (default ≤4 MiB, distinct from the blob cap) checked before JSON parse; bounded JSON recursion depth; per-session upload size cap; `n`/pagination parameters on tag-list and referrers capped server-side (never allocate `O(n)` from a client integer) and served by a storage-level seek, so per-request work is bounded by the page, never by the repo's tag or referrer count; wired read/write timeouts + per-method rate limits. (CVE-2023-2253 / GHSA-hqxw-f8mx-cpmw catalog `n` OOM; GHSA-259w-8hf6-59bj referrers amplification.)
 - **Cache-poisoning split (tag vs digest).** Manifest-by-**tag** responses are mutable → `Cache-Control: no-cache`/`must-revalidate`, no immutable ETag. Manifest/blob-by-**digest** responses are immutable → `ETag: "<digest>"`, `Cache-Control: immutable, max-age=31536000`, `If-None-Match`→`304`. Filtered referrers responses set an appropriate `Vary`. A mutable tag must never be cacheable as immutable. (GHSA-77mh-r6f6-crvq containerd cache poisoning; ARCHITECTURE invariant 14.)
-- **TLS / 0-RTT.** Non-idempotent requests (POST/PATCH/PUT/DELETE) carrying TLS 1.3 `Early-Data` are rejected with `425 Too Early` (RFC 8470) — only idempotent GET/HEAD may use 0-RTT. *Current state (Phase 4):* the rustls acceptor sets `max_early_data_size = 0`, so no early data is accepted at all (hyper cannot expose per-request `Early-Data`); ticket-based 1-RTT resumption is on. This is strictly safer than the target; GET/HEAD 0-RTT is deferred. kTLS fallback to userspace TLS is logged and alertable (`registry.sendfile.zerocopy{result=fallback}`), never silent. Cluster-peer mTLS uses a per-cluster CA / cert pinning; `accept_invalid_certs` is prohibited in sync and cluster configs. (RFC 8470; CVE-2022-26945 go-getter TLS bypass.)
+- **TLS / 0-RTT.** **[implemented — Phase 6]** Direct 0-RTT stays refused (`max_early_data_size = 0`). An always-on middleware returns `425 Too Early` (code `DENIED`, "request sent in TLS early data; retry after the handshake completes") for any request carrying the `Early-Data: 1` header with a method other than GET/HEAD/OPTIONS (RFC 8470 §5.1, proxy-forwarded early data). Ticket-based 1-RTT resumption is on. *(kTLS-fallback alert deferred to the kTLS work in Phase 4; no kTLS path exists yet.)* mTLS (`http.tls.client_auth = optional|required`) uses a per-deployment CA with optional leaf-fingerprint pinning (`client_cert_sha256`); `accept_invalid_certs` is prohibited in sync and cluster configs. (RFC 8470; CVE-2022-26945 go-getter TLS bypass.)
 
 ## Storage-boundary controls
 
@@ -131,9 +176,9 @@ Everything operating on files derived from untrusted input. Content addressing i
 
 ## Secrets handling
 
-- Sensitive config (backend credentials, LDAP bind password, token signing keys) MAY live in separate referenced files with stricter filesystem permissions, and mount as Kubernetes Secrets (zot config model).
+- Sensitive config (backend credentials, LDAP bind password via `auth.ldap.bind_password_file`, bearer verification keys via `auth.bearer.verify_key_file`, mTLS CA via `http.tls.client_ca`, S3 keys via `secret_access_key_file`) live in separate referenced files with stricter filesystem permissions, mountable as Kubernetes Secrets (zot config model).
 - Cloud credentials resolvable via environment / instance IAM roles rather than inline config (avoid secrets at rest in the main config).
-- Signing/token keys never logged; telemetry redacts credential-bearing fields.
+- Credentials, tokens, and `Authorization` header values are never logged or attached to spans; telemetry redacts credential-bearing fields. A startup warning fires when a header mechanism is enabled without TLS.
 
 ## Security invariants (must never regress)
 

@@ -45,7 +45,7 @@ Requires **Rust** via [`rustup`](https://rustup.rs). The pinned toolchain in `ru
 ```sh
 git clone https://github.com/jakobmoellerdev/roci && cd roci
 cargo run -p roci-cli                     # minimal build
-cargo run -p roci-cli --features full     # + OpenTelemetry export, Prometheus /metrics, mimalloc
+cargo run -p roci-cli --features full     # + S3, redb, LDAP, OpenTelemetry export, Prometheus /metrics, mimalloc
 ```
 
 To build, test, and contribute, see [Developing locally](/guide/developing).

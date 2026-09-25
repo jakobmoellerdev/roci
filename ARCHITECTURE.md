@@ -33,7 +33,7 @@ roci-full = roci-minimal + extensions
 ```
 
 - **`roci-minimal`** — core OCI-compliant registry only (Distribution Spec). Smallest attack surface and binary. The baseline release.
-- **`roci-full`** — minimal + all extensions (search, signatures, scanning, sync, metrics UI, …).
+- **`roci-full`** — minimal + all extensions (search, signatures, scanning, sync, metrics UI, …) + the S3 storage backend (`s3`), the embedded redb metadata engine (`redb`), LDAP authentication (`ldap`), OpenTelemetry export (`otel`), and `mimalloc`.
 - **Custom** — any subset, e.g. `cargo build --features search` yields minimal + search only. The build system exposes each extension as an independent feature so operators tune the minimal↔full spectrum.
 
 Extensions map to the OCI [distribution-spec extensions](https://github.com/opencontainers/distribution-spec/tree/main/extensions) model — features not in the Distribution Spec but permitted as extensions.
@@ -128,9 +128,9 @@ flowchart TB
 
 ### Layers
 
-- **HTTP API layer.** Async server (axum/hyper), **HTTP/2 multiplexing + keep-alive** with HTTP/1.1 fallback, TLS 1.3 (0-RTT resumption) with optional kTLS. Terminates TLS, parses/validates requests, applies read/write timeouts and rate limits, honors conditional requests (`ETag`/`If-None-Match` → `304`), routes to handlers. Every request is an OpenTelemetry span. Roundtrip-efficiency design in §HTTP roundtrip efficiency.
-- **Core (`roci-minimal`).** Distribution API handlers (all `end-1`..`end-13` endpoints), protocol types (`Digest`, `RepositoryName`, `Reference`, manifest models, the 14-code error enum), and the AuthN/AuthZ gate. **The core has zero dependency on any extension.** This is the seam that makes minimal builds real.
-- **AuthN/AuthZ gate.** Enforced *before* any storage access — mirrors zot: "controls are enforced before access is allowed into the storage layer." Detailed in [`SECURITY.md`](SECURITY.md).
+- **HTTP API layer.** Async server (axum/hyper), **HTTP/2 multiplexing + keep-alive** with HTTP/1.1 fallback, TLS 1.3 with optional kTLS and mTLS (`http.tls.client_auth`). Terminates TLS, parses/validates requests, applies read/write timeouts and rate limits, honors conditional requests (`ETag`/`If-None-Match` → `304`), routes to handlers. Every request is an OpenTelemetry span. **Middleware order at runtime** (outermost → innermost): request span → early-data (`425 Too Early` for non-idempotent `Early-Data: 1` per RFC 8470 §5.1) → rate limit → authn → handler. Roundtrip-efficiency design in §HTTP roundtrip efficiency.
+- **Core (`roci-minimal`).** Distribution API handlers (all `end-1`..`end-13` endpoints), protocol types (`Digest`, `RepositoryName`, `Reference`, manifest models, the 14-code error enum), and the AuthN/AuthZ gate. **The core has zero dependency on any extension.** This is the seam that makes minimal builds real. The `ldap` cargo feature (in `full`) adds LDAP authentication support.
+- **AuthN/AuthZ gate.** **[implemented — Phase 6]** Enforced at `routes::dispatch`, after path parsing and *before* any `Storage` call — the single enforcement point satisfying invariant 3. Authentication resolves the request principal (htpasswd → LDAP → bearer → mTLS cert → Anonymous); authorization checks the principal against the IBAC policy or bearer token `access` claims. Mount double-authorization checks pull on `from` in `uploads::start`. Detailed in [`SECURITY.md`](SECURITY.md).
 - **Extensions (`roci-full`).** Each is an independent crate behind a cargo feature, consuming stable core + storage traits. An extension can never be on the critical path of core conformance; disabling all extensions must leave a fully conformant registry.
 - **Storage subsystem.** Two traits: **`Storage`** (blob CAS: reflink dedup, `O_TMPFILE`+linkat staging, `copy_file_range` mount, `sendfile`, fanout; local FS or remote object backend + dedupe cache) and **`MetadataStore`** (default append-log + in-RAM maps + WAL group-commit + rkyv snapshot; optional embedded B-tree KV), fronted by existence filters and a small-blob content cache. Detailed below.
 - **Task scheduler.** Runs periodic background work — GC, sync mirroring, scrub, vuln-DB refresh — without degrading or interrupting foreground HTTP request handling (zot design). Bounded concurrency; foreground requests take priority.
@@ -149,14 +149,18 @@ Two interaction types:
 
 A single configuration file governs the instance, divided into sections:
 
-- `http` — listen address/port, TLS, read/write timeouts, rate limits.
+- `http` — listen address/port, TLS (including `client_auth`, `client_ca`, `client_cert_sha256` for mTLS), read/write timeouts, rate limits.
+- `auth` — realm, `cache_ttl_secs`; sub-tables `auth.htpasswd` (path), `auth.ldap` (url, bind_dn, bind_password_file, base_dn, user_attribute, user_filter, group_attribute, ca_file, timeout_secs), `auth.bearer` (realm, service, issuer, verify_key_file). **[added — Phase 6]**
+- `access_control` — admins, groups map, `[[access_control.repositories]]` with pattern/anonymous/authenticated/policies (users, groups, actions). **[added — Phase 6]**
 - `storage` — root directory, dedupe, gc, commit, subpaths, storage driver, cache driver (see storage section).
 - `log` — level, format, OTLP export.
 - `extensions` — per-extension enablement and settings (`search`, `signatures`, `scan`, `sync`, `metrics`).
 
-**Sensitive-credential exception (from zot):** config items containing secrets (S3 keys, LDAP bind password, token signing keys) MAY be stored in separate referenced files, allowing stricter filesystem permissions and native Kubernetes Secret mounting. Only authorization config is live-reloadable while running (see [`PLAN.md`](PLAN.md) Phase 6); other changes require restart.
+**Auth is opt-in.** `Auth::from_config` returns `None`, and no auth layer is installed, unless at least one of `auth.htpasswd`, `auth.ldap`, `auth.bearer`, `access_control`, or `http.tls.client_auth != "none"` is configured.
 
-**[roci divergence]** config format is **TOML** (`roci --config <path>`, schema in `roci-config`), whereas zot uses JSON: sections `http` (listen, `tls`, `timeouts`, `rate_limit`), `storage` (root, `cache_max_bytes`, `dedupe`, `s3`, `subpaths`, `gc`, `scrub`, `quota`, `metadata`), `limits`, `delete`, `log`, `telemetry`; unknown keys are rejected and `Config::validate` enforces cross-field invariants on load (e.g. subpath prefixes follow the repository-name grammar and backend roots never nest; `snapshot`/`hmac_key_file` require the log engine; S3 redirect TTL ≤ 60 s, part size ≥ 5 MiB, plaintext endpoints only with `allow_http`). Zero-config defaults yield a working local registry with no file at all. A key is added only together with the subsystem it configures — no inert knobs; a knob whose build feature is absent (`s3`, `redb`) fails startup with a field-qualified error rather than being ignored.
+**Sensitive-credential exception (from zot):** config items containing secrets (S3 keys, LDAP bind password via `bind_password_file`, bearer verification keys via `verify_key_file`, mTLS CA) MAY be stored in separate referenced files, allowing stricter filesystem permissions and native Kubernetes Secret mounting. Only `[access_control]` is live-reloadable while running (2 s file poll; see [`PLAN.md`](PLAN.md) Phase 6); other changes (auth mechanisms, TLS, storage) require restart.
+
+**[roci divergence]** config format is **TOML** (`roci --config <path>`, schema in `roci-config`), whereas zot uses JSON: sections `http` (listen, `tls`, `timeouts`, `rate_limit`), `auth` (realm, htpasswd, ldap, bearer, cache_ttl_secs), `access_control` (admins, groups, repositories), `storage` (root, `cache_max_bytes`, `dedupe`, `s3`, `subpaths`, `gc`, `scrub`, `quota`, `metadata`), `limits`, `delete`, `log`, `telemetry`; unknown keys are rejected and `Config::validate` enforces cross-field invariants on load (e.g. subpath prefixes follow the repository-name grammar and backend roots never nest; `snapshot`/`hmac_key_file` require the log engine; S3 redirect TTL ≤ 60 s, part size ≥ 5 MiB, plaintext endpoints only with `allow_http`; LDAP plaintext requires `start_tls`; access-control patterns follow the component grammar; mTLS field consistency; S3 endpoint with internal host rejected when `redirect_min_size > 0`). Zero-config defaults yield a working local registry with no file at all. A key is added only together with the subsystem it configures.
 
 ## Storage subsystem
 
@@ -372,6 +376,7 @@ Defined once as OTel instruments; exported via OTLP push and a Prometheus `/metr
 - **MetadataStore:** `registry.meta.op.duration` (by `op`=`tag_set`/`resolve`/`referrers`/`backref`), `registry.wal.group_commit.batch_size` (histogram — proves group-commit is coalescing), `registry.wal.fsync.duration`, `registry.index.rss_bytes` (gauge — the memory-scaling invariant, alertable), `registry.cold_start.duration` (replay vs snapshot path).
 - **GC / scrub:** `registry.gc.duration`, `registry.gc.blobs_reclaimed`, `registry.gc.bytes_reclaimed`, `registry.gc.candidates_skipped` (grace-period/pinned — proves conservatism), `registry.scrub.checksum_mismatch` (counter — bit-rot alert), `registry.scrub.progress`. **[implemented — Phase 5]** as bounded counters: `registry.gc.collected{kind=blob|upload}` + `registry.gc.collected.bytes{kind}`, `registry.scrub.checked{result=ok|repaired|corrupt|skipped}` + `registry.scrub.bytes`, `registry.dedupe.links{op=mount|dedupe, mechanism=reflink|hardlink|copy|existing|server_side_copy}`, `registry.quota.rejections{scope=repository|total|sessions}`; sweeps/passes/rebuilds are spans with counts on their completion log.
 - **Upload sessions:** `registry.upload.active` (gauge), `registry.upload.duration`, `registry.upload.mount_hits` (cross-repo mount avoided a transfer).
+- **Auth [added — Phase 6]:** `registry.auth.decisions` (counter, labels `method`=`anonymous`|`htpasswd`|`ldap`|`bearer`|`mtls`, `result`=`allowed`|`denied`|`unauthenticated`|`invalid`).
 - **Cluster (feature):** `registry.cluster.proxied` (`local`/`forwarded`), `registry.cluster.owner_load` (per-shard load vs the CHBL cap), `registry.cluster.peer_errors`.
 - **Process:** RSS/heap (allocator stats), FD count, open upload sessions, tokio runtime task/poll metrics, build info (`service.version`, features enabled).
 
@@ -409,10 +414,10 @@ All of this is behind the `telemetry` feature; a minimal build compiles it out t
 ## Module / crate layout
 
 ```
-roci-core        # HTTP API, protocol types, dist-spec handlers, authn/authz gate
+roci-core        # HTTP API, protocol types, dist-spec handlers, authn/authz gate (auth module: htpasswd, bearer, mTLS identity, IBAC policy, credential cache; LDAP behind feature `ldap`)
 roci-storage     # Storage/StorageBackend + MetadataStore traits; local FS/CAS backend (reflink dedup, O_TMPFILE+linkat staging, copy_file_range mount); metadata engines = append-log + in-RAM maps + WAL group-commit + compaction + rkyv mmap snapshot + optional HMAC (default), redb B-tree KV (feature `redb`); small-blob LRU content cache; cuckoo presence filter; backref index; dedupe cache; quotas; O(garbage) grace-period GC; CRC32C+staggered scrub; multi-path routing; background maintenance scheduler
-roci-storage-s3  # Remote object-storage backend over `object_store` (S3-compatible; feature `s3`)
-roci-config      # Config schema, validation, live authz reload
+roci-storage-s3  # Remote object-storage backend over `object_store` (S3-compatible; feature `s3`); 307 redirect guard (host allowlist + internal-host check)
+roci-config      # Config schema (auth, access_control, mTLS fields), validation, is_internal_host, live authz reload
 roci-telemetry   # OTel provider: RED + storage/meta/GC/upload/cluster meters, span helpers, dist-spec error→span/metric mapping, tail sampling, cardinality caps, Prometheus view (feature)
 roci-ext-search  # GraphQL search + index (feature)
 roci-ext-sig     # cosign/notation (feature)

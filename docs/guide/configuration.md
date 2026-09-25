@@ -103,6 +103,79 @@ sample_ratio = 0.01           # head sampling for root traces, [0, 1]
 metrics = { enabled = false, path = "/metrics" }  # Prometheus scrape view; path must not be under /v2
 ```
 
+### Authentication & access control
+
+Auth is **opt-in**: no auth layer is installed unless at least one of `auth.htpasswd`, `auth.ldap`, `auth.bearer`, `access_control`, or `http.tls.client_auth != "none"` is configured. Without any, behavior is identical to a registry with no auth.
+
+::: warning /metrics is unauthenticated
+The Prometheus `/metrics` endpoint is merged after the auth-gated router and stays unauthenticated regardless of auth configuration. Restrict access to it via network policy or a reverse proxy if needed.
+:::
+
+```toml
+[auth]
+realm = "roci"              # WWW-Authenticate realm for Basic challenges (default "roci")
+cache_ttl_secs = 60         # credential cache TTL; max 3600, 0 disables caching
+
+# --- HTTP Basic: local htpasswd (bcrypt only: $2a$/$2b$/$2y$) ---
+[auth.htpasswd]
+path = "/etc/roci/htpasswd"
+
+# --- HTTP Basic: LDAP (requires the `ldap` cargo feature / `full` build) ---
+# [auth.ldap]
+# url = "ldaps://ldap.example.com"          # ldaps:// or ldap:// with start_tls = true
+# start_tls = false
+# bind_dn = "cn=svc,dc=example,dc=com"
+# bind_password_file = "/run/secrets/ldap"
+# base_dn = "ou=people,dc=example,dc=com"
+# user_attribute = "uid"                    # default "uid"
+# user_filter = "(objectClass=person)"      # optional; must start with ( and end with )
+# group_attribute = "memberOf"              # optional; returns LDAP group DNs for the user
+# ca_file = "/etc/roci/ldap-ca.pem"         # optional; system roots used if absent
+# timeout_secs = 5
+
+# --- HTTP Bearer: external token server (roci does not issue tokens) ---
+# [auth.bearer]
+# realm = "https://auth.example.com/token"
+# service = "registry.example.com"
+# issuer = "auth.example.com"
+# verify_key_file = "/etc/roci/token-key.pem"  # PEM: PUBLIC KEY and/or CERTIFICATE blocks (ES256, RS256)
+
+# --- mTLS fields on [http.tls] ---
+# [http.tls]
+# cert = "/etc/roci/tls.crt"
+# key = "/etc/roci/tls.key"
+# client_auth = "none"         # none | optional | required (default "none")
+# client_ca = "/etc/roci/client-ca.pem"          # required when client_auth != none
+# client_cert_sha256 = ["aabbccdd...64hex..."]    # optional leaf-fingerprint pins (case-insensitive)
+
+# --- Access control (IBAC) ---
+[access_control]
+admins = ["admin"]                               # these identities get all actions on all repos
+
+[access_control.groups]
+team-a = ["alice", "bob"]                         # config-defined groups (also merged with LDAP groups)
+
+[[access_control.repositories]]
+pattern = "team-a/**"                             # glob: * within component, ** across (incl. empty)
+anonymous = ["pull"]                              # actions granted to anonymous requests
+authenticated = ["pull"]                          # actions granted to any authenticated user
+policies = [
+  { users = ["alice"], actions = ["pull", "push", "delete"] },
+  { groups = ["team-a"], actions = ["pull", "push"] },
+]
+
+[[access_control.repositories]]
+pattern = "public/**"
+anonymous = ["pull"]
+authenticated = ["pull", "push"]
+```
+
+**Authentication order:** `Authorization` header decides (Basic: htpasswd first, then LDAP; Bearer: JWT verify) → else verified client cert → else Anonymous. An invalid header always yields `401`, never falls back to anonymous. **Exception:** `Basic` with both user and password empty (the `:` pair) is treated as no credentials — container-image clients (skopeo, podman, buildah) send this when answering a Basic challenge without stored credentials, so anonymous pull still works.
+
+**IBAC rule matching:** the single most-specific rule wins (most literal bytes, then fewest wildcards, then earliest). A narrow rule can remove grants a broad one gives. Bearer token principals are authorized only by their token's `access` claims (IBAC not consulted).
+
+**Live reload:** only `[access_control]` is reloaded (2 s file poll). Changes to `[auth]`, `[auth.htpasswd]`, `[auth.ldap]`, `[auth.bearer]`, or `[http.tls]` require a restart.
+
 ### Observability notes
 
 - Traces, metrics, and logs share one OpenTelemetry pipeline; an incoming W3C `traceparent` header is honored.
@@ -115,7 +188,7 @@ metrics = { enabled = false, path = "/metrics" }  # Prometheus scrape view; path
 roci compiles in two flavors (see [Architecture](/design/architecture)):
 
 - **minimal** — the core distribution API only, with the smallest possible dependency graph.
-- **full** — the core plus the optional extensions (`roci-ext-*`) for signatures, search, sync, and scanning, the S3 storage backend (`s3`), the embedded redb metadata engine (`redb`), OpenTelemetry export, and the `mimalloc` allocator. Release binaries and the container image are built with `full`. Configuring `s3` or `engine = "redb"` in a build without that feature aborts startup with a field-qualified error.
+- **full** — the core plus the optional extensions (`roci-ext-*`) for signatures, search, sync, and scanning, the S3 storage backend (`s3`), the embedded redb metadata engine (`redb`), LDAP authentication (`ldap`), OpenTelemetry export, and the `mimalloc` allocator. Release binaries and the container image are built with `full`. Configuring `s3`, `engine = "redb"`, or `auth.ldap` in a build without the corresponding feature aborts startup with a field-qualified error.
 
 Every extension is reachable from the CLI **only** behind a cargo feature, never as an unconditional dependency. Behavior is then selected at runtime through configuration.
 

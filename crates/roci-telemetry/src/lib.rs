@@ -21,8 +21,8 @@ mod metrics;
 
 #[cfg(feature = "otel")]
 pub use metrics::{
-    record_dedupe_link, record_error, record_gc_collected, record_quota_rejection, record_request,
-    record_scrub,
+    record_auth_decision, record_dedupe_link, record_error, record_gc_collected,
+    record_quota_rejection, record_request, record_scrub,
 };
 
 /// Record a completed request (duration histogram + error counter).
@@ -65,6 +65,12 @@ pub fn record_dedupe_link(_op: &str, _mechanism: &str) {}
 #[cfg(not(feature = "otel"))]
 #[inline(always)]
 pub fn record_quota_rejection(_scope: &str) {}
+
+/// Count one authentication/authorization decision by `method` and `result`.
+/// No-op in minimal builds.
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+pub fn record_auth_decision(_method: &str, _result: &str) {}
 
 // ── Guard ───────────────────────────────────────────────────────────────
 

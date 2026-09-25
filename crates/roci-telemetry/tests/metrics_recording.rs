@@ -45,6 +45,7 @@ async fn metrics_full_lifecycle() {
     roci_telemetry::record_scrub("corrupt", 512);
     roci_telemetry::record_dedupe_link("dedupe", "hardlink");
     roci_telemetry::record_quota_rejection("total");
+    roci_telemetry::record_auth_decision("htpasswd", "denied");
 
     let router = roci_telemetry::metrics_router(&config);
     let resp = router
@@ -84,5 +85,11 @@ async fn metrics_full_lifecycle() {
     assert!(
         text.contains("registry_dedupe_links_total{") && text.contains("mechanism=\"hardlink\""),
         "missing dedupe link series in: {text}"
+    );
+    assert!(
+        text.contains("registry_auth_decisions_total{")
+            && text.contains("method=\"htpasswd\"")
+            && text.contains("result=\"denied\""),
+        "missing auth decision series in: {text}"
     );
 }

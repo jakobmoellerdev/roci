@@ -6,8 +6,10 @@ use axum::response::Response;
 use axum::Router;
 use http_body_util::BodyExt;
 use roci_config::Config;
+use roci_core::auth::Auth;
 use roci_core::{build_router, AppState};
 use roci_storage::{sha256_of, Digest, FsStorage};
+use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -21,6 +23,18 @@ pub fn app_with_config(config: Config) -> (Router, TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(dir.path()).unwrap();
     (build_router(AppState::new_with(storage, config)), dir)
+}
+
+/// App with the auth engine built from `config` (which must enable auth);
+/// the engine is returned for live-reload assertions.
+pub fn app_with_auth(config: Config) -> (Router, Arc<Auth>, TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = FsStorage::new(dir.path()).unwrap();
+    let auth = Auth::from_config(&config)
+        .unwrap()
+        .expect("auth configured");
+    let state = AppState::new_with(storage, config).with_auth(Some(Arc::clone(&auth)));
+    (build_router(state), auth, dir)
 }
 
 /// App plus the storage handle, for direct seeding / IO-error injection.

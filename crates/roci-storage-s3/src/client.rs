@@ -10,6 +10,58 @@ use roci_config::S3Config;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
+use url::Url;
+
+/// SSRF containment: only redirect to pre-approved hosts.
+///
+/// Built from `S3Config` at startup; checked before every signed-URL redirect.
+/// If the URL fails the guard the blob is proxied instead of redirected.
+#[derive(Debug, Clone)]
+pub(crate) struct RedirectGuard {
+    hosts: Vec<String>,
+    allow_http: bool,
+}
+
+impl RedirectGuard {
+    /// Derive the allowlist from config.
+    ///
+    /// With `endpoint`: the endpoint's host (lowercased).
+    /// Without: `s3.<region>.amazonaws.com` and `<bucket>.s3.<region>.amazonaws.com`.
+    pub(crate) fn from_config(s3: &S3Config) -> Self {
+        let allow_http = s3.allow_http;
+        let hosts = if let Some(ep) = &s3.endpoint {
+            // The endpoint is validated as an http(s) URL at config load.
+            Url::parse(ep)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_lowercase))
+                .into_iter()
+                .collect()
+        } else {
+            let region = s3.region.to_lowercase();
+            let bucket = s3.bucket.to_lowercase();
+            vec![
+                format!("s3.{region}.amazonaws.com"),
+                format!("{bucket}.s3.{region}.amazonaws.com"),
+            ]
+        };
+        Self { hosts, allow_http }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(hosts: Vec<String>, allow_http: bool) -> Self {
+        Self { hosts, allow_http }
+    }
+
+    /// Returns `true` when the signed URL may be sent to the client as a 307.
+    pub(crate) fn permits(&self, url: &Url) -> bool {
+        let scheme_ok = url.scheme() == "https" || (self.allow_http && url.scheme() == "http");
+        scheme_ok
+            && url.host_str().is_some_and(|host| {
+                let host = host.to_lowercase();
+                !roci_config::is_internal_host(&host) && self.hosts.contains(&host)
+            })
+    }
+}
 
 /// Wraps `Arc<dyn ObjectStore>` plus an optional signer and config knobs.
 #[derive(Clone)]
@@ -30,6 +82,8 @@ pub(crate) struct S3Client {
     /// Single CopyObject ceiling; objects above this use parallel ranged-read
     /// → multipart copy. Production default: 5 GiB; tests may lower it.
     pub copy_limit: u64,
+    /// SSRF host guard for signed-URL redirects.
+    pub redirect_guard: RedirectGuard,
 }
 
 /// The HTTPS client is built on rustls without a bundled provider: make
@@ -88,6 +142,8 @@ impl S3Client {
         // AmazonS3 implements Signer.
         let signer: Arc<dyn Signer> = Arc::new(store.clone());
 
+        let redirect_guard = RedirectGuard::from_config(s3);
+
         Ok(Self {
             store: Arc::new(store),
             signer: Some(signer),
@@ -97,6 +153,7 @@ impl S3Client {
             multipart_part_size: s3.multipart_part_size,
             multipart_concurrency: s3.multipart_concurrency,
             copy_limit: super::storage_impl::S3_COPY_LIMIT,
+            redirect_guard,
         })
     }
 
@@ -121,6 +178,13 @@ impl S3Client {
             multipart_part_size,
             multipart_concurrency,
             copy_limit: super::storage_impl::S3_COPY_LIMIT,
+            redirect_guard: RedirectGuard::new(vec!["s3.test.example".into()], false),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_redirect_guard(mut self, g: RedirectGuard) -> Self {
+        self.redirect_guard = g;
+        self
     }
 }
