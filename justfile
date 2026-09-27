@@ -212,9 +212,13 @@ container-multiarch:
 helm-lint:
     bash scripts/helm-lint.sh
 
-# Benchmark roci vs CNCF distribution vs zot in pinned containers (requires rootful Docker, ≥4 CPUs).
-# `quick` ≈ 10 min smoke; `full` = 5 interleaved reps (authoritative only on a dedicated Linux host).
-bench profile="quick":
+# Benchmark roci (multiple engine configs) vs CNCF distribution vs zot in pinned containers
+# (requires rootful Docker, ≥4 CPUs). `quick` ≈ 10 min smoke; `full` = 5 interleaved reps
+# (authoritative only on a dedicated Linux host). Pass a comma-separated `registries` list
+# to select a subset, e.g. `just bench quick "roci-log,roci-lmdb,zot"`.
+bench profile="quick" registries="":
+    #!/usr/bin/env bash
+    if [[ -n "{{registries}}" ]]; then export BENCH_REGISTRIES="{{registries}}"; fi
     bash bench/run.sh compare {{profile}}
 
 # Profile roci alone (perf CPU flamegraphs, syscall summary, server-side route latency, findings) with a

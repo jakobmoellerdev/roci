@@ -1,5 +1,11 @@
 seed = 42
 
+# All registries: every roci engine variant + external registries.
+all_registries = ["roci-log", "roci-snapshot", "roci-lmdb", "zot", "distribution"]
+
+# roci variants share the same image — only the config file differs.
+roci_variants = ["roci-log", "roci-snapshot", "roci-lmdb"]
+
 [images.zot]   # zot full image, no extensions configured (shipped default image; zot-minimal is not benchmarked)
 amd64 = "ghcr.io/project-zot/zot-linux-amd64:v2.1.21@sha256:8258443838e95989c13c891f78a02bc1c391b5a00591ffef24cb8c17cde28038"
 arm64 = "ghcr.io/project-zot/zot-linux-arm64:v2.1.21@sha256:0270db3550faf4de3b4a1c6e2fe0a638abbf588769f673d2a4bb0bccaaaa50e8"
@@ -20,6 +26,15 @@ step_secs = 5
 warmup_secs = 2
 fleet = 4
 
+[profiles.quick.scale]
+# Metadata-scale: many small manifests sharing one config+layer, vary tag.
+# Target ~100k tags in "quick-scale"; scale_repos × scale_tags_per_repo.
+scale_repos = 10
+scale_tags_per_repo = 10000
+scale_concurrency = 32
+scale_read_concurrency = 32
+scale_read_secs = 10
+
 [profiles.full]
 reps = 5
 zb_concurrency = [1, 16]
@@ -31,3 +46,10 @@ ladder_rps = [1000, 2000, 4000, 8000, 16000, 32000]
 step_secs = 10
 warmup_secs = 3
 fleet = 16
+
+[profiles.full.scale]
+scale_repos = 100
+scale_tags_per_repo = 10000
+scale_concurrency = 64
+scale_read_concurrency = 64
+scale_read_secs = 20

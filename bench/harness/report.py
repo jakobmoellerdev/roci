@@ -5,14 +5,20 @@ from __future__ import annotations
 import re
 import statistics
 
+
+# Shared with bench.py — roci variant names.
+_ROCI_NAMES = {"roci", "roci-log", "roci-snapshot", "roci-lmdb"}
 # key -> (label, unit, better)
 METRICS: dict[str, tuple[str, str, str]] = {
     "startup.empty_ms": ("Startup, empty store", "ms", "lower"),
     "startup.populated_ms": ("Startup, populated store", "ms", "lower"),
     "startup.populated_first_manifest_ms": ("Startup → first manifest served", "ms", "lower"),
     "memory.idle_anon_mib": ("Idle anon RSS", "MiB", "lower"),
+    "memory.idle_file_mib": ("Idle page cache", "MiB", "lower"),
     "memory.corpus_anon_mib": ("Anon RSS after corpus seed", "MiB", "lower"),
+    "memory.corpus_file_mib": ("Page cache after corpus seed", "MiB", "lower"),
     "memory.peak_anon_mib": ("Peak anon RSS (whole run)", "MiB", "lower"),
+    "memory.peak_file_mib": ("Peak page cache (whole run)", "MiB", "lower"),
     "storm.images_per_s": ("Push storm throughput", "images/s", "higher"),
     "storm.p99_ms": ("Push storm p99 per image", "ms", "lower"),
     "crane.push_s": ("crane push (85 MiB image)", "s", "lower"),
@@ -22,6 +28,22 @@ METRICS: dict[str, tuple[str, str, str]] = {
     "crane.fleet_pull_s": ("crane fleet pull (concurrent)", "s", "lower"),
     "cpu.zb_cpu_s_per_gib": ("Server CPU per GiB moved (zb)", "CPU-s/GiB", "lower"),
     "disk.bytes": ("Disk used after run", "bytes", "lower"),
+    "disk.meta_bytes": ("Metadata on-disk size", "bytes", "lower"),
+    "scale.push_images_per_s": ("Scale push throughput", "images/s", "higher"),
+    "scale.push_p99_ms": ("Scale push p99 per image", "ms", "lower"),
+    "scale.total_tags": ("Scale total tags pushed", "tags", "higher"),
+    "scale.resolve_p50_ms": ("Tag resolve p50 (scale corpus)", "ms", "lower"),
+    "scale.resolve_p99_ms": ("Tag resolve p99 (scale corpus)", "ms", "lower"),
+    "scale.resolve_rps": ("Tag resolve rps (scale corpus)", "rps", "higher"),
+    "scale.tags_list_ms": ("tags/list paging (one repo, all pages)", "ms", "lower"),
+    "scale.tags_list_count": ("tags/list total count", "tags", "higher"),
+    "scale.referrers_ms": ("Referrers listing", "ms", "lower"),
+    "scale.anon_mib_after_push": ("Anon RSS after scale push", "MiB", "lower"),
+    "scale.file_mib_after_push": ("Page cache after scale push", "MiB", "lower"),
+    "scale.anon_mib_after_read": ("Anon RSS after scale reads", "MiB", "lower"),
+    "scale.file_mib_after_read": ("Page cache after scale reads", "MiB", "lower"),
+    "scale.startup_populated_ms": ("Startup with scale corpus", "ms", "lower"),
+    "scale.meta_bytes": ("Metadata size after scale", "bytes", "lower"),
 }
 for _ep in ("manifest_get", "blob_head", "blob_head_missing", "tags_list"):
     METRICS[f"hot.{_ep}.max_sustained_rps"] = (f"{_ep}: max sustained rps", "rps", "higher")
@@ -34,7 +56,7 @@ _ZB_META = {"rps": ("rps", "higher"), "p50_ms": ("ms", "lower"), "p99_ms": ("ms"
 
 GROUPS = [("Startup", "startup."), ("Memory", "memory."), ("Push storm (loadgen)", "storm."),
           ("Hot path (vegeta)", "hot."), ("Real client (crane)", "crane."), ("Throughput (zb)", "zb."),
-          ("CPU efficiency", "cpu."), ("Disk", "disk.")]
+          ("CPU efficiency", "cpu."), ("Disk", "disk."), ("Metadata scale", "scale.")]
 
 
 def metric_meta(key: str) -> tuple[str, str, str] | None:
@@ -80,7 +102,7 @@ def summarize(per_rep: list[dict]) -> dict:
 
 def _phase_of(key: str) -> str:
     return {"startup": "startup_empty", "memory": "startup_empty", "storm": "storm", "hot": "hot",
-            "crane": "crane", "zb": "zb", "cpu": "zb", "disk": "disk"}[key.split(".")[0]]
+            "crane": "crane", "zb": "zb", "cpu": "zb", "disk": "disk", "scale": "scale"}[key.split(".")[0]]
 
 
 def _fmt(v: float) -> str:
@@ -94,9 +116,12 @@ def _fmt(v: float) -> str:
 
 
 def render_markdown(summary: dict, env: dict, title_note: str | None = None) -> str:
+    _is_roci = _ROCI_NAMES.__contains__
     regs = summary["registries"]
-    has_roci = "roci" in regs and len(regs) > 1
-    others = [r for r in regs if r != "roci"]
+    # Use the first roci variant as baseline for "vs" columns; fall back to bare "roci".
+    roci_base = next((r for r in regs if _is_roci(r)), None)
+    has_base = roci_base is not None and len(regs) > 1
+    others = [r for r in regs if r != roci_base] if has_base else []
     L: list[str] = ["# Registry benchmark: " + " vs ".join(regs), ""]
     if title_note:
         L += [f"> **{title_note}**", ""]
@@ -113,15 +138,16 @@ def render_markdown(summary: dict, env: dict, title_note: str | None = None) -> 
     for r, img in env.get("images", {}).items():
         L.append(f"- **image {r}**: `{(img.get('RepoDigests') or [img.get('Id')])[0]}`")
     L.append("")
-    L += ["Cells are `median [min–max]` over reps. `vs roci` = other/roci median; `≈` = ranges overlap; "
-          "`⚠ unstable` = CV > 10%.", ""]
+    base_label = roci_base or "roci"
+    L += [f"Cells are `median [min–max]` over reps. `vs {base_label}` = other/baseline median; "
+          "`≈` = ranges overlap; `⚠ unstable` = CV > 10%.", ""]
     footnotes: list[str] = []
     for gname, prefix in GROUPS:
         keys = [k for k in summary["metrics"] if k.startswith(prefix) and metric_meta(k)]
         if not keys:
             continue
         keys.sort(key=lambda k: (list(METRICS).index(k) if k in METRICS else len(METRICS), k))
-        hdr = ["metric"] + regs + ([f"{o} vs roci" for o in others] if has_roci else [])
+        hdr = ["metric"] + regs + ([f"{o} vs {base_label}" for o in others] if has_base else [])
         L += [f"## {gname}", "", "| " + " | ".join(hdr) + " |", "|" + "---|" * len(hdr)]
         for k in keys:
             label, unit, better = metric_meta(k)
@@ -153,8 +179,8 @@ def render_markdown(summary: dict, env: dict, title_note: str | None = None) -> 
                         if fn not in footnotes:
                             footnotes.append(fn)
                 row.append(cell)
-            if has_roci:
-                base = m.get("roci")
+            if has_base:
+                base = m.get(roci_base)
                 for o in others:
                     s = m.get(o)
                     if not base or not s or not base["median"] or "FAILED" in row:

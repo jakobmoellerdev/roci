@@ -1,0 +1,5 @@
+[log]
+level = "warn"
+
+[storage.metadata]
+engine = "lmdb"
