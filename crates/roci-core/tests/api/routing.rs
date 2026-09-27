@@ -15,7 +15,6 @@ async fn base_endpoint_ok() {
 #[tokio::test]
 async fn unsupported_paths_for_every_method() {
     let (app, _d) = app();
-    // parse_path → Unknown: too few segments, and an unknown verb.
     for path in ["/v2/onlyone", "/v2/repo/bogusverb/x"] {
         for method in [
             Method::GET,
@@ -37,46 +36,31 @@ async fn unsupported_paths_for_every_method() {
 #[tokio::test]
 async fn malformed_name_and_reference_rejected_before_handler() {
     let (app, _d) = app();
-    // Uppercase repo name → NAME_INVALID (400), before any storage access.
     let v = body_json_of(&app, get("/v2/Foo/manifests/tag")).await;
     assert_eq!(v["errors"][0]["code"], "NAME_INVALID");
-    // Path-traversal repo component → NAME_INVALID.
     assert_eq!(
         status_of(&app, get("/v2/a/../b/manifests/t")).await,
         StatusCode::BAD_REQUEST
     );
-    // A syntactically-invalid manifest reference is NOT a 400 — per the
-    // dist-spec conformance suite it resolves to 404 MANIFEST_UNKNOWN
-    // (matches the suite's `.INVALID_MANIFEST_NAME` nonexistent-manifest
-    // case). Only the repository name is grammar-rejected (above).
     let v = body_json_of(&app, get("/v2/ok/manifests/.INVALID_MANIFEST_NAME")).await;
     assert_eq!(v["errors"][0]["code"], "MANIFEST_UNKNOWN");
 }
 
 #[tokio::test]
-async fn put_and_patch_to_invalid_name_rejected() {
+async fn invalid_name_rejected_for_all_methods() {
     let (app, _d) = app();
-    assert_eq!(
-        status_of(&app, put("/v2/BAD/manifests/t", Body::empty())).await,
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        status_of(&app, patch("/v2/BAD/blobs/uploads/x", Body::empty())).await,
-        StatusCode::BAD_REQUEST
-    );
-}
-
-#[tokio::test]
-async fn head_and_post_to_invalid_name_rejected() {
-    let (app, _d) = app();
-    assert_eq!(
-        status_of(&app, head("/v2/BAD/manifests/t")).await,
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        status_of(&app, post("/v2/BAD/blobs/uploads/", Body::empty())).await,
-        StatusCode::BAD_REQUEST
-    );
+    for (label, req) in [
+        ("PUT", put("/v2/BAD/manifests/t", Body::empty())),
+        ("PATCH", patch("/v2/BAD/blobs/uploads/x", Body::empty())),
+        ("HEAD", head("/v2/BAD/manifests/t")),
+        ("POST", post("/v2/BAD/blobs/uploads/", Body::empty())),
+    ] {
+        assert_eq!(
+            status_of(&app, req).await,
+            StatusCode::BAD_REQUEST,
+            "{label}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -111,6 +95,5 @@ async fn delete_disabled_returns_405() {
             StatusCode::METHOD_NOT_ALLOWED
         );
     }
-    // Nothing was deleted.
     assert!(storage.get_manifest("r", "v1").await.is_ok());
 }

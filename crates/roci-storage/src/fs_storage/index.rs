@@ -1,6 +1,4 @@
-//! `index.json` write-behind and reconciliation: deriving the on-disk image
-//! index from the metadata store, importing foreign tags, and the background
-//! writer that persists dirty repos.
+//! `index.json` write-behind and reconciliation.
 
 use super::paths::repo_rel;
 use super::FsStorage;
@@ -16,15 +14,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::AsyncReadExt;
 
-/// Retry interval for dirty `index.json` rewrites that failed (transient IO).
 const INDEX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
-/// Quiet period after a mutation before persisting, so a burst of pushes to a
-/// repo rewrites its index once rather than per manifest. Reads through roci
-/// never wait on it (a dirty repo's index is derived in memory).
+/// Quiet period before persisting, so a burst rewrites the index once.
 const INDEX_COALESCE: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl FsStorage {
-    /// Mark `repo` dirty (bumping its generation) and wake the background writer.
+    /// Mark `repo` dirty and wake the background writer.
     pub(super) fn mark_index_dirty(&self, repo: &str) {
         *self
             .index_dirty
@@ -35,16 +30,7 @@ impl FsStorage {
         self.index_notify.notify_one();
     }
 
-    /// Spawn the coalescing background `index.json` writer. Each wake snapshots
-    /// the dirty map, rebuilds every dirty repo's index from the metadata store
-    /// (preserving foreign descriptors on disk), writes it atomically, and
-    /// clears the entry only if no newer mutation arrived meanwhile. A failed
-    /// write stays dirty for the next wake. Exits when the last `FsStorage`
-    /// clone drops (cancel sender dropped → `cancel` resolves).
-    ///
-    /// Constructed outside a Tokio runtime there is nowhere to run the task;
-    /// the repos simply stay dirty (reads through roci derive the index in
-    /// memory) and [`FsStorage::reconcile_index_json`] persists them later.
+    /// Spawn the coalescing background `index.json` writer. Exits when cancel fires.
     pub(super) fn spawn_index_writer(&self, mut cancel: oneshot::Receiver<()>) {
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return;
@@ -55,9 +41,6 @@ impl FsStorage {
         let meta = Arc::clone(&self.meta);
         rt.spawn(async move {
             loop {
-                // Wake on a new mutation; while anything is still dirty after a
-                // failed pass (transient ENOSPC/EIO), also retry on a bounded
-                // backoff so the on-disk index cannot stay stale indefinitely.
                 let pending = !dirty.lock().expect("index_dirty poisoned").is_empty();
                 tokio::select! {
                     _ = notify.notified() => {}
@@ -70,10 +53,6 @@ impl FsStorage {
         });
     }
 
-    /// Persist every currently dirty repo's `index.json` (one pass). A repo
-    /// whose existing index cannot be *read* (as opposed to being absent) is
-    /// skipped and stays dirty — overwriting it from metadata alone would drop
-    /// its foreign descriptors.
     pub(super) async fn flush_dirty(
         root: &Path,
         meta: &dyn MetadataStore,
@@ -112,11 +91,8 @@ impl FsStorage {
         }
     }
 
-    /// Read and parse `<repo>/index.json` beneath the root, no-follow. `Ok(None)`
-    /// when absent. `Err` when the file exists but cannot be read or parsed
-    /// (the GC must treat an unreadable existing index differently from an
-    /// absent one — a missing index is benign, but a corrupt/unreadable one
-    /// means root digests are unknown and GC must not sweep that repo).
+    /// Read `<repo>/index.json` beneath root (no-follow). `Ok(None)` when absent;
+    /// `Err` for corrupt/unreadable (GC must not sweep that repo).
     pub(super) async fn read_index_beneath(
         root: &Path,
         repo: &str,
@@ -136,22 +112,11 @@ impl FsStorage {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
-    /// Startup reconciliation (crash recovery for the write-behind): for every
-    /// repo the metadata store knows, rebuild `index.json` and persist it if it
-    /// differs from disk. Closes the window where a WAL record was durable but
-    /// the process died before the background rename. Also imports tags from
-    /// any pre-existing (externally written) `index.json` the log has not seen,
-    /// so the first rebuild never drops them. Sweeps stale `.index.json.*.tmp`
-    /// orphans left by a crash during the named-temp fallback write path (the
-    /// `O_TMPFILE` path cannot leave orphans because the inode is anonymous
-    /// until `linkat`). Run once before serving.
+    /// Startup reconciliation: rebuild `index.json` from WAL + import foreign
+    /// tags. Sweeps stale `.index.json.*.tmp` orphans.
     pub async fn reconcile_index_json(&self) {
         for repo in discover_repos(&self.root) {
-            // Sweep stale `.index.json.<rand>.tmp` orphans in this repo dir.
-            // Only regular files matching that exact pattern are removed
-            // (never follow symlinks, never remove directories).
             Self::sweep_index_tmp_orphans(&self.root, &repo);
-
             let Ok(Some(existing)) = Self::read_index_beneath(&self.root, &repo).await else {
                 continue;
             };
@@ -171,8 +136,7 @@ impl FsStorage {
             }
         }
         for repo in self.meta.repos() {
-            // Also sweep repos known to the metadata store (they may not
-            // have been discovered above if they lack an index/layout).
+            // Sweep repos known to metadata that lack an index/layout.
             Self::sweep_index_tmp_orphans(&self.root, &repo);
 
             if Self::read_index_beneath(&self.root, &repo)
@@ -187,11 +151,7 @@ impl FsStorage {
         Self::flush_dirty(&self.root, &*self.meta, &self.index_dirty).await;
     }
 
-    /// Remove stale `.index.json.<rand>.tmp` orphans from a single repo
-    /// directory. Only regular files (no-follow via `symlink_metadata`)
-    /// matching the exact naming pattern are unlinked; symlinks and
-    /// directories are left alone. Bounded to one `read_dir` per repo
-    /// (already visited at startup by `discover_repos`).
+    /// Remove stale `.index.json.<rand>.tmp` orphans (no-follow, regular files only).
     fn sweep_index_tmp_orphans(root: &Path, repo: &str) {
         let Ok(repo_rel) = repo_rel(repo) else {
             return;
@@ -206,7 +166,6 @@ impl FsStorage {
             if !name_str.starts_with(".index.json.") || !name_str.ends_with(".tmp") {
                 continue;
             }
-            // Only remove regular files (no-follow) — never a symlink or dir.
             let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
                 continue;
             };
@@ -217,22 +176,8 @@ impl FsStorage {
         }
     }
 
-    /// Atomically replace `<repo>/index.json`, anchored to a dirfd walked
-    /// no-follow beneath the store root (a symlink planted at any repo
-    /// component cannot redirect the write), ensuring the `oci-layout` marker
-    /// first.
-    ///
-    /// On Linux: opens an anonymous `O_TMPFILE` inode in the repo dirfd →
-    /// writes + `fsync` → `linkat` via `/proc/self/fd/N` to a unique hidden
-    /// temp name → `renameat` onto `index.json` → dir `fsync`. The inode is
-    /// namespace-invisible until the `linkat` completes, so a crash during the
-    /// write leaves no orphan. Only the tiny `linkat`→`renameat` window can
-    /// leave a *complete* temp (cleaned at startup by
-    /// [`Self::sweep_index_tmp_orphans`]).
-    ///
-    /// On `O_TMPFILE` unsupported (or non-Linux): falls back to the named-temp
-    /// path (unique `.index.json.<rand>.tmp` → write → `fsync` → `renameat`
-    /// → dir `fsync`). Orphans from this path are also cleaned at startup.
+    /// Atomically replace `<repo>/index.json` via `O_TMPFILE`+`linkat` (Linux)
+    /// or named-temp fallback.
     pub(super) async fn write_index_at_root(
         root: &Path,
         repo: &str,
@@ -247,19 +192,14 @@ impl FsStorage {
             use rustix::fs::{Mode, OFlags};
             use std::io::Write as _;
             let dirfd = dir_beneath(&root, &repo_rel, false)?;
-            // Generate a random suffix used by both the O_TMPFILE linkat
-            // target and the named-temp fallback.
             let mut rnd = [0u8; 8];
             getrandom::fill(&mut rnd).map_err(io::Error::other)?;
             let tmp = format!(".index.json.{}.tmp", hex::encode(rnd));
 
             if Self::try_write_index_otmpfile(&dirfd, &bytes, &tmp)? {
-                // O_TMPFILE path succeeded: the temp has been linkat'd and
-                // renamed onto index.json.
                 return Ok(());
             }
 
-            // Fallback: named temp (non-Linux or O_TMPFILE unsupported).
             let fd = rustix::fs::openat(
                 &dirfd,
                 tmp.as_str(),
@@ -283,10 +223,7 @@ impl FsStorage {
         .await
     }
 
-    /// Attempt to write `index.json` via the Linux `O_TMPFILE`+`linkat` path.
-    /// Returns `Ok(true)` if it succeeded (file is committed), `Ok(false)` if
-    /// `O_TMPFILE` is unsupported (caller should fall back to named temp),
-    /// `Err` on a real I/O error.
+    /// Linux: write via `O_TMPFILE`+`linkat`. Returns `Ok(false)` if unsupported.
     #[cfg(target_os = "linux")]
     fn try_write_index_otmpfile(
         dirfd: &std::os::fd::OwnedFd,
@@ -310,16 +247,12 @@ impl FsStorage {
         };
         let fd = match opened {
             Ok(fd) => fd,
-            // O_TMPFILE unavailable → signal the portable fallback.
             Err(_) => return Ok(false),
         };
         let mut f = std::fs::File::from(fd);
         f.write_all(bytes)?;
         f.sync_all()?;
 
-        // Link the anonymous inode into place via /proc/self/fd magic link
-        // as a unique hidden temp name (linkat never overwrites, so we
-        // cannot link directly onto index.json).
         let proc_path = format!("/proc/self/fd/{}", f.as_raw_fd());
         rustix::fs::linkat(
             rustix::fs::CWD,
@@ -329,11 +262,8 @@ impl FsStorage {
             AtFlags::SYMLINK_FOLLOW,
         )
         .map_err(io::Error::from)?;
-
-        // Now atomically replace index.json with our complete temp.
         let renamed = rustix::fs::renameat(dirfd, tmp_name, dirfd, "index.json");
         if renamed.is_err() {
-            // Clean up the linkat'd temp on rename failure.
             let _ = rustix::fs::unlinkat(dirfd, tmp_name, AtFlags::empty());
         }
         renamed.map_err(io::Error::from)?;
@@ -341,7 +271,7 @@ impl FsStorage {
         Ok(true)
     }
 
-    /// Non-Linux: `O_TMPFILE` is not available; always signal fallback.
+    /// Non-Linux: `O_TMPFILE` unavailable; signal fallback.
     #[cfg(not(target_os = "linux"))]
     fn try_write_index_otmpfile(
         _dirfd: &std::os::fd::OwnedFd,
@@ -351,12 +281,8 @@ impl FsStorage {
         Ok(false)
     }
 
-    /// Read `<repo>/index.json` as an image index. A missing index yields the
-    /// canonical empty image index. A malformed on-disk index is an internal
-    /// error (mapped to [`StorageError::Io`]).
+    /// Read `<repo>/index.json`. Dirty repos derive the current view in memory.
     pub(super) async fn read_index(&self, repo: &str) -> Result<serde_json::Value, StorageError> {
-        // A dirty repo's on-disk index.json lags the metadata store (write-behind);
-        // derive the current view in memory. The background writer persists it.
         let is_dirty = self
             .index_dirty
             .lock()
@@ -384,9 +310,7 @@ impl FsStorage {
         }
     }
 
-    /// Fallback: recover a manifest's media type from `index.json` when the
-    /// in-RAM index has no entry (e.g. an externally-provided layout the seed
-    /// did not cover). `None` if the digest is not listed.
+    /// Recover media type from `index.json` for a digest not in the in-RAM index.
     pub(super) async fn index_media_type_for_digest(
         &self,
         repo: &str,
@@ -401,8 +325,7 @@ impl FsStorage {
             .map(str::to_string))
     }
 
-    /// Fallback: resolve a tag to `(digest, media_type)` from `index.json` when
-    /// the in-RAM tag map misses. `NotFound` if no descriptor carries the tag.
+    /// Resolve a tag to `(digest, media_type)` from `index.json` fallback.
     pub(super) async fn index_resolve_tag(
         &self,
         repo: &str,

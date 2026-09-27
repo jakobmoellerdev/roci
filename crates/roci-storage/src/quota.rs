@@ -1,13 +1,5 @@
-//! Storage quotas and the concurrent upload-session cap (SECURITY §Storage
-//! boundary "Quota / exhaustion"). One [`QuotaTracker`] is shared by every
-//! backend of a registry, so the registry-wide cap spans all subpaths while a
-//! repository — routed to exactly one backend — is capped on its own.
-//!
-//! Accounting is **logical**: a blob counts once per repository that holds it,
-//! whether it is stored as its own file or deduplicated via reflink/hard link.
-//! That over-approximates physical usage under dedupe, so a cap never admits
-//! more than the configured bytes. Byte tracking is only kept when a byte cap
-//! is configured (no per-blob `stat` at startup otherwise).
+//! Storage quotas and upload-session cap (SECURITY §Storage boundary
+//! "Quota / exhaustion"). Logical accounting: per-repo + registry-wide.
 
 use crate::error::{QuotaScope, StorageError};
 use std::collections::HashMap;
@@ -44,14 +36,11 @@ impl QuotaTracker {
         }
     }
 
-    /// Whether byte usage is tracked (some byte cap is configured).
     pub fn tracks_bytes(&self) -> bool {
         self.limits.max_repo_bytes > 0 || self.limits.max_total_bytes > 0
     }
 
-    /// Reserve `size` bytes for a blob entering `repo`, failing without any
-    /// change when either cap would be exceeded. Check and charge are one
-    /// critical section, so concurrent finalizes cannot jointly overshoot.
+    /// Reserve `size` bytes, failing atomically if either cap is exceeded.
     pub fn admit(&self, repo: &str, size: u64) -> Result<(), StorageError> {
         if !self.tracks_bytes() {
             return Ok(());
@@ -76,7 +65,7 @@ impl QuotaTracker {
         Ok(())
     }
 
-    /// Count an already-stored blob (startup accounting): no cap check.
+    /// Count an already-stored blob (startup); no cap check.
     pub fn seed(&self, repo: &str, size: u64) {
         if self.tracks_bytes() {
             self.bytes
@@ -86,17 +75,12 @@ impl QuotaTracker {
         }
     }
 
-    /// Return `size` bytes: a blob left `repo`, or an admitted blob was not
-    /// stored after all (failed promote / it was already present). An unknown
-    /// repo is a no-op, and at most what the repo currently holds is released
-    /// from both the per-repo and total counters (prevents undercount from
-    /// stale/double cleanup).
+    /// Return `size` bytes (capped at what `repo` holds).
     pub fn release(&self, repo: &str, size: u64) {
         if !self.tracks_bytes() {
             return;
         }
         let mut b = self.bytes.lock().expect("quota lock poisoned");
-        // Only release what the repo actually holds.
         let Some(used) = b.per_repo.get_mut(repo) else {
             return; // unknown repo → no-op
         };
@@ -108,18 +92,15 @@ impl QuotaTracker {
         b.total = b.total.saturating_sub(actual);
     }
 
-    /// Bytes currently accounted to `repo`.
     pub fn repo_bytes(&self, repo: &str) -> u64 {
         let b = self.bytes.lock().expect("quota lock poisoned");
         b.per_repo.get(repo).copied().unwrap_or(0)
     }
 
-    /// Bytes currently accounted registry-wide.
     pub fn total_bytes(&self) -> u64 {
         self.bytes.lock().expect("quota lock poisoned").total
     }
 
-    /// Open one upload session, failing at the concurrent-session cap.
     pub fn begin_session(&self) -> Result<(), StorageError> {
         let limit = self.limits.max_upload_sessions;
         let admitted = self
@@ -139,13 +120,11 @@ impl QuotaTracker {
         }
     }
 
-    /// Count sessions found staged at startup: no cap check.
     pub fn seed_sessions(&self, n: usize) {
         self.sessions.fetch_add(n, Ordering::AcqRel);
         roci_telemetry::record_upload_active(i64::try_from(n).unwrap_or(i64::MAX));
     }
 
-    /// Close one upload session (its staging file is gone).
     pub fn end_session(&self) {
         let closed = self
             .sessions
@@ -155,11 +134,10 @@ impl QuotaTracker {
         }
     }
 
-    /// Upload sessions currently open.
     pub fn sessions(&self) -> usize {
         self.sessions.load(Ordering::Acquire)
     }
-    /// Per-repo byte usage snapshot for fast-restart stamp serialization.
+    /// Per-repo byte snapshot for fast-restart.
     pub fn per_repo_bytes(&self) -> Vec<(String, u64)> {
         self.bytes
             .lock()
@@ -211,7 +189,6 @@ mod tests {
                 requested: 1
             }
         ));
-        // A rejected admission charged nothing.
         assert_eq!((q.repo_bytes("a"), q.total_bytes()), (10, 10));
         q.admit("b", 5).unwrap();
         assert!(matches!(
@@ -221,7 +198,6 @@ mod tests {
                 ..
             })
         ));
-        // Releasing makes room again; an emptied repo drops out.
         q.release("a", 10);
         assert_eq!(q.repo_bytes("a"), 0);
         q.admit("c", 1).unwrap();
@@ -257,7 +233,6 @@ mod tests {
     fn release_unknown_repo_is_noop() {
         let q = limits(100, 200, 0);
         q.admit("a", 10).unwrap();
-        // Releasing from an unknown repo changes nothing.
         q.release("unknown", 10);
         assert_eq!(q.total_bytes(), 10);
         assert_eq!(q.repo_bytes("a"), 10);
@@ -268,7 +243,6 @@ mod tests {
         let q = limits(100, 200, 0);
         q.admit("a", 10).unwrap();
         q.admit("b", 20).unwrap();
-        // Release more than repo "a" holds: only 10 released from total.
         q.release("a", 50);
         assert_eq!(q.repo_bytes("a"), 0);
         assert_eq!(q.total_bytes(), 20); // only b's 20 remain
@@ -279,7 +253,6 @@ mod tests {
         let q = limits(100, 200, 0);
         q.admit("a", 10).unwrap();
         q.release("a", 10);
-        // Second release: repo "a" is gone → no-op.
         q.release("a", 10);
         assert_eq!(q.total_bytes(), 0);
     }
@@ -299,10 +272,8 @@ mod tests {
             q.end_session();
         }
         assert_eq!(q.sessions(), 0);
-        // Seeded (pre-existing) sessions count against the cap.
         q.seed_sessions(2);
         assert!(q.begin_session().is_err());
-        // Zero means unlimited.
         let u = limits(0, 0, 0);
         for _ in 0..100 {
             u.begin_session().unwrap();

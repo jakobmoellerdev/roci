@@ -1,50 +1,27 @@
-//! Online GC bookkeeping (ARCHITECTURE §Inline storage optimizations, RESEARCH
-//! §8.3): the **candidate set** of blobs that are currently unreferenced, each
-//! stamped with the last time something wanted it, plus the **fence** that
-//! makes "is it still collectable?" and "delete it" atomic with respect to
-//! every path that wants a blob.
-//!
-//! A blob becomes a candidate when it enters the CAS unreferenced (a pushed
-//! layer before its manifest arrives) or when its backref set empties (its last
-//! manifest was deleted); it stops being one when a manifest references it.
-//! Work is **O(garbage)**: the set holds only unreferenced blobs, and a sweep
-//! visits only candidates whose grace period (`delay`) has elapsed.
-//!
-//! **In-flight safety.** Every path that is about to depend on a blob — a
-//! `HEAD`/existence check before a manifest push, a finalize/mount/put that
-//! lands it — holds [`GcTracker::pin`] (a shared fence) while it refreshes the
-//! blob's stamp. The sweeper takes the fence exclusively while it re-checks a
-//! candidate and unlinks it, so a blob is never deleted between a client's
-//! existence check and the manifest that references it (the Harbor in-flight
-//! deletion class): the refreshed stamp keeps it out of the sweep for another
-//! full `delay`, far longer than any push takes.
+//! Online GC bookkeeping (ARCHITECTURE §Inline storage optimizations,
+//! RESEARCH §8.3): candidate set of unreferenced blobs, each stamped,
+//! plus an in-flight fence for safe concurrent sweeps.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-/// A `(repo, digest)` candidate key.
 pub type BlobKey = (String, String);
 
 #[derive(Debug)]
 pub struct GcTracker {
     enabled: bool,
     delay: Duration,
-    /// `(repo, digest) → last time the blob was wanted` for unreferenced blobs.
     candidates: Mutex<HashMap<BlobKey, Instant>>,
-    /// Shared by want-paths, exclusive for a sweep's re-check + unlink.
+    /// Shared by want-paths, exclusive for sweeps.
     fence: RwLock<()>,
-    /// Set once the startup consistency check (backref rebuild + candidate
-    /// seeding) completed; sweeps are refused until then.
     ready: AtomicBool,
-    /// Root manifest digests that are GC-immune: manifests known from the
-    /// layout (`index.json` descriptors / image-index children) are roots
-    /// regardless of whether the metadata store recorded them.
+    /// Root manifests immune to GC (from index.json / image-index children).
     roots: Mutex<HashSet<BlobKey>>,
-    /// Repos whose root manifests are unreadable or unparseable: sweeps skip
-    /// these entirely (a missing edge must never read as "unreferenced").
+    /// Repos with unreadable roots; sweeps skip them entirely.
     unsafe_repos: Mutex<HashSet<String>>,
 }
 
@@ -61,7 +38,6 @@ impl GcTracker {
         }
     }
 
-    /// A tracker that records nothing and never sweeps.
     pub fn disabled() -> Self {
         Self::new(false, Duration::ZERO)
     }
@@ -70,13 +46,11 @@ impl GcTracker {
         self.enabled
     }
 
-    /// The grace period an unreferenced blob must stay untouched.
     pub fn delay(&self) -> Duration {
         self.delay
     }
 
-    /// Hold while depending on a blob's presence (existence check, promote).
-    /// `None` when GC is disabled (nothing to fence against).
+    /// Hold while depending on a blob's presence; `None` when GC is off.
     pub async fn pin(&self) -> Option<RwLockReadGuard<'_, ()>> {
         if self.enabled {
             Some(self.fence.read().await)
@@ -85,18 +59,16 @@ impl GcTracker {
         }
     }
 
-    /// Exclusive fence for a sweep batch: no want-path runs while held.
+    /// Exclusive sweep fence: no want-path runs while held.
     pub async fn exclusive(&self) -> RwLockWriteGuard<'_, ()> {
         self.fence.write().await
     }
 
-    /// `(repo, digest)` is unreferenced as of now: (re)stamp it a candidate.
     pub fn mark(&self, repo: &str, digest: &str) {
         self.mark_at(repo, digest, Instant::now());
     }
 
-    /// `(repo, digest)` is unreferenced as of `at`: stamp it a candidate.
-    /// Allows the startup seed to use a deterministic timestamp.
+    /// Stamp as candidate at `at` (deterministic startup seeding).
     pub fn mark_at(&self, repo: &str, digest: &str, at: Instant) {
         if self.enabled {
             self.lock()
@@ -104,7 +76,7 @@ impl GcTracker {
         }
     }
 
-    /// Something wants `(repo, digest)`: refresh its stamp if it is a candidate.
+    /// Refresh stamp if `(repo, digest)` is a candidate.
     pub fn touch(&self, repo: &str, digest: &str) {
         if self.enabled {
             if let Some(t) = self.lock().get_mut(&(repo.to_string(), digest.to_string())) {
@@ -113,14 +85,12 @@ impl GcTracker {
         }
     }
 
-    /// `(repo, digest)` is referenced (or gone): no longer a candidate.
     pub fn clear(&self, repo: &str, digest: &str) {
         if self.enabled {
             self.lock().remove(&(repo.to_string(), digest.to_string()));
         }
     }
 
-    /// Candidates whose grace period has elapsed at `now`.
     pub fn due(&self, now: Instant) -> Vec<BlobKey> {
         self.lock()
             .iter()
@@ -129,15 +99,13 @@ impl GcTracker {
             .collect()
     }
 
-    /// Whether `(repo, digest)` is still a due candidate at `now` — the
-    /// sweeper's re-check under [`GcTracker::exclusive`].
+    /// Re-check under [`GcTracker::exclusive`]: still due at `now`?
     pub fn is_due(&self, repo: &str, digest: &str, now: Instant) -> bool {
         self.lock()
             .get(&(repo.to_string(), digest.to_string()))
             .is_some_and(|t| now.saturating_duration_since(*t) >= self.delay)
     }
 
-    /// Number of current candidates.
     pub fn len(&self) -> usize {
         self.lock().len()
     }
@@ -146,12 +114,11 @@ impl GcTracker {
         self.len() == 0
     }
 
-    /// Open the sweep gate after the startup consistency check.
+    /// Mark ready after startup consistency check.
     pub fn set_ready(&self) {
         self.ready.store(true, Ordering::Release);
     }
 
-    /// Whether sweeps may run.
     pub fn is_ready(&self) -> bool {
         self.enabled && self.ready.load(Ordering::Acquire)
     }
@@ -160,8 +127,6 @@ impl GcTracker {
         self.candidates.lock().expect("gc lock poisoned")
     }
 
-    /// Record `(repo, digest)` as a GC root: a manifest known from the layout
-    /// that the sweeper must never collect.
     pub fn add_root(&self, repo: &str, digest: &str) {
         if self.enabled {
             self.roots
@@ -171,7 +136,6 @@ impl GcTracker {
         }
     }
 
-    /// Whether `(repo, digest)` is a root manifest.
     pub fn is_root(&self, repo: &str, digest: &str) -> bool {
         self.roots
             .lock()
@@ -179,7 +143,6 @@ impl GcTracker {
             .contains(&(repo.to_string(), digest.to_string()))
     }
 
-    /// Mark `repo` as GC-unsafe: sweeps skip it entirely.
     pub fn mark_unsafe(&self, repo: &str) {
         if self.enabled {
             self.unsafe_repos
@@ -189,7 +152,6 @@ impl GcTracker {
         }
     }
 
-    /// Whether `repo` is GC-unsafe.
     pub fn is_unsafe(&self, repo: &str) -> bool {
         self.unsafe_repos
             .lock()
@@ -197,17 +159,17 @@ impl GcTracker {
             .contains(repo)
     }
 
-    /// Number of root manifests tracked.
+    #[cfg(test)]
     pub fn roots_len(&self) -> usize {
         self.roots.lock().expect("gc roots lock poisoned").len()
     }
 
-    /// Snapshot of candidate keys for fast-restart stamp serialization.
+    /// Candidate keys snapshot for fast-restart.
     pub fn candidate_keys(&self) -> Vec<(String, String)> {
         self.lock().keys().cloned().collect()
     }
 
-    /// Snapshot of root keys for fast-restart stamp serialization.
+    /// Root keys snapshot for fast-restart.
     pub fn root_keys(&self) -> Vec<(String, String)> {
         self.roots
             .lock()
@@ -217,7 +179,7 @@ impl GcTracker {
             .collect()
     }
 
-    /// Snapshot of unsafe repo names for fast-restart stamp serialization.
+    /// Unsafe repo names snapshot for fast-restart.
     pub fn unsafe_repo_names(&self) -> Vec<String> {
         self.unsafe_repos
             .lock()
@@ -225,6 +187,85 @@ impl GcTracker {
             .iter()
             .cloned()
             .collect()
+    }
+}
+
+/// Max bytes when reading a root manifest for GC consistency.
+pub const MAX_ROOT_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Rebuild missing backref edges for one repo by walking a manifest worklist.
+pub async fn rebuild_backrefs<F, Fut>(
+    repo: &str,
+    meta: &dyn crate::MetadataStore,
+    gc: &GcTracker,
+    roots: HashSet<String>,
+    mut read_manifest: F,
+) where
+    F: FnMut(crate::Digest) -> Fut,
+    Fut: Future<Output = std::io::Result<Option<Vec<u8>>>>,
+{
+    let mut to_visit: Vec<String> = roots.iter().cloned().collect();
+    let mut all_roots: HashSet<String> = roots;
+
+    while let Some(digest_str) = to_visit.pop() {
+        let parsed = match crate::Digest::parse(&digest_str) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let bytes = match read_manifest(parsed).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                tracing::warn!(repo, digest = %digest_str, "root manifest missing from CAS; repo is GC-unsafe");
+                gc.mark_unsafe(repo);
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(repo, digest = %digest_str, error = %e, "oversized or unreadable root manifest; repo is GC-unsafe");
+                gc.mark_unsafe(repo);
+                continue;
+            }
+        };
+        let manifest: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(repo, digest = %digest_str, "unparseable root manifest; repo is GC-unsafe");
+                gc.mark_unsafe(repo);
+                continue;
+            }
+        };
+
+        for child in crate::layout::index_manifests(&manifest) {
+            if let Some(cd) = crate::layout::descriptor_digest(child) {
+                if all_roots.insert(cd.to_string()) {
+                    to_visit.push(cd.to_string());
+                }
+            }
+        }
+
+        let references: Vec<String> = crate::layout::manifest_references(&manifest)
+            .iter()
+            .map(crate::Digest::as_string)
+            .collect();
+        let missing: Vec<String> = references
+            .iter()
+            .filter(|blob| !meta.backrefs(repo, blob).contains(&digest_str))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            if let Err(e) = meta.apply(crate::MetaOp::PutBackrefs {
+                repo: repo.to_string(),
+                manifest: digest_str.clone(),
+                blobs: missing,
+            }) {
+                tracing::warn!(repo, digest = %digest_str, error = %e, "recording backref edges failed");
+            }
+        }
+    }
+
+    for d in &all_roots {
+        if meta.manifest_media_type(repo, d).is_none() {
+            gc.add_root(repo, d);
+        }
     }
 }
 
@@ -242,10 +283,8 @@ mod tests {
         let later = now + Duration::from_secs(61);
         assert_eq!(gc.due(later), vec![("r".into(), "sha256:a".into())]);
         assert!(gc.is_due("r", "sha256:a", later));
-        // A touch restamps: not due relative to the same instant any more.
         gc.touch("r", "sha256:a");
         assert!(!gc.is_due("r", "sha256:a", Instant::now()));
-        // Touching a non-candidate does not create one.
         gc.touch("r", "sha256:b");
         assert_eq!(gc.len(), 1);
         gc.clear("r", "sha256:a");
@@ -260,7 +299,6 @@ mod tests {
         assert!(gc.pin().await.is_none());
         gc.set_ready();
         assert!(!gc.is_ready());
-        // Roots and unsafe repos are still trackable (disabled only means no sweeps).
         gc.add_root("r", "d");
         assert_eq!(gc.roots_len(), 0); // disabled → no-op
         gc.mark_unsafe("r");
@@ -289,9 +327,7 @@ mod tests {
         let gc = GcTracker::new(true, Duration::from_secs(10));
         let base = Instant::now();
         gc.mark_at("r", "sha256:a", base);
-        // Not due before delay elapses relative to the stamped instant.
         assert!(!gc.is_due("r", "sha256:a", base + Duration::from_secs(5)));
-        // Due after the delay from the stamped instant.
         assert!(gc.is_due("r", "sha256:a", base + Duration::from_secs(11)));
     }
 

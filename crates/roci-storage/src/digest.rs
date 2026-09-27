@@ -1,11 +1,10 @@
-//! Content digests (`algorithm:hex`) and the hashers used to compute and verify them.
+//! Content digests (`algorithm:hex`) and hash computation.
 
 use crate::StorageError;
 use sha2::{Sha256, Sha512};
 use std::io;
 use tokio::io::AsyncReadExt;
 
-/// A parsed `algorithm:hex` content digest.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Digest {
     algorithm: String,
@@ -13,8 +12,7 @@ pub struct Digest {
 }
 
 impl Digest {
-    /// Parse a digest string of the form `sha256:<64 hex>`. Only sha256 and
-    /// sha512 are accepted (the algorithms the OCI spec registers).
+    /// Parse `sha256:<hex>` or `sha512:<hex>` (OCI-registered algorithms).
     pub fn parse(s: &str) -> Result<Self, StorageError> {
         let (algorithm, hex) = s
             .split_once(':')
@@ -33,24 +31,19 @@ impl Digest {
         })
     }
 
-    /// The canonical `algorithm:hex` string.
     pub fn as_string(&self) -> String {
         self.to_string()
     }
 
-    /// The digest's lowercase hex encoding (the part after `algorithm:`).
     pub fn hex(&self) -> &str {
         &self.hex
     }
 
-    /// The digest's wire algorithm (`sha256` or `sha512`).
     pub fn algorithm(&self) -> &str {
         &self.algorithm
     }
 
-    /// Constant-time equality: compares the algorithm, then the hex bytes with
-    /// a branch-free accumulator so digest verification leaks no timing signal
-    /// (SECURITY.md §Storage boundary).
+    /// Constant-time equality (SECURITY §Storage boundary).
     pub fn ct_eq(&self, other: &Digest) -> bool {
         if self.algorithm != other.algorithm || self.hex.len() != other.hex.len() {
             return false;
@@ -69,7 +62,7 @@ impl std::fmt::Display for Digest {
     }
 }
 
-/// Hash `data` with `H` (the concrete SHA family), tagged with its wire `algorithm`.
+/// Hash `data` with `H`, tagged with its wire `algorithm`.
 fn hash_bytes<H: sha2::Digest>(algorithm: &str, data: &[u8]) -> Digest {
     Digest {
         algorithm: algorithm.to_owned(),
@@ -77,9 +70,7 @@ fn hash_bytes<H: sha2::Digest>(algorithm: &str, data: &[u8]) -> Digest {
     }
 }
 
-/// Blocking-thread twin of [`hash_reader`]: digest (sha256/sha512 by
-/// `algorithm`) and CRC32C of `f` in one pass, for callers already on the
-/// blocking pool.
+/// Blocking-pool digest+CRC32C of `f` in one pass.
 pub(crate) fn hash_std(mut f: std::fs::File, algorithm: &str) -> io::Result<(Digest, u32)> {
     fn run<H: sha2::Digest>(alg: &str, f: &mut std::fs::File) -> io::Result<(Digest, u32)> {
         use std::io::Read;
@@ -109,9 +100,7 @@ pub(crate) fn hash_std(mut f: std::fs::File, algorithm: &str) -> io::Result<(Dig
     }
 }
 
-/// Stream `f` through `H` in 64 KiB reads without buffering the whole file,
-/// tagging the result with its wire `algorithm`; the same single pass also
-/// folds every byte into a CRC32C (the scrub's fast checksum).
+/// Stream `f` through `H` in 64 KiB reads, returning digest and CRC32C.
 async fn hash_file<H: sha2::Digest>(
     algorithm: &str,
     mut f: tokio::fs::File,
@@ -136,7 +125,7 @@ async fn hash_file<H: sha2::Digest>(
     ))
 }
 
-/// The sha256 [`Digest`] of an incrementally fed hasher.
+/// Finish an incremental sha256 hasher.
 pub(crate) fn finish_sha256(h: Sha256) -> Digest {
     Digest {
         algorithm: "sha256".to_owned(),
@@ -144,27 +133,19 @@ pub(crate) fn finish_sha256(h: Sha256) -> Digest {
     }
 }
 
-/// Compute the sha256 digest of `data`.
 pub fn sha256_of(data: &[u8]) -> Digest {
     hash_bytes::<Sha256>("sha256", data)
 }
 
-/// Compute the digest of `data` using the given wire algorithm (sha256 or
-/// sha512 — the values [`Digest::parse`] accepts). Verification hashes with the
-/// *expected* algorithm so a sha512 digest is honored, not silently rejected.
+/// Digest of `data` using the given wire algorithm (sha256/sha512).
 pub fn digest_of(data: &[u8], algorithm: &str) -> Digest {
     match algorithm {
         "sha512" => hash_bytes::<Sha512>("sha512", data),
-        // Default to sha256 for the only other allowlisted algorithm.
         _ => sha256_of(data),
     }
 }
 
-/// Stream `f` through the hasher selected by `algorithm` (sha256/sha512),
-/// returning its [`Digest`] and CRC32C without buffering the whole file. `f`
-/// is an already-opened, no-follow-validated regular-file handle (the caller
-/// opens it beneath the store root). Used to verify a staged upload before
-/// promoting it, and by the scrub's full re-hash.
+/// Stream `f` through the selected hasher, returning digest and CRC32C.
 pub(crate) async fn hash_reader(f: tokio::fs::File, algorithm: &str) -> io::Result<(Digest, u32)> {
     if algorithm == "sha512" {
         hash_file::<Sha512>("sha512", f).await

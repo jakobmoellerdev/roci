@@ -2,16 +2,13 @@
 
 use x509_parser::extensions::GeneralName;
 
-/// Longest accepted identity.
 const MAX_IDENTITY_LEN: usize = 255;
 
 fn usable(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_IDENTITY_LEN && !id.chars().any(char::is_control)
 }
 
-/// The user name a verified client leaf certificate authenticates: its
-/// Subject CN, else its first DNS SAN. `None` (→ Anonymous) when neither
-/// yields a usable name (non-empty, ≤255 bytes, no control characters).
+/// Certificate identity: Subject CN or first DNS SAN.
 pub fn client_cert_identity(leaf_der: &[u8]) -> Option<String> {
     let (_, cert) = x509_parser::parse_x509_certificate(leaf_der).ok()?;
     let cn = cert
@@ -61,12 +58,10 @@ mod tests {
             client_cert_identity(&cert(Some("alice"), &["svc.example"])).as_deref(),
             Some("alice")
         );
-        // Non-DNS SAN entries are skipped.
         assert_eq!(
             client_cert_identity(&cert(None, &["10.0.0.1", "svc.example", "b.example"])).as_deref(),
             Some("svc.example")
         );
-        // An unusable CN falls back to the SAN.
         let long = "x".repeat(256);
         assert_eq!(
             client_cert_identity(&cert(Some(&long), &["svc.example"])).as_deref(),

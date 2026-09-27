@@ -1,6 +1,5 @@
-//! Streamed upload bodies: request bytes go straight to a staging file in
-//! large batches on the blocking pool — never whole-blob buffered (invariant
-//! 4) — optionally hashing as they are written so finalize need not re-read.
+//! Streamed upload bodies: staging file writes in large batches on the
+//! blocking pool, optionally hashing on write (invariant 4).
 
 use crate::{Digest, StorageError};
 use bytes::Bytes;
@@ -12,20 +11,16 @@ use sha2::Sha256;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-/// A streamed request body.
 pub type UploadBody = BoxStream<'static, io::Result<Bytes>>;
 
-/// Bytes accumulated per blocking-pool write: large enough that the hop is
-/// amortized, small enough to bound per-upload memory.
 const WRITE_BATCH: usize = 1 << 20;
 
-/// A body holding exactly `data` (tests, and callers that already have bytes).
 pub fn upload_body(data: impl AsRef<[u8]>) -> UploadBody {
     let b = Bytes::copy_from_slice(data.as_ref());
     futures::stream::once(async move { Ok(b) }).boxed()
 }
 
-/// Incremental sha256 + CRC32C over the first `len` bytes of a staging file.
+/// Incremental sha256 + CRC32C state.
 #[derive(Clone)]
 pub struct StagedHash {
     sha: Sha256,
@@ -34,7 +29,6 @@ pub struct StagedHash {
 }
 
 impl StagedHash {
-    /// Hash state for an empty file.
     pub fn new() -> Self {
         Self {
             sha: Sha256::new(),
@@ -49,17 +43,14 @@ impl StagedHash {
         self.len += buf.len() as u64;
     }
 
-    /// Bytes covered.
     pub fn len(&self) -> u64 {
         self.len
     }
 
-    /// Whether no bytes are covered.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// The sha256 digest and CRC32C of the covered bytes.
     pub fn finish(self) -> (Digest, u32) {
         (crate::digest::finish_sha256(self.sha), self.crc)
     }
@@ -71,11 +62,9 @@ impl Default for StagedHash {
     }
 }
 
-/// Recycled upload batch buffers: at most 16 idle (16 MiB).
 static UPLOAD_POOL: crate::bufpool::BufPool = crate::bufpool::BufPool::new(WRITE_BATCH, 16);
 
-/// Write `batch` (and extend `hash` over it) on the blocking pool, returning
-/// the emptied buffer for the next batch.
+/// Write `batch` on the blocking pool, returning the emptied buffer.
 async fn write_batch(
     file: &Arc<std::fs::File>,
     batch: Vec<u8>,
@@ -99,11 +88,7 @@ async fn write_batch(
     .and_then(|r| r)
 }
 
-/// Append `body` (at most `limit` bytes) to `file`, an append-mode handle whose
-/// current length is `start`, extending `hash` when it covers exactly `start`
-/// bytes. On any failure — body error, over `limit`, IO — the file is truncated
-/// back to `start` (a rejected request leaves the session as it was) and the
-/// error returned. Returns the new length and the extended hash, if any.
+/// Append `body` to `file`; truncates back to `start` on failure.
 pub async fn append_body(
     file: tokio::fs::File,
     start: u64,
@@ -116,9 +101,7 @@ pub async fn append_body(
     Ok((d.len, d.hash))
 }
 
-/// A streamed body whose last (< 1 MiB) batch is not yet written, so the
-/// caller can write it inside the blocking hop it makes next anyway. `hash`
-/// covers `tail_at` bytes (everything but `tail`); `len` includes the tail.
+/// Deferred tail: last partial batch not yet written.
 pub(crate) struct Deferred {
     pub len: u64,
     pub hash: Option<StagedHash>,
@@ -128,8 +111,7 @@ pub(crate) struct Deferred {
 }
 
 impl Deferred {
-    /// Blocking: write the tail (truncating back to `tail_at` on failure) and
-    /// fold it into the hash; returns the hash covering `len` bytes, if any.
+    /// Write the tail; truncate on failure.
     pub(crate) fn write_tail(mut self) -> io::Result<Option<StagedHash>> {
         if !self.tail.is_empty() {
             if let Err(e) = (&*self.file).write_all(&self.tail) {
@@ -145,7 +127,6 @@ impl Deferred {
     }
 }
 
-/// [`append_body`] without writing the final partial batch (see [`Deferred`]).
 pub(crate) async fn append_body_deferring_tail(
     file: tokio::fs::File,
     start: u64,
@@ -180,8 +161,6 @@ async fn append_inner(
                         actual: received,
                     });
                 }
-                // Fill the batch to exactly WRITE_BATCH (never growing the
-                // pooled buffer), writing each full batch as it completes.
                 let mut rest = &chunk[..];
                 while !rest.is_empty() {
                     let take = rest.len().min(WRITE_BATCH - batch.len());

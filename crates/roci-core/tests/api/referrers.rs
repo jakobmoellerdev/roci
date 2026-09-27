@@ -7,7 +7,6 @@ use super::common::*;
 async fn subject_manifest_appears_in_referrers() {
     let (app, _d) = app();
     let subject = sha256_of(b"the-subject");
-    // A referring manifest carrying a `subject` and `artifactType`.
     let referrer = serde_json::json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -36,7 +35,6 @@ async fn subject_manifest_appears_in_referrers() {
         subject.as_string()
     );
 
-    // The referrers index for the subject lists exactly this manifest.
     let get_resp = send(&app, get(format!("/v2/r/referrers/{subject}"))).await;
     assert_eq!(
         hv(&get_resp, header::CONTENT_TYPE).unwrap(),
@@ -50,7 +48,6 @@ async fn subject_manifest_appears_in_referrers() {
         "application/vnd.example.sig"
     );
 
-    // Filtering by a non-matching artifactType yields an empty, filter-applied index.
     let filtered = send(
         &app,
         get(format!(
@@ -109,11 +106,9 @@ async fn referrers_pagination_filter_link_and_vary() {
             .await
             .unwrap();
     }
-    // Unfiltered: no Vary, no filter header, full list.
     let resp = send(&app, get(format!("/v2/r/referrers/{subject}"))).await;
     assert!(resp.headers().get(header::VARY).is_none());
     assert!(resp.headers().get(header::LINK).is_none());
-    // Filtered + paged: walk every page via Link; collect only sigs.
     let mut url = format!(
         "/v2/r/referrers/{}?artifactType=application/sig&n=2",
         subject.as_string()
@@ -141,7 +136,6 @@ async fn referrers_pagination_filter_link_and_vary() {
             None => break,
         }
     }
-    // Pages walk the referrer set in digest order.
     sigs.sort();
     assert_eq!(seen, sigs);
 }
@@ -185,7 +179,6 @@ async fn next_link_encodes_query_values_and_round_trips() {
             .get(header::LINK)
             .map(|v| v.to_str().unwrap().to_string());
         let v = json_body(resp).await;
-        // The filter survives every hop: each page still has its one match.
         assert_eq!(v["manifests"].as_array().unwrap().len(), 1);
         pages += 1;
         match link {
@@ -217,8 +210,6 @@ async fn referrer_artifact_type_falls_back_to_config_media_type() {
     });
     let body = serde_json::to_vec(&referrer).unwrap();
     let rd = sha256_of(&body);
-    // The config blob the manifest references must exist (referenced-blob
-    // existence is enforced on push); upload it monolithically first.
     push_blob(&app, "r", b"c").await;
     push_manifest(
         &app,

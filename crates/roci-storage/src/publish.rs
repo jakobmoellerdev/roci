@@ -1,26 +1,20 @@
-//! Crash-atomic CAS blob publication and cross-repo promotion, all anchored
-//! to dirfds walked no-follow beneath the store root: reflink, then hard link,
-//! then a streaming copy (SECURITY.md:124 contract order).
+//! Crash-atomic CAS blob publication and cross-repo promotion beneath the
+//! store root (SECURITY.md:124 contract order: reflink → hard link → copy).
 
 use crate::beneath::{dir_beneath, run_blocking};
 use std::io;
 use std::path::Path;
 
-/// How a cross-repo promotion materialized the destination blob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Promotion {
-    /// A regular file was already at the destination (idempotent).
     Existing,
-    /// `FICLONE` copy-on-write clone (the contract primary).
     Reflink,
-    /// `linkat` hard link (the logged fallback).
     Hardlink,
-    /// Streaming copy (cross-device / no-hardlink).
+    /// Streaming copy (cross-device fallback).
     Copy,
 }
 
 impl Promotion {
-    /// Low-cardinality metric label for this mechanism.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Promotion::Existing => "existing",
@@ -31,17 +25,8 @@ impl Promotion {
     }
 }
 
-/// Promote a blob named `leaf` from `from_alg_rel` into `to_alg_rel` (both
-/// directories relative to `root`), for a cross-repo mount or dedupe.
-/// Everything is anchored to dirfds walked no-follow beneath `root`, so a
-/// symlinked `repo`, `blobs`, or `<alg>` parent on either side cannot redirect
-/// the promotion. Contract order (SECURITY.md:124): **reflink first**
-/// (`FICLONE` into a temp opened in the destination dirfd, then `renameat` —
-/// CoW, independent deletion), then a **hard link** (`linkat` between dirfds,
-/// O(1) same-fs), then — only when `allow_copy` — a **streaming copy**
-/// (cross-device / no-hardlink); without it the hard-link error is returned so
-/// a dedupe caller keeps its own copy instead. A pre-existing destination is
-/// re-validated no-follow as a regular file (idempotent success) or rejected.
+/// Promote a blob from `from_alg_rel` into `to_alg_rel` via dirfds beneath
+/// `root`. Contract order (SECURITY.md:124): reflink → hard link → streaming copy.
 #[cfg(unix)]
 pub(crate) async fn mount_promote_beneath(
     root: &Path,
@@ -64,15 +49,14 @@ pub(crate) async fn mount_promote_beneath(
         }
     })
     .await;
-    // Record the mechanism on the span after the blocking work completes.
+    // Record mechanism on the span after blocking work completes.
     if let Ok(promo) = &result {
         span.record("mechanism", promo.label());
     }
     result
 }
 
-/// Synchronous body of [`mount_promote_beneath`], for callers already on a blocking
-/// thread (one hop for a whole operation).
+/// Synchronous body of [`mount_promote_beneath`].
 #[cfg(unix)]
 pub(crate) fn mount_promote_beneath_sync(
     root: std::path::PathBuf,
@@ -86,8 +70,7 @@ pub(crate) fn mount_promote_beneath_sync(
 
     let from_dir = dir_beneath(&root, &from_alg_rel, false)?;
     let to_dir = dir_beneath(&root, &to_alg_rel, true)?;
-    // Open the source no-follow (the caller already verified via blob_exists
-    // that it is a present regular file beneath the root).
+    // Open source no-follow.
     let src = rustix::fs::openat(
         &from_dir,
         leaf.as_str(),
@@ -96,12 +79,8 @@ pub(crate) fn mount_promote_beneath_sync(
     )
     .map_err(io::Error::from)?;
     let mut src_file = std::fs::File::from(src);
-    // Prove the opened source is a *regular file* on the fd we hold — not the
-    // path. `O_NOFOLLOW` refuses a symlink leaf, but a FIFO/socket/device
-    // planted at the source name is still openable (`O_NONBLOCK` keeps the
-    // open from blocking) and would otherwise be reflink/copy-read or, worse,
-    // hard-linked into the CAS as a non-regular inode. Bind the check to the
-    // inode we will actually promote by fstat'ing the descriptor.
+    // SECURITY: fstat the fd (not path) to reject a planted FIFO/device/socket
+    // that O_NOFOLLOW+O_NONBLOCK would still open.
     {
         let st = rustix::fs::fstat(&src_file).map_err(io::Error::from)?;
         if !FileType::from_raw_mode(st.st_mode).is_file() {
@@ -111,10 +90,7 @@ pub(crate) fn mount_promote_beneath_sync(
             ));
         }
     }
-    // Treat a pre-existing regular-file destination as idempotent success; a
-    // symlink/dir/other there is rejected (re-checked here, not only in the
-    // caller's earlier stat, to close the check→promote race). A missing dest
-    // (NOENT) proceeds to promotion; any other stat error propagates.
+    // Pre-existing regular file = idempotent; symlink/dir rejected; missing proceeds.
     match rustix::fs::statat(&to_dir, leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
         Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => return Ok(Promotion::Existing),
         Ok(_) => {
@@ -126,8 +102,7 @@ pub(crate) fn mount_promote_beneath_sync(
         Err(rustix::io::Errno::NOENT) => {}
         Err(e) => return Err(io::Error::from(e)),
     }
-    // Write into a unique temp in the destination dir (no-follow), by
-    // reflink where possible else a streaming copy, then renameat into place.
+    // Temp in destination dir, try reflink then hardlink then copy.
     let mut rnd = [0u8; 8];
     getrandom::fill(&mut rnd).map_err(io::Error::other)?;
     let tmp = format!(".{}.{}.tmp", leaf, hex::encode(rnd));
@@ -146,10 +121,7 @@ pub(crate) fn mount_promote_beneath_sync(
         .map(std::fs::File::from)
         .map_err(io::Error::from)
     };
-    // First try a hard link (O(1), no temp) — skipped when a reflink is
-    // preferred and available. Reflink is the contract primary, so attempt it
-    // into the temp; if the filesystem cannot reflink, hard-link directly;
-    // if that also fails (cross-device), stream-copy into the temp.
+    // Try reflink (contract primary) into temp, else hardlink, else copy.
     let mut out = promote_via_temp(OFlags::empty())?;
     if try_reflink(&mut out, &mut src_file) {
         if sync {
@@ -159,7 +131,7 @@ pub(crate) fn mount_promote_beneath_sync(
         promote_temp_noreplace(&to_dir, tmp.as_str(), leaf.as_str(), sync)?;
         return Ok(Promotion::Reflink);
     }
-    // Reflink unavailable: drop the temp and try a direct hard link.
+    // Reflink unavailable: try a direct hard link.
     drop(out);
     let _ = rustix::fs::unlinkat(&to_dir, tmp.as_str(), AtFlags::empty());
     match try_hardlink_at(&from_dir, leaf.as_str(), &to_dir, leaf.as_str()) {
@@ -169,11 +141,7 @@ pub(crate) fn mount_promote_beneath_sync(
             }
             Ok(Promotion::Hardlink)
         }
-        // Destination raced in between our earlier stat and this link. Accept
-        // it as idempotent success ONLY if it is now a regular file, re-checked
-        // no-follow — `EEXIST` alone also fires for a symlink/dir/other planted
-        // in the race, which must not count as a valid CAS blob (would 201 a
-        // bogus entry). Mirrors the pre-link destination check above.
+        // EEXIST: accept only if a regular file (SECURITY: no symlink/dir).
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             match rustix::fs::statat(&to_dir, leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => {
@@ -189,7 +157,7 @@ pub(crate) fn mount_promote_beneath_sync(
                 Err(e) => Err(io::Error::from(e)),
             }
         }
-        // Cross-device / no-hardlink: stream-copy into a fresh temp + rename.
+        // Cross-device: stream-copy into a fresh temp + rename.
         Err(_) if allow_copy => {
             let mut out = promote_via_temp(OFlags::empty())?;
             stream_copy(&mut src_file, &mut out)?;
@@ -204,16 +172,8 @@ pub(crate) fn mount_promote_beneath_sync(
     }
 }
 
-/// Atomically move the temp `tmp` onto `leaf` in `to_dir` with **no-replace**
-/// semantics (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)`
-/// on Apple), then (when `sync`) fsync the dir. Plain `renameat` has replace semantics: a
-/// racer that installs a symlink or a different file at `leaf` between the
-/// caller's no-follow check and the rename would be silently overwritten (or the
-/// symlink followed on a later replace). NOREPLACE closes that window — the
-/// rename fails `EEXIST` if anything is at `leaf`, which is accepted as an
-/// idempotent dedup hit ONLY when the existing entry is a regular file
-/// (re-validated no-follow); a symlink/dir/other is rejected. The leftover temp
-/// is removed on the idempotent path so no orphan survives.
+/// `renameat2(RENAME_NOREPLACE)` rename: `EEXIST` accepted only when the existing
+/// entry is a regular file (no-follow). Cleans up the temp on all paths.
 #[cfg(unix)]
 pub(crate) fn promote_temp_noreplace(
     to_dir: &std::os::fd::OwnedFd,
@@ -229,9 +189,7 @@ pub(crate) fn promote_temp_noreplace(
             }
             Ok(())
         }
-        // Something is already at `leaf`. Accept only a regular file (idempotent
-        // dedup — content-addressed, so identical bytes); reject a raced
-        // symlink/dir/other. Drop our now-unneeded temp either way.
+        // EEXIST: accept only a regular file (dedup); reject symlink/dir.
         Err(rustix::io::Errno::EXIST) => {
             let st = rustix::fs::statat(to_dir, leaf, AtFlags::SYMLINK_NOFOLLOW);
             let _ = rustix::fs::unlinkat(to_dir, tmp, AtFlags::empty());
@@ -251,9 +209,7 @@ pub(crate) fn promote_temp_noreplace(
     }
 }
 
-/// `linkat` between two dirfds, with a test-only fault seam: when
-/// `FORCE_COPY_FALLBACK` is set it returns an `EXDEV`-shaped error so the copy
-/// fallback runs deterministically on a single filesystem.
+/// `linkat` between dirfds; `FORCE_COPY_FALLBACK` injects EXDEV in tests.
 #[cfg(unix)]
 pub(crate) fn try_hardlink_at(
     from_dir: &std::os::fd::OwnedFd,
@@ -280,25 +236,19 @@ pub(crate) fn try_reflink(output: &mut std::fs::File, input: &mut std::fs::File)
         return false;
     }
     if fault!(FORCE_REFLINK_OK) {
-        // Simulate a successful whole-file reflink by actually moving the bytes
-        // (ext4 in CI has no CoW), so the "reflink succeeded" branch is covered
-        // with a correct destination.
+        // Simulate reflink via copy so the reflink branch is covered in CI.
         return stream_copy(input, output).is_ok();
     }
     rustix::fs::ioctl_ficlone(&*output, &*input).is_ok()
 }
 
-/// Non-Linux: no `FICLONE`, so a reflink is never available (the caller falls
-/// back to a hard link, then a streaming copy).
+/// Non-Linux: no `FICLONE`; always returns `false`.
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn try_reflink(_output: &mut std::fs::File, _input: &mut std::fs::File) -> bool {
     false
 }
 
-/// Rewind both files and copy `input` to `output` with a buffered read/write
-/// loop, first truncating the destination so a retry never leaves stale tail
-/// bytes. The streaming fallback used when a reflink is not possible. Runs on
-/// the blocking thread that owns the file handles.
+/// Streaming copy fallback: rewind, truncate destination, buffered copy.
 #[cfg(unix)]
 pub(crate) fn stream_copy(input: &mut std::fs::File, output: &mut std::fs::File) -> io::Result<()> {
     use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -316,13 +266,7 @@ pub(crate) fn stream_copy(input: &mut std::fs::File, output: &mut std::fs::File)
     Ok(())
 }
 
-/// Publish `data` as the CAS blob named `leaf` inside the directory `alg_rel`
-/// (relative to `root`, e.g. `<repo…>/blobs/<alg>`) with a per-operation unique
-/// temp sibling, fsync (when `sync`), and atomic rename — all **relative to a dirfd walked
-/// no-follow beneath `root`**, so a symlinked `repo`/`blobs`/`<alg>` parent
-/// cannot redirect the write outside the store. Portable across every platform
-/// and the fallback the Linux `O_TMPFILE` path degrades to. A rename onto an
-/// existing blob is harmless (content-addressed: identical bytes).
+/// Publish `data` as CAS blob `leaf` in `alg_rel` via temp+rename beneath `root`.
 #[cfg(unix)]
 pub(crate) fn publish_bytes_rename_sync(
     root: &Path,
@@ -350,22 +294,12 @@ pub(crate) fn publish_bytes_rename_sync(
         f.sync_data()?;
     }
     drop(f);
-    // No-replace promotion: a raced symlink/file at `leaf` is not silently
-    // overwritten; an `EEXIST` is a dedup hit only if the existing entry is a
-    // regular file (matches the Linux O_TMPFILE+linkat path's contract).
+    // No-replace promotion; EEXIST is dedup only if regular file.
     promote_temp_noreplace(&dirfd, tmp_name.as_str(), leaf, sync)
 }
 
-/// Publish `data` as the CAS blob `leaf` inside `alg_rel` crash-atomically,
-/// anchored to a dirfd walked no-follow beneath `root`. On Linux this opens an
-/// anonymous `O_TMPFILE` inode in the (beneath-root) directory, writes (and,
-/// when `sync`, fsyncs) it, then `linkat`s it into place: a partial blob is
-/// never visible under its digest name and no orphan temp survives a crash. A
-/// filesystem without `O_TMPFILE` degrades to the portable temp+rename path.
-/// `linkat` `EEXIST` means a blob already exists at the name; it is dedup
-/// success only if that entry is a *regular file* (validated no-follow via the
-/// dirfd) — a planted symlink/dir is rejected. Non-Linux platforms use the
-/// temp+rename path. Blocking: call on the blocking pool (see [`publish_bytes`]).
+/// Linux: publish via `O_TMPFILE` + `linkat` (crash-atomic, no orphan temps).
+/// Falls back to [`publish_bytes_rename_sync`] without `O_TMPFILE`.
 #[cfg(target_os = "linux")]
 pub(crate) fn publish_bytes_sync(
     root: &Path,
@@ -379,9 +313,7 @@ pub(crate) fn publish_bytes_sync(
     use std::io::Write as _;
     use std::os::fd::AsRawFd;
     let dirfd = dir_beneath(root, alg_rel, true)?;
-    // Anonymous inode in the (beneath-root) target directory. In test,
-    // `FORCE_TMPFILE_UNSUPPORTED` simulates a filesystem without O_TMPFILE so
-    // the fallback arm runs deterministically (ext4 in CI always supports it).
+    // O_TMPFILE anonymous inode; FORCE_TMPFILE_UNSUPPORTED triggers fallback.
     let opened = if fault!(FORCE_TMPFILE_UNSUPPORTED) {
         Err(Errno::OPNOTSUPP)
     } else {
@@ -393,7 +325,7 @@ pub(crate) fn publish_bytes_sync(
         )
     };
     let Ok(fd) = opened else {
-        // O_TMPFILE unavailable → the portable temp+rename fallback.
+        // O_TMPFILE unavailable → portable temp+rename fallback.
         return publish_bytes_rename_sync(root, alg_rel, leaf, data, sync);
     };
     let mut f = std::fs::File::from(fd);
@@ -401,9 +333,7 @@ pub(crate) fn publish_bytes_sync(
     if sync {
         f.sync_data()?;
     }
-    // Link the anonymous inode into place via its /proc/self/fd magic link,
-    // relative to the beneath-root dirfd (AT_EMPTY_PATH would need
-    // CAP_DAC_READ_SEARCH).
+    // Link via /proc/self/fd (AT_EMPTY_PATH needs CAP_DAC_READ_SEARCH).
     let proc_path = format!("/proc/self/fd/{}", f.as_raw_fd());
     match rustix::fs::linkat(
         rustix::fs::CWD,
@@ -413,9 +343,7 @@ pub(crate) fn publish_bytes_sync(
         AtFlags::SYMLINK_FOLLOW,
     ) {
         Ok(()) => {}
-        // A blob already exists at the name: dedup success only if it is a
-        // regular file (no-follow, via the dirfd). A planted symlink/dir is
-        // rejected — never reported present nor later followed on read.
+        // EEXIST: dedup only if regular file (no-follow); planted symlink rejected.
         Err(Errno::EXIST) => {
             let st = rustix::fs::statat(&dirfd, leaf, AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(io::Error::from)?;
@@ -434,19 +362,7 @@ pub(crate) fn publish_bytes_sync(
     Ok(())
 }
 
-/// Non-Linux **Unix** publish (macOS/BSD): portable dirfd-anchored temp+rename.
-#[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) fn publish_bytes_sync(
-    root: &Path,
-    alg_rel: &Path,
-    leaf: &str,
-    data: &[u8],
-    sync: bool,
-) -> io::Result<()> {
-    publish_bytes_rename_sync(root, alg_rel, leaf, data, sync)
-}
-
-/// [`publish_bytes_sync`] as one blocking-pool hop.
+/// [`publish_bytes_sync`] / [`publish_bytes_rename_sync`] as one blocking-pool hop.
 #[cfg(unix)]
 pub(crate) async fn publish_bytes(
     root: &Path,
@@ -462,7 +378,14 @@ pub(crate) async fn publish_bytes(
         data.to_vec(),
     );
     run_blocking("publish_bytes", move || {
-        publish_bytes_sync(&root, &alg_rel, &leaf, &data, sync)
+        #[cfg(target_os = "linux")]
+        {
+            publish_bytes_sync(&root, &alg_rel, &leaf, &data, sync)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            publish_bytes_rename_sync(&root, &alg_rel, &leaf, &data, sync)
+        }
     })
     .await
 }

@@ -1,5 +1,4 @@
-//! S3 client construction and abstraction: `AmazonS3` from `S3Config` or
-//! `InMemory` for tests.
+//! S3 client construction and abstraction.
 
 use object_store::aws::AmazonS3Builder;
 use object_store::client::HttpConnector;
@@ -14,9 +13,6 @@ use std::time::Duration;
 use url::Url;
 
 /// SSRF containment: only redirect to pre-approved hosts.
-///
-/// Built from `S3Config` at startup; checked before every signed-URL redirect.
-/// If the URL fails the guard the blob is proxied instead of redirected.
 #[derive(Debug, Clone)]
 pub(crate) struct RedirectGuard {
     hosts: Vec<String>,
@@ -25,13 +21,9 @@ pub(crate) struct RedirectGuard {
 
 impl RedirectGuard {
     /// Derive the allowlist from config.
-    ///
-    /// With `endpoint`: the endpoint's host (lowercased).
-    /// Without: `s3.<region>.amazonaws.com` and `<bucket>.s3.<region>.amazonaws.com`.
     pub(crate) fn from_config(s3: &S3Config) -> Self {
         let allow_http = s3.allow_http;
         let hosts = if let Some(ep) = &s3.endpoint {
-            // The endpoint is validated as an http(s) URL at config load.
             Url::parse(ep)
                 .ok()
                 .and_then(|u| u.host_str().map(str::to_lowercase))
@@ -53,7 +45,7 @@ impl RedirectGuard {
         Self { hosts, allow_http }
     }
 
-    /// Returns `true` when the signed URL may be sent to the client as a 307.
+    /// Returns `true` when the signed URL may be safely redirected.
     pub(crate) fn permits(&self, url: &Url) -> bool {
         let scheme_ok = url.scheme() == "https" || (self.allow_http && url.scheme() == "http");
         scheme_ok
@@ -64,41 +56,30 @@ impl RedirectGuard {
     }
 }
 
-/// Wraps `Arc<dyn ObjectStore>` plus an optional signer and config knobs.
+/// S3 client wrapper with optional signer and config knobs.
 #[derive(Clone)]
 pub(crate) struct S3Client {
     pub store: Arc<dyn ObjectStore>,
-    /// When available, generates signed GET URLs for blob redirects.
     pub signer: Option<Arc<dyn Signer>>,
-    /// Key prefix inside the bucket (no leading/trailing `/`).
     pub prefix: String,
-    /// Blobs ≥ this size get a 307 redirect to a signed URL.
     pub redirect_min_size: u64,
-    /// Lifetime of redirect signed URLs.
     pub redirect_ttl: Duration,
-    /// Multipart part size in bytes.
     pub multipart_part_size: u64,
-    /// Maximum parts in flight per multipart upload/copy.
     pub multipart_concurrency: usize,
-    /// Single CopyObject ceiling; objects above this use parallel ranged-read
-    /// → multipart copy. Production default: 5 GiB; tests may lower it.
+    /// CopyObject ceiling; larger objects use parallel ranged-read copy.
     pub copy_limit: u64,
-    /// SSRF host guard for signed-URL redirects.
     pub redirect_guard: RedirectGuard,
     /// Raw HTTP client sharing the store's `ClientOptions` (TLS roots,
     /// `allow_http`), for bucket-level calls object_store has no API for.
     pub bucket_http: Option<object_store::client::HttpClient>,
 }
 
-/// The HTTPS client is built on rustls without a bundled provider: make
-/// `ring` (roci's audited crypto backend) the process default before any
-/// client is built. Idempotent — a provider installed earlier stays.
+/// Install the `ring` crypto provider for rustls. Idempotent.
 pub(crate) fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 impl S3Client {
-    /// Build a real `AmazonS3` from config. Sync (credential file read only).
     pub fn from_config(s3: &S3Config) -> io::Result<Self> {
         install_crypto_provider();
         let mut builder = AmazonS3Builder::new()
@@ -115,7 +96,6 @@ impl S3Client {
         // `allow_http` and the `ca_file` roots apply to both.
         let mut opts = object_store::ClientOptions::default().with_allow_http(s3.allow_http);
 
-        // Static credentials: key id + secret from file.
         if let Some(key_id) = &s3.access_key_id {
             let secret = match &s3.secret_access_key_file {
                 Some(path) => std::fs::read_to_string(path).map_err(|e| {
@@ -180,7 +160,6 @@ impl S3Client {
             )
         })?;
 
-        // AmazonS3 implements Signer.
         let signer: Arc<dyn Signer> = Arc::new(store.clone());
 
         let redirect_guard = RedirectGuard::from_config(s3);
@@ -199,8 +178,7 @@ impl S3Client {
         })
     }
 
-    /// Build an in-memory client for tests. Supports signing via a provided
-    /// signer or no signing (proxied reads only).
+    /// In-memory client for tests.
     #[cfg(test)]
     pub fn in_memory(
         store: Arc<InMemory>,

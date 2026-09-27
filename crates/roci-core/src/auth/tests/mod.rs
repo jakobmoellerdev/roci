@@ -1,7 +1,3 @@
-//! Unit tests for the auth module. Those using fixed test credentials live
-//! here, under a `tests/` directory, which the CodeQL configuration excludes
-//! (`.github/codeql/config.yml` `paths-ignore`) like every other test file.
-
 mod cache;
 mod htpasswd;
 

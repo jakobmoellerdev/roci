@@ -16,21 +16,13 @@ async fn monolithic_push_then_pull_blob() {
 }
 
 #[tokio::test]
-async fn unknown_blob_is_404() {
+async fn missing_blob_is_404_blob_unknown() {
     let (app, _d) = app();
     let d = sha256_of(b"absent");
-    assert_eq!(
-        status_of(&app, get(format!("/v2/r/blobs/{d}"))).await,
-        StatusCode::NOT_FOUND
-    );
-}
-
-#[tokio::test]
-async fn missing_blob_is_blob_unknown() {
-    let (app, _d) = app();
-    let d = sha256_of(b"absent");
-    let v = body_json_of(&app, get(format!("/v2/ok/blobs/{d}"))).await;
-    assert_eq!(v["errors"][0]["code"], "BLOB_UNKNOWN");
+    let resp = send(&app, get(format!("/v2/ok/blobs/{d}"))).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "status");
+    let v = json_body(resp).await;
+    assert_eq!(v["errors"][0]["code"], "BLOB_UNKNOWN", "error code");
 }
 
 #[tokio::test]
@@ -42,9 +34,6 @@ async fn non_allowlisted_digest_rejected() {
 
 #[tokio::test]
 async fn sha512_blob_and_manifest_roundtrip() {
-    // The wire allowlist advertises sha512; a sha512 monolithic blob push
-    // and a sha512-referenced manifest push must both succeed (regression
-    // for the sha256-only hashing bug).
     let (app, _d) = app();
     let blob = b"sha512-payload";
     let bd = roci_storage::digest_of(blob, "sha512");
@@ -67,7 +56,6 @@ async fn head_blob_and_manifest() {
     let data = b"blobdata";
     let d = sha256_of(data);
     storage.put_blob("r", &d, data).await.unwrap();
-    // HEAD blob → 200 with content-length + digest, no body.
     let resp = send(&app, head(format!("/v2/r/blobs/{d}"))).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let ds = d.to_string();
@@ -78,7 +66,6 @@ async fn head_blob_and_manifest() {
         ),
         Some(ds.as_str())
     );
-    // HEAD manifest.
     let m = br#"{"schemaVersion":2}"#;
     let md = sha256_of(m);
     storage
@@ -94,7 +81,6 @@ async fn head_blob_and_manifest() {
         .unwrap();
     let resp = send(&app, head("/v2/r/manifests/t")).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    // HEAD absent blob/manifest → 404.
     let absent = sha256_of(b"absent");
     assert_eq!(
         status_of(&app, head(format!("/v2/r/blobs/{absent}"))).await,
@@ -116,7 +102,6 @@ async fn delete_blob_success_and_absent() {
         status_of(&app, delete(format!("/v2/r/blobs/{d}"))).await,
         StatusCode::ACCEPTED
     );
-    // Deleting again → 404. Also a malformed digest → 400.
     assert_eq!(
         status_of(&app, delete(format!("/v2/r/blobs/{d}"))).await,
         StatusCode::NOT_FOUND
@@ -129,8 +114,6 @@ async fn delete_blob_success_and_absent() {
 
 #[tokio::test]
 async fn delete_blob_io_error_maps_to_500() {
-    // Make `<repo>/blobs/<alg>/<hex>` a directory so remove_file yields a
-    // non-NotFound IO error, exercising delete_blob's Io → 500 arm.
     let (app, dir) = app();
     let d = sha256_of(b"x");
     let blob_dir = dir
@@ -146,11 +129,6 @@ async fn delete_blob_io_error_maps_to_500() {
 
 #[tokio::test]
 async fn blob_and_manifest_io_errors_map_to_500() {
-    // A *present* blob (recorded in the presence filter) whose CAS directory
-    // is made unreadable yields a non-NotFound IO error (EACCES) on both the
-    // HEAD stat and GET open paths, exercising get_blob's Io → 500 arms. The
-    // filter guards *absence*, so the blob must actually exist for the read
-    // to reach the filesystem.
     let (app, storage, dir) = app_with_storage();
     let data = b"present";
     let d = sha256_of(data);
@@ -165,14 +143,9 @@ async fn blob_and_manifest_io_errors_map_to_500() {
             status_of(&app, get(&uri)).await,
             StatusCode::INTERNAL_SERVER_ERROR
         );
-        // HEAD of a blob roci wrote is answered from its recorded size without
-        // touching the filesystem (invariant 14), so the broken dir is unseen.
         assert_eq!(status_of(&app, head(&uri)).await, StatusCode::OK);
-        // Restore perms so the tempdir cleans up.
         std::fs::set_permissions(&alg_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    // `<repo2>/index.json` as a directory makes get_manifest by digest fail
-    // with a non-NotFound Io error (read_index), exercising its Io arm.
     std::fs::create_dir_all(dir.path().join("r2").join("index.json")).unwrap();
     assert_eq!(
         status_of(&app, get(format!("/v2/r2/manifests/{d}"))).await,
@@ -182,10 +155,6 @@ async fn blob_and_manifest_io_errors_map_to_500() {
 
 #[tokio::test]
 async fn absent_blob_is_404_even_with_malformed_cas() {
-    // The presence filter answers a definite absence without touching the
-    // filesystem, so a blob the registry never stored is a clean 404 even
-    // when the CAS path underneath is malformed (here `<repo>/blobs/sha256`
-    // is a file). This pins the filter's absence guarantee.
     let (app, dir) = app();
     let alg_dir = dir.path().join("r").join("blobs");
     std::fs::create_dir_all(&alg_dir).unwrap();
@@ -214,7 +183,6 @@ async fn blob_range_requests() {
     storage.put_blob("r", &d, data).await.unwrap();
     let uri = format!("/v2/r/blobs/{d}");
 
-    // Closed range 2-5 → 206, 4 bytes "2345".
     let resp = send(
         &app,
         request(
@@ -232,7 +200,6 @@ async fn blob_range_requests() {
     let body = body_bytes(resp).await;
     assert_eq!(&body[..], b"2345");
 
-    // Suffix range -3 → last 3 bytes "789".
     let resp = send(
         &app,
         request(
@@ -248,7 +215,6 @@ async fn blob_range_requests() {
     let body = body_bytes(resp).await;
     assert_eq!(&body[..], b"789");
 
-    // Open-ended range 7- → bytes 7..9, clamped to end.
     let resp = send(
         &app,
         request(
@@ -262,7 +228,6 @@ async fn blob_range_requests() {
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(hv(&resp, header::CONTENT_RANGE), Some("bytes 7-9/10"));
 
-    // Overlong end clamps to the last byte.
     let resp = send(
         &app,
         request(
@@ -276,7 +241,6 @@ async fn blob_range_requests() {
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(hv(&resp, header::CONTENT_RANGE), Some("bytes 8-9/10"));
 
-    // Unsatisfiable (start ≥ size) → 416 + Content-Range: bytes */10.
     let resp = send(
         &app,
         request(
@@ -290,7 +254,6 @@ async fn blob_range_requests() {
     assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
     assert_eq!(hv(&resp, header::CONTENT_RANGE), Some("bytes */10"));
 
-    // A zero-length suffix is unsatisfiable.
     let resp = send(
         &app,
         request(
@@ -311,8 +274,6 @@ async fn blob_ignored_ranges_serve_full() {
     let d = sha256_of(data);
     storage.put_blob("r", &d, data).await.unwrap();
     let uri = format!("/v2/r/blobs/{d}");
-    // Each of these is ignored (malformed/multi/reversed/non-bytes-unit) →
-    // full 200 with the whole body and Accept-Ranges advertised.
     for range in [
         "items=0-1",
         "bytes=1-0",
@@ -332,7 +293,6 @@ async fn blob_ignored_ranges_serve_full() {
         let body = body_bytes(resp).await;
         assert_eq!(&body[..], data, "range {range}");
     }
-    // No Range header at all → full 200 with immutable cache validators.
     let resp = send(&app, get(&uri)).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
@@ -351,14 +311,12 @@ async fn blob_conditional_get_and_head() {
     let uri = format!("/v2/r/blobs/{d}");
     let etag = format!("\"{d}\"");
 
-    // HEAD advertises ranges + immutable cache + ETag.
     let resp = send(&app, head(&uri)).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(hv(&resp, header::ACCEPT_RANGES), Some("bytes"));
     assert_eq!(hv(&resp, header::CONTENT_LENGTH), Some("9"));
     assert_eq!(hv(&resp, header::ETAG), Some(etag.as_str()));
 
-    // If-None-Match matching the digest ETag → 304 (GET and HEAD).
     for method in [Method::GET, Method::HEAD] {
         let req = request(
             method.clone(),
@@ -372,7 +330,6 @@ async fn blob_conditional_get_and_head() {
         let body = body_bytes(resp).await;
         assert!(body.is_empty(), "304 has no body ({method})");
     }
-    // A `*` If-None-Match also short-circuits to 304.
     let resp = send(
         &app,
         request(

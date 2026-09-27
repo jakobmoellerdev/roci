@@ -1,5 +1,3 @@
-//! Test: `init` with OTel + HTTP OTLP + JSON log format.
-//! Exercises the http-proto exporter path (reqwest-blocking-client).
 #![cfg(feature = "otel")]
 
 use roci_config::{Config, LogFormat, OtlpConfig, OtlpProtocol};

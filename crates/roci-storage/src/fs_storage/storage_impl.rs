@@ -1,6 +1,4 @@
-//! The [`Storage`] trait implementation for [`FsStorage`] — the registry's
-//! blob/upload/manifest/tag/referrer operations, each anchored beneath the
-//! store root.
+//! [`Storage`] implementation for [`FsStorage`].
 
 use super::super::FsStorage;
 use super::paths::{blob_dir_rel, blob_rel, upload_dir_rel, upload_rel, SafeComponent};
@@ -20,22 +18,14 @@ use tokio::io::AsyncReadExt;
 
 impl Storage for FsStorage {
     async fn blob_size(&self, repo: &str, digest: &Digest) -> Result<u64, StorageError> {
-        // Validate the path first (the traversal backstop must run before any
-        // short-circuit), then let a definite-absent filter answer skip the
-        // stat; a "maybe" falls through to a no-follow stat resolved *beneath*
-        // the store root — no symlink at any component (repo, `blobs`, `<alg>`,
-        // digest) is followed, so an external file can never be sized as a blob.
+        // Traversal backstop, then presence filter before no-follow stat.
         let rel = blob_rel(repo, digest)?;
         let digest_str = digest.as_string();
         if !self.presence.maybe_present(repo, &digest_str) {
             return Err(StorageError::NotFound);
         }
-        // A HEAD usually precedes a push that skips this layer: keep it alive.
         self.want_blob(repo, &digest_str).await;
-        // Every blob roci wrote has its size recorded with its checksum (kept in
-        // lockstep with the CAS by the lifecycle hooks, invariant 15): answer
-        // HEAD from RAM with no syscall or blocking-pool hop (invariant 14).
-        // Blobs only found on disk (an imported layout) fall back to a stat.
+        // Answer HEAD from RAM (inv. 14/15); fall back to stat for imported blobs.
         if let Some(recorded) = self.meta.checksum(repo, &digest_str) {
             return Ok(recorded.size);
         }
@@ -46,25 +36,14 @@ impl Storage for FsStorage {
     }
 
     async fn blob_exists(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError> {
-        // Validate the path first (traversal backstop before any short-circuit),
-        // then let a definite-absent filter answer skip the stat; a "maybe"
-        // falls through to an authoritative no-follow stat resolved beneath the
-        // store root. A CAS entry counts as present only if it is a *regular
-        // file* reached without traversing any symlink — so neither a planted
-        // leaf symlink nor a symlinked parent dir can satisfy a manifest's
-        // referenced-blob check and then be served from outside the store.
+        // Traversal backstop, then presence filter before no-follow stat.
         let rel = blob_rel(repo, digest)?;
         let digest_str = digest.as_string();
         if !self.presence.maybe_present(repo, &digest_str) {
             return Ok(false);
         }
-        // The manifest push checking this blob is about to reference it.
         self.want_blob(repo, &digest_str).await;
-        // A blob roci wrote has its size recorded in lockstep with the CAS
-        // (invariant 15): answer from RAM, no syscall. This is advisory for the
-        // manifest push, which re-checks every referenced blob authoritatively
-        // (no-follow stat) under the GC fence inside `put_manifest` — so a blob
-        // swapped for a symlink since is still rejected (MissingReference).
+        // RAM shortcut (inv. 15); authoritative re-check in put_manifest.
         if self.meta.checksum(repo, &digest_str).is_some() {
             return Ok(true);
         }
@@ -76,8 +55,7 @@ impl Storage for FsStorage {
 
     async fn read_blob(&self, repo: &str, digest: &Digest) -> Result<Vec<u8>, StorageError> {
         let digest_str = digest.as_string();
-        // Serve small blobs (manifests/configs) from the RAM cache with zero
-        // syscalls; a miss falls through to the loose file.
+        // Serve from cache if warm; else read the loose file.
         if let Some(bytes) = self.cache.get(repo, &digest_str) {
             return Ok(bytes.to_vec());
         }
@@ -85,9 +63,7 @@ impl Storage for FsStorage {
         if !self.presence.maybe_present(repo, &digest_str) {
             return Err(StorageError::NotFound);
         }
-        // Read through the same no-follow beneath-root open as open_blob: a
-        // planted CAS symlink (leaf or parent) can never redirect a whole-blob
-        // read outside the store, even on a cache miss.
+        // No-follow beneath-root read (symlink-safe).
         let mut f = open_beneath(&self.root, &rel)
             .await
             .map_err(map_not_found)?;
@@ -101,9 +77,7 @@ impl Storage for FsStorage {
         if !self.presence.maybe_present(repo, &digest.as_string()) {
             return Err(StorageError::NotFound);
         }
-        // Open beneath the store root, refusing any symlink traversal at every
-        // component: a planted `blobs/<alg>/<hex>` leaf — or a symlinked `repo`,
-        // `blobs`, or `<alg>` parent — can never stream bytes from outside the CAS.
+        // No-follow beneath-root open (symlink-safe).
         let rel = blob_rel(repo, digest)?;
         let f = open_beneath(&self.root, &rel)
             .await
@@ -113,17 +87,10 @@ impl Storage for FsStorage {
     }
 
     async fn begin_upload(&self, repo: &str) -> Result<String, StorageError> {
-        // A random 128-bit id: unguessable and independent of pid/restart (the
-        // old `{pid}-{counter}` scheme collided across restarts). Hex-encoded,
-        // so `upload_path`→`safe_component` accepts it unchanged.
         let mut buf = [0u8; 16];
         getrandom::fill(&mut buf).map_err(|e| StorageError::Io(io::Error::other(e)))?;
         let id = hex::encode(buf);
-        // Validate the staging path now; the file itself is created (beneath
-        // the store root, no-follow, `O_EXCL`) by the session's first
-        // append/finalize, inside the blocking hop it makes anyway.
         upload_dir_rel(repo, &id)?;
-        // The concurrent-session cap counts pending sessions too.
         self.quota.begin_session()?;
         self.pending_uploads
             .lock()
@@ -140,19 +107,13 @@ impl Storage for FsStorage {
         expected_offset: Option<u64>,
         limit: u64,
     ) -> Result<u64, StorageError> {
-        // Serialize with any concurrent append/finish/abort on this session so
-        // bytes cannot be appended between a finish's hash-verify and its
-        // promote, and so the Content-Range offset check below is atomic with
-        // the append (two concurrent PATCHes cannot both pass it). The guard
-        // also carries the session's hash-on-write state.
+        // Session lock serializes with concurrent append/finish/abort.
         let lock = self.session_lock(repo, id)?;
         let mut hash = lock.lock().await;
         let (f, current) = match self.prepare_session(repo, id).await? {
             Staging::Ready { file, len, .. } => (tokio::fs::File::from_std(file), len),
             Staging::Missing => {
-                // No such session: drop the just-created lock entry so a stream
-                // of unknown ids cannot leak lock-map entries.
-                self.drop_session_lock(repo, id);
+                self.upload_locks.remove(repo, id);
                 return Err(StorageError::NotFound);
             }
             Staging::NotRegular => {
@@ -161,8 +122,7 @@ impl Storage for FsStorage {
                 ))))
             }
         };
-        // Enforce the Content-Range precondition under the lock: the current
-        // committed size must equal the client-declared start offset.
+        // Content-Range precondition: current size must equal declared offset.
         if let Some(offset) = expected_offset.filter(|&o| o != current) {
             return Err(StorageError::RangeNotSatisfiable {
                 expected: current,
@@ -180,9 +140,7 @@ impl Storage for FsStorage {
     }
 
     async fn upload_size(&self, repo: &str, id: &str) -> Result<u64, StorageError> {
-        // Stat the staging file no-follow beneath the store root: a symlinked
-        // `uploads`/`<id>` component cannot redirect the size read outside the
-        // store. A missing or non-regular entry is NotFound (no such session).
+        // No-follow stat beneath root.
         if self.is_pending(repo, id) {
             return Ok(0);
         }
@@ -205,26 +163,14 @@ impl Storage for FsStorage {
         trailing: UploadBody,
         limit: u64,
     ) -> Result<(), StorageError> {
-        // Hold the session lock across the trailing append AND the verify+promote
-        // so a concurrent PATCH cannot inject bytes between the append and the
-        // hash (which would make the digest cover unverified data, or fail a
-        // valid completion).
+        // Session lock covers trailing append + verify + promote.
         let lock = self.session_lock(repo, id)?;
         let mut guard = lock.lock().await;
         let staging_rel = upload_rel(repo, id)?;
-        // The filesystem work runs as three blocking-pool hops (prepare, body,
-        // land) instead of one per syscall: each hop costs a queue + two
-        // thread wake-ups, far more than a cached stat/open itself.
-        //
-        // Hop 1 — resolve the staging entry beneath the store root with no
-        // symlink traversal at any component (a planted `uploads` parent or
-        // `uploads/<id>` symlink is not a valid staging file, so it is never
-        // hashed-through and promoted), open it for the trailing append, and
-        // capture its size and inode.
         let (file, current, staging_ino) = match self.prepare_session(repo, id).await? {
             Staging::Ready { file, len, ino } => (file, len, ino),
             Staging::Missing => {
-                self.drop_session_lock(repo, id);
+                self.upload_locks.remove(repo, id);
                 return Err(StorageError::NotFound);
             }
             Staging::NotRegular => {
@@ -234,9 +180,6 @@ impl Storage for FsStorage {
                 )));
             }
         };
-        // Body — stream the monolithic PUT's trailing body onto the staging
-        // file under the same lock (one hop per full 1 MiB batch). The final
-        // partial batch is written inside the next hop instead of its own.
         let seed = guard
             .take()
             .or_else(|| (current == 0).then(StagedHash::new));
@@ -249,10 +192,7 @@ impl Storage for FsStorage {
         )
         .await?;
         let staged_size = body.len;
-        // Re-check the per-session cap *under the lock*: a PATCH that appended
-        // past the cap and was preempted before aborting cannot be promoted by a
-        // racing empty-body PUT, because finalize itself rejects an oversized
-        // staging file (and drops it) here.
+        // Reject oversized staging file under lock.
         if staged_size > max_size {
             self.discard_session(repo, id).await?;
             roci_telemetry::record_upload_finalize("too_large");
@@ -261,13 +201,8 @@ impl Storage for FsStorage {
                 actual: staged_size,
             });
         }
-        // Hash-on-write covers every staged byte (sha256) through the handle
-        // opened in hop 1, so the verified inode is `staging_ino`, and the
-        // landing hop writes the tail, finishes the hash and verifies it.
-        // Otherwise — a session from before a restart, sha512, or
-        // `storage.commit` (sync the staged data before it is promoted, so a
-        // crash after the rename cannot leave a named blob with torn contents)
-        // — a verify hop writes the tail and re-hashes (or finishes) first.
+        // When hash-on-write covers all staged bytes, the landing hop
+        // verifies; otherwise a separate verify hop re-hashes.
         let covers = body.hash.as_ref().is_some_and(|h| h.len() == body.tail_at)
             && expected.algorithm() == "sha256";
         let (verify, verified) = if covers && !self.config.commit {
@@ -297,7 +232,6 @@ impl Storage for FsStorage {
         };
         let staging_ino = verified.as_ref().map_or(staging_ino, |v| v.2);
         if let Some((actual, _, _)) = verified.as_ref().filter(|v| !v.0.ct_eq(expected)) {
-            // Reject and drop the staging file so a bad upload leaves nothing.
             self.discard_session(repo, id).await?;
             roci_telemetry::record_upload_finalize("digest_mismatch");
             return Err(StorageError::DigestMismatch {
@@ -309,20 +243,10 @@ impl Storage for FsStorage {
         let (alg_rel, hex) = blob_dir_rel(repo, expected)?;
         let repo_rel = super::paths::repo_rel(repo)?;
         let digest_str = expected.as_string();
-        // Serialize admission + publication per (repo, digest) so concurrent
-        // uploads of the same absent blob cannot both charge quota, and hold the
-        // GC pin from before the blob lands until it is stamped, so a sweep
-        // never sees it half-registered.
-        let admit_lock = self.blob_admit_lock(repo, &digest_str);
+        // Per-(repo,digest) lock: no double quota charge; GC pin until stamped.
+        let admit_lock = self.blob_admit_locks.get(repo, &digest_str);
         let _admit_guard = admit_lock.lock().await;
         let pin = self.gc.pin().await;
-        // Hop 3 — ensure the layout marker, charge quota, then land the
-        // verified blob: dedupe-link an identical blob another repo already
-        // stores (reflink → hard link; the staged copy is dropped), otherwise
-        // rename the staging file in place — atomic on one filesystem,
-        // copy-free, and safe against a symlinked `uploads`, `blobs` or `<alg>`
-        // parent (a crash never leaves a corrupt-but-named blob). A small blob
-        // is read back for the cache in the same hop.
         let landed = {
             let ctx = LandCtx {
                 root: self.root.to_path_buf(),
@@ -348,7 +272,7 @@ impl Storage for FsStorage {
             Landed::Mismatch(actual) => {
                 drop(pin);
                 drop(_admit_guard);
-                self.drop_blob_admit_lock(repo, &digest_str);
+                self.blob_admit_locks.release(repo, &digest_str);
                 self.discard_session(repo, id).await?;
                 return Err(StorageError::DigestMismatch {
                     expected: expected.as_string(),
@@ -356,10 +280,9 @@ impl Storage for FsStorage {
                 });
             }
             Landed::Rejected(e) => {
-                // Over quota: the session can never complete, so drop it.
                 drop(pin);
                 drop(_admit_guard);
-                self.drop_blob_admit_lock(repo, &digest_str);
+                self.blob_admit_locks.release(repo, &digest_str);
                 self.discard_session(repo, id).await?;
                 return Err(e);
             }
@@ -367,13 +290,13 @@ impl Storage for FsStorage {
                 drop(pin);
                 self.quota.release(repo, charged);
                 drop(_admit_guard);
-                self.drop_blob_admit_lock(repo, &digest_str);
+                self.blob_admit_locks.release(repo, &digest_str);
                 return Err(error);
             }
         };
         let crc32c = landed_crc.or(verified.map(|v| v.1)).unwrap_or_default();
         self.quota.end_session();
-        self.drop_session_lock(repo, id);
+        self.upload_locks.remove(repo, id);
         self.blob_entered(
             repo,
             &digest_str,
@@ -384,7 +307,7 @@ impl Storage for FsStorage {
         );
         drop(pin);
         drop(_admit_guard);
-        self.drop_blob_admit_lock(repo, &digest_str);
+        self.blob_admit_locks.release(repo, &digest_str);
         if let Some(bytes) = warm {
             self.cache.put(repo, &digest_str, &bytes);
         }
@@ -393,13 +316,9 @@ impl Storage for FsStorage {
     }
 
     async fn abort_upload(&self, repo: &str, id: &str) -> Result<bool, StorageError> {
-        // Serialize with any concurrent append/finish, then drop the session.
         let lock = self.session_lock(repo, id)?;
         let guard = lock.lock().await;
-        // Idempotent: a missing session is `Ok(false)` (nothing removed). Remove
-        // via a dirfd walked no-follow beneath the store root so a symlinked
-        // `uploads`/`<id>` component cannot redirect the deletion outside the
-        // store; a missing entry / symlinked parent maps to NotFound → false.
+        // No-follow unlink beneath root; missing = Ok(false).
         let (up_dir, up_leaf) = upload_dir_rel(repo, id)?;
         let removed = self.take_pending(repo, id)
             || match unlink_beneath(&self.root, &up_dir, &up_leaf).await {
@@ -411,13 +330,11 @@ impl Storage for FsStorage {
             self.quota.end_session();
         }
         drop(guard);
-        self.drop_session_lock(repo, id);
+        self.upload_locks.remove(repo, id);
         Ok(removed)
     }
 
     async fn put_blob(&self, repo: &str, digest: &Digest, data: &[u8]) -> Result<(), StorageError> {
-        // Hash with the *expected* algorithm so sha512 digests are honored, not
-        // silently rejected against a sha256 recompute.
         let actual = digest_of(data, digest.algorithm());
         if !actual.ct_eq(digest) {
             return Err(StorageError::DigestMismatch {
@@ -425,26 +342,16 @@ impl Storage for FsStorage {
                 actual: actual.as_string(),
             });
         }
-        // A repo populated only by blob pushes still gets a valid oci-layout
-        // marker so the directory is a well-formed OCI image layout.
         self.ensure_layout(repo).await?;
         let (alg_rel, leaf) = blob_dir_rel(repo, digest)?;
         let digest_str = digest.as_string();
-        // Serialize admission + publication per (repo, digest) so concurrent
-        // uploads of the same absent blob cannot both charge quota.
-        let admit_lock = self.blob_admit_lock(repo, &digest_str);
+        let admit_lock = self.blob_admit_locks.get(repo, &digest_str);
         let _admit_guard = admit_lock.lock().await;
         let charged = self
             .admit_blob(repo, &alg_rel, &leaf, data.len() as u64)
             .await?;
         let pin = self.gc.pin().await;
-        // Dedupe-link an identical blob another repo holds; otherwise publish
-        // the bytes into the CAS crash-atomically, anchored to a dirfd walked
-        // no-follow beneath the store root (dir_beneath creates the
-        // `blobs/<alg>` tree): a symlinked parent cannot redirect the write, a
-        // partial blob is never namespace-visible (Linux `O_TMPFILE`+`linkat`),
-        // and an `EEXIST` at the digest name is dedup only if it is a regular
-        // file. Non-Linux / no-`O_TMPFILE` uses a temp+`renameat` in that dirfd.
+        // Dedupe-link or crash-atomic publish (no-follow beneath root).
         if !self.dedupe_link(repo, &alg_rel, &leaf, &digest_str).await {
             if let Err(e) =
                 publish_bytes(&self.root, &alg_rel, &leaf, data, self.config.commit).await
@@ -452,7 +359,7 @@ impl Storage for FsStorage {
                 drop(pin);
                 self.quota.release(repo, charged);
                 drop(_admit_guard);
-                self.drop_blob_admit_lock(repo, &digest_str);
+                self.blob_admit_locks.release(repo, &digest_str);
                 return Err(e.into());
             }
         }
@@ -466,15 +373,13 @@ impl Storage for FsStorage {
         );
         drop(pin);
         drop(_admit_guard);
-        self.drop_blob_admit_lock(repo, &digest_str);
-        // Warm the small-blob cache (a no-op for large layers).
+        self.blob_admit_locks.release(repo, &digest_str);
         self.cache.put(repo, &digest_str, data);
         Ok(())
     }
 
     async fn delete_blob(&self, repo: &str, digest: &Digest) -> Result<(), StorageError> {
-        // Remove via a dirfd walked no-follow beneath the store root so a
-        // symlinked `blobs`/`<alg>` parent cannot redirect the deletion.
+        // No-follow unlink beneath root.
         let (alg_rel, leaf) = blob_dir_rel(repo, digest)?;
         let size = self.size_for_release(&alg_rel.join(&leaf)).await;
         unlink_beneath(&self.root, &alg_rel, &leaf)
@@ -493,9 +398,7 @@ impl Storage for FsStorage {
         data: &[u8],
         links: ManifestLinks<'_>,
     ) -> Result<(), StorageError> {
-        // Validate the tag (if any) and build the referrer descriptor *before*
-        // writing any content, so a bad tag or descriptor cannot leave a
-        // manifest blob committed with no index entry.
+        // Validate tag and build referrer descriptor before writing.
         if let Some(tag) = tag {
             SafeComponent::new(tag)?;
         }
@@ -506,12 +409,7 @@ impl Storage for FsStorage {
             )),
             None => None,
         };
-        // ── Publish the manifest blob under a GC fence held continuously
-        // from here through the MetaOp::PutManifest apply and the GC clears.
-        // The fence is the backend's shared RwLock read guard (`gc.pin()`);
-        // do NOT re-acquire it (a waiting writer deadlocks). ──
-        //
-        // Verify digest.
+        // GC fence: hold through PutManifest apply + clears; do NOT re-acquire.
         let actual = digest_of(data, digest.algorithm());
         if !actual.ct_eq(digest) {
             return Err(StorageError::DigestMismatch {
@@ -526,16 +424,8 @@ impl Storage for FsStorage {
             .iter()
             .map(|r| blob_rel(repo, r))
             .collect::<Result<Vec<_>, _>>()?;
-        // Hold the GC pin from before the blob lands through the metadata
-        // commit and GC clears — no sweep can see it half-registered or
-        // delete a referenced blob between the publish and PutManifest.
         let pin = self.gc.pin().await;
-        // One blocking hop: layout marker, quota admission, dedupe link or
-        // crash-atomic publish of the manifest blob, then — under the same
-        // fence — the authoritative re-check that every `required` digest
-        // (config + layers the core already checked) is still a regular file.
-        // A sweep that ran before this pin cannot have deleted them (the pin
-        // blocks), and one that starts after will see them referenced.
+        // One hop: layout, quota, dedupe/publish, re-check required blobs.
         let ctx = ManifestCtx {
             root: self.root.to_path_buf(),
             repo: repo.to_string(),
@@ -582,9 +472,7 @@ impl Storage for FsStorage {
             ));
         }
 
-        // Manifest, tag, backref edges and referrer land in ONE metadata record
-        // (authoritative immediately), then the coalesced index.json rewrite is
-        // scheduled. A crash can never keep the manifest but lose its edges.
+        // All edges land in one metadata record (crash-atomic).
         let references: Vec<String> = links.references.iter().map(Digest::as_string).collect();
         self.apply_meta(
             repo,
@@ -597,7 +485,6 @@ impl Storage for FsStorage {
                 referrer,
             },
         )?;
-        // The manifest is a GC root, and everything it references is live.
         self.gc.clear(repo, &digest_str);
         for r in &references {
             self.gc.clear(repo, r);
@@ -608,8 +495,6 @@ impl Storage for FsStorage {
 
     async fn get_manifest(&self, repo: &str, reference: &str) -> Result<ManifestRef, StorageError> {
         let (digest, media_type) = if reference.contains(':') {
-            // By-digest: the digest *is* the reference; recover the media type
-            // from the in-RAM index, then the on-disk index, then default.
             let digest = Digest::parse(reference)?;
             let media_type = match self.meta.manifest_media_type(repo, reference) {
                 Some(mt) => mt,
@@ -620,22 +505,15 @@ impl Storage for FsStorage {
             };
             (digest, media_type)
         } else {
-            // By-tag: resolve via the in-RAM tag map; on a miss fall back to the
-            // on-disk index.json (the layout is the source of truth).
             match self.meta.resolve_tag(repo, reference) {
                 Some((digest_str, media_type)) => (Digest::parse(&digest_str)?, media_type),
                 None => self.index_resolve_tag(repo, reference).await?,
             }
         };
-        // Manifests are small blobs; serve their bytes from the RAM cache when
-        // warm, else read the loose file and warm the cache.
         let digest_str = digest.as_string();
         let bytes = match self.cache.get(repo, &digest_str) {
             Some(cached) => cached.to_vec(),
             None => {
-                // Read the manifest blob through a no-follow beneath-root open
-                // (regular-file-checked) so a symlinked CAS parent/leaf cannot
-                // redirect the read outside the store, even on a cache miss.
                 let mut f = open_beneath(&self.root, &blob_rel(repo, &digest)?)
                     .await
                     .map_err(map_not_found)?;
@@ -653,9 +531,7 @@ impl Storage for FsStorage {
     }
 
     async fn delete_manifest(&self, repo: &str, digest: &Digest) -> Result<(), StorageError> {
-        // Read what the manifest references before it goes: those objects may
-        // become unreferenced and so GC candidates. A missing manifest is
-        // NotFound; an unparseable one simply references nothing.
+        // Capture references before removing (GC candidate seeding).
         let digest_str = digest.as_string();
         let (alg_rel, leaf) = blob_dir_rel(repo, digest)?;
         let bytes = match self.cache.get(repo, &digest_str) {
@@ -672,9 +548,7 @@ impl Storage for FsStorage {
         let references = serde_json::from_slice(&bytes)
             .map(|v| manifest_references(&v))
             .unwrap_or_default();
-        // Remove the manifest blob from the CAS via a dirfd walked no-follow
-        // beneath the store root (NotFound if absent); a symlinked parent cannot
-        // redirect the deletion outside the store.
+        // No-follow unlink beneath root.
         unlink_beneath(&self.root, &alg_rel, &leaf)
             .await
             .map_err(map_not_found)?;
@@ -686,8 +560,6 @@ impl Storage for FsStorage {
                 digest: digest_str,
             },
         )?;
-        // Every stored object whose last referencing manifest this was is now
-        // garbage-in-waiting: collected once its grace period passes untouched.
         for r in references.iter().map(Digest::as_string) {
             if self.meta.backrefs(repo, &r).is_empty() && self.presence.maybe_present(repo, &r) {
                 self.gc.mark(repo, &r);
@@ -702,20 +574,11 @@ impl Storage for FsStorage {
         last: Option<&str>,
         limit: usize,
     ) -> Result<Page<String>, StorageError> {
-        // Fast path: a seek into the in-RAM sorted tag map. A repo the store
-        // does not yet cover (e.g. an out-of-band layout mutation after
-        // startup) falls back to the on-disk index.json, the source of truth.
+        // In-RAM tag map; fall back to on-disk index.json.
         if let Some(page) = self.meta.tags_page(repo, last, limit) {
             return Ok(page);
         }
-        let index = self.read_index(repo).await?;
-        let mut tags: Vec<String> = index_manifests(&index)
-            .iter()
-            .filter_map(|e| descriptor_tag(e).map(str::to_string))
-            .collect();
-        tags.sort();
-        tags.dedup();
-        Ok(page_sorted(tags, String::as_str, last, limit))
+        Ok(layout_tags_page(&self.read_index(repo).await?, last, limit))
     }
 
     async fn list_referrers(
@@ -727,27 +590,18 @@ impl Storage for FsStorage {
         limit: usize,
     ) -> Result<Page<Referrer>, StorageError> {
         let target = subject.as_string();
-        // Fast path: a seek into the in-RAM subject→referrers index.
         if let Some(page) = self
             .meta
             .referrers_page(repo, &target, artifact_type, last, limit)
         {
             return Ok(page);
         }
-        // Fallback: scan index.json for any descriptor carrying `subject`.
         let index = self.read_index(repo).await?;
-        let linked: Vec<(String, &serde_json::Value)> = index_manifests(&index)
-            .iter()
-            .filter(|e| subject_digest(e) == Some(target.as_str()))
-            .filter_map(|e| Some((descriptor_digest(e)?.to_string(), e)))
-            .collect();
+        let linked = layout_subject_referrers(&index, &target);
         if !linked.is_empty() {
             return Ok(page_layout_referrers(linked, artifact_type, last, limit));
         }
-        // Tag-schema fallback (dist-spec §Referrers tag schema): a client that
-        // pushed to a registry without the referrers API maintains an image
-        // index under the tag `<alg>-<ref>` (ref = hex, truncated to 64). Serve
-        // its `manifests`, de-duplicated by digest; anything malformed → empty.
+        // Tag-schema fallback (dist-spec §Referrers tag schema).
         let hex_up_to_64 = &subject.hex()[..subject.hex().len().min(64)];
         let tag_schema_tag = format!("{}-{}", subject.algorithm(), hex_up_to_64);
         let resolved = match self.meta.resolve_tag(repo, &tag_schema_tag) {
@@ -772,8 +626,6 @@ impl Storage for FsStorage {
         let Some(arr) = parsed.get("manifests").and_then(|m| m.as_array()) else {
             return Ok(Page::default());
         };
-        // Only well-formed descriptors: an object whose digest parses under
-        // the registry's digest grammar. Anything else is skipped.
         let listed: Vec<(String, &serde_json::Value)> = arr
             .iter()
             .filter_map(|entry| {
@@ -790,15 +642,12 @@ impl Storage for FsStorage {
         to_repo: &str,
         digest: &Digest,
     ) -> Result<bool, StorageError> {
-        // Source absent → the caller falls back to a normal upload session.
         let size = match self.blob_size(from_repo, digest).await {
             Ok(size) => size,
             Err(StorageError::NotFound) => return Ok(false),
             Err(e) => return Err(e),
         };
         let digest_str = digest.as_string();
-        // Same-repo mount: source and destination are the same path — already
-        // present, nothing to promote (a copy-onto-self would truncate it).
         let (from_alg_rel, leaf) = blob_dir_rel(from_repo, digest)?;
         let (to_alg_rel, _) = blob_dir_rel(to_repo, digest)?;
         if from_alg_rel == to_alg_rel {
@@ -806,23 +655,17 @@ impl Storage for FsStorage {
             return Ok(true);
         }
         self.ensure_layout(to_repo).await?;
-        // Admission and promotion are one critical section per destination
-        // blob, so a concurrent duplicate sees the promoted file (no charge).
-        let admit_lock = self.blob_admit_lock(to_repo, &digest_str);
+        let admit_lock = self.blob_admit_locks.get(to_repo, &digest_str);
         let _admitting = admit_lock.lock().await;
         let charged = match self.admit_blob(to_repo, &to_alg_rel, &leaf, size).await {
             Ok(c) => c,
             Err(e) => {
-                self.drop_blob_admit_lock(to_repo, &digest_str);
+                self.blob_admit_locks.release(to_repo, &digest_str);
                 return Err(e);
             }
         };
         let pin = self.gc.pin().await;
-        // Promote via dirfds walked no-follow beneath the store root, contract
-        // order reflink → hard link → streaming copy (SECURITY.md:124). A
-        // pre-existing regular-file destination is idempotent success; a planted
-        // symlink/dir parent or destination is rejected (re-validated inside the
-        // promotion, closing the check→promote race).
+        // Promote no-follow beneath root: reflink → hard link → copy (SECURITY.md:124).
         let promoted = mount_promote_beneath(
             &self.root,
             &from_alg_rel,
@@ -837,13 +680,11 @@ impl Storage for FsStorage {
             Err(e) => {
                 drop(pin);
                 self.quota.release(to_repo, charged);
-                self.drop_blob_admit_lock(to_repo, &digest_str);
+                self.blob_admit_locks.release(to_repo, &digest_str);
                 return Err(match e.kind() {
                     io::ErrorKind::AlreadyExists => StorageError::BadPath(format!(
                         "mount destination for {digest_str} is not a regular file"
                     )),
-                    // A symlinked/non-directory destination parent is refused
-                    // beneath the root as `NotFound` → 404 (documented), not 500.
                     io::ErrorKind::NotFound => StorageError::NotFound,
                     _ => StorageError::Io(e),
                 });
@@ -853,13 +694,12 @@ impl Storage for FsStorage {
         let checksum = self.meta.checksum(from_repo, &digest_str);
         self.blob_entered(to_repo, &digest_str, checksum);
         drop(pin);
-        self.drop_blob_admit_lock(to_repo, &digest_str);
+        self.blob_admit_locks.release(to_repo, &digest_str);
         Ok(true)
     }
 }
 
-/// Log + count how a cross-repo promotion materialized: the hard-link and
-/// copy fallbacks are logged so an operator sees reflink is unavailable.
+/// Log + count how a cross-repo promotion materialized.
 pub(super) fn record_promotion(op: &str, how: Promotion, repo: &str, digest: &str) {
     roci_telemetry::record_dedupe_link(op, how.label());
     match how {
@@ -876,26 +716,8 @@ pub(super) fn record_promotion(op: &str, how: Promotion, repo: &str, digest: &st
     }
 }
 
-/// The stored referrer descriptor: the core-computed descriptor (artifactType,
-/// annotations, …) with the `subject` link merged in. A non-object descriptor
-/// is an internal inconsistency → `Io`.
-fn referrer_descriptor(subject: &Digest, descriptor: &[u8]) -> Result<Vec<u8>, StorageError> {
-    let invalid =
-        |e: serde_json::Error| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, e));
-    let mut merged: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_slice(descriptor).map_err(invalid)?;
-    merged.insert(
-        "subject".into(),
-        serde_json::json!({ "digest": subject.as_string() }),
-    );
-    serde_json::to_vec(&merged).map_err(invalid)
-}
-
 impl FsStorage {
-    /// Dedupe: when another repo holds `digest`, link its copy into
-    /// `alg_rel/leaf` (reflink → hard link; never a byte copy — the caller
-    /// already holds the bytes). `true` when the destination now holds the
-    /// blob; `false` sends the caller down its normal write path.
+    /// Dedupe: link from another repo (reflink → hard link). `true` on success.
     async fn dedupe_link(&self, repo: &str, alg_rel: &Path, leaf: &str, digest: &str) -> bool {
         let Some(src_repo) = self.dedupe.locate(digest, repo) else {
             return false;
@@ -921,8 +743,6 @@ impl FsStorage {
                 true
             }
             Err(e) => {
-                // The located copy vanished or cannot be linked (other device):
-                // forget a stale location and keep the caller's own copy.
                 if e.kind() == io::ErrorKind::NotFound {
                     self.dedupe.remove(&src_repo, digest);
                 }
@@ -932,8 +752,7 @@ impl FsStorage {
         }
     }
 
-    /// The blob size to hand back to the quota when it is removed; only
-    /// stat'ed when byte quotas are tracked.
+    /// Blob size for quota release; only stat'ed when byte quotas are tracked.
     async fn size_for_release(&self, rel: &Path) -> Option<u64> {
         if !self.quota.tracks_bytes() {
             return None;
@@ -944,8 +763,7 @@ impl FsStorage {
         }
     }
 
-    /// Drop an upload session that can never complete: its staging file (if
-    /// still there), its session count, and its lock entry.
+    /// Drop an upload session that can never complete.
     async fn discard_session(&self, repo: &str, id: &str) -> Result<(), StorageError> {
         let (up_dir, up_leaf) = upload_dir_rel(repo, id)?;
         if self.take_pending(repo, id)
@@ -953,16 +771,14 @@ impl FsStorage {
         {
             self.quota.end_session();
         }
-        self.drop_session_lock(repo, id);
+        self.upload_locks.remove(repo, id);
         Ok(())
     }
 }
 
-/// Absolute ceiling for a small-blob cache warm read (never derived from
-/// config alone, so the read-back buffer is bounded by a constant).
+/// Ceiling for small-blob cache warm reads.
 const WARM_CAP: usize = 8 * 1024 * 1024;
 
-/// The staging file of an upload session, as resolved by `finish_upload`.
 enum Staging {
     Missing,
     NotRegular,
@@ -973,8 +789,7 @@ enum Staging {
     },
 }
 
-/// Blocking: resolve the staging file beneath `root` (no symlink at any
-/// component), require a regular file, and open it for appending.
+/// Blocking: resolve staging file beneath `root` (no-follow), open for appending.
 fn prepare_staging(
     root: std::path::PathBuf,
     rel: std::path::PathBuf,
@@ -982,9 +797,7 @@ fn prepare_staging(
 ) -> io::Result<Staging> {
     use rustix::fs::{Mode, OFlags};
     if create {
-        // First write to a pending session: create the staging file beneath
-        // the root (creating `<repo…>/uploads`), no-follow, exclusive — a
-        // symlink planted at any component cannot redirect the create.
+        // Create staging file (no-follow, O_EXCL) beneath root.
         let dir = rel.parent().unwrap_or(Path::new(""));
         let leaf = rel.file_name().unwrap_or_default();
         let dirfd = dir_beneath(&root, dir, true)?;
@@ -1020,7 +833,6 @@ fn prepare_staging(
     })
 }
 
-/// Everything the landing hop needs, owned so it can move to the blocking pool.
 struct LandCtx {
     root: std::path::PathBuf,
     repo: String,
@@ -1036,14 +848,12 @@ struct LandCtx {
     quota: std::sync::Arc<crate::quota::QuotaTracker>,
     dedupe: std::sync::Arc<crate::DedupeIndex>,
     warm_limit: usize,
-    /// The deferred body tail plus its hash-on-write state, when the landing
-    /// hop itself writes the tail and verifies the digest.
+    /// Deferred body tail + hash-on-write state for landing hop verification.
     verify: Option<(Deferred, Digest)>,
 }
 
 enum Landed {
-    /// Landed, with the bytes to warm the cache with and — when this hop
-    /// verified the digest — the blob's CRC32C.
+    /// Landed; cache warm bytes and optional CRC32C.
     Done {
         warm: Option<Vec<u8>>,
         crc: Option<u32>,
@@ -1056,11 +866,8 @@ enum Landed {
     Failed { charged: u64, error: StorageError },
 }
 
-/// Blocking: the landing half of `finish_upload` in one hop.
 fn land_blob(mut c: LandCtx) -> Landed {
     use std::io::Read;
-    // Deferred tail: write it, finish the hash-on-write digest and verify it
-    // before anything is admitted or moved.
     let crc = match c.verify.take() {
         None => None,
         Some((body, expected)) => match body.write_tail() {
@@ -1071,7 +878,6 @@ fn land_blob(mut c: LandCtx) -> Landed {
                 }
                 Some(crc)
             }
-            // `verify` is only set when the hash covers the staged bytes.
             Ok(None) => return Landed::Mismatch(expected),
             Err(e) => {
                 return Landed::Failed {
@@ -1113,8 +919,7 @@ fn land_blob(mut c: LandCtx) -> Landed {
             error: map_not_found(e),
         };
     }
-    // Optional small-blob cache warm: read back (no-follow, beneath-root) at
-    // most limit+1 bytes; an IO hiccup or an over-limit blob skips it.
+    // Cache warm for small blobs.
     let warm = (c.warm_limit > 0 && c.size as usize <= c.warm_limit)
         .then(|| {
             let f = resolve_beneath(&c.root, &c.alg_rel.join(&c.hex), rustix::fs::OFlags::RDONLY)
@@ -1130,16 +935,13 @@ fn land_blob(mut c: LandCtx) -> Landed {
     Landed::Done { warm, crc }
 }
 
-/// Blocking twin of `FsStorage::dedupe_link` for the landing hops.
 fn dedupe_link_sync(c: &LandCtx) -> bool {
     dedupe_link_at(
         &c.root, &c.dedupe, &c.repo, &c.alg_rel, &c.hex, &c.digest, c.commit,
     )
 }
 
-/// Link `digest` into `repo` (at `alg_rel/hex`) from another repo that already
-/// stores it (reflink → hard link); `false` when there is none or it cannot be
-/// linked, so the caller stores its own copy.
+/// Link `digest` from another repo (reflink → hard link); `false` if unavailable.
 fn dedupe_link_at(
     root: &Path,
     dedupe: &crate::DedupeIndex,
@@ -1182,9 +984,7 @@ fn dedupe_link_at(
     }
 }
 
-/// Blocking: ensure the repo's layout marker (persisting a newly created repo
-/// entry) and admit `size` bytes against quota — nothing is charged when the
-/// blob is already present. Returns the bytes charged.
+/// Blocking: layout marker + quota admission. Returns bytes charged.
 fn layout_and_admit(
     root: &Path,
     repo_rel: &Path,
@@ -1210,25 +1010,19 @@ fn layout_and_admit(
     Ok(size)
 }
 
-/// Outcome of the manifest landing hop.
 enum ManifestLanded {
     /// Layout or quota refused before anything was written or charged.
     Rejected(StorageError),
     /// Writing the manifest blob failed after `charged` bytes were admitted.
     Failed { charged: u64, error: StorageError },
-    /// The manifest blob is stored; `missing` indexes the first `required`
-    /// blob that is not (or no longer) a regular file in the repo, and
-    /// `error` is a genuine IO error from that re-check.
+    /// Stored; `missing` = first required blob not found.
     Stored {
         missing: Option<usize>,
         error: Option<StorageError>,
     },
 }
 
-/// Blocking: the filesystem half of `put_manifest` in one hop — layout marker,
-/// quota admission, dedupe link or crash-atomic publish of the manifest blob
-/// (always synced: a committed WAL record must never name a torn manifest),
-/// then the authoritative no-follow re-check of every `required` blob.
+/// Blocking: manifest landing hop (layout, quota, publish, recheck required blobs).
 struct ManifestCtx {
     root: std::path::PathBuf,
     repo: String,
@@ -1261,7 +1055,11 @@ fn land_manifest(c: ManifestCtx) -> ManifestLanded {
         &c.root, &c.dedupe, &c.repo, &c.alg_rel, &c.leaf, &c.digest, c.commit,
     );
     if !linked {
-        if let Err(e) = publish_bytes_sync(&c.root, &c.alg_rel, &c.leaf, &c.data, true) {
+        #[cfg(target_os = "linux")]
+        let res = publish_bytes_sync(&c.root, &c.alg_rel, &c.leaf, &c.data, true);
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let res = publish_bytes_rename_sync(&c.root, &c.alg_rel, &c.leaf, &c.data, true);
+        if let Err(e) = res {
             return ManifestLanded::Failed {
                 charged,
                 error: e.into(),
@@ -1292,9 +1090,7 @@ fn land_manifest(c: ManifestCtx) -> ManifestLanded {
 }
 
 impl FsStorage {
-    /// One blocking hop: open a session's staging file for appending (creating
-    /// it for a pending session), with its size and inode. Call holding the
-    /// session lock.
+    /// Open a session's staging file for appending (creating for pending sessions).
     async fn prepare_session(&self, repo: &str, id: &str) -> Result<Staging, StorageError> {
         let rel = upload_rel(repo, id)?;
         let create = self.is_pending(repo, id);

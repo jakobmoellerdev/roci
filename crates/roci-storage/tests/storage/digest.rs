@@ -30,7 +30,6 @@ fn sha512_digest_parses_and_displays() {
 
 #[test]
 fn error_messages_render() {
-    // Exercise the Display arms of every StorageError variant.
     assert_eq!(StorageError::NotFound.to_string(), "not found");
     assert_eq!(
         StorageError::BadDigest("x".into()).to_string(),
@@ -50,8 +49,6 @@ fn error_messages_render() {
 
 #[test]
 fn sha512_bad_hex_rejected() {
-    // Correct length, non-hex char → BadDigest (covers the hex guard).
     assert!(Digest::parse(&format!("sha512:{}", "z".repeat(128))).is_err());
-    // Unknown algorithm → BadDigest (covers the match's fallback arm).
     assert!(Digest::parse("md5:abcdef").is_err());
 }

@@ -1,20 +1,11 @@
-//! The OCI distribution-spec error vocabulary.
-//!
-//! [`ErrorCode`] enumerates all 14 canonical codes from the spec error-code
-//! table (`spec/distribution-spec/spec.md` §"Error Codes"). [`ApiError`] is the
-//! single error type handlers return; it renders the spec JSON envelope
-//! `{ "errors": [{ "code", "message" }] }` with the correct HTTP status.
-//!
-//! `Internal` and `Unavailable` are the *only* non-spec cases: they render
-//! `500` / `503` with the registry-specific `UNKNOWN` code (the spec permits
-//! registry-defined codes) and a fixed message, never backend error text.
+//! OCI distribution-spec error vocabulary (§"Error Codes").
 
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use roci_storage::{QuotaScope, StorageError};
 
-/// A dist-spec error code with its canonical wire string and HTTP status.
+/// Dist-spec error code with canonical wire string and HTTP status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
     BlobUnknown,
@@ -34,56 +25,37 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    const fn parts(self) -> (&'static str, StatusCode) {
+        match self {
+            ErrorCode::BlobUnknown => ("BLOB_UNKNOWN", StatusCode::NOT_FOUND),
+            ErrorCode::BlobUploadInvalid => ("BLOB_UPLOAD_INVALID", StatusCode::BAD_REQUEST),
+            ErrorCode::BlobUploadUnknown => ("BLOB_UPLOAD_UNKNOWN", StatusCode::NOT_FOUND),
+            ErrorCode::DigestInvalid => ("DIGEST_INVALID", StatusCode::BAD_REQUEST),
+            ErrorCode::ManifestBlobUnknown => ("MANIFEST_BLOB_UNKNOWN", StatusCode::BAD_REQUEST),
+            ErrorCode::ManifestInvalid => ("MANIFEST_INVALID", StatusCode::BAD_REQUEST),
+            ErrorCode::ManifestUnknown => ("MANIFEST_UNKNOWN", StatusCode::NOT_FOUND),
+            ErrorCode::NameInvalid => ("NAME_INVALID", StatusCode::BAD_REQUEST),
+            ErrorCode::NameUnknown => ("NAME_UNKNOWN", StatusCode::NOT_FOUND),
+            ErrorCode::SizeInvalid => ("SIZE_INVALID", StatusCode::BAD_REQUEST),
+            ErrorCode::Unauthorized => ("UNAUTHORIZED", StatusCode::UNAUTHORIZED),
+            ErrorCode::Denied => ("DENIED", StatusCode::FORBIDDEN),
+            ErrorCode::Unsupported => ("UNSUPPORTED", StatusCode::METHOD_NOT_ALLOWED),
+            ErrorCode::TooManyRequests => ("TOOMANYREQUESTS", StatusCode::TOO_MANY_REQUESTS),
+        }
+    }
+
     /// The canonical `SCREAMING_SNAKE` wire string (spec error-code table).
     pub fn wire(self) -> &'static str {
-        match self {
-            ErrorCode::BlobUnknown => "BLOB_UNKNOWN",
-            ErrorCode::BlobUploadInvalid => "BLOB_UPLOAD_INVALID",
-            ErrorCode::BlobUploadUnknown => "BLOB_UPLOAD_UNKNOWN",
-            ErrorCode::DigestInvalid => "DIGEST_INVALID",
-            ErrorCode::ManifestBlobUnknown => "MANIFEST_BLOB_UNKNOWN",
-            ErrorCode::ManifestInvalid => "MANIFEST_INVALID",
-            ErrorCode::ManifestUnknown => "MANIFEST_UNKNOWN",
-            ErrorCode::NameInvalid => "NAME_INVALID",
-            ErrorCode::NameUnknown => "NAME_UNKNOWN",
-            ErrorCode::SizeInvalid => "SIZE_INVALID",
-            ErrorCode::Unauthorized => "UNAUTHORIZED",
-            ErrorCode::Denied => "DENIED",
-            ErrorCode::Unsupported => "UNSUPPORTED",
-            ErrorCode::TooManyRequests => "TOOMANYREQUESTS",
-        }
+        self.parts().0
     }
 
     /// The HTTP status the spec maps this code to.
     pub fn status(self) -> StatusCode {
-        match self {
-            ErrorCode::NameUnknown
-            | ErrorCode::ManifestUnknown
-            | ErrorCode::BlobUnknown
-            | ErrorCode::BlobUploadUnknown => StatusCode::NOT_FOUND,
-            ErrorCode::NameInvalid
-            | ErrorCode::DigestInvalid
-            | ErrorCode::SizeInvalid
-            | ErrorCode::ManifestInvalid
-            | ErrorCode::ManifestBlobUnknown
-            | ErrorCode::BlobUploadInvalid => StatusCode::BAD_REQUEST,
-            ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
-            ErrorCode::Denied => StatusCode::FORBIDDEN,
-            ErrorCode::Unsupported => StatusCode::METHOD_NOT_ALLOWED,
-            ErrorCode::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
-        }
+        self.parts().1
     }
 }
 
-/// An error rendered as the dist-spec JSON envelope. `Spec` carries one of the
-/// 14 canonical codes; `Internal` is the sole non-spec (500 / `UNKNOWN`) case;
-/// `PayloadTooLarge` renders `413` with the `SIZE_INVALID` code (the dist-spec
-/// binds end-7 body-limit rejection to `413`, spec endpoint table);
-/// `InsufficientStorage` renders `507` with `DENIED` when the registry-wide
-/// storage quota is exhausted (a 5xx body is not bound to the code table);
-/// `Unauthenticated` renders `401 UNAUTHORIZED` plus an optional
-/// `WWW-Authenticate` challenge; `TooEarly` renders `425` with `DENIED` for a
-/// state-changing request replayable from TLS early data (RFC 8470 §5.1).
+/// Dist-spec error response envelope.
 #[derive(Debug, Clone)]
 pub enum ApiError {
     Spec {
@@ -104,7 +76,6 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    /// Construct a spec error with an explicit code and message.
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         ApiError::Spec {
             code,
@@ -115,12 +86,6 @@ impl ApiError {
     pub fn name_invalid(message: impl Into<String>) -> Self {
         ApiError::new(ErrorCode::NameInvalid, message)
     }
-    pub fn name_unknown() -> Self {
-        ApiError::new(
-            ErrorCode::NameUnknown,
-            "repository name not known to registry",
-        )
-    }
     pub fn digest_invalid(message: impl Into<String>) -> Self {
         ApiError::new(ErrorCode::DigestInvalid, message)
     }
@@ -130,21 +95,10 @@ impl ApiError {
     pub fn manifest_blob_unknown(message: impl Into<String>) -> Self {
         ApiError::new(ErrorCode::ManifestBlobUnknown, message)
     }
-    pub fn manifest_unknown() -> Self {
-        ApiError::new(ErrorCode::ManifestUnknown, "manifest unknown to registry")
-    }
-    pub fn blob_unknown() -> Self {
-        ApiError::new(ErrorCode::BlobUnknown, "blob unknown to registry")
-    }
-    pub fn unsupported() -> Self {
-        ApiError::new(ErrorCode::Unsupported, "the operation is unsupported")
-    }
-    /// A body exceeding the accepted size: `413` with the `SIZE_INVALID` code.
     pub fn payload_too_large(message: impl Into<String>) -> Self {
         ApiError::PayloadTooLarge(message.into())
     }
 
-    /// The HTTP status of this error.
     pub fn status(&self) -> StatusCode {
         match self {
             ApiError::Spec { code, .. } => code.status(),
@@ -157,7 +111,6 @@ impl ApiError {
         }
     }
 
-    /// The wire code string (`UNKNOWN` for the internal and unavailable cases).
     pub fn code(&self) -> &str {
         match self {
             ApiError::Spec { code, .. } => code.wire(),
@@ -187,7 +140,6 @@ impl IntoResponse for ApiError {
         let code = self.code();
         let status = self.status();
 
-        // Record error on the current span + increment the error counter.
         let span = tracing::Span::current();
         span.record("error.type", code);
         span.record("otel.status_code", "ERROR");
@@ -215,9 +167,10 @@ impl IntoResponse for ApiError {
 impl From<StorageError> for ApiError {
     fn from(e: StorageError) -> Self {
         match e {
-            // Generic default; blob/manifest endpoints override 404s to
-            // BLOB_UNKNOWN / MANIFEST_UNKNOWN at their call sites.
-            StorageError::NotFound => ApiError::name_unknown(),
+            StorageError::NotFound => ApiError::new(
+                ErrorCode::NameUnknown,
+                "repository name not known to registry",
+            ),
             StorageError::BadDigest(d) => ApiError::digest_invalid(format!("invalid digest: {d}")),
             StorageError::DigestMismatch { expected, actual } => ApiError::digest_invalid(format!(
                 "digest mismatch: expected {expected}, got {actual}"
@@ -225,8 +178,6 @@ impl From<StorageError> for ApiError {
             StorageError::BadPath(p) => {
                 ApiError::name_invalid(format!("unsafe path component: {p}"))
             }
-            // The upload endpoints translate this to a 416 with a Range header
-            // at the call site; the generic fallback is a 400 BLOB_UPLOAD_INVALID.
             StorageError::RangeNotSatisfiable { .. } => ApiError::new(
                 ErrorCode::BlobUploadInvalid,
                 "content range does not match offset",
@@ -234,8 +185,6 @@ impl From<StorageError> for ApiError {
             StorageError::TooLarge { limit, actual } => ApiError::payload_too_large(format!(
                 "upload size {actual} exceeds maximum blob size {limit}"
             )),
-            // A repository over its quota is a client-side size problem (413);
-            // an exhausted registry-wide quota is the server's (507).
             e @ StorageError::QuotaExceeded {
                 scope: QuotaScope::Repository,
                 ..
@@ -260,7 +209,9 @@ impl From<StorageError> for ApiError {
 }
 
 /// Map `StorageError::NotFound` to `unknown()` and every other error through `From`.
-pub(crate) fn not_found_as(unknown: fn() -> ApiError) -> impl FnOnce(StorageError) -> ApiError {
+pub(crate) fn not_found_as(
+    unknown: impl FnOnce() -> ApiError,
+) -> impl FnOnce(StorageError) -> ApiError {
     move |e| match e {
         StorageError::NotFound => unknown(),
         other => ApiError::from(other),
@@ -273,47 +224,84 @@ mod tests {
 
     #[test]
     fn every_code_has_wire_and_status() {
-        let all = [
-            ErrorCode::BlobUnknown,
-            ErrorCode::BlobUploadInvalid,
-            ErrorCode::BlobUploadUnknown,
-            ErrorCode::DigestInvalid,
-            ErrorCode::ManifestBlobUnknown,
-            ErrorCode::ManifestInvalid,
-            ErrorCode::ManifestUnknown,
-            ErrorCode::NameInvalid,
-            ErrorCode::NameUnknown,
-            ErrorCode::SizeInvalid,
-            ErrorCode::Unauthorized,
-            ErrorCode::Denied,
-            ErrorCode::Unsupported,
-            ErrorCode::TooManyRequests,
+        let all: [(ErrorCode, &str, StatusCode); 14] = [
+            (
+                ErrorCode::BlobUnknown,
+                "BLOB_UNKNOWN",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ErrorCode::BlobUploadInvalid,
+                "BLOB_UPLOAD_INVALID",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ErrorCode::BlobUploadUnknown,
+                "BLOB_UPLOAD_UNKNOWN",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ErrorCode::DigestInvalid,
+                "DIGEST_INVALID",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ErrorCode::ManifestBlobUnknown,
+                "MANIFEST_BLOB_UNKNOWN",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ErrorCode::ManifestInvalid,
+                "MANIFEST_INVALID",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ErrorCode::ManifestUnknown,
+                "MANIFEST_UNKNOWN",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ErrorCode::NameInvalid,
+                "NAME_INVALID",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ErrorCode::NameUnknown,
+                "NAME_UNKNOWN",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ErrorCode::SizeInvalid,
+                "SIZE_INVALID",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ErrorCode::Unauthorized,
+                "UNAUTHORIZED",
+                StatusCode::UNAUTHORIZED,
+            ),
+            (ErrorCode::Denied, "DENIED", StatusCode::FORBIDDEN),
+            (
+                ErrorCode::Unsupported,
+                "UNSUPPORTED",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                ErrorCode::TooManyRequests,
+                "TOOMANYREQUESTS",
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
         ];
-        // All 14 codes present; wire strings are SCREAMING_SNAKE and unique.
-        assert_eq!(all.len(), 14);
         let mut seen = std::collections::HashSet::new();
-        for c in all {
-            let w = c.wire();
-            assert!(w.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_'));
-            assert!(seen.insert(w), "duplicate wire string {w}");
-            let _ = c.status();
+        for (code, wire, status) in all {
+            assert_eq!(code.wire(), wire, "{wire}");
+            assert_eq!(code.status(), status, "{wire}");
+            assert!(
+                wire.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_'),
+                "{wire}"
+            );
+            assert!(seen.insert(wire), "duplicate wire string {wire}");
         }
-    }
-
-    #[test]
-    fn status_mapping_is_correct() {
-        assert_eq!(ErrorCode::NameInvalid.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(ErrorCode::NameUnknown.status(), StatusCode::NOT_FOUND);
-        assert_eq!(ErrorCode::Unauthorized.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(ErrorCode::Denied.status(), StatusCode::FORBIDDEN);
-        assert_eq!(
-            ErrorCode::Unsupported.status(),
-            StatusCode::METHOD_NOT_ALLOWED
-        );
-        assert_eq!(
-            ErrorCode::TooManyRequests.status(),
-            StatusCode::TOO_MANY_REQUESTS
-        );
     }
 
     #[test]

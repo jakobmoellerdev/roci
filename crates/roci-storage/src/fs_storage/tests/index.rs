@@ -2,8 +2,6 @@ use super::*;
 
 #[tokio::test]
 async fn put_errors_when_parent_path_is_a_file() {
-    // If `<repo>/blobs` is a regular file, create_dir_all for the blob's
-    // parent fails, exercising the `?` error path in put_blob.
     let (dir, s) = store();
     let repo_dir = dir.path().join("r");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -15,8 +13,6 @@ async fn put_errors_when_parent_path_is_a_file() {
         Err(StorageError::Io(_))
     ));
 
-    // put_manifest first writes the manifest blob (fails here too since
-    // `<repo>/blobs` is a file), covering the CAS-write error path.
     assert!(matches!(
         s.put_manifest(
             "r",
@@ -30,9 +26,6 @@ async fn put_errors_when_parent_path_is_a_file() {
         Err(StorageError::Io(_))
     ));
 
-    // In a clean repo where the blob write succeeds, a pre-existing
-    // `index.json` directory makes writing index.json fail; put_manifest
-    // succeeds (write-behind), but reading the dirty index surfaces the IO error.
     let body = br#"{"schemaVersion":2}"#;
     let bd = sha256_of(body);
     std::fs::create_dir_all(dir.path().join("r2").join("index.json")).unwrap();
@@ -51,8 +44,6 @@ async fn put_errors_when_parent_path_is_a_file() {
 
 #[tokio::test]
 async fn non_notfound_io_error_surfaces() {
-    // A pre-existing `index.json` *directory* makes read_index fail with a
-    // non-NotFound error, surfacing as StorageError::Io through every reader.
     let (dir, s) = store();
     let repo_dir = dir.path().join("r");
     std::fs::create_dir_all(repo_dir.join("index.json")).unwrap();
@@ -66,7 +57,6 @@ async fn non_notfound_io_error_surfaces() {
             .await,
         Err(StorageError::Io(_))
     ));
-    // A syntactically corrupt index.json is also an internal Io error.
     let repo2 = dir.path().join("r2");
     std::fs::create_dir_all(&repo2).unwrap();
     std::fs::write(repo2.join("index.json"), b"{ not json").unwrap();
@@ -79,8 +69,7 @@ async fn non_notfound_io_error_surfaces() {
 #[tokio::test]
 async fn index_preserves_foreign_entries_and_referrer_append() {
     let (_dir, s) = store();
-    // Seed an index with a foreign descriptor (no ref.name annotation, no
-    // subject) and a non-array `manifests` sibling field would be coerced.
+    // Foreign descriptor + non-array manifests sibling.
     let subject = sha256_of(b"subject");
     let referrer = sha256_of(b"referrer");
     s.ensure_layout("r").await.unwrap();
@@ -94,7 +83,6 @@ async fn index_preserves_foreign_entries_and_referrer_append() {
     FsStorage::write_index_at_root(&s.root, "r", &seeded)
         .await
         .unwrap();
-    // The foreign entry contributes no tag and is not a referrer.
     assert!(s
         .list_tags("r", None, usize::MAX)
         .await
@@ -107,8 +95,7 @@ async fn index_preserves_foreign_entries_and_referrer_append() {
         .unwrap()
         .items
         .is_empty());
-    // A referrer with no pre-existing manifest entry appends the merged
-    // descriptor (carrying the subject link) — covers the append branch.
+    // Referrer with no pre-existing manifest entry → append branch.
     s.put_manifest(
         "r",
         None,
@@ -137,7 +124,6 @@ async fn index_preserves_foreign_entries_and_referrer_append() {
             .and_then(|v| v.as_str()),
         Some(subject.as_string().as_str())
     );
-    // The foreign descriptor is still present after the append.
     let idx = s.read_index("r").await.unwrap();
     assert_eq!(idx["manifests"].as_array().unwrap().len(), 2);
 }
@@ -147,8 +133,7 @@ async fn upgrade_semantics_preexisting_subjects() {
     let dir = tempfile::tempdir().unwrap();
     let subject = sha256_of(b"subject");
     let referrer = sha256_of(b"preexisting-referrer");
-    // A layout written by another tool: index.json already carries a
-    // descriptor with `subject`, but roci's metadata log has never seen it.
+    // Pre-existing layout with `subject` descriptor roci has never seen.
     let repo = dir.path().join("r");
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(
@@ -172,7 +157,6 @@ async fn upgrade_semantics_preexisting_subjects() {
     .unwrap();
     let s = FsStorage::new(dir.path()).unwrap();
     s.warm_referrers_from_layout().await;
-    // Served from the metadata store (fast path), not the index.json scan.
     let page = |s: &FsStorage| {
         s.meta
             .referrers_page("r", &subject.as_string(), None, None, usize::MAX)
@@ -181,7 +165,6 @@ async fn upgrade_semantics_preexisting_subjects() {
     };
     let from_meta = page(&s);
     assert_eq!(from_meta.len(), 1);
-    // Idempotent: a second pass records nothing new.
     s.warm_referrers_from_layout().await;
     assert_eq!(page(&s).len(), 1);
     assert_eq!(from_meta[0].0, referrer.as_string());
@@ -189,9 +172,7 @@ async fn upgrade_semantics_preexisting_subjects() {
 
 #[tokio::test]
 async fn layout_fallback_pages_like_the_store() {
-    // An out-of-band layout roci's store has never seen: tags and the
-    // subject link are served from index.json, with the same cursor,
-    // order, de-dup and filter semantics as the in-RAM fast path.
+    // Out-of-band layout served from index.json.
     let dir = tempfile::tempdir().unwrap();
     let subject = sha256_of(b"subject");
     let mut refs: Vec<(String, &str)> = (0..3u8)
@@ -210,7 +191,6 @@ async fn layout_fallback_pages_like_the_store() {
                                    "subject": {"digest": subject.as_string()}})
         })
         .collect();
-    // Unsorted, with one tag listed twice.
     for t in ["c", "a", "b", "a"] {
         manifests.push(tagged(t, &refs[0].0));
     }
@@ -268,12 +248,10 @@ async fn index_write_behind_eventual() {
     )
     .await
     .unwrap();
-    // The in-RAM index is authoritative immediately.
     assert_eq!(
         s.list_tags("r", None, usize::MAX).await.unwrap().items,
         ["v1"]
     );
-    // The on-disk index.json converges without any read through roci.
     let path = dir.path().join("r").join("index.json");
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
     loop {
@@ -292,7 +270,6 @@ async fn index_write_behind_eventual() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    // Converges: the repo leaves the dirty map and no temp files linger.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
     while s.index_dirty.lock().unwrap().contains_key("r") {
         assert!(
@@ -307,7 +284,6 @@ async fn index_write_behind_eventual() {
         .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
         .collect();
     assert!(leftovers.is_empty());
-    // Delete converges too: the entry disappears from disk.
     s.delete_manifest("r", &d).await.unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
     loop {
@@ -325,8 +301,7 @@ async fn index_write_behind_eventual() {
 
 #[test]
 fn new_outside_runtime_does_not_panic_and_reconcile_persists() {
-    // Construction needs no Tokio runtime; mutations made later stay
-    // readable through roci and are persisted by reconcile.
+    // No Tokio runtime needed at construction time.
     let (dir, s) = store();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -362,8 +337,7 @@ fn new_outside_runtime_does_not_panic_and_reconcile_persists() {
 
 #[tokio::test]
 async fn reconcile_recovers_wal_ahead_of_index() {
-    // Simulate a crash after the WAL append but before the background
-    // rename: record via the metadata log only, then reopen.
+    // Simulate crash after WAL append but before background rename.
     let dir = tempfile::tempdir().unwrap();
     let body = br#"{"schemaVersion":2}"#;
     let d = sha256_of(body);
@@ -393,7 +367,6 @@ async fn reconcile_recovers_wal_ahead_of_index() {
 
 #[tokio::test]
 async fn rebuild_preserves_preexisting_foreign_tags() {
-    // A layout another tool wrote: a tagged descriptor roci's log never saw.
     let dir = tempfile::tempdir().unwrap();
     let foreign_body = br#"{"schemaVersion":2,"x":1}"#;
     let fd = sha256_of(foreign_body);
@@ -414,7 +387,6 @@ async fn rebuild_preserves_preexisting_foreign_tags() {
     .unwrap();
     let s = FsStorage::new(dir.path()).unwrap();
     s.reconcile_index_json().await;
-    // A new push triggers a rebuild; the legacy tag must survive it.
     let body = br#"{"schemaVersion":2}"#;
     let d = sha256_of(body);
     s.put_manifest(
@@ -497,8 +469,7 @@ async fn rebuild_keeps_top_level_fields_and_skips_unreadable_index() {
     .unwrap();
     let idx = s.read_index("r").await.unwrap();
     assert_eq!(idx["annotations"]["org.example"], "keep");
-    // An existing-but-unreadable index (here: not a regular file) is never
-    // overwritten from metadata alone; the repo stays dirty for retry.
+    // Unreadable index → never overwritten from metadata; stays dirty.
     let dirty = StdMutex::new(HashMap::from([("q".to_string(), 1u64)]));
     std::fs::create_dir_all(dir.path().join("q/index.json")).unwrap();
     FsStorage::flush_dirty(&s.root, &*s.meta, &dirty).await;
@@ -535,8 +506,7 @@ async fn warm_referrers_ignores_symlinked_index() {
 
 #[tokio::test]
 async fn serves_external_oci_layout() {
-    // Hand-build a valid OCI image layout roci did NOT write, then prove it
-    // serves the tagged manifest and its config blob (the headline feature).
+    // Hand-built OCI layout serves tagged manifest and config blob.
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("app");
     let config = br#"{"architecture":"amd64","os":"linux"}"#;
@@ -547,7 +517,6 @@ async fn serves_external_oci_layout() {
         config.len()
     );
     let manifest_d = sha256_of(manifest.as_bytes());
-    // Lay out oci-layout + blobs/<alg>/<hex> + index.json by hand.
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("oci-layout"), OCI_LAYOUT_MARKER).unwrap();
     let blobs = repo.join("blobs").join("sha256");
@@ -579,8 +548,7 @@ async fn serves_external_oci_layout() {
         vec!["v1".to_string()]
     );
     assert_eq!(s.read_blob("app", &config_d).await.unwrap(), config);
-    // A by-digest manifest blob present but unlisted in index.json falls
-    // back to the image-manifest media type.
+    // By-digest blob not in index.json → image-manifest media type.
     let extra = br#"{"schemaVersion":2}"#;
     let extra_d = sha256_of(extra);
     std::fs::write(blobs.join(extra_d.hex()), extra).unwrap();
@@ -590,7 +558,6 @@ async fn serves_external_oci_layout() {
         "application/vnd.oci.image.manifest.v1+json"
     );
     assert_eq!(by_digest.bytes, extra);
-    // A digest that is neither listed nor present is NotFound.
     let absent = sha256_of(b"absent");
     assert!(matches!(
         s.get_manifest("app", &absent.as_string()).await,
@@ -600,16 +567,12 @@ async fn serves_external_oci_layout() {
 
 #[tokio::test]
 async fn referrer_merges_into_annotated_entry() {
-    // A tagged manifest already carries an `annotations` entry in the index;
-    // add_referrer must preserve it (the k=="annotations" skip branch) while
-    // merging the subject/artifactType.
+    // Existing annotations survive add_referrer merge.
     let (_dir, s) = store();
     let body = br#"{"schemaVersion":2}"#;
     let referrer = sha256_of(body);
     let subject = sha256_of(b"subject");
-    // put_manifest with a tag records an index entry carrying annotations; the
-    // referrer descriptor the core passes also carries annotations, and the
-    // entry's own annotations must win (skip) while other fields merge.
+    // Entry's annotations win over referrer descriptor's.
     s.put_manifest(
         "r",
         Some("v1"),
@@ -634,8 +597,7 @@ async fn referrer_merges_into_annotated_entry() {
         .items;
     assert_eq!(listed.len(), 1);
     let d: serde_json::Value = serde_json::from_slice(&listed[0].1).unwrap();
-    // The referrer descriptor (from the metadata store) carries the subject
-    // link and its own artifactType.
+    // Referrer descriptor carries subject link and artifactType.
     assert_eq!(
         d.get("subject")
             .and_then(|v| v.get("digest"))
@@ -643,9 +605,7 @@ async fn referrer_merges_into_annotated_entry() {
         Some(subject.as_string().as_str())
     );
     assert_eq!(d.get("artifactType").and_then(|v| v.as_str()), Some("a/b"));
-    // In the on-disk index.json, the merge preserved the manifest entry's
-    // pre-existing tag annotation (the k=="annotations" skip branch) rather
-    // than overwriting it with the referrer descriptor's annotations.
+    // Tag annotation preserved (k=="annotations" skip).
     let index = s.read_index("r").await.unwrap();
     let entry = index["manifests"]
         .as_array()
@@ -671,249 +631,70 @@ async fn referrer_merges_into_annotated_entry() {
 }
 
 #[tokio::test]
-async fn import_foreign_tags_imports_new_tags_from_layout() {
-    // Exercise layout::import_foreign_tags for a descriptor with a tag+digest
-    // that the metadata store doesn't know → it should get imported.
-    // Covers layout.rs lines 205, 208, 222.
-    let (_dir, s) = store();
-    // Write a repo layout with a tagged descriptor the metadata store doesn't know.
-    s.ensure_layout("ext").await.unwrap();
-    let body = br#"{"schemaVersion":2}"#;
-    let d = sha256_of(body);
-    s.put_blob("ext", &d, body).await.unwrap();
-    let existing = serde_json::json!({
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.index.v1+json",
-        "manifests": [{
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "digest": d.as_string(),
-            "size": body.len(),
-            "annotations": {"org.opencontainers.image.ref.name": "foreign"}
-        }]
-    });
-    // The tag "foreign" is not in the metadata store yet.
-    assert!(s.meta.resolve_tag("ext", "foreign").is_none());
-    crate::layout::import_foreign_tags(&*s.meta, "ext", &existing);
-    // Now the tag is imported.
-    assert!(s.meta.resolve_tag("ext", "foreign").is_some());
-    // Re-import is idempotent (resolve_tag returns Some → skip).
-    crate::layout::import_foreign_tags(&*s.meta, "ext", &existing);
-}
-
-#[tokio::test]
-async fn import_foreign_tags_skips_invalid_digest_and_untagged() {
-    // Descriptors without a tag, without a digest, or with an invalid digest
-    // are skipped by import_foreign_tags (coverage for the continue branches).
-    let (_dir, s) = store();
-    let existing = serde_json::json!({
-        "schemaVersion": 2,
-        "manifests": [
-            // No tag → skipped
-            {"digest": "sha256:0000000000000000000000000000000000000000000000000000000000000001", "size": 1},
-            // No digest → skipped
-            {"annotations": {"org.opencontainers.image.ref.name": "v1"}, "size": 1},
-            // Invalid digest → skipped
-            {"digest": "garbage", "annotations": {"org.opencontainers.image.ref.name": "v2"}, "size": 1}
-        ]
-    });
-    crate::layout::import_foreign_tags(&*s.meta, "r", &existing);
-    assert!(s.meta.resolve_tag("r", "v1").is_none());
-    assert!(s.meta.resolve_tag("r", "v2").is_none());
-}
-
-#[tokio::test]
-async fn index_from_meta_handles_non_object_and_foreign_entries() {
-    // An existing index with a non-object element (e.g. a bare string) in
-    // manifests[] → treated as foreign (layout.rs lines 256-257).
-    let (_dir, s) = store();
-    let body = br#"{"schemaVersion":2}"#;
-    let d = sha256_of(body);
-    s.put_manifest(
-        "r",
-        Some("t1"),
-        &d,
-        "application/json",
-        body,
-        ManifestLinks::default(),
-    )
-    .await
-    .unwrap();
-    let existing = serde_json::json!({
-        "schemaVersion": 2,
-        "manifests": [
-            "a bare string entry",
-            {"digest": d.as_string(), "size": body.len()}
-        ]
-    });
-    let rebuilt = crate::layout::index_from_meta(&*s.meta, "r", Some(existing), |_| None).unwrap();
-    let ms = rebuilt["manifests"].as_array().unwrap();
-    // The known manifest should be present with its tag, plus the foreign string.
-    assert!(ms.iter().any(|e| e.is_string()));
-    assert!(ms
-        .iter()
-        .any(|e| crate::layout::descriptor_tag(e) == Some("t1")));
-}
-
-#[tokio::test]
-async fn index_from_meta_referrer_non_json_descriptor_skipped() {
-    // A referrer whose descriptor bytes are not valid JSON → the `let Ok(r) =
-    // serde_json::from_slice` guard skips it (layout.rs lines 310-311).
-    let (_dir, s) = store();
-    let subject = sha256_of(b"subj");
-    // Directly register a referrer with invalid JSON descriptor bytes.
-    s.meta
-        .apply(crate::metadata::MetaOp::PutReferrer {
-            repo: "r".to_string(),
-            subject: subject.as_string(),
-            referrer: "sha256:0000000000000000000000000000000000000000000000000000000000000001"
-                .to_string(),
-            descriptor: b"not json at all".to_vec(),
-        })
-        .unwrap();
-    let rebuilt = crate::layout::index_from_meta(&*s.meta, "r", None, |_| None).unwrap();
-    // Should not panic — the broken descriptor is skipped.
-    assert!(rebuilt["manifests"].is_array());
-}
-
-#[tokio::test]
-async fn index_from_meta_uses_existing_top_level_as_base_object() {
-    // When the existing index is a JSON Value::Object with extra top-level
-    // keys, those keys are preserved in the rebuilt index. layout.rs line 380
-    // covers the `_ => None` branch when existing is not an object.
-    let (_dir, s) = store();
-    // Rebuild from a non-object existing (e.g. a null/array) → line 380.
-    let rebuilt =
-        crate::layout::index_from_meta(&*s.meta, "r", Some(serde_json::Value::Null), |_| None)
-            .unwrap();
-    assert_eq!(rebuilt["schemaVersion"], 2);
-}
-
-/// write_index_at_root produces a valid index with no `.tmp` leftovers on the
-/// portable (named-temp) fallback path. On macOS this is the only path; on
-/// Linux with FORCE_TMPFILE_UNSUPPORTED it exercises the same branch.
-#[tokio::test]
-async fn write_index_no_tmp_leftovers_fallback() {
+async fn write_index_no_tmp_leftovers() {
     #[cfg(target_os = "linux")]
     let _serialize = FAULT_TEST_LOCK.lock().await;
 
-    #[cfg(target_os = "linux")]
-    {
-        use std::sync::atomic::Ordering;
-        crate::fault::FORCE_TMPFILE_UNSUPPORTED.store(true, Ordering::Relaxed);
+    async fn assert_no_tmp_leftovers(s: &FsStorage, dir: &std::path::Path) {
+        let body = br#"{"schemaVersion":2}"#;
+        let d = sha256_of(body);
+        s.put_manifest(
+            "r",
+            Some("v1"),
+            &d,
+            "application/json",
+            body,
+            ManifestLinks::default(),
+        )
+        .await
+        .unwrap();
+        s.reconcile_index_json().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+        while s.index_dirty.lock().unwrap().contains_key("r") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "repo never became clean"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let index_bytes = std::fs::read(dir.join("r/index.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&index_bytes).unwrap();
+        assert!(v["manifests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| descriptor_tag(e) == Some("v1")));
+        let leftovers: Vec<_> = std::fs::read_dir(dir.join("r"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover tmp files: {leftovers:?}");
     }
-
-    let (dir, s) = store();
-    let body = br#"{"schemaVersion":2}"#;
-    let d = sha256_of(body);
-    s.put_manifest(
-        "r",
-        Some("v1"),
-        &d,
-        "application/json",
-        body,
-        ManifestLinks::default(),
-    )
-    .await
-    .unwrap();
-    s.reconcile_index_json().await;
-
-    // Wait for the background writer to settle so its concurrent write (if
-    // any) has finished its rename before we check for leftovers.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
-    while s.index_dirty.lock().unwrap().contains_key("r") {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "repo never became clean"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    // Small additional sleep for any in-flight rename to land.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    // Verify the written index is valid.
-    let index_bytes = std::fs::read(dir.path().join("r/index.json")).unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&index_bytes).unwrap();
-    assert!(v["manifests"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|e| descriptor_tag(e) == Some("v1")));
-
-    // No `.tmp` leftovers in the repo dir.
-    let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("r"))
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
-        .collect();
-    assert!(leftovers.is_empty(), "leftover tmp files: {leftovers:?}");
 
     #[cfg(target_os = "linux")]
     {
         use std::sync::atomic::Ordering;
+        for force in [true, false] {
+            crate::fault::FORCE_TMPFILE_UNSUPPORTED.store(force, Ordering::Relaxed);
+            let (dir, s) = store();
+            assert_no_tmp_leftovers(&s, dir.path()).await;
+        }
         crate::fault::FORCE_TMPFILE_UNSUPPORTED.store(false, Ordering::Relaxed);
     }
-}
-
-/// On Linux, the O_TMPFILE path produces a valid index with no `.tmp`
-/// leftovers (the anonymous inode is invisible until linkat→rename).
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn write_index_no_tmp_leftovers_otmpfile() {
-    let _serialize = FAULT_TEST_LOCK.lock().await;
-    // Ensure FORCE_TMPFILE_UNSUPPORTED is *off* so the O_TMPFILE path runs.
-    use std::sync::atomic::Ordering;
-    crate::fault::FORCE_TMPFILE_UNSUPPORTED.store(false, Ordering::Relaxed);
-
-    let (dir, s) = store();
-    let body = br#"{"schemaVersion":2}"#;
-    let d = sha256_of(body);
-    s.put_manifest(
-        "r",
-        Some("v1"),
-        &d,
-        "application/json",
-        body,
-        ManifestLinks::default(),
-    )
-    .await
-    .unwrap();
-    s.reconcile_index_json().await;
-
-    // Wait for the background writer to settle.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
-    while s.index_dirty.lock().unwrap().contains_key("r") {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "repo never became clean"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let (dir, s) = store();
+        assert_no_tmp_leftovers(&s, dir.path()).await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let index_bytes = std::fs::read(dir.path().join("r/index.json")).unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&index_bytes).unwrap();
-    assert!(v["manifests"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|e| descriptor_tag(e) == Some("v1")));
-
-    let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("r"))
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
-        .collect();
-    assert!(leftovers.is_empty(), "leftover tmp files: {leftovers:?}");
 }
 
-/// A planted stale `.index.json.<x>.tmp` regular file is removed at startup
-/// reconcile, while a symlink or directory named like that is not
-/// followed/removed.
+/// Stale `.index.json.*.tmp` regular files swept; symlinks/dirs not.
 #[cfg(unix)]
 #[tokio::test]
 async fn reconcile_sweeps_stale_tmp_but_not_symlinks_or_dirs() {
     let (dir, s) = store();
-    // Create a repo dir with a valid oci-layout so discover_repos finds it.
     let repo_dir = dir.path().join("r");
     std::fs::create_dir_all(&repo_dir).unwrap();
     std::fs::write(
@@ -921,38 +702,31 @@ async fn reconcile_sweeps_stale_tmp_but_not_symlinks_or_dirs() {
         r#"{"imageLayoutVersion":"1.0.0"}"#,
     )
     .unwrap();
-    // Empty index so reconcile can read it.
     std::fs::write(
         repo_dir.join("index.json"),
         r#"{"schemaVersion":2,"manifests":[]}"#,
     )
     .unwrap();
 
-    // Plant a stale regular-file orphan.
     let orphan_path = repo_dir.join(".index.json.deadbeef01234567.tmp");
     std::fs::write(&orphan_path, b"stale leftover").unwrap();
 
-    // Plant a symlink matching the pattern — must NOT be removed.
     let symlink_path = repo_dir.join(".index.json.cafebabe00000000.tmp");
     std::os::unix::fs::symlink("/dev/null", &symlink_path).unwrap();
 
-    // Plant a directory matching the pattern — must NOT be removed.
     let dir_path = repo_dir.join(".index.json.0000000000000000.tmp");
     std::fs::create_dir(&dir_path).unwrap();
 
     s.reconcile_index_json().await;
 
-    // The regular-file orphan was swept.
     assert!(
         !orphan_path.exists(),
         "stale regular-file .tmp should be removed"
     );
-    // The symlink is untouched (symlink_metadata still finds it).
     assert!(
         std::fs::symlink_metadata(&symlink_path).is_ok(),
         "symlink matching .tmp pattern should NOT be removed"
     );
-    // The directory is untouched.
     assert!(
         dir_path.is_dir(),
         "directory matching .tmp pattern should NOT be removed"

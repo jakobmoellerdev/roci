@@ -1,7 +1,7 @@
 //! `/v2/<name>/<verb>` path parsing and per-method dispatch to the handlers.
 
 use crate::auth::principal_of;
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorCode};
 use crate::names::RepositoryName;
 use crate::{blobs, listing, manifests, uploads, AppState};
 use axum::extract::{Path, Request, State};
@@ -10,7 +10,6 @@ use axum::response::{IntoResponse, Response};
 use roci_config::Action;
 use roci_storage::{Digest, Storage};
 
-/// The parsed grammar of a `/v2/<name>/<verb>...` path.
 pub(crate) enum Parsed {
     Blob { repo: String, digest: Digest },
     ManifestRef { repo: String, reference: String },
@@ -21,23 +20,17 @@ pub(crate) enum Parsed {
     Unknown,
 }
 
-/// Split `<name>/<tail...>` where the last one or two segments form the verb,
-/// **validating** the repository name (and the reference/digest, where the verb
-/// carries one) against the dist-spec grammar before any handler runs. An
-/// unrecognized path shape yields `Ok(Parsed::Unknown)` (→ 404); a recognized
-/// shape with a malformed name/reference/digest yields `Err(ApiError)`.
+/// Parse and validate a `/v2/<name>/<verb>...` path.
 pub(crate) fn parse_path(rest: &str) -> Result<Parsed, ApiError> {
     let segments: Vec<&str> = rest.split('/').collect();
     let n = segments.len();
     if n < 2 {
         return Ok(Parsed::Unknown);
     }
-    // Validate a repository name, surfacing NAME_INVALID.
     let checked_repo = |repo: String| -> Result<String, ApiError> {
         RepositoryName::parse(&repo)?;
         Ok(repo)
     };
-    // blobs/uploads/<id?>
     if n >= 3 && segments[n - 3] == "blobs" && segments[n - 2] == "uploads" {
         let repo = checked_repo(segments[..n - 3].join("/"))?;
         let id = segments[n - 1];
@@ -51,7 +44,6 @@ pub(crate) fn parse_path(rest: &str) -> Result<Parsed, ApiError> {
         });
     }
     if n >= 2 && segments[n - 2] == "blobs" && segments[n - 1] == "uploads" {
-        // trailing slash omitted: `.../blobs/uploads`
         let repo = checked_repo(segments[..n - 2].join("/"))?;
         return Ok(Parsed::UploadStart { repo });
     }
@@ -62,11 +54,6 @@ pub(crate) fn parse_path(rest: &str) -> Result<Parsed, ApiError> {
             Parsed::Blob { repo, digest }
         }
         "manifests" => {
-            // The repo name is validated (400 NAME_INVALID); the manifest
-            // reference is NOT grammar-rejected here. Per the dist-spec
-            // conformance suite, a syntactically-invalid or unknown manifest
-            // reference must resolve to 404 MANIFEST_UNKNOWN, not 400 — so the
-            // reference flows through and the storage lookup decides.
             let repo = checked_repo(segments[..n - 2].join("/"))?;
             Parsed::ManifestRef {
                 repo,
@@ -94,14 +81,10 @@ pub(crate) async fn get_base() -> Response {
         .into_response()
 }
 
-/// Deserialize the request query string, defaulting on absence or parse failure.
 fn query<T: serde::de::DeserializeOwned + Default>(req: &Request) -> T {
     serde_urlencoded::from_str(req.uri().query().unwrap_or("")).unwrap_or_default()
 }
 
-/// The repository and action a (method, path shape) pair requires, or
-/// `None` for shapes `dispatch` rejects as NAME_UNKNOWN without touching
-/// storage.
 fn required_action<'a>(method: &Method, parsed: &'a Parsed) -> Option<(&'a str, Action)> {
     use Parsed::*;
     Some(match (method, parsed) {
@@ -115,11 +98,8 @@ fn required_action<'a>(method: &Method, parsed: &'a Parsed) -> Option<(&'a str, 
     })
 }
 
-/// Parse `/v2/<rest>` and dispatch on (method, path shape). Unknown shapes and
-/// method/shape mismatches are NAME_UNKNOWN, exactly as the per-method routers
-/// were. With auth configured, the request's principal is authorized for the
-/// endpoint's action here — the single enforcement point, ahead of every
-/// storage call (SECURITY inv. 1).
+/// Parse `/v2/<rest>` and dispatch. Auth enforcement point
+/// ahead of every storage call (SECURITY inv. 1).
 pub(crate) async fn dispatch<S: Storage>(
     State(st): State<AppState<S>>,
     Path(rest): Path<String>,
@@ -174,6 +154,9 @@ pub(crate) async fn dispatch<S: Storage>(
         (&Method::DELETE, Parsed::ManifestRef { repo, reference }) => {
             manifests::delete(&st, &repo, &reference).await
         }
-        _ => Err(ApiError::name_unknown()),
+        _ => Err(ApiError::new(
+            ErrorCode::NameUnknown,
+            "repository name not known to registry",
+        )),
     }
 }

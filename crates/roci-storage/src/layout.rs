@@ -1,27 +1,21 @@
-//! On-disk OCI image-layout helpers: the marker/media-type constants, the
-//! `index.json` descriptor accessors, and the in-memory paging used by the
-//! layout read-path fallbacks.
+//! OCI image-layout helpers: constants, descriptor accessors, in-memory paging.
 
 use crate::metadata::{self, MetaOp, MetadataStore, Page, Referrer};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// The `oci-layout` marker file contents (image-layout.md §oci-layout file).
-pub(crate) const OCI_LAYOUT_MARKER: &str = "{\"imageLayoutVersion\":\"1.0.0\"}";
+/// `oci-layout` marker contents (image-layout.md §oci-layout file).
+pub const OCI_LAYOUT_MARKER: &str = "{\"imageLayoutVersion\":\"1.0.0\"}";
 
-/// Annotation key a descriptor carries to name a tag (image-layout.md
-/// §index.json file).
-pub(crate) const REF_NAME_ANNOTATION: &str = "org.opencontainers.image.ref.name";
+/// Annotation key naming a tag (image-layout.md §index.json file).
+pub const REF_NAME_ANNOTATION: &str = "org.opencontainers.image.ref.name";
 
-/// OCI image manifest media type (image-spec `mediaType`); the default when a
-/// descriptor/request omits one.
+/// OCI image manifest media type; the default when omitted.
 pub const MEDIA_TYPE_IMAGE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 
-/// OCI image index media type.
 pub const MEDIA_TYPE_IMAGE_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 
-/// The canonical empty OCI image index.
-pub(crate) fn empty_index() -> serde_json::Value {
+pub fn empty_index() -> serde_json::Value {
     serde_json::json!({
         "schemaVersion": 2,
         "mediaType": MEDIA_TYPE_IMAGE_INDEX,
@@ -29,39 +23,31 @@ pub(crate) fn empty_index() -> serde_json::Value {
     })
 }
 
-/// The tag a descriptor names via its `org.opencontainers.image.ref.name`
-/// annotation, if any.
-pub(crate) fn descriptor_tag(descriptor: &serde_json::Value) -> Option<&str> {
+pub fn descriptor_tag(descriptor: &serde_json::Value) -> Option<&str> {
     descriptor
         .get("annotations")
         .and_then(|a| a.get(REF_NAME_ANNOTATION))
         .and_then(|v| v.as_str())
 }
 
-/// The `digest` field of a descriptor, if present and a string.
-pub(crate) fn descriptor_digest(descriptor: &serde_json::Value) -> Option<&str> {
+pub fn descriptor_digest(descriptor: &serde_json::Value) -> Option<&str> {
     descriptor.get("digest").and_then(|v| v.as_str())
 }
 
-/// The `manifests` descriptors of an image index; empty when absent or not an array.
-pub(crate) fn index_manifests(index: &serde_json::Value) -> &[serde_json::Value] {
+/// The `manifests` array of an image index; empty when absent.
+pub fn index_manifests(index: &serde_json::Value) -> &[serde_json::Value] {
     index
         .get("manifests")
         .and_then(serde_json::Value::as_array)
         .map_or(&[], Vec::as_slice)
 }
 
-/// The `subject.digest` string of a descriptor, if present.
-pub(crate) fn subject_digest(descriptor: &serde_json::Value) -> Option<&str> {
+/// The `subject.digest` string, if present.
+pub fn subject_digest(descriptor: &serde_json::Value) -> Option<&str> {
     descriptor.get("subject")?.get("digest")?.as_str()
 }
 
-/// Every object a manifest references — `config`, each `layers` entry, each
-/// image-index `manifests` child, and `subject` — as parsed digests: the GC
-/// liveness edges (backrefs). The single definition shared by the push path
-/// and the GC startup rebuild, so both derive identical edges. Lenient: a
-/// malformed descriptor contributes nothing (the push path validates the
-/// required config/layers separately and rejects a malformed manifest).
+/// All digests a manifest references (config, layers, index children, subject) — GC backrefs.
 pub fn manifest_references(manifest: &serde_json::Value) -> Vec<crate::Digest> {
     let descriptors = manifest
         .get("config")
@@ -78,10 +64,8 @@ pub fn manifest_references(manifest: &serde_json::Value) -> Vec<crate::Digest> {
         .collect()
 }
 
-/// Page an in-memory list already sorted and de-duplicated by `key`: at most
-/// `limit` items strictly after `last`. Used only by the layout fallbacks,
-/// whose cost is bounded by the document they must read whole anyway.
-pub(crate) fn page_sorted<T>(
+/// Page a sorted, deduped list: at most `limit` items after `last`.
+pub fn page_sorted<T>(
     items: Vec<T>,
     key: fn(&T) -> &str,
     last: Option<&str>,
@@ -91,11 +75,8 @@ pub(crate) fn page_sorted<T>(
     metadata::take_page(items.into_iter().skip(start), limit)
 }
 
-/// Page referrer candidates read from the layout, `(digest, descriptor)`, the
-/// way the metadata store pages its index: keep the `artifactType` matches,
-/// order and de-duplicate by digest (first occurrence wins), and serialize
-/// only the served page.
-pub(crate) fn page_layout_referrers(
+/// Page referrer candidates by `artifactType`, deduped by digest.
+pub fn page_layout_referrers(
     mut refs: Vec<(String, &serde_json::Value)>,
     artifact_type: Option<&str>,
     last: Option<&str>,
@@ -117,7 +98,51 @@ pub(crate) fn page_layout_referrers(
     }
 }
 
-/// Whether two image indexes carry the same descriptor set (order-insensitive).
+/// Build a referrer descriptor with `subject` merged in.
+pub fn referrer_descriptor(
+    subject: &crate::Digest,
+    descriptor: &[u8],
+) -> Result<Vec<u8>, crate::StorageError> {
+    let invalid = |e: serde_json::Error| {
+        crate::StorageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    };
+    let mut merged: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(descriptor).map_err(invalid)?;
+    merged.insert(
+        "subject".into(),
+        serde_json::json!({ "digest": subject.as_string() }),
+    );
+    serde_json::to_vec(&merged).map_err(invalid)
+}
+
+/// Tags page from an in-memory index.json.
+pub fn layout_tags_page(
+    index: &serde_json::Value,
+    last: Option<&str>,
+    limit: usize,
+) -> Page<String> {
+    let mut tags: Vec<String> = index_manifests(index)
+        .iter()
+        .filter_map(|e| descriptor_tag(e).map(str::to_string))
+        .collect();
+    tags.sort();
+    tags.dedup();
+    page_sorted(tags, String::as_str, last, limit)
+}
+
+/// Referrer candidates from an in-memory index.json matching `subject`.
+pub fn layout_subject_referrers<'a>(
+    index: &'a serde_json::Value,
+    subject: &str,
+) -> Vec<(String, &'a serde_json::Value)> {
+    index_manifests(index)
+        .iter()
+        .filter(|e| subject_digest(e) == Some(subject))
+        .filter_map(|e| Some((descriptor_digest(e)?.to_string(), e)))
+        .collect()
+}
+
+/// Whether two indexes carry the same descriptor set (order-insensitive).
 pub(crate) fn same_manifest_set(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     let set = |v: &serde_json::Value| -> Vec<String> {
         let mut s: Vec<String> = index_manifests(v).iter().map(|e| e.to_string()).collect();
@@ -127,29 +152,20 @@ pub(crate) fn same_manifest_set(a: &serde_json::Value, b: &serde_json::Value) ->
     set(a) == set(b)
 }
 
-/// Repository names under `root`: every directory (bounded depth) that directly
-/// contains an `index.json` file **or** an `oci-layout` marker — the latter
-/// catches a blob-only repo (blobs pushed before its first manifest, so no
-/// `index.json` yet) whose blobs must still seed the presence filter. Named by
-/// its `/`-joined path relative to `root`. Best-effort — an unreadable
-/// directory is skipped. Used only to seed the blob-presence filter at startup.
+/// Discover repo names under `root` (dirs with `index.json` or `oci-layout`).
 ///
-/// Symlinks are never followed at any level: `DirEntry::file_type` and
-/// `symlink_metadata` are used throughout so a symlinked repo, `blobs`, or
-/// algorithm directory cannot redirect enumeration outside the store root.
+/// SECURITY: symlinks never followed — `symlink_metadata` / `file_type` ensure
+/// no symlinked repo or marker can redirect enumeration outside the store root.
 pub(crate) fn discover_repos(root: &Path) -> Vec<String> {
     fn walk(dir: &Path, rel: &[String], depth: usize, out: &mut Vec<String>) {
-        // Bound depth so a pathological tree cannot recurse without limit;
-        // repo names are a handful of path segments in practice.
         if depth == 0 {
             return;
         }
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
-        // Use symlink_metadata so a symlinked index.json/oci-layout cannot
-        // masquerade as a regular file and make us treat an attacker-controlled
-        // directory as a valid repo.
+        // SECURITY: symlink_metadata — no-follow so a symlinked marker cannot
+        // trick us into treating an external dir as a repo.
         if !rel.is_empty() {
             let has_index = std::fs::symlink_metadata(dir.join("index.json"))
                 .map(|m| m.is_file())
@@ -162,15 +178,10 @@ pub(crate) fn discover_repos(root: &Path) -> Vec<String> {
             }
         }
         for entry in entries.flatten() {
-            // DirEntry::file_type does not follow symlinks on most platforms;
-            // only real directories are entered.
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            // The CAS/staging subdirs of a repo are never themselves repos, and
-            // neither is a dot-directory (the repo grammar forbids a leading
-            // `.`; roci keeps internal state such as a quarantine there).
             if name == "blobs" || name == "uploads" || name.starts_with('.') {
                 continue;
             }
@@ -184,23 +195,16 @@ pub(crate) fn discover_repos(root: &Path) -> Vec<String> {
     repos
 }
 
-/// Visit every CAS blob under `root` as `(repo, digest, dir entry)`: every
-/// `<repo>/blobs/<alg>/<hex>` of every [`discover_repos`] repository whose
-/// name parses as a wire [`crate::Digest`] (in-progress `.tmp` siblings and
-/// foreign names are skipped). Best-effort — an unreadable directory is
-/// skipped. The shared startup/GC/scrub enumeration.
+/// Visit every CAS blob under `root`: `<repo>/blobs/<alg>/<hex>` for each
+/// [`discover_repos`] repo. `.tmp` siblings and foreign names skipped.
 ///
-/// Symlinks are never followed: at the `blobs` and `<alg>` levels only real
-/// directories are entered; at the leaf level only regular files (via
-/// `symlink_metadata`) are visited — so a symlinked repo, `blobs`, algorithm
-/// directory or digest leaf cannot redirect enumeration outside the store root.
+/// SECURITY: symlinks never followed at any level — only real dirs/files entered.
 pub(crate) fn for_each_cas_blob(
     root: &Path,
     mut visit: impl FnMut(&str, &crate::Digest, &std::fs::DirEntry),
 ) {
     for repo in discover_repos(root) {
         let blobs_path = root.join(&repo).join("blobs");
-        // Skip if `blobs` is a symlink (no-follow check).
         match std::fs::symlink_metadata(&blobs_path) {
             Ok(m) if m.is_dir() => {}
             _ => continue,
@@ -209,7 +213,6 @@ pub(crate) fn for_each_cas_blob(
             continue;
         };
         for alg in algs.flatten() {
-            // Skip algorithm dirs that are symlinks.
             if !alg.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
@@ -218,7 +221,6 @@ pub(crate) fn for_each_cas_blob(
                 continue;
             };
             for hex in hexes.flatten() {
-                // Leaves must be regular files (not symlinks).
                 if !hex.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     continue;
                 }
@@ -231,9 +233,7 @@ pub(crate) fn for_each_cas_blob(
     }
 }
 
-/// Record tagged descriptors from an existing index that the metadata store
-/// does not yet know (a layout written by another tool) so the write-behind
-/// treats them as live.
+/// Import tagged descriptors from a foreign layout the metadata store has not seen.
 pub fn import_foreign_tags(meta: &dyn MetadataStore, repo: &str, existing: &serde_json::Value) {
     for e in index_manifests(existing) {
         let (Some(tag), Some(digest)) = (descriptor_tag(e), descriptor_digest(e)) else {
@@ -259,19 +259,7 @@ pub fn import_foreign_tags(meta: &dyn MetadataStore, repo: &str, existing: &serd
     }
 }
 
-/// Rebuild a spec-valid `index.json` from the metadata store (authoritative
-/// for everything roci wrote) merged over the existing on-disk index.
-///
-/// Rules: a manifest the store knows emits one descriptor per tag (or one
-/// untagged descriptor), enriched with its referrer fields (`subject`,
-/// `artifactType`, annotations) and any extra fields already on disk. An
-/// on-disk entry the store does not know is kept only if it is *foreign*
-/// — no `ref.name` tag and no `subject` (roci would have recorded either);
-/// otherwise it is a deleted manifest and is dropped.
-///
-/// `size_lookup` resolves a digest to its byte size (from CAS stat, existing
-/// index entry, or manifest bytes length) — avoids coupling to a specific
-/// backend's storage access.
+/// Rebuild `index.json` from the metadata store merged over the existing on-disk index.
 pub fn index_from_meta(
     meta: &dyn MetadataStore,
     repo: &str,
@@ -281,8 +269,6 @@ pub fn index_from_meta(
     type Obj = serde_json::Map<String, serde_json::Value>;
     let known: HashSet<String> = meta.manifests(repo).into_iter().collect();
 
-    // Per-digest base descriptor (tag stripped) for known manifests, plus
-    // foreign entries passed through verbatim.
     let mut base: HashMap<String, Obj> = HashMap::new();
     let mut foreign: Vec<serde_json::Value> = Vec::new();
     let existing_ms = existing.as_ref().map_or(&[][..], index_manifests);
@@ -310,8 +296,6 @@ pub fn index_from_meta(
         }
     }
 
-    // Every known manifest gets a base (media type from the store; size
-    // from the size_lookup when not already recorded).
     for d in &known {
         let o = base.entry(d.clone()).or_insert_with(|| {
             let mut o = Obj::new();
@@ -328,10 +312,7 @@ pub fn index_from_meta(
         }
     }
 
-    // Merge referrer descriptor fields into the referring manifest's base
-    // (never overwriting its identity; existing annotations win). A live
-    // referrer whose manifest the store does not track (DeleteManifest
-    // already drops referrers) contributes its own descriptor.
+    // Merge referrer descriptor fields into the base (annotations preserved).
     for (subject, refs) in meta.referrers_snapshot(repo) {
         for (ref_digest, ref_bytes) in refs {
             let o = base.entry(ref_digest.clone()).or_insert_with(|| {
@@ -375,9 +356,7 @@ pub fn index_from_meta(
         }
     }
 
-    // Emit: one descriptor per tag, then untagged known manifests, then
-    // foreign entries. Sorted for a deterministic, diff-friendly file.
-    // `tags_snapshot` is tag-sorted.
+    // Emit: one descriptor per tag, then untagged, then foreign (sorted).
     let tags = meta.tags_snapshot(repo);
     let mut tagged: HashSet<&str> = HashSet::new();
     let mut manifests: Vec<serde_json::Value> = Vec::with_capacity(base.len() + tags.len());
@@ -407,8 +386,7 @@ pub fn index_from_meta(
             .map(|(_, o)| serde_json::Value::Object(o.clone())),
     );
     manifests.extend(foreign);
-    // Keep any top-level fields another tool wrote (`annotations`,
-    // `artifactType`, `subject`, …); regenerate only what roci owns.
+    // Preserve top-level fields another tool wrote; regenerate roci-owned.
     let mut top = existing
         .and_then(|v| match v {
             serde_json::Value::Object(o) => Some(o),
@@ -422,4 +400,106 @@ pub fn index_from_meta(
     );
     top.insert("manifests".into(), serde_json::Value::Array(manifests));
     Ok(serde_json::Value::Object(top))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::digest::sha256_of;
+    use crate::metadata::MetaOp;
+    use crate::storage::{ManifestLinks, Storage};
+    use crate::FsStorage;
+
+    fn store() -> (tempfile::TempDir, FsStorage) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        (dir, s)
+    }
+
+    #[tokio::test]
+    async fn import_foreign_tags_imports_and_skips() {
+        let (_dir, s) = store();
+        let body = br#"{"schemaVersion":2}"#;
+        let d = sha256_of(body);
+        s.put_blob("ext", &d, body).await.unwrap();
+        let existing = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [{
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": d.as_string(), "size": body.len(),
+                "annotations": {"org.opencontainers.image.ref.name": "foreign"}
+            }]
+        });
+        assert!(
+            s.meta.resolve_tag("ext", "foreign").is_none(),
+            "precondition"
+        );
+        import_foreign_tags(&*s.meta, "ext", &existing);
+        assert!(s.meta.resolve_tag("ext", "foreign").is_some(), "imported");
+        import_foreign_tags(&*s.meta, "ext", &existing); // idempotent
+
+        let skip_cases = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [
+                {"digest": "sha256:0000000000000000000000000000000000000000000000000000000000000001", "size": 1},
+                {"annotations": {"org.opencontainers.image.ref.name": "v1"}, "size": 1},
+                {"digest": "garbage", "annotations": {"org.opencontainers.image.ref.name": "v2"}, "size": 1}
+            ]
+        });
+        import_foreign_tags(&*s.meta, "r", &skip_cases);
+        assert!(s.meta.resolve_tag("r", "v1").is_none(), "no-digest skipped");
+        assert!(
+            s.meta.resolve_tag("r", "v2").is_none(),
+            "bad-digest skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_from_meta_edge_cases() {
+        let (_dir, s) = store();
+        let body = br#"{"schemaVersion":2}"#;
+        let d = sha256_of(body);
+        s.put_manifest(
+            "r",
+            Some("t1"),
+            &d,
+            "application/json",
+            body,
+            ManifestLinks::default(),
+        )
+        .await
+        .unwrap();
+
+        let existing = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": ["a bare string entry", {"digest": d.as_string(), "size": body.len()}]
+        });
+        let rebuilt = index_from_meta(&*s.meta, "r", Some(existing), |_| None).unwrap();
+        let ms = rebuilt["manifests"].as_array().unwrap();
+        assert!(ms.iter().any(|e| e.is_string()), "foreign string preserved");
+        assert!(
+            ms.iter().any(|e| descriptor_tag(e) == Some("t1")),
+            "known tag present"
+        );
+
+        let subject = sha256_of(b"subj");
+        s.meta
+            .apply(MetaOp::PutReferrer {
+                repo: "r".to_string(),
+                subject: subject.as_string(),
+                referrer: "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+                    .to_string(),
+                descriptor: b"not json at all".to_vec(),
+            })
+            .unwrap();
+        let rebuilt2 = index_from_meta(&*s.meta, "r", None, |_| None).unwrap();
+        assert!(
+            rebuilt2["manifests"].is_array(),
+            "non-json referrer skipped"
+        );
+
+        let rebuilt3 =
+            index_from_meta(&*s.meta, "r", Some(serde_json::Value::Null), |_| None).unwrap();
+        assert_eq!(rebuilt3["schemaVersion"], 2, "null existing handled");
+    }
 }

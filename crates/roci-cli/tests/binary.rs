@@ -1,16 +1,10 @@
-//! Integration test that runs the real `roci` binary so the `#[tokio::main]`
-//! entrypoint (`main` → `run` → `serve`) is exercised end to end. Under
-//! `cargo llvm-cov`, the binary is instrumented and this child process's
-//! coverage merges into the report.
+//! End-to-end test running the real `roci` binary.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;
 use std::time::Duration;
 
-/// Locate the compiled `roci` binary. Cargo sets `CARGO_BIN_EXE_roci` for
-/// integration tests of the crate that defines the binary, pointing at the
-/// instrumented binary under `cargo llvm-cov`.
 fn roci_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_roci"))
 }
@@ -20,7 +14,6 @@ fn binary_serves_v2_then_shuts_down_on_sigint() {
     let bin = roci_bin();
     assert!(bin.exists(), "roci binary not found at {}", bin.display());
     let storage = tempfile::tempdir().unwrap();
-    // Use a fixed loopback port unlikely to collide in CI.
     let port = 5599;
     let mut child = Command::new(&bin)
         .arg("--listen")
@@ -30,7 +23,6 @@ fn binary_serves_v2_then_shuts_down_on_sigint() {
         .spawn()
         .expect("spawn roci");
 
-    // Poll /v2/ until the server answers.
     let addr = format!("127.0.0.1:{port}");
     let mut ready = false;
     for _ in 0..50 {
@@ -47,12 +39,10 @@ fn binary_serves_v2_then_shuts_down_on_sigint() {
     }
     assert!(ready, "roci did not answer /v2/ with 200");
 
-    // Graceful shutdown via SIGINT so main()/run()/serve() return Ok(()).
     #[cfg(unix)]
     {
         let pid = child.id() as i32;
-        // SAFETY-free: use the `kill` command to avoid an unsafe libc call
-        // (crates here are #![forbid(unsafe_code)]).
+        // Use `kill` command to avoid unsafe libc call.
         let _ = Command::new("kill")
             .arg("-INT")
             .arg(pid.to_string())

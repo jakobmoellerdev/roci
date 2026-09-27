@@ -53,7 +53,7 @@ audit:
 
 # Lint the GitHub Actions workflows (CI `actionlint` job). Requires `actionlint`.
 lint-workflows:
-    actionlint -color
+    actionlint -color -ignore 'unknown permission scope "code-quality"'
 
 # Security-audit the workflows (CI `zizmor` workflow). Requires `zizmor` (`uv tool install zizmor` or `cargo install zizmor`).
 zizmor:

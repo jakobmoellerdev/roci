@@ -1,7 +1,4 @@
-//! OTel traceparent propagation test.
-//!
-//! This test lives in its own binary so its global tracing subscriber is not
-//! poisoned by another test's NoSubscriber (tracing callsite caching).
+//! OTel traceparent propagation (own binary to avoid global-subscriber races).
 #![cfg(feature = "otel")]
 
 use axum::body::Body;
@@ -29,12 +26,10 @@ async fn traceparent_header_propagates_trace_id() {
         .build();
     let tracer = trace_provider.tracer("roci-test");
 
-    // Register W3C propagator.
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
 
-    // Set up tracing subscriber with OTel layer as the global default.
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
     let subscriber = tracing_subscriber::registry().with(otel_layer);
     tracing::subscriber::set_global_default(subscriber).expect("set global subscriber");
@@ -43,7 +38,6 @@ async fn traceparent_header_propagates_trace_id() {
     let storage = FsStorage::new(dir.path()).unwrap();
     let app = build_router(AppState::new(storage));
 
-    // Craft a request with a W3C traceparent header.
     let expected_trace_id = "0af7651916cd43dd8448eb211c80319c";
     let traceparent = format!("00-{expected_trace_id}-b7ad6b7169203331-01");
 
@@ -58,11 +52,8 @@ async fn traceparent_header_propagates_trace_id() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 
-    // Flush to make sure spans are exported.
     let _ = trace_provider.force_flush();
 
-    // The exported root span continues the caller's trace and carries the
-    // dist-spec error as OTel span status ERROR + `error.type`.
     let expected = TraceId::from_hex(expected_trace_id).unwrap();
     let root = std::iter::from_fn(|| rx_export.try_recv().ok())
         .find(|s| s.name == "http.request")

@@ -1,13 +1,9 @@
 //! Local upload staging: resumable chunked sessions staged under
 //! `root/uploads/<repo components>/<id>` with random 128-bit hex ids,
 //! per-session lock, Content-Range precondition.
-//!
 //! All staging file I/O uses `roci_storage::beneath` component-wise no-follow
 //! opens so a symlink planted at `uploads/<repo>` or at the session id cannot
 //! redirect operations outside the storage root.
-//!
-//! Staging is repo-scoped: a session id is only usable within its originating
-//! repo, matching FsStorage's isolation semantics.
 
 use crate::S3Storage;
 use roci_storage::beneath::{
@@ -19,32 +15,26 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncReadExt;
 
 impl S3Storage {
-    /// Relative path from root to the staging directory for a repo:
-    /// `uploads/<repo>`.
     pub(crate) fn repo_staging_rel(&self, repo: &str) -> Result<PathBuf, StorageError> {
-        validate_repo_for_staging(repo)?;
+        crate::keys::validate_repo(repo)?;
         Ok(Path::new("uploads").join(repo))
     }
 
-    /// Relative path from root to a staging file: `uploads/<repo>/<id>`.
     pub(crate) fn staging_rel(&self, repo: &str, id: &str) -> Result<PathBuf, StorageError> {
         validate_session_id(id)?;
         Ok(self.repo_staging_rel(repo)?.join(id))
     }
 
-    /// Full staging file path (for legacy callers that need it, e.g. enumeration).
     pub(crate) fn staging_path(&self, repo: &str, id: &str) -> Result<PathBuf, StorageError> {
         validate_session_id(id)?;
-        validate_repo_for_staging(repo)?;
+        crate::keys::validate_repo(repo)?;
         Ok(self.root.join("uploads").join(repo).join(id))
     }
 
-    /// Begin a new upload session. Returns the session id.
     pub(crate) async fn begin_upload_session(&self, repo: &str) -> Result<String, StorageError> {
         let mut buf = [0u8; 16];
         getrandom::fill(&mut buf).map_err(|e| StorageError::Io(io::Error::other(e)))?;
         let id = hex::encode(buf);
-        // Validate the id before creating the lock entry.
         validate_session_id(&id)?;
         self.quota.begin_session()?;
         // Create the staging file via no-follow beneath-root open.
@@ -56,7 +46,6 @@ impl S3Storage {
         Ok(id)
     }
 
-    /// Append bytes to a staging file under the session lock.
     pub(crate) async fn append_to_staging(
         &self,
         repo: &str,
@@ -85,7 +74,6 @@ impl S3Storage {
         Ok(total)
     }
 
-    /// Get the current size of a staging file.
     pub(crate) async fn staging_size(&self, repo: &str, id: &str) -> Result<u64, StorageError> {
         let rel = self.staging_rel(repo, id)?;
         match stat_beneath(&self.root, &rel)
@@ -97,7 +85,6 @@ impl S3Storage {
         }
     }
 
-    /// Remove a staging file and release the session.
     pub(crate) async fn remove_staging(&self, repo: &str, id: &str) {
         if let Ok(dir_rel) = self.repo_staging_rel(repo) {
             if validate_session_id(id).is_ok() {
@@ -107,7 +94,6 @@ impl S3Storage {
         self.quota.end_session();
     }
 
-    /// Stream-hash a staging file: returns (digest, crc32c, size).
     pub(crate) async fn hash_staging(
         &self,
         repo: &str,
@@ -132,7 +118,6 @@ impl S3Storage {
         Ok((digest, crc, size))
     }
 
-    /// Seed the open-session count from existing staging files at startup.
     pub(crate) fn seed_sessions_from_staging(&self) {
         let uploads_dir = self.root.join("uploads");
         let count = count_staging_files(&uploads_dir);
@@ -145,8 +130,6 @@ impl S3Storage {
         }
     }
 
-    /// Enumerate all staging files under `root/uploads/` recursively.
-    /// Returns `(repo, id, size, modified)` for each file.
     pub(crate) fn enumerate_staging_files(
         &self,
     ) -> Vec<(String, String, u64, std::time::SystemTime)> {
@@ -157,7 +140,6 @@ impl S3Storage {
     }
 }
 
-/// Stream a file through a hasher + CRC32C in 64 KiB reads.
 async fn hash_file<H: sha2::Digest>(
     algorithm: &str,
     f: &mut tokio::fs::File,
@@ -180,7 +162,6 @@ async fn hash_file<H: sha2::Digest>(
     Ok((digest, crc))
 }
 
-/// Validate a session id: 32 hex chars (128-bit), no path separators.
 fn validate_session_id(id: &str) -> Result<(), StorageError> {
     if id.is_empty()
         || id == "."
@@ -194,17 +175,6 @@ fn validate_session_id(id: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Validate a repo name for staging path construction: each component is
-/// non-empty, not `.`/`..`, no backslash or NUL.
-fn validate_repo_for_staging(repo: &str) -> Result<(), StorageError> {
-    for c in repo.split('/') {
-        if c.is_empty() || c == "." || c == ".." || c.bytes().any(|b| b == b'\\' || b == 0) {
-            return Err(StorageError::BadPath(repo.to_string()));
-        }
-    }
-    Ok(())
-}
-
 fn map_not_found(e: io::Error) -> StorageError {
     if e.kind() == io::ErrorKind::NotFound {
         StorageError::NotFound
@@ -213,7 +183,6 @@ fn map_not_found(e: io::Error) -> StorageError {
     }
 }
 
-/// Count all regular files under a staging directory recursively.
 fn count_staging_files(dir: &std::path::Path) -> usize {
     let mut count = 0;
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -229,7 +198,6 @@ fn count_staging_files(dir: &std::path::Path) -> usize {
     count
 }
 
-/// Walk the staging directory recursively, collecting file metadata.
 fn walk_staging_files(
     base: &std::path::Path,
     dir: &std::path::Path,

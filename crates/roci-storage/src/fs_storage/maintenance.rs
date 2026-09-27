@@ -1,25 +1,14 @@
-//! The background task scheduler (ARCHITECTURE §Background task scheduler):
-//! one place that owns every periodic storage task — metadata upkeep (log
-//! compaction / snapshot cut), GC sweeps, scrub passes. Each task is a single
-//! Tokio task (a bounded pool by construction: one per subsystem), runs its
-//! blocking filesystem work off the async workers, is its own span tree, and
-//! exits when the shutdown signal flips.
+//! Background task scheduler (ARCHITECTURE §Background task scheduler).
 
 use super::super::FsStorage;
-use crate::storage::StorageBackend;
-use std::future::Future;
+use crate::storage::{spawn_periodic, StorageBackend};
 use std::time::Duration;
 use tokio::sync::watch;
-use tracing::Instrument;
 
-/// How often the metadata engine is offered upkeep (it decides whether any
-/// compaction/snapshot is actually due, so a tick is cheap).
+/// Metadata upkeep period (compaction/snapshot check).
 const METADATA_UPKEEP_PERIOD: Duration = Duration::from_secs(30);
-
 impl StorageBackend for FsStorage {
-    /// Register pre-existing `subject` links (referrers upgrade), then
-    /// reconcile `index.json` with the replayed metadata log (write-behind
-    /// crash recovery, foreign-tag import).
+    /// Recover referrers and reconcile `index.json` (write-behind crash recovery).
     async fn recover(&self) {
         self.warm_referrers_from_layout().await;
         self.reconcile_index_json().await;
@@ -41,9 +30,7 @@ impl StorageBackend for FsStorage {
 }
 
 impl FsStorage {
-    /// Start the enabled background subsystems. Call once, after startup
-    /// recovery (`warm_referrers_from_layout`, `reconcile_index_json`) and
-    /// before serving; every task stops when `shutdown` becomes `true`.
+    /// Start enabled background subsystems; call once after recovery.
     pub fn start_maintenance(&self, shutdown: watch::Receiver<bool>) {
         tracing::info!(
             root = %self.root.display(),
@@ -52,7 +39,8 @@ impl FsStorage {
             dedupe = self.config.dedupe,
             "storage maintenance started"
         );
-        self.spawn_periodic(
+        spawn_periodic(
+            self.clone(),
             "metadata.maintain",
             METADATA_UPKEEP_PERIOD,
             shutdown.clone(),
@@ -77,38 +65,5 @@ impl FsStorage {
         if self.config.scrub.enabled {
             self.start_scrub(shutdown.clone());
         }
-    }
-
-    /// Run `task` every `period` (first run one period after start) until
-    /// `shutdown` flips. A slow run delays the next tick instead of bursting.
-    pub(super) fn spawn_periodic<F, Fut>(
-        &self,
-        name: &'static str,
-        period: Duration,
-        mut shutdown: watch::Receiver<bool>,
-        task: F,
-    ) where
-        F: Fn(FsStorage) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        let store = self.clone();
-        tokio::spawn(async move {
-            let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    _ = ticks.tick() => {
-                        task(store.clone())
-                            .instrument(tracing::info_span!("storage.maintenance", task = name))
-                            .await;
-                    }
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
     }
 }

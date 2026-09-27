@@ -1,14 +1,5 @@
-//! Feature-gated embedded B+ tree metadata engine backed by LMDB via heed3
-//! (mdb.master3 branch — supports encryption-at-rest with ChaCha20-Poly1305;
-//! ARCHITECTURE §Metadata index engine).
-//!
-//! Every query is a bounded range seek over named LMDB databases whose
-//! composite keys encode `(repo, …)` prefixes with `\0` separators — no
-//! full-table scans, no in-RAM index copies. One [`RwTxn`] per
-//! [`MetadataStore::apply`] call keeps every [`MetaOp`] atomic (the combined
-//! `PutManifest` stays one record). [`apply_relaxed`](MetadataStore::apply_relaxed)
-//! commits without fsync (env opened with `NO_SYNC`; `apply` and `maintain`
-//! call [`force_sync`](heed3::Env::force_sync) after commit).
+//! LMDB metadata engine (heed3 / ChaCha20-Poly1305 encryption-at-rest).
+//! ARCHITECTURE §Metadata index engine.
 
 use super::{BlobChecksum, MetaOp, MetadataStore, Page, Referrer};
 use heed3::types::Bytes;
@@ -19,32 +10,16 @@ use std::ops::Bound;
 use std::path::Path;
 use std::sync::Mutex;
 
-// ---------------------------------------------------------------------------
-// Named LMDB databases
-// ---------------------------------------------------------------------------
-//
-// Composite keys: parts joined with `\0` after each part, so a prefix
-// `"repo\0"` never accidentally matches `"repo2\0…"`. Byte-order ==
-// tuple order. All queries use bounded range/prefix seeks.
-
-/// Number of named databases we create. `max_dbs` must be ≥ this.
 const DB_COUNT: u32 = 10;
 
-// Convenience aliases.
 type PlainDb = heed3::Database<Bytes, Bytes>;
 type EncDb = heed3::EncryptedDatabase<Bytes, Bytes>;
 
-/// Format marker written to `<dir>/roci-format` to detect encryption mismatch.
 const FORMAT_PLAIN: &str = "plain";
 const FORMAT_ENCRYPTED: &str = "chacha20poly1305-v1";
 
-/// HKDF info string used to derive the ChaCha20-Poly1305 key from the
-/// per-deployment HMAC key file.
+/// HKDF info for ChaCha20-Poly1305 key derivation.
 const HKDF_INFO: &[u8] = b"roci-meta.lmdb encryption v1";
-
-// ---------------------------------------------------------------------------
-// Database-index constants — used to index into the arrays in `Dbs`.
-// ---------------------------------------------------------------------------
 
 const I_TAGS: usize = 0;
 const I_TAGS_BY_DIGEST: usize = 1;
@@ -57,11 +32,7 @@ const I_BACKREFS: usize = 7; // DUP_SORT
 const I_BACKREFS_REVERSE: usize = 8; // DUP_SORT
 const I_CHECKSUMS: usize = 9;
 
-// ---------------------------------------------------------------------------
-// Composite key helpers
-// ---------------------------------------------------------------------------
-
-/// Build a composite key from parts: each part is followed by `\0`.
+/// Composite key: each part followed by `\0`.
 fn make_key(parts: &[&[u8]]) -> Vec<u8> {
     let total: usize = parts.iter().map(|p| p.len() + 1).sum();
     let mut buf = Vec::with_capacity(total);
@@ -72,13 +43,11 @@ fn make_key(parts: &[&[u8]]) -> Vec<u8> {
     buf
 }
 
-/// Build a prefix from the first N parts of a composite key.
 fn make_prefix(parts: &[&[u8]]) -> Vec<u8> {
     make_key(parts) // same encoding; prefix_iter matches by prefix bytes
 }
 
-/// The exclusive upper-bound key for a prefix: increment the last byte that is
-/// not `0xFF`. Returns `None` if the prefix is all-`0xFF` (degenerate).
+/// Exclusive upper-bound for a prefix scan.
 fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut s = prefix.to_vec();
     while let Some(&last) = s.last() {
@@ -91,13 +60,11 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Build a half-open `[start, end)` range of `(Bound<&[u8]>, Bound<&[u8]>)`,
-/// which satisfies `RangeBounds<[u8]>` for heed3's `Database::range`.
+/// Half-open `[start, end)` range for heed3 range scans.
 fn byte_range<'a>(start: &'a [u8], end: &'a [u8]) -> (Bound<&'a [u8]>, Bound<&'a [u8]>) {
     (Bound::Included(start), Bound::Excluded(end))
 }
 
-/// Split a composite key on `\0` separators.
 fn split_key(key: &[u8]) -> Vec<&[u8]> {
     let mut parts = Vec::new();
     let mut start = 0;
@@ -109,10 +76,6 @@ fn split_key(key: &[u8]) -> Vec<&[u8]> {
     }
     parts
 }
-
-// ---------------------------------------------------------------------------
-// Checksum encoding (12 bytes: u32 LE crc32c + u64 LE size)
-// ---------------------------------------------------------------------------
 
 fn encode_checksum(crc: u32, size: u64) -> [u8; 12] {
     let mut buf = [0u8; 12];
@@ -127,12 +90,7 @@ fn decode_checksum(bytes: &[u8]) -> BlobChecksum {
     BlobChecksum { crc32c, size }
 }
 
-// ---------------------------------------------------------------------------
-// HKDF key derivation + error mapping
-// ---------------------------------------------------------------------------
-
-/// Derive a 32-byte ChaCha20-Poly1305 key from the HMAC key file using
-/// HKDF-SHA256 with info `b"roci-meta.lmdb encryption v1"`.
+/// Derive a 32-byte encryption key from the HMAC key file via HKDF-SHA256.
 fn derive_encryption_key(key_file_bytes: &[u8]) -> io::Result<[u8; 32]> {
     use hkdf::Hkdf;
     use sha2::Sha256;
@@ -156,16 +114,7 @@ fn map_heed_err(e: heed3::Error) -> io::Error {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Inner: abstracts plain vs encrypted env+databases
-// ---------------------------------------------------------------------------
-
-/// Holds the LMDB environment and all 10 named databases, either as plain
-/// `Database` handles or as `EncryptedDatabase` handles. Write operations use
-/// `RwTxn` (which both types accept as `&mut`). Read operations on the
-/// encrypted variant take `&mut RoTxn` — every read copies its result to owned
-/// data before the next read, avoiding the use-after-free hazard with the
-/// internal decryption buffer.
+/// Plain or encrypted LMDB env + databases.
 enum Inner {
     Plain {
         env: heed3::Env<WithoutTls>,
@@ -177,32 +126,28 @@ enum Inner {
     },
 }
 
-// -- Txn helpers --
+macro_rules! both {
+    ($self:expr, $b:ident => $e:expr) => {
+        match $self {
+            Inner::Plain { $b, .. } => $e,
+            Inner::Encrypted { $b, .. } => $e,
+        }
+    };
+}
 
 impl Inner {
     fn write_txn(&self) -> heed3::Result<heed3::RwTxn<'_>> {
-        match self {
-            Self::Plain { env, .. } => env.write_txn(),
-            Self::Encrypted { env, .. } => env.write_txn(),
-        }
+        both!(self, env => env.write_txn())
     }
 
     fn read_txn(&self) -> heed3::Result<heed3::RoTxn<'_, WithoutTls>> {
-        match self {
-            Self::Plain { env, .. } => env.read_txn(),
-            Self::Encrypted { env, .. } => env.read_txn(),
-        }
+        both!(self, env => env.read_txn())
     }
 
     fn force_sync(&self) -> heed3::Result<()> {
-        match self {
-            Self::Plain { env, .. } => env.force_sync(),
-            Self::Encrypted { env, .. } => env.force_sync(),
-        }
+        both!(self, env => env.force_sync())
     }
 }
-
-// -- Write helpers (both Database and EncryptedDatabase delegate to same LMDB FFI) --
 
 impl Inner {
     fn put(
@@ -212,17 +157,11 @@ impl Inner {
         key: &[u8],
         val: &[u8],
     ) -> heed3::Result<()> {
-        match self {
-            Self::Plain { dbs, .. } => dbs[idx].put(txn, key, val),
-            Self::Encrypted { dbs, .. } => dbs[idx].put(txn, key, val),
-        }
+        both!(self, dbs => dbs[idx].put(txn, key, val))
     }
 
     fn delete(&self, txn: &mut heed3::RwTxn<'_>, idx: usize, key: &[u8]) -> heed3::Result<bool> {
-        match self {
-            Self::Plain { dbs, .. } => dbs[idx].delete(txn, key),
-            Self::Encrypted { dbs, .. } => dbs[idx].delete(txn, key),
-        }
+        both!(self, dbs => dbs[idx].delete(txn, key))
     }
 
     fn delete_one_dup(
@@ -232,43 +171,20 @@ impl Inner {
         key: &[u8],
         val: &[u8],
     ) -> heed3::Result<bool> {
-        match self {
-            Self::Plain { dbs, .. } => dbs[idx].delete_one_duplicate(txn, key, val),
-            Self::Encrypted { dbs, .. } => dbs[idx].delete_one_duplicate(txn, key, val),
-        }
+        both!(self, dbs => dbs[idx].delete_one_duplicate(txn, key, val))
     }
 }
 
-// -- Read helpers — always return owned data --
-
 impl Inner {
-    /// Get a single value, copied to an owned `Vec`.
     fn get_owned(
         &self,
         txn: &mut heed3::RoTxn<'_, WithoutTls>,
         idx: usize,
         key: &[u8],
     ) -> heed3::Result<Option<Vec<u8>>> {
-        match self {
-            Self::Plain { dbs, .. } => Ok(dbs[idx].get(txn, key)?.map(|v| v.to_vec())),
-            Self::Encrypted { dbs, .. } => Ok(dbs[idx].get(txn, key)?.map(|v| v.to_vec())),
-        }
+        both!(self, dbs => Ok(dbs[idx].get(txn, key)?.map(|v| v.to_vec())))
     }
 
-    /// Get a value during a write transaction (RwTxn derefs to RoTxn-like).
-    fn get_in_write(
-        &self,
-        txn: &mut heed3::RwTxn<'_>,
-        idx: usize,
-        key: &[u8],
-    ) -> heed3::Result<Option<Vec<u8>>> {
-        match self {
-            Self::Plain { dbs, .. } => Ok(dbs[idx].get(txn, key)?.map(|v| v.to_vec())),
-            Self::Encrypted { dbs, .. } => Ok(dbs[idx].get(txn, key)?.map(|v| v.to_vec())),
-        }
-    }
-
-    /// Collect all (key, value) pairs in a range, fully owned.
     fn range_owned(
         &self,
         txn: &mut heed3::RoTxn<'_, WithoutTls>,
@@ -277,70 +193,27 @@ impl Inner {
         end: &[u8],
     ) -> heed3::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let r = &byte_range(start, end);
-        match self {
-            Self::Plain { dbs, .. } => {
-                let iter = dbs[idx].range(txn, r)?;
-                Ok(iter
-                    .filter_map(|e| e.ok().map(|(k, v)| (k.to_vec(), v.to_vec())))
-                    .collect())
-            }
-            Self::Encrypted { dbs, .. } => {
-                let iter = dbs[idx].range(txn, r)?;
-                Ok(iter
-                    .filter_map(|e| e.ok().map(|(k, v)| (k.to_vec(), v.to_vec())))
-                    .collect())
-            }
-        }
+        both!(self, dbs => {
+            let iter = dbs[idx].range(txn, r)?;
+            Ok(iter
+                .filter_map(|e| e.ok().map(|(k, v)| (k.to_vec(), v.to_vec())))
+                .collect())
+        })
     }
 
-    /// Range inside a write txn.
-    fn range_in_write(
-        &self,
-        txn: &mut heed3::RwTxn<'_>,
-        idx: usize,
-        start: &[u8],
-        end: &[u8],
-    ) -> heed3::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let r = &byte_range(start, end);
-        match self {
-            Self::Plain { dbs, .. } => {
-                let iter = dbs[idx].range(txn, r)?;
-                Ok(iter
-                    .filter_map(|e| e.ok().map(|(k, v)| (k.to_vec(), v.to_vec())))
-                    .collect())
-            }
-            Self::Encrypted { dbs, .. } => {
-                let iter = dbs[idx].range(txn, r)?;
-                Ok(iter
-                    .filter_map(|e| e.ok().map(|(k, v)| (k.to_vec(), v.to_vec())))
-                    .collect())
-            }
-        }
-    }
-
-    /// Iterate all entries in a database (for repos()), fully owned.
     fn iter_owned(
         &self,
         txn: &mut heed3::RoTxn<'_, WithoutTls>,
         idx: usize,
     ) -> heed3::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        match self {
-            Self::Plain { dbs, .. } => {
-                let iter = dbs[idx].iter(txn)?;
-                Ok(iter
-                    .filter_map(|e| e.ok().map(|(k, v)| (k.to_vec(), v.to_vec())))
-                    .collect())
-            }
-            Self::Encrypted { dbs, .. } => {
-                let iter = dbs[idx].iter(txn)?;
-                Ok(iter
-                    .filter_map(|e| e.ok().map(|(k, v)| (k.to_vec(), v.to_vec())))
-                    .collect())
-            }
-        }
+        both!(self, dbs => {
+            let iter = dbs[idx].iter(txn)?;
+            Ok(iter
+                .filter_map(|e| e.ok().map(|(k, v)| (k.to_vec(), v.to_vec())))
+                .collect())
+        })
     }
 
-    /// Check if any key with prefix exists.
     fn has_any_with_prefix(
         &self,
         txn: &mut heed3::RoTxn<'_, WithoutTls>,
@@ -351,21 +224,13 @@ impl Inner {
             return false;
         };
         let r = &byte_range(prefix, &end);
-        match self {
-            Self::Plain { dbs, .. } => dbs[idx]
-                .range(txn, r)
-                .ok()
-                .and_then(|mut it| it.next())
-                .is_some(),
-            Self::Encrypted { dbs, .. } => dbs[idx]
-                .range(txn, r)
-                .ok()
-                .and_then(|mut it| it.next())
-                .is_some(),
-        }
+        both!(self, dbs => dbs[idx]
+            .range(txn, r)
+            .ok()
+            .and_then(|mut it| it.next())
+            .is_some())
     }
 
-    /// Collect all duplicate values for a key in a DUP_SORT db (write txn).
     fn dup_values_in_write(
         &self,
         txn: &mut heed3::RwTxn<'_>,
@@ -373,28 +238,17 @@ impl Inner {
         key: &[u8],
     ) -> heed3::Result<Vec<Vec<u8>>> {
         let mut values = Vec::new();
-        match self {
-            Self::Plain { dbs, .. } => {
-                if let Some(iter) = dbs[idx].get_duplicates(txn, key)? {
-                    for entry in iter {
-                        let (_k, v) = entry?;
-                        values.push(v.to_vec());
-                    }
+        both!(self, dbs => {
+            if let Some(iter) = dbs[idx].get_duplicates(txn, key)? {
+                for entry in iter {
+                    let (_k, v) = entry?;
+                    values.push(v.to_vec());
                 }
             }
-            Self::Encrypted { dbs, .. } => {
-                if let Some(iter) = dbs[idx].get_duplicates(txn, key)? {
-                    for entry in iter {
-                        let (_k, v) = entry?;
-                        values.push(v.to_vec());
-                    }
-                }
-            }
-        }
+        });
         Ok(values)
     }
 
-    /// Collect all duplicate values as strings (read txn).
     fn dup_values_as_strings(
         &self,
         txn: &mut heed3::RoTxn<'_, WithoutTls>,
@@ -402,30 +256,18 @@ impl Inner {
         key: &[u8],
     ) -> Vec<String> {
         let mut values = Vec::new();
-        match self {
-            Self::Plain { dbs, .. } => {
-                if let Ok(Some(iter)) = dbs[idx].get_duplicates(txn, key) {
-                    for (_k, v) in iter.flatten() {
-                        if let Ok(s) = std::str::from_utf8(v) {
-                            values.push(s.to_string());
-                        }
+        both!(self, dbs => {
+            if let Ok(Some(iter)) = dbs[idx].get_duplicates(txn, key) {
+                for (_k, v) in iter.flatten() {
+                    if let Ok(s) = std::str::from_utf8(v) {
+                        values.push(s.to_string());
                     }
                 }
             }
-            Self::Encrypted { dbs, .. } => {
-                if let Ok(Some(iter)) = dbs[idx].get_duplicates(txn, key) {
-                    for (_k, v) in iter.flatten() {
-                        if let Ok(s) = std::str::from_utf8(v) {
-                            values.push(s.to_string());
-                        }
-                    }
-                }
-            }
-        }
+        });
         values
     }
 
-    /// Collect keys with a given prefix (write txn).
     fn keys_with_prefix_in_write(
         &self,
         txn: &mut heed3::RwTxn<'_>,
@@ -435,14 +277,10 @@ impl Inner {
         let Some(end) = prefix_successor(prefix) else {
             return Ok(Vec::new());
         };
-        self.range_in_write(txn, idx, prefix, &end)
+        self.range_owned(&mut *txn, idx, prefix, &end)
             .map(|pairs| pairs.into_iter().map(|(k, _)| k).collect())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Database names (in creation order)
-// ---------------------------------------------------------------------------
 
 const DB_NAMES: [&str; 10] = [
     "tags",
@@ -457,30 +295,20 @@ const DB_NAMES: [&str; 10] = [
     "checksums",
 ];
 
-/// Which databases use DUP_SORT.
 const DUP_SORT_INDICES: [usize; 2] = [I_BACKREFS, I_BACKREFS_REVERSE];
 
 fn is_dup_sort(idx: usize) -> bool {
     DUP_SORT_INDICES.contains(&idx)
 }
 
-// ---------------------------------------------------------------------------
-// LmdbMetadataStore
-// ---------------------------------------------------------------------------
-
 /// Embedded LMDB metadata engine.
-///
-/// The env directory lives at `<root>/roci-meta.lmdb/`. All queries are
-/// bounded range seeks — no in-RAM copies of the full dataset. A single
-/// `Mutex<()>` serializes write transactions (LMDB enforces single-writer
-/// anyway); reads use `read_txn` which can overlap.
 pub struct LmdbMetadataStore {
     inner: Inner,
     write_lock: Mutex<()>,
 }
 
 impl LmdbMetadataStore {
-    /// Open (or create) the LMDB metadata store at `<root>/roci-meta.lmdb/`.
+    /// Open (or create) the LMDB metadata store.
     pub fn open(root: &Path, config: &MetadataConfig) -> io::Result<Self> {
         let dir = root.join("roci-meta.lmdb");
         std::fs::create_dir_all(&dir)
@@ -529,6 +357,28 @@ impl LmdbMetadataStore {
 
         let map_size = config.map_size_bytes as usize;
 
+        macro_rules! create_dbs {
+            ($env:expr, $wtxn:expr) => {{
+                let mut arr: [Option<_>; 10] = Default::default();
+                for (i, name) in DB_NAMES.iter().enumerate() {
+                    let db = if is_dup_sort(i) {
+                        $env.database_options()
+                            .types::<Bytes, Bytes>()
+                            .name(name)
+                            .flags(DatabaseFlags::DUP_SORT)
+                            .create(&mut $wtxn)
+                            .map_err(map_heed_err)?
+                    } else {
+                        $env.create_database(&mut $wtxn, Some(name))
+                            .map_err(map_heed_err)?
+                    };
+                    arr[i] = Some(db);
+                }
+                $wtxn.commit().map_err(map_heed_err)?;
+                arr.map(|o| o.expect("all dbs created"))
+            }};
+        }
+
         let inner = if let Some(ref key_file) = config.hmac_key_file {
             let key_bytes = std::fs::read(key_file).map_err(|e| {
                 io::Error::new(
@@ -559,23 +409,7 @@ impl LmdbMetadataStore {
             .map_err(map_heed_err)?;
 
             let mut wtxn = env.write_txn().map_err(map_heed_err)?;
-            let mut dbs_arr: [Option<EncDb>; 10] = Default::default();
-            for (i, name) in DB_NAMES.iter().enumerate() {
-                let db = if is_dup_sort(i) {
-                    env.database_options()
-                        .types::<Bytes, Bytes>()
-                        .name(name)
-                        .flags(DatabaseFlags::DUP_SORT)
-                        .create(&mut wtxn)
-                        .map_err(map_heed_err)?
-                } else {
-                    env.create_database(&mut wtxn, Some(name))
-                        .map_err(map_heed_err)?
-                };
-                dbs_arr[i] = Some(db);
-            }
-            wtxn.commit().map_err(map_heed_err)?;
-            let dbs = dbs_arr.map(|o| o.expect("all dbs created"));
+            let dbs = create_dbs!(env, wtxn);
             Inner::Encrypted { env, dbs }
         } else {
             let mut opts = EnvOpenOptions::new().read_txn_without_tls();
@@ -592,32 +426,15 @@ impl LmdbMetadataStore {
             let env = unsafe { opts.open(&dir) }.map_err(map_heed_err)?;
 
             let mut wtxn = env.write_txn().map_err(map_heed_err)?;
-            let mut dbs_arr: [Option<PlainDb>; 10] = Default::default();
-            for (i, name) in DB_NAMES.iter().enumerate() {
-                let db = if is_dup_sort(i) {
-                    env.database_options()
-                        .types::<Bytes, Bytes>()
-                        .name(name)
-                        .flags(DatabaseFlags::DUP_SORT)
-                        .create(&mut wtxn)
-                        .map_err(map_heed_err)?
-                } else {
-                    env.create_database(&mut wtxn, Some(name))
-                        .map_err(map_heed_err)?
-                };
-                dbs_arr[i] = Some(db);
-            }
-            wtxn.commit().map_err(map_heed_err)?;
-            let dbs = dbs_arr.map(|o| o.expect("all dbs created"));
+            let dbs = create_dbs!(env, wtxn);
             Inner::Plain { env, dbs }
         };
 
-        // Write the format marker (idempotent).
         std::fs::write(&format_path, expected_format).map_err(|e| {
             io::Error::new(e.kind(), format!("writing {}: {e}", format_path.display()))
         })?;
 
-        // Warn about leftover redb database (never delete — user may want it).
+        // Warn about leftover redb database.
         let redb_path = root.join("roci-meta.redb");
         if redb_path.exists() {
             tracing::warn!(
@@ -634,7 +451,6 @@ impl LmdbMetadataStore {
         })
     }
 
-    /// Apply `op` and optionally fsync.
     fn apply_inner(&self, op: MetaOp, durable: bool) -> io::Result<()> {
         let _guard = self.write_lock.lock().expect("lmdb write lock poisoned");
         let mut txn = self.inner.write_txn().map_err(map_heed_err)?;
@@ -657,20 +473,17 @@ impl LmdbMetadataStore {
                 references,
                 referrer,
             } => {
-                // media type
                 {
                     let key = make_key(&[repo.as_bytes(), digest.as_bytes()]);
                     self.inner
                         .put(txn, I_MEDIA_TYPES, &key, media_type.as_bytes())
                         .map_err(map_heed_err)?;
                 }
-                // tag
                 if let Some(tag) = tag {
                     let tag_key = make_key(&[repo.as_bytes(), tag.as_bytes()]);
-                    // Remove old reverse entry if this tag pointed elsewhere
                     if let Some(old_val) = self
                         .inner
-                        .get_in_write(txn, I_TAGS, &tag_key)
+                        .get_owned(&mut *txn, I_TAGS, &tag_key)
                         .map_err(map_heed_err)?
                     {
                         if let Some(sep) = old_val.iter().position(|&b| b == 0) {
@@ -694,16 +507,13 @@ impl LmdbMetadataStore {
                         .put(txn, I_TAGS_BY_DIGEST, &rev_key, &[])
                         .map_err(map_heed_err)?;
                 }
-                // backrefs
                 self.add_backrefs_in_txn(txn, repo, digest, references)?;
-                // referrer
                 if let Some((subject, descriptor)) = referrer {
                     self.add_referrer_in_txn(txn, repo, subject, digest, descriptor)?;
                 }
             }
 
             MetaOp::DeleteManifest { repo, digest } => {
-                // Remove checksum + media type
                 {
                     let key = make_key(&[repo.as_bytes(), digest.as_bytes()]);
                     self.inner
@@ -713,7 +523,6 @@ impl LmdbMetadataStore {
                         .delete(txn, I_MEDIA_TYPES, &key)
                         .map_err(map_heed_err)?;
                 }
-                // Drop every tag pointing at this digest
                 {
                     let prefix = make_prefix(&[repo.as_bytes(), digest.as_bytes()]);
                     let keys = self
@@ -734,7 +543,6 @@ impl LmdbMetadataStore {
                             .map_err(map_heed_err)?;
                     }
                 }
-                // Drop this digest as a referrer of any subject
                 {
                     let prefix = make_prefix(&[repo.as_bytes(), digest.as_bytes()]);
                     let keys = self
@@ -754,7 +562,6 @@ impl LmdbMetadataStore {
                         }
                     }
                 }
-                // Drop this digest from every blob's backref set
                 {
                     let dup_key = make_key(&[repo.as_bytes(), digest.as_bytes()]);
                     let blobs = self
@@ -887,7 +694,7 @@ impl LmdbMetadataStore {
         let rt_key = make_key(&[repo.as_bytes(), subject.as_bytes(), referrer.as_bytes()]);
         let had_type = self
             .inner
-            .get_in_write(txn, I_REFERRER_TYPES, &rt_key)
+            .get_owned(&mut *txn, I_REFERRER_TYPES, &rt_key)
             .map_err(map_heed_err)?;
 
         {
@@ -1536,7 +1343,6 @@ mod tests {
         }
     }
 
-    // ---- Prefix-boundary paging: `team` vs `team2` repos -----------------
     #[test]
     fn prefix_boundary_repos() {
         let dir = tempfile::tempdir().unwrap();
@@ -1556,7 +1362,6 @@ mod tests {
                 .unwrap();
         }
 
-        // `team`'s tags must not include `team2`.
         let page = store.tags_page("team", None, 10).unwrap();
         assert_eq!(page.items, vec!["v1"]);
         assert!(!page.more);
@@ -1565,12 +1370,10 @@ mod tests {
         assert_eq!(page2.items, vec!["v1"]);
         assert!(!page2.more);
 
-        // manifests() also respects boundaries.
         assert_eq!(store.manifests("team"), vec!["sha256:aaa"]);
         assert_eq!(store.manifests("team2"), vec!["sha256:aaa"]);
     }
 
-    // ---- Prefix-boundary paging: tag `a` vs `ab` -------------------------
     #[test]
     fn prefix_boundary_tags() {
         let dir = tempfile::tempdir().unwrap();
@@ -1590,7 +1393,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Paging past `a` must give `ab`, not skip it.
         let page = store.tags_page("r", None, 1).unwrap();
         assert_eq!(page.items, vec!["a"]);
         assert!(page.more);
@@ -1604,7 +1406,6 @@ mod tests {
         assert!(!page3.more);
     }
 
-    // ---- Encryption mismatch moves dir aside to .untrusted-* -------------
     #[test]
     fn encryption_mismatch_moves_aside() {
         let dir = tempfile::tempdir().unwrap();
@@ -1622,18 +1423,14 @@ mod tests {
             .unwrap();
         drop(store);
 
-        // The format file should say "plain".
         let format_path = dir.path().join("roci-meta.lmdb/roci-format");
         assert_eq!(std::fs::read_to_string(&format_path).unwrap(), "plain");
 
-        // Now open with encryption — should move the plain env aside.
         let enc_config = make_encrypted_config(dir.path());
         let store2 = LmdbMetadataStore::open(dir.path(), &enc_config).unwrap();
 
-        // Old data is gone (moved aside).
         assert!(store2.resolve_tag("r", "v1").is_none());
 
-        // The untrusted directory must exist.
         let untrusted: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1645,14 +1442,12 @@ mod tests {
             .collect();
         assert_eq!(untrusted.len(), 1, "expected one untrusted dir");
 
-        // The new env should use encrypted format.
         assert_eq!(
             std::fs::read_to_string(&format_path).unwrap(),
             "chacha20poly1305-v1"
         );
     }
 
-    // ---- Encrypted env reopen persists -----------------------------------
     #[test]
     fn encrypted_reopen_persists() {
         let dir = tempfile::tempdir().unwrap();
@@ -1680,7 +1475,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Reopen with the same key file and check persistence.
         {
             let store = LmdbMetadataStore::open(dir.path(), &enc_config).unwrap();
             let (d, mt) = store.resolve_tag("r", "v1").unwrap();
