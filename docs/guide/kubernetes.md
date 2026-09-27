@@ -61,7 +61,7 @@ With 4 pods and default parity, the cluster survives one pod loss. To increase t
 
 ### Bucket bootstrap
 
-RustFS creates no buckets at startup. The bucket-init Job (`post-install,post-upgrade` hook) creates `s3.bucket` with a curl SigV4 `PUT`, retrying until RustFS has formed its erasure set; a `409` on upgrade counts as success. roci itself starts before the bucket exists: startup recovery lists the bucket, tolerates the miss, and binds (it waits out S3 client retries, up to about a minute, while RustFS is still unreachable).
+RustFS creates no buckets at startup. The bucket-init Job (`post-install,post-upgrade` hook) creates `s3.bucket` with a curl SigV4 `PUT`, retrying until RustFS has formed its erasure set; a `409` on upgrade counts as success. A new bucket reaches the other RustFS pods asynchronously, and a pod can reject `PutObject` with `NoSuchBucket` for seconds after creation. The Job therefore also writes and deletes a `.roci-bucket-init-probe` object on every RustFS pod (via the headless Service) and completes only once each pod accepts it. roci itself starts before the bucket exists: startup recovery lists the bucket, tolerates the miss, and binds (it waits out S3 client retries, up to about a minute, while RustFS is still unreachable).
 
 ### redirect_min_size = 0
 

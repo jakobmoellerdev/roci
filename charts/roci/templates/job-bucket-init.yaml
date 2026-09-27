@@ -2,8 +2,11 @@
 {{- /*
 RustFS has no startup bucket creation, so this hook creates s3.bucket with a
 SigV4-signed PUT. Idempotent (409 BucketAlreadyOwnedByYou on upgrade) and
-retrying while RustFS is still forming its erasure set. Credentials reach
-curl through a config on stdin, never argv.
+retrying while RustFS is still forming its erasure set. A new bucket reaches
+the other RustFS pods asynchronously (a pod can answer NoSuchBucket to
+PutObject seconds after creation), so the hook then writes and deletes a
+probe object on every pod until each accepts it. Credentials reach curl
+through a config on stdin, never argv.
 */}}
 {{- $fullname := include "roci.fullname" . }}
 apiVersion: batch/v1
@@ -61,6 +64,8 @@ spec:
               value: {{ .Values.s3.bucket | quote }}
             - name: REGION
               value: {{ include "roci.s3Region" . | quote }}
+            - name: POD_ENDPOINTS
+              value: {{ include "roci.rustfsPodEndpoints" . | quote }}
           volumeMounts:
             - name: rustfs-credentials
               mountPath: /etc/rustfs-credentials
@@ -73,15 +78,20 @@ spec:
               ak="$(cat /etc/rustfs-credentials/access-key)"
               sk="$(cat /etc/rustfs-credentials/secret-key)"
               cfg="user = \"$(esc "$ak"):$(esc "$sk")\""
+              # s3 METHOD URL [curl args...]: prints the HTTP status (000 on transport error).
+              s3() {
+                m="$1"; u="$2"; shift 2
+                printf '%s\n' "$cfg" | curl -sS -K - -o /dev/null -w '%{http_code}' -X "$m" \
+                  --aws-sigv4 "aws:amz:${REGION}:s3" \
+                  -H 'x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' \
+                  "$@" "$u" || true
+              }
               attempt=0
               while :; do
                 attempt=$((attempt + 1))
-                code="$(printf '%s\n' "$cfg" | curl -sS -K - -o /dev/null -w '%{http_code}' -X PUT \
-                  --aws-sigv4 "aws:amz:${REGION}:s3" \
-                  -H 'x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' \
-                  "${ENDPOINT}/${BUCKET}" || true)"
+                code="$(s3 PUT "${ENDPOINT}/${BUCKET}")"
                 case "$code" in
-                  200|409) echo "bucket ${BUCKET} ready (HTTP ${code})"; exit 0 ;;
+                  200|409) echo "bucket ${BUCKET} created (HTTP ${code})"; break ;;
                 esac
                 if [ "$attempt" -ge 60 ]; then
                   echo "creating bucket ${BUCKET} failed: last HTTP ${code}" >&2
@@ -89,6 +99,27 @@ spec:
                 fi
                 sleep 5
               done
+              probe=".roci-bucket-init-probe"
+              for ep in $POD_ENDPOINTS; do
+                attempt=0
+                while :; do
+                  attempt=$((attempt + 1))
+                  code="$(s3 PUT "${ep}/${BUCKET}/${probe}" --data-binary '')"
+                  [ "$code" = 200 ] && break
+                  if [ "$attempt" -ge 60 ]; then
+                    echo "bucket ${BUCKET} not writable via ${ep}: last HTTP ${code}" >&2
+                    exit 1
+                  fi
+                  sleep 1
+                done
+                code="$(s3 DELETE "${ep}/${BUCKET}/${probe}")"
+                case "$code" in
+                  204|200) ;;
+                  *) echo "deleting probe via ${ep} failed: HTTP ${code}" >&2; exit 1 ;;
+                esac
+                echo "bucket ${BUCKET} writable via ${ep} (attempt ${attempt})"
+              done
+              echo "bucket ${BUCKET} ready"
       volumes:
         - name: rustfs-credentials
           secret:
