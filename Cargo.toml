@@ -50,7 +50,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 opentelemetry = "0.31"
 tracing-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "experimental_metrics_custom_reader"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "experimental_metrics_custom_reader"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-blocking-client", "reqwest-rustls", "internal-logs"] }
 opentelemetry-appender-tracing = "0.31"
 clap = { version = "4", features = ["derive"] }
