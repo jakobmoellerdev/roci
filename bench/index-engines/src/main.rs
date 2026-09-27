@@ -1,4 +1,4 @@
-//! roci index-engine bake-off: heed (LMDB) vs redb
+//! roci index-engine bake-off: heed3 (LMDB, plain + encrypted) vs redb
 //!
 //! Mirrors roci's real metadata schema and access patterns
 //! (ARCHITECTURE §Metadata index engine, `crates/roci-storage/src/metadata/redb.rs`):
@@ -327,13 +327,13 @@ mod redb_engine {
 // ---------------------------------------------------------------------------
 
 mod heed_engine {
-    use heed::types::*;
-    use heed::{Database, Env, EnvOpenOptions};
+    use heed3::types::*;
+    use heed3::{Database, EnvOpenOptions, WithoutTls};
     use std::fs;
     use std::path::Path;
 
     pub struct HeedEngine {
-        pub env: Env,
+        pub env: heed3::Env<WithoutTls>,
         pub tags: Database<Str, Str>,
         pub media_types: Database<Str, Str>,
         pub referrers: Database<Str, Bytes>,
@@ -361,12 +361,14 @@ mod heed_engine {
     impl HeedEngine {
         pub fn open(dir: &Path, map_size: usize) -> Self {
             fs::create_dir_all(dir).unwrap();
+            #[allow(unsafe_code)]
             let env = unsafe {
                 EnvOpenOptions::new()
+                    .read_txn_without_tls()
                     .max_dbs(10)
                     .map_size(map_size)
                     .open(dir)
-                    .expect("heed open")
+                    .expect("heed3 open")
             };
 
             let mut wtxn = env.write_txn().unwrap();
@@ -462,13 +464,6 @@ mod heed_engine {
             subjects: &[String],
             descriptors: &[Vec<u8>],
         ) -> std::time::Duration {
-            // NOTE: LMDB doesn't have a "NoSync" per-txn flag via heed in the
-            // same way redb does. We use MDB_NOSYNC on the env for write benches.
-            // For fair comparison we just time the commits as-is (both engines
-            // already have fsync disabled for write-throughput measurement via
-            // their respective mechanisms — redb: Durability::None, LMDB: default
-            // heed write_txn which doesn't force MDB_NOSYNC but the OS buffers
-            // writes on macOS/APFS anyway). The population above uses fsync commits.
             let t0 = std::time::Instant::now();
             let n = repos.len();
             let mut i = start;
@@ -617,7 +612,7 @@ fn run_benchmark(config: &BenchConfig) {
     fs::create_dir_all(&tmpdir).unwrap();
 
     println!("╔══════════════════════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║  roci index-engine bake-off: heed (LMDB) vs redb                                              ║");
+    println!("║  roci index-engine bake-off: heed3 (LMDB, mdb.master3) vs redb                                ║");
     println!("╠══════════════════════════════════════════════════════════════════════════════════════════════════╣");
     println!("║  Host: {:<85}║", format!("{} {}", env::consts::OS, env::consts::ARCH));
     println!("║  Profile: --release with LTO (fat)                                                             ║");

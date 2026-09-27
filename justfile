@@ -223,7 +223,7 @@ bench-perf profile="quick" compare="":
     bash bench/run.sh perf {{profile}} {{compare}}
 
 
-# Index-engine bake-off: heed (LMDB) vs redb on roci's real access pattern.
+# Index-engine bake-off: heed3 (LMDB, plain + encrypted) vs redb on roci's real access pattern.
 # Default runs 100K + 1M refs (~5 min); pass sizes for larger (e.g. `just bench-index 100000,1000000,5000000`).
 bench-index sizes="":
     #!/usr/bin/env bash

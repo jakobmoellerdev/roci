@@ -1923,24 +1923,24 @@ max_body = 0
         assert_eq!(config, parsed);
     }
 
-    /// `storage.metadata.engine = "redb"` opens the embedded KV in a `redb`
-    /// build and aborts startup, naming the field, in any other build.
+    /// `storage.metadata.engine = "lmdb"` opens the embedded LMDB env in an
+    /// `lmdb` build and aborts startup, naming the field, in any other build.
     #[test]
-    fn redb_engine_is_selected_by_config() {
+    fn lmdb_engine_is_selected_by_config() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.storage.root = dir.path().to_path_buf();
-        config.storage.metadata.engine = roci_config::MetadataEngine::Redb;
+        config.storage.metadata.engine = roci_config::MetadataEngine::Lmdb;
         let built = build_storage(&config);
-        #[cfg(feature = "redb")]
+        #[cfg(feature = "lmdb")]
         {
             built.unwrap();
-            assert!(dir.path().join("roci-meta.redb").exists());
+            assert!(dir.path().join("roci-meta.lmdb").exists());
         }
-        #[cfg(not(feature = "redb"))]
+        #[cfg(not(feature = "lmdb"))]
         {
             let Err(err) = built else {
-                panic!("redb needs its build feature");
+                panic!("lmdb needs its build feature");
             };
             let err = err.to_string();
             assert!(err.contains("storage.metadata.engine"), "{err}");

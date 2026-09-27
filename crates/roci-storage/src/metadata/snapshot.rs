@@ -196,7 +196,7 @@ impl VerifiedSnapshot {
         // SAFETY: The snapshot file is written via atomic rename (never
         // modified in place). An external actor truncating/overwriting
         // the file after our open is a documented SIGBUS risk (same
-        // risk profile as LMDB/redb). The file descriptor is read-only.
+        // risk profile as LMDB). The file descriptor is read-only.
         #[allow(unsafe_code)]
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
 

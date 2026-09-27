@@ -75,10 +75,11 @@ max_total_bytes = 0           # registry-wide, across every storage path → 507
 max_upload_sessions = 1024    # concurrent upload sessions → 429 TOOMANYREQUESTS
 
 [storage.metadata]
-engine = "log"                # log: append-only WAL + in-RAM maps; redb: embedded B-tree KV (`redb` build)
+engine = "log"                # log: append-only WAL + in-RAM maps; lmdb: embedded B-tree KV (`lmdb` build, optional encryption at rest)
 snapshot = false              # log engine: serve from an rkyv mmap snapshot + WAL tail
 compact_threshold_bytes = 67108864  # compact the WAL / cut a snapshot past this size
-# hmac_key_file = "/etc/roci/meta.key"  # ≥ 32-byte key authenticating WAL records + snapshot
+# hmac_key_file = "/etc/roci/meta.key"  # ≥ 32-byte key authenticating WAL records + snapshot; with engine = "lmdb" also enables ChaCha20-Poly1305 encryption at rest
+# map_size_bytes = 68719476736  # lmdb engine: LMDB mmap address-space reservation (default 64 GiB); must be > 0
 
 # Route a repository prefix to its own storage path or backend (zot `subPaths`).
 # The longest prefix on a `/` boundary wins; roots must not nest.
@@ -207,10 +208,12 @@ authenticated = ["pull", "push"]
 roci compiles in two flavors (see [Architecture](/design/architecture)):
 
 - **minimal** — the core distribution API only, with the smallest possible dependency graph.
-- **full** — the core plus the optional extensions (`roci-ext-*`) for signatures, search, sync, and scanning, the S3 storage backend (`s3`), the embedded redb metadata engine (`redb`), OpenTelemetry export, and the `mimalloc` allocator. Release binaries and the container image are built with `full`.
+- **full** — the core plus the optional extensions (`roci-ext-*`) for signatures, search, sync, and scanning, the S3 storage backend (`s3`), the embedded LMDB metadata engine (`lmdb`), OpenTelemetry export, and the `mimalloc` allocator. Release binaries and the container image are built with `full`.
 - **`ldap`** — LDAP authentication (`[auth.ldap]`) is opt-in and **not** part of `full`, so release binaries and the container image do not include it; build with `--features full,ldap` to enable it.
 
-Configuring `s3`, `engine = "redb"`, or `auth.ldap` in a build without the corresponding feature aborts startup with a field-qualified error.
+Configuring `s3`, `engine = "lmdb"`, or `auth.ldap` in a build without the corresponding feature aborts startup with a field-qualified error. Configuring `engine = "redb"` fails with an error directing users to `"lmdb"` — redb has been removed and metadata is rebuilt from the layout on first LMDB open.
+
+**Switching metadata engines** (e.g. `redb` → `lmdb`, or `log` → `lmdb`): the new engine starts from the on-disk layout (`index.json` + `blobs/`), not from the old engine's files. `index.json` is written behind by a background task, so let pushes settle for a few seconds before stopping the old build — a tag stored only in the old engine and not yet in `index.json` is not carried over. The old `roci-meta.redb` is left in place (a warning is logged) and can be deleted once the switch is verified; with `hmac_key_file` set the LMDB environment is encrypted, and an environment whose encryption does not match the configuration is moved aside to `roci-meta.lmdb.untrusted-<ts>` and rebuilt.
 
 Every extension is reachable from the CLI **only** behind a cargo feature, never as an unconditional dependency. Behavior is then selected at runtime through configuration.
 

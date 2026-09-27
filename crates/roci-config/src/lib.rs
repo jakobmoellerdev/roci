@@ -377,8 +377,15 @@ pub struct MetadataConfig {
     /// Compact the log (or cut a new snapshot) once it grows past this size.
     pub compact_threshold_bytes: u64,
     /// File holding a per-deployment HMAC key authenticating every log record
-    /// and snapshot (compromised-storage-volume threat model).
+    /// and snapshot (compromised-storage-volume threat model). With `engine =
+    /// "lmdb"` the key is used to derive a ChaCha20-Poly1305 encryption key
+    /// via HKDF-SHA256 for transparent encryption-at-rest.
     pub hmac_key_file: Option<PathBuf>,
+    /// Maximum size of the LMDB memory-mapped region (bytes). Applies only to
+    /// `engine = "lmdb"`; the log engine ignores it. LMDB allocates virtual
+    /// address space up front; actual pages are demand-faulted so a generous
+    /// value is safe. Must be > 0.
+    pub map_size_bytes: u64,
 }
 
 impl Default for MetadataConfig {
@@ -388,6 +395,7 @@ impl Default for MetadataConfig {
             snapshot: false,
             compact_threshold_bytes: 64 * 1024 * 1024,
             hmac_key_file: None,
+            map_size_bytes: 68_719_476_736, // 64 GiB
         }
     }
 }
@@ -398,7 +406,13 @@ pub enum MetadataEngine {
     /// Append-only CRC32C-framed log + in-RAM maps (the minimal default).
     #[default]
     Log,
-    /// Embedded B-tree KV (redb) for out-of-RAM metadata (needs the `redb` build).
+    /// Embedded LMDB (heed3, mdb.master3) for out-of-RAM metadata with
+    /// optional encryption-at-rest (needs the `lmdb` build feature).
+    Lmdb,
+    /// Removed — kept only so config files that say `engine = "redb"` get a
+    /// clear validation error instead of a generic serde unknown-variant
+    /// message.
+    #[doc(hidden)]
     Redb,
 }
 
@@ -1042,25 +1056,27 @@ impl StorageConfig {
             }
         }
         let m = &self.metadata;
+        if m.engine == MetadataEngine::Redb {
+            return Err(invalid(
+                "storage.metadata.engine",
+                "the redb engine has been removed; \
+                 use \"lmdb\" instead — metadata is rebuilt from the layout",
+            ));
+        }
         if m.compact_threshold_bytes == 0 {
             return Err(invalid(
                 "storage.metadata.compact_threshold_bytes",
                 "must be > 0",
             ));
         }
-        if m.engine != MetadataEngine::Log {
-            if m.snapshot {
-                return Err(invalid(
-                    "storage.metadata.snapshot",
-                    "requires engine = \"log\"",
-                ));
-            }
-            if m.hmac_key_file.is_some() {
-                return Err(invalid(
-                    "storage.metadata.hmac_key_file",
-                    "requires engine = \"log\"",
-                ));
-            }
+        if m.engine != MetadataEngine::Log && m.snapshot {
+            return Err(invalid(
+                "storage.metadata.snapshot",
+                "requires engine = \"log\"",
+            ));
+        }
+        if m.map_size_bytes == 0 {
+            return Err(invalid("storage.metadata.map_size_bytes", "must be > 0"));
         }
         if let Some(s3) = &self.s3 {
             s3.validate("storage.s3")?;
@@ -1335,13 +1351,13 @@ mod tests {
 
     #[test]
     fn subsystem_checks_apply_only_when_relevant() {
-        // Periods are only checked for an enabled subsystem, snapshot/HMAC
-        // only restrict the redb engine when set, and an https endpoint needs
-        // no `allow_http`.
+        // Periods are only checked for an enabled subsystem, snapshot only
+        // restricts non-log engines, and an https endpoint needs no
+        // `allow_http`.
         for ok in [
             "[storage.gc]\nenabled = false\ndelay_secs = 0\ninterval_secs = 0",
             "[storage.scrub]\nenabled = false\ninterval_secs = 0",
-            "[storage.metadata]\nengine = \"redb\"",
+            "[storage.metadata]\nengine = \"lmdb\"",
             "[storage.s3]\nbucket = \"b\"\nendpoint = \"https://s3.example\"",
             "[storage.s3]\nbucket = \"b\"",
         ] {
@@ -1422,12 +1438,16 @@ mod tests {
                 "compact_threshold_bytes",
             ),
             (
-                "[storage.metadata]\nengine = \"redb\"\nsnapshot = true",
+                "[storage.metadata]\nengine = \"redb\"",
+                "storage.metadata.engine",
+            ),
+            (
+                "[storage.metadata]\nengine = \"lmdb\"\nsnapshot = true",
                 "storage.metadata.snapshot",
             ),
             (
-                "[storage.metadata]\nengine = \"redb\"\nhmac_key_file = \"/k\"",
-                "storage.metadata.hmac_key_file",
+                "[storage.metadata]\nmap_size_bytes = 0",
+                "storage.metadata.map_size_bytes",
             ),
             ("[storage.s3]\nbucket = \" \"", "storage.s3.bucket"),
             (

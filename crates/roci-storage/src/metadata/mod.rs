@@ -13,11 +13,11 @@ mod log;
 mod snapshot;
 pub(crate) mod wal_hmac;
 
-#[cfg(feature = "redb")]
-mod redb;
+#[cfg(feature = "lmdb")]
+mod lmdb;
 
-#[cfg(feature = "redb")]
-pub use self::redb::RedbMetadataStore;
+#[cfg(feature = "lmdb")]
+pub use self::lmdb::LmdbMetadataStore;
 
 pub use log::LogMetadataStore;
 
@@ -174,12 +174,17 @@ pub(crate) fn after(last: Option<&str>) -> (Bound<&str>, Bound<&str>) {
 pub fn open_metadata(root: &Path, config: &MetadataConfig) -> io::Result<Arc<dyn MetadataStore>> {
     match config.engine {
         MetadataEngine::Log => Ok(Arc::new(LogMetadataStore::open_with(root, config)?)),
-        #[cfg(feature = "redb")]
-        MetadataEngine::Redb => Ok(Arc::new(RedbMetadataStore::open(root, config)?)),
-        #[cfg(not(feature = "redb"))]
+        #[cfg(feature = "lmdb")]
+        MetadataEngine::Lmdb => Ok(Arc::new(LmdbMetadataStore::open(root, config)?)),
+        #[cfg(not(feature = "lmdb"))]
+        MetadataEngine::Lmdb => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "storage.metadata.engine = \"lmdb\" requires a build with the `lmdb` feature",
+        )),
         MetadataEngine::Redb => Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "storage.metadata.engine = \"redb\" requires a build with the `redb` feature",
+            "storage.metadata.engine: the redb engine has been removed; \
+             use \"lmdb\" instead — metadata is rebuilt from the layout",
         )),
     }
 }
@@ -905,10 +910,22 @@ mod engine_tests {
         LogMetadataStore::open(root).unwrap()
     });
 
-    // ---- Redb engine (feature-gated) --------------------------------------
-    #[cfg(feature = "redb")]
-    engine_tests!(redb_engine, |root: &Path| {
-        RedbMetadataStore::open(root, &MetadataConfig::default()).unwrap()
+    // ---- LMDB engine (feature-gated) -------------------------------------
+    #[cfg(feature = "lmdb")]
+    engine_tests!(lmdb_engine, |root: &Path| {
+        LmdbMetadataStore::open(root, &MetadataConfig::default()).unwrap()
+    });
+
+    // ---- LMDB encrypted engine -------------------------------------------
+    #[cfg(feature = "lmdb")]
+    engine_tests!(lmdb_encrypted_engine, |root: &Path| {
+        let key_path = root.join("hmac-test.key");
+        std::fs::write(&key_path, b"test-key-material-32-bytes-long!").unwrap();
+        let config = MetadataConfig {
+            hmac_key_file: Some(key_path),
+            ..MetadataConfig::default()
+        };
+        LmdbMetadataStore::open(root, &config).unwrap()
     });
 
     // ---- open_metadata dispatch -------------------------------------------
@@ -931,12 +948,12 @@ mod engine_tests {
         assert!(store.resolve_tag("r", "t").is_some());
     }
 
-    #[cfg(feature = "redb")]
+    #[cfg(feature = "lmdb")]
     #[test]
-    fn open_metadata_redb() {
+    fn open_metadata_lmdb() {
         let dir = tempfile::tempdir().unwrap();
         let config = MetadataConfig {
-            engine: roci_config::MetadataEngine::Redb,
+            engine: roci_config::MetadataEngine::Lmdb,
             ..MetadataConfig::default()
         };
         let store = open_metadata(dir.path(), &config).unwrap();
@@ -953,12 +970,12 @@ mod engine_tests {
         assert!(store.resolve_tag("r", "t").is_some());
     }
 
-    #[cfg(not(feature = "redb"))]
+    #[cfg(not(feature = "lmdb"))]
     #[test]
-    fn open_metadata_redb_unsupported() {
+    fn open_metadata_lmdb_unsupported() {
         let dir = tempfile::tempdir().unwrap();
         let config = MetadataConfig {
-            engine: roci_config::MetadataEngine::Redb,
+            engine: roci_config::MetadataEngine::Lmdb,
             ..MetadataConfig::default()
         };
         match open_metadata(dir.path(), &config) {
@@ -967,15 +984,15 @@ mod engine_tests {
         }
     }
 
-    // ---- Redb persistence across reopen -----------------------------------
-    #[cfg(feature = "redb")]
+    // ---- LMDB persistence across reopen ----------------------------------
+    #[cfg(feature = "lmdb")]
     #[test]
-    fn redb_persistence_across_reopen() {
+    fn lmdb_persistence_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let config = MetadataConfig::default();
 
         {
-            let store = RedbMetadataStore::open(dir.path(), &config).unwrap();
+            let store = LmdbMetadataStore::open(dir.path(), &config).unwrap();
             let desc = descriptor(Some("sbom"));
             store
                 .apply(MetaOp::PutManifest {
@@ -999,7 +1016,7 @@ mod engine_tests {
 
         // Reopen and verify everything survived
         {
-            let store = RedbMetadataStore::open(dir.path(), &config).unwrap();
+            let store = LmdbMetadataStore::open(dir.path(), &config).unwrap();
             let (d, mt) = store.resolve_tag("r", "v1").unwrap();
             assert_eq!(d, "sha256:m");
             assert_eq!(mt, "mt");
@@ -1014,5 +1031,28 @@ mod engine_tests {
             assert_eq!(snap.len(), 1);
             assert_eq!(snap[0].0, "v1");
         }
+    }
+
+    // ---- Config rejects engine = "redb" ----------------------------------
+    #[test]
+    fn config_rejects_redb_engine() {
+        let toml_str = r#"
+            [storage.metadata]
+            engine = "redb"
+        "#;
+        // serde accepts the variant (it's kept for a clear message) but
+        // validation rejects it.
+        let config: roci_config::Config = toml::from_str(toml_str).unwrap();
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("storage.metadata.engine"),
+            "error should name the field: {msg}"
+        );
+        assert!(
+            msg.contains("redb engine has been removed"),
+            "error should explain removal: {msg}"
+        );
+        assert!(msg.contains("lmdb"), "error should suggest lmdb: {msg}");
     }
 }

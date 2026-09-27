@@ -53,8 +53,8 @@ scan = ["dep:roci-ext-scan"]
 sync = ["dep:roci-ext-sync"]
 cluster = ["dep:roci-cluster"]
 mimalloc = ["dep:mimalloc"]
-# Embedded B-tree KV metadata engine (`storage.metadata.engine = "redb"`).
-redb = ["roci-storage/redb"]
+# Embedded LMDB metadata engine (`storage.metadata.engine = "lmdb"`).
+lmdb = ["roci-storage/lmdb"]
 # LDAP bind authentication (`[auth.ldap]`). Opt-in only — deliberately NOT
 # part of `full`: enable explicitly, e.g. `--features full,ldap`.
 ldap = ["roci-core/ldap"]
@@ -69,7 +69,7 @@ full = [
     "cluster",
     "otel",
     "mimalloc",
-    "redb",
+    "lmdb",
 ]
 otel = ["roci-telemetry/otel", "roci-core/otel"]
 

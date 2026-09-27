@@ -5,14 +5,17 @@ edition = "2021"
 publish = false
 
 # Standalone benchmark — NOT a member of the roci root workspace.
-# heed/LMDB's C FFI must never enter the product dependency graph.
+# LMDB's C FFI must never enter the product dependency graph (the product uses
+# the `lmdb` feature gate in roci-storage instead).
 [workspace]
 
 [dependencies]
-heed = "0.22"
+heed3 = { version = "0.22", default-features = false }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
 redb = "4"
 rand = { version = "0.9", features = ["small_rng"] }
-sha2 = "0.10"
 
 [profile.release]
 opt-level = 3

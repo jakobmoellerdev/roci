@@ -7,7 +7,7 @@
 
 # roci
 
-![coverage](https://img.shields.io/badge/coverage-97.18%25-brightgreen)
+![coverage](https://img.shields.io/badge/coverage-97.48%25-brightgreen)
 
 **roci** is a Rust implementation of the [OCI Distribution Specification](spec/distribution-spec/spec.md) — an OCI container registry.
 
@@ -241,7 +241,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [x] Serve multiple storage paths (and backends, incl. S3-compatible object storage) from a single server
 - [x] Per-repo / per-total storage quotas and a concurrent upload-session cap
 - [x] In-memory small-blob content cache (byte-capped LRU, configurable `small_blob_threshold`)
-- [x] Embedded metadata index — append-log + in-RAM maps default (compaction, rkyv mmap snapshot, optional HMAC), redb B-tree KV upgrade
+- [x] Embedded metadata index — append-log + in-RAM maps default (compaction, rkyv mmap snapshot, optional HMAC), LMDB (heed3) B-tree KV upgrade, optional encryption at rest
 
 ### Replication
 
@@ -262,9 +262,6 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [ ] Swagger-based API documentation
 - [x] Fast cold start (rkyv mmap snapshot, opt-in `fast_restart` stamp) and low-fragmentation allocator
 - [x] Hardened Helm chart (PSS restricted, NetworkPolicies, optional HA S3 storage on RustFS), e2e-tested on k0s
-- [x] Health endpoints (`/readyz`, `/livez`) for Kubernetes probes — unauthenticated, rate-limit-free
-- [x] S3 bucket auto-creation (`create_bucket`, always on in the chart's RustFS mode) and private-CA trust (`ca_file`)
-- [ ] RustFS client-cert mTLS (blocked: `object_store` lacks client-cert API; RustFS subchart has no server-TLS-only mode)
 
 ## License
 
