@@ -1,17 +1,5 @@
-//! zot-style `fastRestart`: write a stamp file on graceful shutdown, consume
-//! it at startup to skip the CAS walk (blob-presence, dedupe, quota, GC
-//! candidate seeding). Any mismatch (binary version, config hash, metadata
-//! identity, integrity failure) falls back to the full walk — never data loss.
-//!
-//! The stamp is **consumed** (removed + dir fsync) before the stored state is
-//! applied, so a crash between read and completion forces a full walk on the
-//! next start (identical to zot's model). Out-of-band edits to the layout
-//! while roci is stopped are not observed on a fast restart — the same caveat
-//! as zot; the presence filter is a *definite-miss* filter only for data roci
-//! itself wrote.
-//!
-//! **S3 backend:** not applicable. S3's recovery lists remote objects
-//! asynchronously; there is no local CAS walk to skip.
+//! Fast-restart stamp: skip the CAS walk on startup when a valid stamp exists.
+//! The stamp is consumed before applying so a crash forces a full walk.
 
 use super::super::FsStorage;
 use crate::metadata::wal_hmac::HmacKey;
@@ -21,57 +9,30 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Name of the stamp file under the store root.
 const STAMP_FILE: &str = ".roci-fast-restart";
-
-/// Current stamp format version. Bump when the schema changes.
 const FORMAT_VERSION: u32 = 1;
-
-/// Build-time binary version baked into the stamp.
 const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// ── stamp schema ──────────────────────────────────────────────────────
-
-/// The fast-restart stamp file payload (before integrity wrapping).
+/// Stamp payload (before integrity wrapping).
 #[derive(Debug, Serialize, Deserialize)]
 struct Stamp {
-    /// Format version (for forward compatibility).
     format_version: u32,
-    /// `CARGO_PKG_VERSION` of the binary that wrote the stamp.
     binary_version: String,
-    /// SHA-256 hex of the TOML-serialised storage-relevant config (the
-    /// `StorageConfig` struct minus the `fast_restart` flag itself, since
-    /// toggling the flag shouldn't invalidate the stamp).
+    /// SHA-256 hex of config (minus `fast_restart` and `root`).
     config_hash: String,
-    /// Metadata WAL generation (snapshot identity).
     metadata_generation: u64,
-    /// Size in bytes of the metadata WAL file at the time the stamp was
-    /// written. On open, the replayed log must have the same size; any
-    /// in-between mutation (or compaction) invalidates the stamp.
     metadata_log_len: u64,
-    /// `(repo, digest)` entries for the blob-presence filter.
     presence: Vec<(String, String)>,
-    /// `(digest, repo)` entries for the dedupe index.
     dedupe: Vec<(String, String)>,
-    /// Per-repo quota byte usage.
     quota_per_repo: Vec<(String, u64)>,
-    /// Registry-wide total byte usage.
-    quota_total: u64,
-    /// Upload sessions counted at shutdown.
     quota_sessions: usize,
-    /// GC candidates: `(repo, digest)`. Restored with a fresh timestamp
-    /// (worst case: delays collection by one grace period — never data loss).
+    /// GC candidates (restored with a fresh timestamp).
     gc_candidates: Vec<(String, String)>,
-    /// GC root manifests: `(repo, digest)`.
     gc_roots: Vec<(String, String)>,
-    /// Repos marked GC-unsafe.
     gc_unsafe_repos: Vec<String>,
 }
 
-// ── integrity wrapper ────────────────────────────────────────────────
-
-/// Wire format: `[4-byte LE body_len][body][32-byte integrity]`.
-/// Integrity = HMAC-SHA256 when a key is configured, else CRC32C zero-padded.
+/// Wire: `[4-byte LE body_len][body][32-byte HMAC-SHA256 or CRC32C]`.
 fn wrap(body: &[u8], key: Option<&HmacKey>) -> Vec<u8> {
     let len = (body.len() as u32).to_le_bytes();
     let integrity = match key {
@@ -90,7 +51,6 @@ fn wrap(body: &[u8], key: Option<&HmacKey>) -> Vec<u8> {
     out
 }
 
-/// Unwrap and verify the integrity. Returns the body on success.
 fn unwrap<'a>(data: &'a [u8], key: Option<&HmacKey>) -> Result<&'a [u8], &'static str> {
     if data.len() < 4 + 32 {
         return Err("stamp too small");
@@ -119,29 +79,19 @@ fn unwrap<'a>(data: &'a [u8], key: Option<&HmacKey>) -> Result<&'a [u8], &'stati
     Ok(body)
 }
 
-// ── config hash ───────────────────────────────────────────────────────
-
-/// Hash the storage-relevant config fields (everything except `fast_restart`
-/// and `root`, which don't affect derived in-memory state).
+/// Hash config fields that affect derived in-memory state.
 fn config_hash(config: &roci_config::StorageConfig) -> String {
-    // We hash the TOML serialization of the config with fast_restart forced
-    // false so toggling it alone doesn't invalidate the stamp.
     let mut normalized = config.clone();
     normalized.fast_restart = false;
-    // Root path doesn't affect derived state (presence/dedupe/quota are
-    // relative); however, changing root means a different CAS, so include it.
     let text = toml::to_string(&normalized).unwrap_or_default();
     let hash = Sha256::digest(text.as_bytes());
     hex::encode(hash)
 }
 
-// ── public API ────────────────────────────────────────────────────────
-
 fn stamp_path(root: &Path) -> PathBuf {
     root.join(STAMP_FILE)
 }
 
-/// Atomic write: temp + fsync + rename + dir fsync.
 fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     let dir = path.parent().unwrap_or(path);
     let tmp = path.with_extension("tmp");
@@ -151,14 +101,12 @@ fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
-    // Dir fsync so the rename is durable.
     let d = std::fs::File::open(dir)?;
     d.sync_all()?;
     Ok(())
 }
 
-/// Consume (remove + dir fsync) the stamp file so a crash in this run forces
-/// a full walk next time.
+/// Consume the stamp so a crash forces a full walk.
 fn consume_stamp(path: &Path) -> io::Result<()> {
     std::fs::remove_file(path)?;
     let dir = path.parent().unwrap_or(path);
@@ -167,7 +115,6 @@ fn consume_stamp(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Why a fast-restart stamp was rejected (logged at info/warn).
 #[derive(Debug)]
 pub(crate) enum StampReject {
     Absent,
@@ -199,7 +146,6 @@ impl std::fmt::Display for StampReject {
     }
 }
 
-/// A validated stamp ready to be applied.
 pub(crate) struct ValidStamp {
     pub(crate) presence: Vec<(String, String)>,
     pub(crate) dedupe: Vec<(String, String)>,
@@ -211,9 +157,7 @@ pub(crate) struct ValidStamp {
 }
 
 impl FsStorage {
-    /// Attempt to read, validate and consume the fast-restart stamp. On
-    /// success, returns the validated stamp data to apply. On any failure,
-    /// returns the reason (the caller falls back to the full CAS walk).
+    /// Read, validate and consume the stamp; `Err` falls back to full walk.
     pub(crate) fn try_consume_stamp(
         root: &Path,
         config: &roci_config::StorageConfig,
@@ -223,27 +167,21 @@ impl FsStorage {
     ) -> Result<ValidStamp, StampReject> {
         let path = stamp_path(root);
 
-        // 1. Read the stamp file.
         let data = match std::fs::read(&path) {
             Ok(d) => d,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(StampReject::Absent),
             Err(e) => return Err(StampReject::Io(e)),
         };
 
-        // 2. IMMEDIATELY consume (remove + dir fsync) so a crash from here on
-        //    forces a full walk next time.
         if let Err(e) = consume_stamp(&path) {
             return Err(StampReject::Consumed(e));
         }
 
-        // 3. Verify integrity.
         let body = unwrap(&data, hmac_key).map_err(StampReject::Integrity)?;
 
-        // 4. Deserialize.
         let stamp: Stamp =
             serde_json::from_slice(body).map_err(|e| StampReject::Parse(e.to_string()))?;
 
-        // 5. Validate fields.
         if stamp.format_version != FORMAT_VERSION {
             return Err(StampReject::FormatVersion {
                 got: stamp.format_version,
@@ -259,8 +197,6 @@ impl FsStorage {
         if stamp.config_hash != config_hash(config) {
             return Err(StampReject::ConfigMismatch);
         }
-        // Metadata identity: the WAL generation and file length must match.
-        // A compaction or any append between runs changes one or both.
         if stamp.metadata_generation != metadata_generation
             || stamp.metadata_log_len != metadata_log_len
         {
@@ -278,8 +214,7 @@ impl FsStorage {
         })
     }
 
-    /// Write the fast-restart stamp file atomically. Called on graceful
-    /// shutdown.
+    /// Write the stamp atomically on graceful shutdown.
     pub(crate) fn write_fast_restart_stamp(&self) -> io::Result<()> {
         let hmac_key = self
             .config
@@ -289,10 +224,7 @@ impl FsStorage {
             .map(|p| HmacKey::load(p))
             .transpose()?;
 
-        // Walk the CAS to collect (repo, digest) pairs — the cuckoo filter
-        // does not support enumeration, so we re-derive the set from disk.
-        // This walk happens after the server has stopped accepting requests,
-        // so it is uncontended.
+        // Re-derive presence from disk (cuckoo filter is not enumerable).
         let mut presence = Vec::new();
         crate::layout::for_each_cas_blob(&self.root, |repo, digest, _entry| {
             presence.push((repo.to_string(), digest.as_string()));
@@ -307,7 +239,6 @@ impl FsStorage {
             presence,
             dedupe: self.dedupe.entries(),
             quota_per_repo: self.quota.per_repo_bytes(),
-            quota_total: self.quota.total_bytes(),
             quota_sessions: self.quota.sessions(),
             gc_candidates: self.gc.candidate_keys(),
             gc_roots: self.gc.root_keys(),
@@ -319,7 +250,7 @@ impl FsStorage {
         write_atomic(&stamp_path(&self.root), &wire)
     }
 
-    /// Apply a validated stamp: seed presence, dedupe, quota and GC state.
+    /// Seed in-memory state from a validated stamp.
     pub(crate) fn apply_stamp(&self, stamp: ValidStamp) {
         for (repo, digest) in &stamp.presence {
             self.presence.insert(repo, digest);
@@ -341,9 +272,7 @@ impl FsStorage {
         for repo in &stamp.gc_unsafe_repos {
             self.gc.mark_unsafe(repo);
         }
-        // Mark GC ready immediately — the stamp carries the consistency-check
-        // result, so the background GC task can skip the check and start
-        // sweeping right away.
+        // Stamp includes the GC consistency-check result.
         if self.gc.enabled() {
             self.gc.set_ready();
         }
@@ -444,7 +373,6 @@ mod tests {
             presence: vec![("r".into(), "sha256:aa".into())],
             dedupe: vec![("sha256:aa".into(), "r".into())],
             quota_per_repo: vec![("r".into(), 1024)],
-            quota_total: 1024,
             quota_sessions: 3,
             gc_candidates: vec![("r".into(), "sha256:bb".into())],
             gc_roots: vec![("r".into(), "sha256:cc".into())],
@@ -455,5 +383,49 @@ mod tests {
         assert_eq!(back.format_version, stamp.format_version);
         assert_eq!(back.presence, stamp.presence);
         assert_eq!(back.gc_candidates, stamp.gc_candidates);
+    }
+
+    #[test]
+    fn try_consume_stamp_rejects_format_version_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = roci_config::StorageConfig {
+            fast_restart: true,
+            ..Default::default()
+        };
+        let mut stamp = Stamp {
+            format_version: FORMAT_VERSION + 1,
+            binary_version: BINARY_VERSION.to_string(),
+            config_hash: config_hash(&config),
+            metadata_generation: 0,
+            metadata_log_len: 0,
+            presence: vec![],
+            dedupe: vec![],
+            quota_per_repo: vec![],
+            quota_sessions: 0,
+            gc_candidates: vec![],
+            gc_roots: vec![],
+            gc_unsafe_repos: vec![],
+        };
+        let body = serde_json::to_vec(&stamp).unwrap();
+        let wire = wrap(&body, None);
+        write_atomic(&stamp_path(dir.path()), &wire).unwrap();
+        let result = FsStorage::try_consume_stamp(dir.path(), &config, None, 0, 0);
+        assert!(
+            matches!(result, Err(StampReject::FormatVersion { .. })),
+            "format version mismatch"
+        );
+
+        // Now test binary version mismatch
+        let dir2 = tempfile::tempdir().unwrap();
+        stamp.format_version = FORMAT_VERSION;
+        stamp.binary_version = "0.0.0-fake".to_string();
+        let body2 = serde_json::to_vec(&stamp).unwrap();
+        let wire2 = wrap(&body2, None);
+        write_atomic(&stamp_path(dir2.path()), &wire2).unwrap();
+        let result2 = FsStorage::try_consume_stamp(dir2.path(), &config, None, 0, 0);
+        assert!(
+            matches!(result2, Err(StampReject::BinaryVersion { .. })),
+            "binary version mismatch"
+        );
     }
 }

@@ -1,18 +1,6 @@
-//! WAL + snapshot HMAC authentication.
-//!
-//! When an `hmac_key_file` is configured, every log record carries an
-//! HMAC-SHA256 tag **in addition** to its CRC32C (the CRC detects torn tails;
-//! the HMAC authenticates against a compromised-storage-volume adversary).
-//! The key must be ≥ 32 bytes; shorter keys are rejected at config load with a
-//! clear `InvalidInput` error.
-//!
-//! The log's very first record is always a *header* declaring the framing mode
-//! (`plain` = CRC only, `hmac-sha256` = CRC + 32-byte HMAC tag per record).
-//! Opening a log whose framing mode does not match the current config (or a key
-//! mismatch for an authenticated log) moves the old log aside to
-//! `roci-meta.log.untrusted-<unix-ts>` and starts fresh — recovering from the
-//! layout is the design's safety net (SECURITY §Storage boundary: "Metadata is
-//! a rebuildable cache").
+//! WAL + snapshot HMAC authentication (SECURITY §Storage boundary).
+//! CRC detects torn tails; HMAC authenticates against compromised storage.
+//! Key ≥ 32 bytes; framing/key mismatch → log moved aside, rebuilt from layout.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -50,14 +38,14 @@ impl HmacKey {
         Ok(Self(raw))
     }
 
-    /// Compute the HMAC-SHA256 tag over `data`.
+    /// Compute the HMAC-SHA256 tag.
     pub(crate) fn tag(&self, data: &[u8]) -> [u8; 32] {
         let mut mac = HmacSha256::new_from_slice(&self.0).expect("HMAC accepts any key length ≥ 1");
         mac.update(data);
         mac.finalize().into_bytes().into()
     }
 
-    /// Verify that `tag` is a valid HMAC-SHA256 of `data`.
+    /// Verify an HMAC-SHA256 tag.
     pub(crate) fn verify(&self, data: &[u8], tag: &[u8; 32]) -> bool {
         let mut mac = HmacSha256::new_from_slice(&self.0).expect("HMAC accepts any key length ≥ 1");
         mac.update(data);
@@ -65,25 +53,16 @@ impl HmacKey {
     }
 }
 
-// ---------------------------------------------------------------------------
-// WAL header record
-// ---------------------------------------------------------------------------
-
 /// The framing mode declared by the header record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FramingMode {
-    /// CRC32C integrity only (no authentication).
     Plain,
-    /// CRC32C + HMAC-SHA256 per record.
     HmacSha256,
 }
 
-/// Magic bytes for a WAL header record payload.
 const HEADER_MAGIC: &[u8] = b"roci-wal\x00";
 
-/// Encode a WAL header record declaring the framing mode.
-/// The header is itself a framed record (CRC32C integrity) so replay
-/// can read it with the standard record decoder.
+/// Encode a WAL header declaring the framing mode.
 pub(crate) fn encode_header(mode: FramingMode) -> Vec<u8> {
     let mode_byte = match mode {
         FramingMode::Plain => 0u8,
@@ -95,7 +74,7 @@ pub(crate) fn encode_header(mode: FramingMode) -> Vec<u8> {
     payload
 }
 
-/// Decode a WAL header from the raw payload bytes of the first record.
+/// Decode a WAL header from a first-record payload.
 pub(crate) fn decode_header(payload: &[u8]) -> Option<FramingMode> {
     if payload.len() < HEADER_MAGIC.len() + 1 {
         return None;
@@ -110,12 +89,7 @@ pub(crate) fn decode_header(payload: &[u8]) -> Option<FramingMode> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Trust-boundary helpers
-// ---------------------------------------------------------------------------
-
-/// Move a log file aside when the framing/key doesn't match.
-/// Returns the path the log was renamed to.
+/// Move a log aside when framing/key doesn't match.
 pub(crate) fn move_aside(log_path: &Path) -> io::Result<PathBuf> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -174,20 +148,8 @@ mod tests {
 
     #[test]
     fn key_load_missing_file() {
-        // Covers error wrapping in HmacKey::load lines 32-39
         let err = HmacKey::load(Path::new("/nonexistent/path/to/hmac.key")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(err.to_string().contains("hmac_key_file"), "msg: {}", err);
-    }
-
-    #[test]
-    fn decode_header_unknown_mode_byte() {
-        // Covers the _ => None branch at line 109
-        let mut payload = Vec::new();
-        payload.extend_from_slice(HEADER_MAGIC);
-        payload.push(0x09); // unknown mode byte
-        assert_eq!(decode_header(&payload), None);
-        // Already tested in header_roundtrip but this explicitly targets
-        // the specific match arm.
     }
 }

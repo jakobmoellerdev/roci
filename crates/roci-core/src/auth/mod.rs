@@ -1,14 +1,6 @@
 //! Authentication and authorization (SECURITY.md §AuthN/AuthZ).
-//!
-//! [`Auth`] resolves each request to a [`Principal`] — from the
-//! `Authorization` header (htpasswd / LDAP Basic, or an externally issued
-//! Docker v2 bearer token), else a verified mTLS client certificate, else
-//! Anonymous — and decides whether that principal may perform a repository
-//! [`Action`]. The decision runs in `routes::dispatch` between path parsing
-//! and the handler, so no `Storage` call precedes it (ARCHITECTURE inv. 3,
-//! SECURITY inv. 1).
-//!
-//! Credentials, tokens, and `Authorization` values are never logged.
+//! Resolves each request to a [`Principal`] before any storage call.
+//! Credentials/tokens/`Authorization` values are never logged.
 
 mod bearer;
 mod cache;
@@ -33,7 +25,6 @@ use htpasswd::{Htpasswd, HtpasswdResult};
 pub use identity::client_cert_identity;
 use policy::AccessPolicy;
 
-/// A set of [`Action`]s as a bitmask.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ActionSet(u8);
 
@@ -64,8 +55,6 @@ impl ActionSet {
     }
 }
 
-/// The token-scope action list a client must request for `action` (a push
-/// session also reads, so clients ask for `pull,push`).
 fn challenge_actions(action: Action) -> &'static str {
     match action {
         Action::Pull => "pull",
@@ -74,7 +63,6 @@ fn challenge_actions(action: Action) -> &'static str {
     }
 }
 
-/// How a [`Principal::User`] proved its identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthMethod {
     Htpasswd,
@@ -83,18 +71,6 @@ pub(crate) enum AuthMethod {
     Mtls,
 }
 
-impl AuthMethod {
-    fn label(self) -> &'static str {
-        match self {
-            AuthMethod::Htpasswd => "htpasswd",
-            #[cfg(feature = "ldap")]
-            AuthMethod::Ldap => "ldap",
-            AuthMethod::Mtls => "mtls",
-        }
-    }
-}
-
-/// The authenticated caller of one request.
 #[derive(Debug, Clone)]
 pub(crate) enum Principal {
     Anonymous,
@@ -118,7 +94,12 @@ impl Principal {
     fn method_label(&self) -> &'static str {
         match self {
             Principal::Anonymous => "anonymous",
-            Principal::User { method, .. } => method.label(),
+            Principal::User { method, .. } => match method {
+                AuthMethod::Htpasswd => "htpasswd",
+                #[cfg(feature = "ldap")]
+                AuthMethod::Ldap => "ldap",
+                AuthMethod::Mtls => "mtls",
+            },
             Principal::Token { .. } => "bearer",
         }
     }
@@ -132,18 +113,13 @@ impl Principal {
     }
 }
 
-/// The principal the auth middleware attached to a request; Anonymous when
-/// none was attached.
 pub(crate) fn principal_of(ext: &axum::http::Extensions) -> &Principal {
     ext.get::<Principal>().unwrap_or(&ANONYMOUS)
 }
 
-/// Identity from a verified mTLS client certificate, inserted into the
-/// request extensions by the connection layer.
 #[derive(Debug, Clone)]
 pub struct ClientCertIdentity(pub Arc<str>);
 
-/// Failure to build [`Auth`] from configuration, naming the config field.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("{field}: {reason}")]
@@ -163,7 +139,6 @@ struct Bearer {
     service: String,
 }
 
-/// The authentication mechanisms and access policy of one registry.
 pub struct Auth {
     realm: String,
     htpasswd: Option<Htpasswd>,
@@ -176,10 +151,7 @@ pub struct Auth {
 }
 
 impl Auth {
-    /// Build the auth engine, or `None` when nothing auth-related is
-    /// configured (the registry then stays fully open, as before Phase 6).
-    /// Reads the htpasswd file, bearer verification keys, and LDAP service
-    /// password now, so a bad file fails startup.
+    /// Build the auth engine; `None` = fully open.
     pub fn from_config(config: &Config) -> Result<Option<Arc<Auth>>, AuthError> {
         let a = &config.auth;
         let mtls = config
@@ -237,8 +209,7 @@ impl Auth {
         })))
     }
 
-    /// Replace the access-control policy (live reload). `None` → every
-    /// authenticated identity may do everything, anonymous nothing.
+    /// Replace the access-control policy (live reload).
     pub fn reload_access_control(&self, ac: Option<&AccessControlConfig>) {
         let compiled = ac.map(AccessPolicy::compile);
         *self.policy.write().unwrap_or_else(PoisonError::into_inner) = compiled;
@@ -258,20 +229,13 @@ impl Auth {
         false
     }
 
-    /// Whether a mechanism carried in the `Authorization` header is
-    /// configured — i.e. whether a challenge can lead the client anywhere.
+    /// Whether an `Authorization`-header mechanism is configured.
     pub(crate) fn has_header_mechanism(&self) -> bool {
         self.htpasswd.is_some() || self.ldap_configured() || self.bearer.is_some()
     }
 
-    /// Resolve the request's principal. A present `Authorization` header
-    /// decides alone (invalid → `401`, never a silent anonymous fallback);
-    /// otherwise a verified client certificate; otherwise Anonymous.
-    ///
-    /// `Basic` with an empty user *and* password carries no identity claim:
-    /// containers/image clients (skopeo, podman, buildah) answer a Basic
-    /// challenge that way when they hold no credentials, so it counts as no
-    /// header rather than as invalid credentials.
+    /// Resolve the principal from Authorization header, mTLS cert, or Anonymous.
+    /// Empty Basic `user:` = anonymous (containers/image client convention).
     pub(crate) async fn authenticate(
         &self,
         headers: &HeaderMap,
@@ -299,8 +263,7 @@ impl Auth {
         })
     }
 
-    /// Authenticate an `Authorization` value; `Err` carries the metric
-    /// method label of the failed attempt.
+    /// Authenticate an `Authorization` value.
     async fn authenticate_header(&self, value: &HeaderValue) -> Result<Principal, &'static str> {
         let value = value.to_str().map_err(|_| "anonymous")?;
         let (scheme, cred) = value.split_once(' ').ok_or("anonymous")?;
@@ -350,7 +313,6 @@ impl Auth {
                         .insert(user, password, Vec::new(), AuthMethod::Htpasswd))
                 }
                 HtpasswdResult::BadPassword => return Err("htpasswd"),
-                // Unknown locally: the directory may know the user.
                 HtpasswdResult::UnknownUser => {}
             }
         }
@@ -379,8 +341,7 @@ impl Auth {
         }
     }
 
-    /// Authorize `p` for `action` on `repo`, mapping a denial to the
-    /// response the principal can act on (`401` + challenge vs `403`).
+    /// Authorize `p`; denial → 401+challenge or 403.
     #[tracing::instrument(
         name = "authn.authorize",
         skip_all,
@@ -445,9 +406,7 @@ impl Auth {
         }
     }
 
-    /// The `WWW-Authenticate` value: `Bearer` when a token server is
-    /// configured (Basic credentials are still accepted), else `Basic`;
-    /// `None` when no header mechanism exists to challenge for.
+    /// `WWW-Authenticate` value: `Bearer` or `Basic`; `None` if no mechanism.
     fn challenge(&self, scope: Option<(&str, Action)>, insufficient: bool) -> Option<HeaderValue> {
         let value = if let Some(b) = &self.bearer {
             let mut s = format!("Bearer realm=\"{}\",service=\"{}\"", b.realm, b.service);
@@ -471,7 +430,6 @@ impl Auth {
     }
 }
 
-/// Whether `value` is `Basic` over the empty pair `:`.
 fn is_empty_basic(value: &HeaderValue) -> bool {
     value
         .to_str()

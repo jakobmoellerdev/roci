@@ -1,5 +1,4 @@
-//! Upload-session endpoints: start (monolithic or chunked, cross-repo mount),
-//! PATCH (append), PUT (finish), and status.
+//! Upload-session endpoints: start, PATCH, PUT, status.
 
 use crate::auth::principal_of;
 use crate::error::ApiError;
@@ -24,8 +23,7 @@ pub(crate) fn upload_location(repo: &str, id: &str) -> String {
     format!("/v2/{repo}/blobs/uploads/{id}")
 }
 
-/// Common headers for an in-progress upload session: `Location` and `Range`.
-/// `received` is the cumulative byte count; 0 bytes → `"0-0"` (saturating).
+/// Common headers for an in-progress upload session.
 fn upload_headers(repo: &str, id: &str, received: u64) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -39,16 +37,14 @@ fn upload_headers(repo: &str, id: &str, received: u64) -> HeaderMap {
     headers
 }
 
-/// Upload-progress response: `upload_headers` + `Docker-Upload-UUID`, with the
-/// given status code.
+/// Upload-progress response with the given status code.
 fn upload_progress(status: StatusCode, repo: &str, id: &str, received: u64) -> Response {
     let mut headers = upload_headers(repo, id, received);
     headers.insert("docker-upload-uuid", HeaderValue::from_str(id).unwrap());
     (status, headers).into_response()
 }
 
-/// The request body as a stream, so upload bytes go to storage frame by frame
-/// and are never buffered whole (invariant 4).
+/// Request body as a stream (never buffered whole, inv. 4).
 fn body_stream(req: Request) -> UploadBody {
     Box::pin(
         req.into_body()
@@ -64,11 +60,8 @@ pub(crate) async fn start<S: Storage>(
     q: UploadQuery,
     req: Request,
 ) -> Result<Response, ApiError> {
-    // end-11: cross-repository mount. The destination's push grant was
-    // checked by dispatch; the source additionally needs pull, else the
-    // mount would read a repo the caller may not. A malformed or forbidden
-    // `from` silently falls through to a normal session (no existence
-    // oracle for repos the caller cannot read).
+    // Cross-repo mount: source needs pull (no existence oracle on
+    // repos the caller cannot read).
     if let (Some(mount), Some(from)) = (q.mount.as_ref(), q.from.as_ref()) {
         let source_readable = RepositoryName::parse(from).is_ok()
             && st.auth().is_none_or(|auth| {
@@ -79,20 +72,13 @@ pub(crate) async fn start<S: Storage>(
                 )
             });
         if let (true, Ok(d)) = (source_readable, Digest::parse(mount)) {
-            // Promote via a filesystem link (copy-free on one filesystem); no
-            // blob bytes pass through memory. `Ok(false)` (source absent) or an
-            // error falls through to a normal upload session.
             if let Ok(true) = st.storage.mount_blob(from, repo, &d).await {
                 return Ok(created(&blob_location(repo, &d), &d));
             }
         }
-        // Fall through to a normal upload session if the mount source is absent.
     }
 
-    // end-4b: monolithic upload — the whole blob is in this request. Stream it
-    // through a short-lived session (staged, hashed on write, verified, then
-    // promoted) so it is never buffered whole. The per-session cap applies here
-    // too (e.g. when max_upload is configured below max_body).
+    // Monolithic upload: stream through a short-lived session.
     if let Some(digest) = q.digest {
         let d = Digest::parse(&digest)?;
         let id = st.storage.begin_upload(repo).await?;
@@ -113,7 +99,6 @@ pub(crate) async fn start<S: Storage>(
         return Ok(created(&blob_location(repo, &d), &d));
     }
 
-    // end-4a: begin a chunked session.
     let id = st.storage.begin_upload(repo).await?;
     Ok(upload_progress(StatusCode::ACCEPTED, repo, &id, 0))
 }
@@ -124,9 +109,7 @@ pub(crate) async fn patch<S: Storage>(
     id: &str,
     req: Request,
 ) -> Result<Response, ApiError> {
-    // Parse a Content-Range start offset, if supplied; the storage layer
-    // enforces it against the current size *atomically under the session lock*
-    // (a pre-check here would race two concurrent PATCHes with the same range).
+    // Content-Range start offset; storage enforces atomically.
     let range_start = req
         .headers()
         .get(header::CONTENT_RANGE)
@@ -141,8 +124,6 @@ pub(crate) async fn patch<S: Storage>(
         .await
     {
         Ok(t) => t,
-        // The atomic under-lock offset check rejects a concurrent/duplicate
-        // chunk the pre-check above raced past → 416 with the current range.
         Err(StorageError::RangeNotSatisfiable { expected, .. }) => {
             return Ok((
                 StatusCode::RANGE_NOT_SATISFIABLE,
@@ -152,9 +133,7 @@ pub(crate) async fn patch<S: Storage>(
         }
         Err(e) => return Err(ApiError::from(e)),
     };
-    // Reject a session whose cumulative size exceeds the per-upload cap: drop
-    // the staging file and return 413 / SIZE_INVALID so a client cannot exhaust
-    // disk with one open upload.
+    // Reject oversized sessions: drop staging, return 413.
     if total > st.max_upload() {
         let _ = st.storage.abort_upload(repo, id).await;
         return Err(ApiError::payload_too_large(
@@ -176,9 +155,7 @@ pub(crate) async fn finish<S: Storage>(
         .digest
         .ok_or_else(|| ApiError::digest_invalid("missing digest on upload completion"))?;
     let d = Digest::parse(&digest)?;
-    // Hand the trailing body to finish_upload so the append and the
-    // verify+promote happen under one session-lock hold — a concurrent PATCH
-    // cannot inject bytes between them. The per-session cap is enforced there.
+    // Trailing body appended+verified under one session-lock hold.
     st.storage
         .finish_upload(
             repo,

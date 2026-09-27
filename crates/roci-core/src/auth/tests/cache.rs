@@ -1,5 +1,3 @@
-//! Credential cache: hits, misses, expiry, capacity, and the disabled mode.
-
 use std::time::Duration;
 
 use crate::auth::cache::{CredentialCache, CAPACITY};
@@ -14,10 +12,8 @@ fn hit_miss_expiry_and_capacity() {
     let c = CredentialCache::new(Duration::from_secs(60));
     c.insert("alice", "pw", vec!["g".into()], AuthMethod::Htpasswd);
     assert!(is_user(c.get("alice", "pw"), "alice"));
-    // A different password (or a user/password split shift) misses.
     assert!(c.get("alice", "other").is_none());
     assert!(c.get("alicep", "w").is_none());
-    // Filling to capacity clears the map before the next insert.
     for i in 0..CAPACITY {
         c.insert(&format!("u{i}"), "pw", vec![], AuthMethod::Htpasswd);
     }

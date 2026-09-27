@@ -2,44 +2,6 @@ use super::common::store;
 use roci_storage::*;
 
 #[tokio::test]
-async fn upload_session_finalizes_into_cas() {
-    let (_dir, s) = store();
-    let id = s.begin_upload("r").await.unwrap();
-    s.append_upload(
-        "r",
-        &id,
-        roci_storage::upload_body(b"chunk1"),
-        None,
-        u64::MAX,
-    )
-    .await
-    .unwrap();
-    let total = s
-        .append_upload(
-            "r",
-            &id,
-            roci_storage::upload_body(b"chunk2"),
-            None,
-            u64::MAX,
-        )
-        .await
-        .unwrap();
-    assert_eq!(total, 12);
-    let d = sha256_of(b"chunk1chunk2");
-    s.finish_upload(
-        "r",
-        &id,
-        &d,
-        u64::MAX,
-        roci_storage::upload_body(b""),
-        u64::MAX,
-    )
-    .await
-    .unwrap();
-    assert_eq!(s.read_blob("r", &d).await.unwrap(), b"chunk1chunk2");
-}
-
-#[tokio::test]
 async fn blob_delete_and_finish_upload_mismatch() {
     let (_dir, s) = store();
     let data = b"deleteme";
@@ -51,7 +13,6 @@ async fn blob_delete_and_finish_upload_mismatch() {
         Err(StorageError::NotFound)
     ));
 
-    // finish_upload with a wrong expected digest is rejected.
     let id = s.begin_upload("r").await.unwrap();
     s.append_upload("r", &id, roci_storage::upload_body(b"abc"), None, u64::MAX)
         .await
@@ -69,7 +30,6 @@ async fn blob_delete_and_finish_upload_mismatch() {
         .await,
         Err(StorageError::DigestMismatch { .. })
     ));
-    // Missing upload session size / append errors are NotFound.
     assert!(matches!(
         s.upload_size("r", "nope").await,
         Err(StorageError::NotFound)
@@ -84,8 +44,7 @@ async fn blob_delete_and_finish_upload_mismatch() {
 #[tokio::test]
 async fn upload_size_errors_when_session_path_is_a_dir() {
     let (dir, s) = store();
-    // Create an "upload" that is actually a directory; finish_upload's
-    // non-regular-file guard rejects it as a bad path before hashing.
+    // Directory disguised as upload is rejected before hashing.
     let up = dir.path().join("r").join("uploads").join("dir-session");
     std::fs::create_dir_all(&up).unwrap();
     let d = sha256_of(b"x");
@@ -109,14 +68,11 @@ async fn begin_upload_ids_are_distinct_random_hex() {
     let a = s.begin_upload("r").await.unwrap();
     let b = s.begin_upload("r").await.unwrap();
     assert_ne!(a, b);
-    // 128 random bits → 32 lowercase hex chars.
     assert_eq!(a.len(), 32);
     assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
 }
 
-// finish_upload re-checks the per-session cap under the lock: a staging file
-// that grew past the cap is rejected (413/SIZE_INVALID → TooLarge) and
-// dropped, so a racing empty-body PUT cannot promote an oversized blob.
+// Cap re-check under lock prevents racing PUT from promoting oversized blob.
 #[tokio::test]
 async fn finish_upload_rejects_over_cap_staging() {
     let (_dir, s) = store();
@@ -126,7 +82,6 @@ async fn finish_upload_rejects_over_cap_staging() {
     s.append_upload("r", &id, roci_storage::upload_body(data), None, u64::MAX)
         .await
         .unwrap();
-    // Cap below the staged size → finalize rejects and drops the session.
     assert!(matches!(
         s.finish_upload("r", &id, &d, 4, roci_storage::upload_body(b""), u64::MAX)
             .await,
@@ -145,10 +100,8 @@ async fn finish_upload_rejects_over_cap_staging() {
 async fn abort_upload_is_idempotent() {
     let (dir, s) = store();
     let id = s.begin_upload("r").await.unwrap();
-    // First abort removes the staging file; a second is a no-op Ok(false).
     assert!(s.abort_upload("r", &id).await.unwrap());
     assert!(!s.abort_upload("r", &id).await.unwrap());
-    // A session id that names a directory yields a non-NotFound IO error.
     let uploads = dir.path().join("r").join("uploads");
     tokio::fs::create_dir_all(uploads.join("dirsess"))
         .await
@@ -163,7 +116,6 @@ async fn abort_upload_is_idempotent() {
 async fn finish_upload_honors_sha512_digest() {
     let (_dir, s) = store();
     let data = b"sha512-streamed-blob";
-    // A sha512 upload exercises the sha512 branch of the streaming hasher.
     let d = digest_of(data, "sha512");
     assert_eq!(d.algorithm(), "sha512");
     let id = s.begin_upload("r").await.unwrap();
@@ -181,7 +133,6 @@ async fn finish_upload_honors_sha512_digest() {
     .await
     .unwrap();
     assert_eq!(s.read_blob("r", &d).await.unwrap(), data);
-    // A sha512 mismatch is rejected by the streamed verify.
     let id2 = s.begin_upload("r").await.unwrap();
     s.append_upload(
         "r",
@@ -210,7 +161,6 @@ async fn finish_upload_honors_sha512_digest() {
 async fn append_upload_enforces_content_range_offset() {
     let (_dir, s) = store();
     let id = s.begin_upload("r").await.unwrap();
-    // First chunk at offset 0 is accepted.
     assert_eq!(
         s.append_upload(
             "r",
@@ -223,8 +173,7 @@ async fn append_upload_enforces_content_range_offset() {
         .unwrap(),
         3
     );
-    // A chunk whose declared offset does not match the current size (3) is
-    // rejected under the lock.
+    // Offset mismatch is rejected under the session lock.
     assert!(matches!(
         s.append_upload(
             "r",
@@ -239,7 +188,6 @@ async fn append_upload_enforces_content_range_offset() {
             got: 0
         })
     ));
-    // The correct offset (3) is accepted.
     assert_eq!(
         s.append_upload(
             "r",
@@ -254,8 +202,7 @@ async fn append_upload_enforces_content_range_offset() {
     );
 }
 
-// finish_upload on an id that was never begun (no staging file) resolves to
-// absent beneath the root → NotFound, and drops the session lock.
+// Never-begun session resolves to NotFound via beneath-root guard.
 #[tokio::test]
 async fn finish_upload_missing_session_is_not_found() {
     let (_dir, s) = store();
@@ -277,8 +224,7 @@ async fn finish_upload_missing_session_is_not_found() {
 #[cfg(unix)]
 #[tokio::test]
 async fn finish_rejects_non_regular_staging_file() {
-    // A staging entry that is a symlink (not a regular file) is rejected by
-    // finish_upload's no-follow guard, never hashed-through and promoted.
+    // Symlink staging entry is rejected by no-follow guard, never promoted.
     use std::os::unix::fs::symlink;
     let (dir, s) = store();
     let uploads = dir.path().join("r").join("uploads");
@@ -301,7 +247,6 @@ async fn finish_rejects_non_regular_staging_file() {
     ));
 }
 
-/// A body delivered as many frames, like a real request.
 fn framed(data: &[u8], frame: usize) -> UploadBody {
     use futures::StreamExt;
     let frames: Vec<std::io::Result<bytes::Bytes>> = data
@@ -314,7 +259,6 @@ fn framed(data: &[u8], frame: usize) -> UploadBody {
 #[tokio::test]
 async fn streamed_multi_batch_upload_round_trips() {
     let (_dir, s) = store();
-    // > 2 write batches (1 MiB) of position-dependent bytes across two PATCHes.
     let data: Vec<u8> = (0..2_500_000u32).map(|i| (i % 253) as u8).collect();
     let d = sha256_of(&data);
     let id = s.begin_upload("r").await.unwrap();
@@ -338,14 +282,12 @@ async fn over_limit_body_is_rejected_and_leaves_the_session_unchanged() {
     s.append_upload("r", &id, upload_body(b"keep"), None, u64::MAX)
         .await
         .unwrap();
-    // The limit trips mid-stream, after earlier frames were accepted.
     let err = s
         .append_upload("r", &id, framed(&[7u8; 5000], 1000), None, 4096)
         .await
         .unwrap_err();
     assert!(matches!(err, StorageError::TooLarge { limit: 4096, .. }));
     assert_eq!(s.upload_size("r", &id).await.unwrap(), 4);
-    // The session still completes with exactly its accepted bytes.
     let d = sha256_of(b"keep!");
     s.finish_upload("r", &id, &d, u64::MAX, upload_body(b"!"), u64::MAX)
         .await
@@ -372,9 +314,7 @@ async fn failed_body_stream_rolls_back_the_append() {
 
 #[tokio::test]
 async fn session_finalized_after_restart_is_verified_by_rehash() {
-    // The hash-on-write state is in memory; a fresh store on the same root
-    // (a restart) must still verify the staged bytes by re-reading them — and
-    // still reject a wrong digest.
+    // Hash state is in-memory; after restart, staged bytes are re-verified.
     let (dir, s) = store();
     let id = s.begin_upload("r").await.unwrap();
     s.append_upload("r", &id, upload_body(b"survives"), None, u64::MAX)
@@ -398,4 +338,15 @@ async fn session_finalized_after_restart_is_verified_by_rehash() {
         .await
         .unwrap();
     assert_eq!(s2.read_blob("r", &d).await.unwrap(), b"survives");
+}
+
+#[tokio::test]
+async fn generic_upload_cases() {
+    let (_dir, s) = store();
+    super::suite::case_chunked_upload_flow(&s).await;
+    super::suite::case_monolithic_upload(&s).await;
+    super::suite::case_upload_range_mismatch(&s).await;
+    super::suite::case_upload_too_large(&s).await;
+    super::suite::case_upload_digest_mismatch(&s).await;
+    super::suite::case_abort_upload(&s).await;
 }

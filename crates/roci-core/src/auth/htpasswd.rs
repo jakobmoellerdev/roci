@@ -11,8 +11,7 @@ pub(crate) enum HtpasswdResult {
 
 pub(crate) struct Htpasswd {
     users: HashMap<String, String>,
-    /// Verified against for unknown users, so a lookup miss costs the same
-    /// bcrypt work as a hit (no timing-based user enumeration).
+    /// Dummy hash for timing-safe unknown-user rejection.
     pub(super) dummy: String,
 }
 
@@ -51,15 +50,12 @@ impl Htpasswd {
                 return Err(format!("line {n}: duplicate user `{user}`"));
             }
         }
-        // Match the file's work factor so a miss is as slow as a hit.
         let cost = if users.is_empty() { 10 } else { max_cost };
         let dummy = bcrypt::hash("roci-htpasswd-dummy", cost)
             .map_err(|e| format!("bcrypt cost {cost}: {e}"))?;
         Ok(Self { users, dummy })
     }
 
-    /// Check `password` for `user` on the blocking pool (bcrypt is
-    /// deliberately slow and would stall the async executor).
     pub(crate) async fn verify(&self, user: &str, password: &str) -> HtpasswdResult {
         let (hash, known) = match self.users.get(user) {
             Some(h) => (h.clone(), true),

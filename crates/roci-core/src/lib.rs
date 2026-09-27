@@ -1,10 +1,4 @@
-//! roci-core: the OCI Distribution Spec v1.1.1 HTTP surface.
-//!
-//! Implements the dist-spec endpoint groups end-1 .. end-13 against the
-//! [`roci_storage::Storage`] trait. When authentication is configured, the
-//! [`auth`] layer resolves each request's principal and `routes::dispatch`
-//! authorizes it *before* any handler touches storage (ARCHITECTURE.md
-//! invariant 3, SECURITY.md invariant 1).
+//! OCI Distribution Spec HTTP surface (ARCHITECTURE inv. 3, SECURITY inv. 1).
 #![forbid(unsafe_code)]
 
 pub mod auth;
@@ -40,9 +34,7 @@ type ReadyFn =
 /// Shared handler state.
 pub struct AppState<S: Storage> {
     storage: Arc<S>,
-    /// Effective runtime configuration.
     pub config: Config,
-    /// Authentication/authorization engine; `None` → open registry.
     auth: Option<Arc<auth::Auth>>,
     /// Flipped to `true` after startup recovery (`recover()`) completes.
     recovered: Arc<std::sync::atomic::AtomicBool>,
@@ -50,8 +42,6 @@ pub struct AppState<S: Storage> {
     ready_fn: ReadyFn,
 }
 
-// Manual Clone: `Arc<S>` + `Config` are both cloneable regardless of whether
-// `S` is.
 impl<S: Storage> Clone for AppState<S> {
     fn clone(&self) -> Self {
         Self {
@@ -150,23 +140,16 @@ pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
     let limiter = ratelimit::RateLimiter::from_config(&state.config.http.rate_limit);
     let per_client = ratelimit::PerClientLimiter::from_config(&state.config.http.rate_limit);
 
-    let mut router = Router::new()
-        .route("/v2/", get(routes::get_base))
-        // Repo names may contain slashes; capture the remainder with `*rest`
-        // and dispatch on the trailing path grammar.
-        .route(
-            "/v2/{*rest}",
-            get(routes::dispatch::<S>)
-                .head(routes::dispatch::<S>)
-                .post(routes::dispatch::<S>)
-                .put(routes::dispatch::<S>)
-                .patch(routes::dispatch::<S>)
-                .delete(routes::dispatch::<S>),
-        );
+    let mut router = Router::new().route("/v2/", get(routes::get_base)).route(
+        "/v2/{*rest}",
+        get(routes::dispatch::<S>)
+            .head(routes::dispatch::<S>)
+            .post(routes::dispatch::<S>)
+            .put(routes::dispatch::<S>)
+            .patch(routes::dispatch::<S>)
+            .delete(routes::dispatch::<S>),
+    );
 
-    // Per-client rate limit: runs after authn resolved the principal but
-    // before any handler/storage access. Added first so it is the innermost
-    // layer (wraps the handler directly).
     if let Some(pcl) = per_client {
         router = router.layer(axum::middleware::from_fn_with_state(
             Arc::new(pcl),
@@ -174,8 +157,6 @@ pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
         ));
     }
 
-    // Authentication: resolves the principal for `dispatch` to authorize.
-    // Only installed when auth is configured (byte-identical otherwise).
     if let Some(auth) = state.auth.clone() {
         router = router.layer(axum::middleware::from_fn_with_state(
             auth,
@@ -183,8 +164,6 @@ pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
         ));
     }
 
-    // Global rate-limit layer: only installed when enabled (zero overhead
-    // otherwise). Runs before authn to protect the server unconditionally.
     if let Some(rl) = limiter {
         router = router.layer(axum::middleware::from_fn_with_state(
             Arc::new(rl),
@@ -192,27 +171,18 @@ pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
         ));
     }
 
-    // Health-check routes: outside auth/rate-limit, so they bypass
-    // authentication entirely. `/livez` is always 200 once listening;
-    // `/readyz` probes recovery + storage write readiness.
+    // Health probes bypass auth/rate-limit layers (merged after them).
     let health_routes = Router::new()
         .route("/livez", get(livez).head(livez))
         .route("/readyz", get(readyz::<S>).head(readyz::<S>))
         .with_state(state.clone());
 
-    // Layers wrap outward: at runtime a request passes connection-close →
-    // span → early-data → global rate limit → authn → per-client rate limit →
-    // handler. Health routes are merged AFTER auth layers so they bypass them.
     router
         .merge(health_routes)
         .layer(axum::middleware::from_fn(
             auth::middleware::early_data_middleware,
         ))
-        // One root span per request; every handler's structured events attach
-        // to it (Phase 0 observability spine). OTLP export lands in Phase 4.
         .layer(axum::middleware::from_fn(request_span))
-        // Outermost, so it sees every early rejection (rate limit, authn,
-        // authz, limits) that leaves an HTTP/1 request body unread.
         .layer(axum::middleware::from_fn(conn_close::close_on_unread_body))
         .with_state(state)
 }
@@ -263,17 +233,13 @@ async fn readyz<S: Storage>(
 const READYZ_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Classify a request path into a low-cardinality endpoint label for metrics.
-/// Never the raw path (cardinality discipline — ARCHITECTURE.md §Observability).
 fn classify_endpoint(path: &str) -> &'static str {
-    // Health probes — outside /v2/, no auth.
     if path == "/livez" || path == "/readyz" {
         return "health";
     }
-    // /v2/ base, /v2/<name>/blobs/*, /v2/<name>/manifests/*, etc.
     if path == "/v2/" || path == "/v2" {
         return "base";
     }
-    // Walk backwards through segments to find the dist-spec verb.
     if let Some(rest) = path.strip_prefix("/v2/") {
         let segs: Vec<&str> = rest.split('/').collect();
         let n = segs.len();
@@ -302,9 +268,7 @@ fn classify_endpoint(path: &str) -> &'static str {
     "other"
 }
 
-/// Middleware: wrap each request in a `tracing` span carrying semconv
-/// attributes, classify the endpoint for metrics, record duration + errors,
-/// and (with `otel`) extract W3C `traceparent` as span parent.
+/// Per-request tracing span with semconv attributes and RED metrics.
 async fn request_span(req: Request, next: axum::middleware::Next) -> Response {
     use tracing::Instrument as _;
 
@@ -312,7 +276,6 @@ async fn request_span(req: Request, next: axum::middleware::Next) -> Response {
     let path = req.uri().path().to_string();
     let endpoint = classify_endpoint(&path);
 
-    // With OTel: extract traceparent from request headers and set as parent.
     #[cfg(feature = "otel")]
     let parent_cx = {
         let mut carrier = std::collections::HashMap::new();
@@ -351,7 +314,6 @@ async fn request_span(req: Request, next: axum::middleware::Next) -> Response {
 
         tracing::Span::current().record("http.response.status_code", status);
 
-        // Log + span status based on status class.
         if status >= 500 {
             tracing::error!(http.response.status_code = status, "request failed");
         } else if status >= 400 {
@@ -360,7 +322,6 @@ async fn request_span(req: Request, next: axum::middleware::Next) -> Response {
             tracing::info!(http.response.status_code = status, "request completed");
         }
 
-        // Record RED metrics (no-op in minimal builds).
         roci_telemetry::record_request(endpoint, &method_str, status, duration);
 
         response
@@ -372,12 +333,6 @@ async fn request_span(req: Request, next: axum::middleware::Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn classify_endpoint_base() {
-        assert_eq!(classify_endpoint("/v2/"), "base");
-        assert_eq!(classify_endpoint("/v2"), "base");
-    }
 
     #[test]
     fn classify_endpoint_known_verbs() {
@@ -404,12 +359,15 @@ mod tests {
 
     #[test]
     fn classify_endpoint_other() {
-        // Non-v2 paths.
-        assert_eq!(classify_endpoint("/healthz"), "other");
-        assert_eq!(classify_endpoint("/metrics"), "other");
-        // v2 with too few segments to match any verb (line 150 branch).
-        assert_eq!(classify_endpoint("/v2/foo"), "other");
-        // v2 with unknown verb.
-        assert_eq!(classify_endpoint("/v2/myrepo/unknown/thing"), "other");
+        assert_eq!(classify_endpoint("/v2/"), "base", "base /v2/");
+        assert_eq!(classify_endpoint("/v2"), "base", "base /v2");
+        assert_eq!(classify_endpoint("/healthz"), "other", "healthz");
+        assert_eq!(classify_endpoint("/metrics"), "other", "metrics");
+        assert_eq!(classify_endpoint("/v2/foo"), "other", "too few segments");
+        assert_eq!(
+            classify_endpoint("/v2/myrepo/unknown/thing"),
+            "other",
+            "unknown verb"
+        );
     }
 }

@@ -1,5 +1,4 @@
-//! Listing endpoints: tag list and the referrers API, both paginated with a
-//! server-side cap and `Link` next-page headers.
+//! Tag list and referrers API, paginated with server-side cap.
 
 use crate::error::ApiError;
 use crate::AppState;
@@ -22,7 +21,6 @@ pub(crate) struct ReferrersQuery {
     last: Option<String>,
 }
 
-/// Clamp an optional page-size request to the server-side cap.
 fn page_limit(n: Option<usize>, max_page: usize) -> usize {
     n.map_or(max_page, |n| n.min(max_page))
 }
@@ -32,8 +30,6 @@ pub(crate) async fn tags<S: Storage>(
     repo: &str,
     q: TagsQuery,
 ) -> Result<Response, ApiError> {
-    // Clamp the requested page size to the server-side cap (SECURITY inv. 14);
-    // storage seeks past `last` and returns only this page.
     let limit = page_limit(q.n, st.max_page());
     let page = st.storage.list_tags(repo, q.last.as_deref(), limit).await?;
     let mut headers = HeaderMap::new();
@@ -41,8 +37,7 @@ pub(crate) async fn tags<S: Storage>(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    // Pagination (dist-spec end-8): when tags remain past this page, advertise
-    // the next page with an RFC 5988 `Link` whose cursor is the last tag served.
+    // Advertise next page with RFC 5988 `Link`.
     if page.more && limit > 0 {
         let cursor = page.items.last().map(String::as_str).unwrap_or_default();
         insert_next_link(
@@ -61,11 +56,7 @@ pub(crate) async fn referrers<S: Storage>(
     subject: &Digest,
     q: ReferrersQuery,
 ) -> Response {
-    // Referrers for a subject are returned even if the subject manifest itself
-    // is absent; a missing index is simply an empty list. Storage seeks past
-    // the `last` cursor and applies the artifactType filter itself, so both
-    // lookup and parse work are bounded by the page, never by the whole
-    // referrer set (GHSA-259w-8hf6-59bj amplification class).
+    // Return referrers even if subject is absent; bounded by page size.
     let limit = page_limit(q.n, st.max_page());
     let filter = q.artifact_type.as_deref();
     let page = st
@@ -84,7 +75,6 @@ pub(crate) async fn referrers<S: Storage>(
         header::CONTENT_TYPE,
         HeaderValue::from_static(MEDIA_TYPE_IMAGE_INDEX),
     );
-    // end-12b: advertise the applied filter; the response varies by query.
     if filter.is_some() {
         headers.insert(
             "oci-filters-applied",
@@ -92,7 +82,6 @@ pub(crate) async fn referrers<S: Storage>(
         );
         headers.insert(header::VARY, HeaderValue::from_static("Accept"));
     }
-    // RFC 5988 `Link` to the next page when this one is truncated.
     if page.more && limit > 0 {
         let last_digest = page
             .items
@@ -119,13 +108,8 @@ pub(crate) async fn referrers<S: Storage>(
     (StatusCode::OK, headers, body.to_string()).into_response()
 }
 
-/// Insert an RFC 5988 `Link: <path?query>; rel="next"` header. Query values are
-/// form-urlencoded so cursor/filter values containing `&`, `#`, `%`, `+` or
-/// spaces round-trip through the next request; a value that still cannot form
-/// a header (control bytes) omits the link rather than panicking.
+/// Insert an RFC 5988 `Link: <path?query>; rel="next"` header.
 pub(crate) fn insert_next_link(headers: &mut HeaderMap, path: &str, query: &[(&str, &str)]) {
-    // `serde_urlencoded::to_string` on `&[(&str, &str)]` is infallible (str
-    // pairs always serialize), so unwrap is safe here.
     let qs = serde_urlencoded::to_string(query).expect("str pairs always serialize");
     if let Ok(v) = HeaderValue::from_str(&format!("<{path}?{qs}>; rel=\"next\"")) {
         headers.insert(header::LINK, v);

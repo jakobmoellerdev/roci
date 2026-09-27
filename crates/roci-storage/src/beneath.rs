@@ -1,6 +1,5 @@
-//! No-follow, dirfd-anchored filesystem primitives beneath the store root
-//! (SECURITY.md inv. 8): every path component is opened `O_NOFOLLOW` so a
-//! planted symlink at any level cannot redirect an operation outside the CAS.
+//! Dirfd-anchored, no-follow filesystem primitives beneath the store root
+//! (SECURITY.md inv. 8).
 
 use std::io;
 use std::path::Path;
@@ -8,12 +7,8 @@ use std::path::Path;
 #[cfg(unix)]
 use crate::publish::promote_temp_noreplace;
 
-/// Run blocking filesystem work on tokio's blocking pool, mapping a join
-/// failure to `io::Error`. Each call is one "hop" (queue, wake a pool thread,
-/// wake the task back), counted as `registry.blocking.hops{op}` so the hops per
-/// request are visible. The caller's current `tracing::Span` is entered on the
-/// blocking thread so the work is attributed to the request trace
-/// (storage-internal propagation).
+/// Run blocking filesystem work on tokio's blocking pool, entering the caller's
+/// span and recording a hop metric.
 pub(crate) async fn run_blocking<T, F>(op: &'static str, f: F) -> io::Result<T>
 where
     F: FnOnce() -> io::Result<T> + Send + 'static,
@@ -29,8 +24,6 @@ where
     .map_err(io::Error::other)?
 }
 
-/// Open the (trusted, roci-created) store root as a directory fd; followed,
-/// unlike every component beneath it.
 #[cfg(unix)]
 fn open_root(root: &Path) -> io::Result<std::os::fd::OwnedFd> {
     use rustix::fs::{Mode, OFlags};
@@ -42,13 +35,8 @@ fn open_root(root: &Path) -> io::Result<std::os::fd::OwnedFd> {
     .map_err(io::Error::from)
 }
 
-/// Linux ≥ 5.6 fast path: resolve all of `rel` beneath `dir` in **one**
-/// `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`
-/// call — the kernel enforces the same no-symlink-at-any-component rule the
-/// per-component walk does, without one `openat`+`close` per component.
-/// `None` when `openat2` is unavailable (old kernel `ENOSYS`, seccomp `EPERM`):
-/// the caller walks. A refused symlink / non-directory component is `NotFound`,
-/// matching the walk.
+/// Linux ≥ 5.6 fast path: one `openat2(RESOLVE_BENEATH | NO_SYMLINKS | NO_MAGICLINKS)`
+/// call instead of a per-component walk. `None` when unavailable (old kernel / seccomp).
 #[cfg(target_os = "linux")]
 fn openat2_beneath(
     dir: &std::os::fd::OwnedFd,
@@ -61,8 +49,7 @@ fn openat2_beneath(
         return None;
     }
     let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
-    // Unlike `openat`, `openat2` rejects a non-zero mode without O_CREAT/O_TMPFILE.
-    // (`OFlags::TMPFILE` includes the O_DIRECTORY bit, so test it exactly.)
+    // `openat2` rejects a non-zero mode without O_CREAT/O_TMPFILE.
     let mode = if flags.contains(rustix::fs::OFlags::CREATE)
         || flags.contains(rustix::fs::OFlags::TMPFILE)
     {
@@ -80,7 +67,6 @@ fn openat2_beneath(
     }
 }
 
-/// Non-Linux: no `openat2`; always walk.
 #[cfg(all(unix, not(target_os = "linux")))]
 fn openat2_beneath(
     _dir: &std::os::fd::OwnedFd,
@@ -90,16 +76,9 @@ fn openat2_beneath(
     None
 }
 
-/// Fsync a directory so a prior `rename` into it is durable (the rename's
-/// effect on the directory entry is not persisted by syncing the file alone).
-/// On Unix this opens the directory and `fsync`s it; on platforms where a
-/// directory handle cannot be synced this is a best-effort no-op.
 pub(crate) async fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        // Opening a directory read-only and fsyncing it persists a prior rename
-        // into it. The CAS dir was just created, so the open succeeds; any error
-        // propagates through `?` into the caller's single error path.
         tokio::fs::File::open(dir).await?.sync_all().await
     }
     #[cfg(not(unix))]
@@ -109,14 +88,9 @@ pub(crate) async fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Walk `rel` (a `/`-separated path relative to `root`) component by component
-/// with `openat` + `O_NOFOLLOW`, refusing to traverse a symlink at *any* level,
-/// and open the final component with `final_flags`. `root` is the store root —
-/// created and owned by roci, so it is the trusted anchor; every component below
-/// it (`<repo…>/blobs/<alg>/<hex>`, `<repo…>/uploads/<id>`) is opened no-follow
-/// so a planted symlink anywhere in the path — not just the final component —
-/// cannot redirect the open outside the CAS. Portable across every Unix and
-/// kernel (no `openat2` dependency). Runs on the caller's blocking thread.
+/// Walk `rel` component-by-component with `openat(O_NOFOLLOW)`, refusing symlinks
+/// at every level, and open the final component with `final_flags`.
+/// Symlink at any component → `NotFound`.
 #[cfg(unix)]
 pub(crate) fn resolve_beneath(
     root: &Path,
@@ -125,10 +99,8 @@ pub(crate) fn resolve_beneath(
 ) -> io::Result<std::fs::File> {
     use rustix::fs::{Mode, OFlags};
     use std::os::fd::OwnedFd;
-    // The store root is trusted (roci created it); open it followed.
+    // Store root is trusted; O_NONBLOCK prevents blocking on planted FIFOs.
     let mut dir: OwnedFd = open_root(root)?;
-    // `O_NONBLOCK` so opening a planted FIFO/device does not block; we fstat and
-    // reject any non-regular final entry below.
     let leaf_flags = final_flags | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
     if let Some(opened) = openat2_beneath(&dir, rel, leaf_flags) {
         dir = opened?;
@@ -145,10 +117,7 @@ pub(crate) fn resolve_beneath(
         };
         let next = match rustix::fs::openat(&dir, *comp, flags, Mode::from_raw_mode(0o644)) {
             Ok(fd) => fd,
-            // A symlink at any component (or a non-dir parent) is refused by
-            // `O_NOFOLLOW`/`O_DIRECTORY`: `ELOOP` (Linux) / `ENOTDIR` (macOS/BSD).
-            // Surface it as "not found" so a read/open returns 404, never an
-            // out-of-store target.
+            // Symlink at any component → NotFound (never follows out-of-store).
             Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
                 return Err(io::Error::from(io::ErrorKind::NotFound));
             }
@@ -159,9 +128,6 @@ pub(crate) fn resolve_beneath(
     regular_file(dir)
 }
 
-/// The final descriptor must be a *regular file*: a FIFO/device/socket at a
-/// digest path is not a valid CAS blob and must never be served or appended to
-/// (a FIFO read would block, a device would return non-CAS bytes).
 #[cfg(unix)]
 fn regular_file(fd: std::os::fd::OwnedFd) -> io::Result<std::fs::File> {
     use rustix::fs::FileType;
@@ -172,14 +138,10 @@ fn regular_file(fd: std::os::fd::OwnedFd) -> io::Result<std::fs::File> {
     Ok(std::fs::File::from(fd))
 }
 
-/// Walk a *directory* path `rel` (relative to `root`) component by component
-/// with `openat` + `O_DIRECTORY | O_NOFOLLOW`, refusing to traverse a symlink at
-/// any level, and return an owned fd for the leaf directory. When `create`, a
-/// missing component is `mkdirat`-created (then opened no-follow) so the whole
-/// CAS directory tree is materialised beneath the trusted root — never through a
-/// planted symlink. This is the write-side anchor: callers do `openat`/`linkat`/
-/// `renameat`/`unlinkat` *relative to the returned fd*, so a symlinked `repo`,
-/// `blobs`, or `<alg>` parent can never redirect a mutation outside the store.
+/// Walk a directory path `rel` component-by-component with `O_DIRECTORY | O_NOFOLLOW`,
+/// creating missing components when `create`. Returns an owned fd for the leaf
+/// directory — callers anchor mutations relative to it so a symlinked parent
+/// cannot redirect operations outside the store.
 #[cfg(unix)]
 pub(crate) fn dir_beneath(
     root: &Path,
@@ -189,12 +151,10 @@ pub(crate) fn dir_beneath(
     use rustix::fs::{Mode, OFlags};
     use std::os::fd::OwnedFd;
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    // The store root is trusted (roci created it); open it followed.
     let mut dir: OwnedFd = open_root(root)?;
     if !fault!(FORCE_SYSCALL_ERROR) {
         match openat2_beneath(&dir, rel, dir_flags) {
             Some(Ok(fd)) => return Ok(fd),
-            // A missing component: the walk below creates it (`create`).
             Some(Err(e)) if create && e.kind() == io::ErrorKind::NotFound => {}
             Some(Err(e)) => return Err(e),
             None => {}
@@ -209,17 +169,13 @@ pub(crate) fn dir_beneath(
         match opened {
             Ok(next) => dir = next,
             Err(rustix::io::Errno::NOENT) if create => {
-                // Create the missing directory component (0o755) then open it
-                // no-follow. A concurrent creator racing us yields EEXIST, which
-                // we treat as "already there" and re-open.
+                // Create missing dir then open no-follow; concurrent EEXIST is fine.
                 match rustix::fs::mkdirat(&dir, comp, Mode::from_raw_mode(0o755)) {
                     Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                     Err(e) => return Err(io::Error::from(e)),
                 }
-                // Re-open no-follow. A racer that replaced the just-created dir
-                // with a symlink/non-dir (or removed it) yields LOOP/NOTDIR/NOENT
-                // — normalize to NotFound (404), matching the walk arm below,
-                // rather than surfacing a raw 500.
+                // Re-open no-follow: a racer replacing the dir with a
+                // symlink/non-dir is normalized to NotFound.
                 dir = match rustix::fs::openat(&dir, comp, dir_flags, Mode::empty()) {
                     Ok(next) => next,
                     Err(
@@ -230,9 +186,7 @@ pub(crate) fn dir_beneath(
                     Err(e) => return Err(io::Error::from(e)),
                 };
             }
-            // A symlinked / non-directory / missing component: not a valid CAS
-            // directory. `NotFound` so a read returns 404; a write with
-            // `create=false` likewise cannot proceed through it.
+            // Symlinked/non-directory/missing component → NotFound.
             Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::NOENT) => {
                 return Err(io::Error::from(io::ErrorKind::NotFound));
             }
@@ -242,20 +196,9 @@ pub(crate) fn dir_beneath(
     Ok(dir)
 }
 
-/// Rename `from_leaf` in directory `from_dir_rel` to `to_leaf` in directory
-/// `to_dir_rel` (both relative to `root`), via `renameat` on dirfds walked
-/// no-follow beneath `root` (the destination dir is created). A symlinked parent
-/// on either side cannot redirect the rename outside the store. When `sync`,
-/// then fsyncs the destination directory so the new entry is durable.
-///
-/// `expected_ino` is the `(st_dev, st_ino)` of the inode the caller already
-/// hashed+verified. Because `renameat` is name-based, a hostile local
-/// filesystem actor could swap `from_leaf` for a different inode between the
-/// hash and this call, promoting unverified bytes under the verified digest
-/// name. We `statat` the source leaf no-follow and require the same inode
-/// before renaming — binding the promotion to the hashed inode. A mismatch
-/// (the leaf was swapped) is rejected as `NotFound` so the upload is not
-/// finalized against foreign content.
+/// Rename `from_leaf` → `to_leaf` via dirfds walked no-follow beneath `root`.
+/// `expected_ino` binds the promotion to the hashed inode: a raced swap
+/// between hash and rename is rejected as `NotFound` (SECURITY: TOCTOU defence).
 #[cfg(unix)]
 pub(crate) fn rename_beneath_sync(
     root: std::path::PathBuf,
@@ -270,18 +213,13 @@ pub(crate) fn rename_beneath_sync(
 
     let from_fd = dir_beneath(&root, &from_dir_rel, false)?;
     let to_fd = dir_beneath(&root, &to_dir_rel, true)?;
-    // Prove the source leaf is still the exact inode we hashed (no-follow):
-    // reject a raced swap rather than promote foreign bytes under the digest.
+    // Verify source inode matches what we hashed (TOCTOU defence).
     let st = rustix::fs::statat(&from_fd, from_leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW)
         .map_err(io::Error::from)?;
     if (st.st_dev as u64, st.st_ino as u64) != expected_ino {
         return Err(io::Error::from(io::ErrorKind::NotFound));
     }
-    // No-replace rename onto the CAS leaf: a racer that installs a
-    // symlink/file at `to_leaf` is not overwritten. `EEXIST` means the digest
-    // already exists — idempotent success only if it is a regular file
-    // (content-addressed, identical bytes), else rejected; our verified
-    // staging inode is discarded on the dedup path.
+    // NOREPLACE: EEXIST accepted only if destination is a regular file.
     use rustix::fs::{FileType, RenameFlags};
     match rustix::fs::renameat_with(
         &from_fd,
@@ -312,9 +250,6 @@ pub(crate) fn rename_beneath_sync(
     }
 }
 
-/// Remove `leaf` from directory `dir_rel` (relative to `root`) via `unlinkat`
-/// on a dirfd walked no-follow beneath `root`, so a symlinked parent cannot
-/// redirect the deletion. Maps a missing entry / symlinked parent to `NotFound`.
 #[cfg(unix)]
 pub async fn unlink_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io::Result<()> {
     let root = root.to_path_buf();
@@ -326,8 +261,6 @@ pub async fn unlink_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io::Resu
     .await
 }
 
-/// Synchronous body of [`unlink_beneath`], for callers already on a blocking
-/// thread (one hop for a whole operation).
 #[cfg(unix)]
 pub(crate) fn unlink_beneath_sync(
     root: std::path::PathBuf,
@@ -339,12 +272,8 @@ pub(crate) fn unlink_beneath_sync(
         .map_err(io::Error::from)
 }
 
-/// Create an empty file `leaf` inside `dir_rel` (relative to `root`), creating
-/// the directory tree, via a dirfd walked no-follow beneath `root` and an
-/// `O_CREAT|O_EXCL|O_NOFOLLOW` open. A symlink planted at any parent component
-/// (or at `leaf` itself) cannot redirect the creation outside the store. Used to
-/// stage an upload session (`<repo…>/uploads/<id>`) without following a planted
-/// `uploads` symlink the way a path-based `File::create` would.
+/// Create an empty file `leaf` inside `dir_rel` via a no-follow dirfd beneath
+/// `root`, creating the directory tree.
 #[cfg(unix)]
 pub async fn create_empty_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io::Result<()> {
     use rustix::fs::{Mode, OFlags};
@@ -366,12 +295,8 @@ pub async fn create_empty_beneath(root: &Path, dir_rel: &Path, leaf: &str) -> io
     .await
 }
 
-/// Ensure `<repo…>` exists with a valid `oci-layout` marker, anchored to a dirfd
-/// walked no-follow beneath `root` so a symlink planted at a repo path component
-/// cannot redirect the marker write outside the store (the path-based
-/// `create_dir_all`+`write` would follow it). Idempotent: an existing regular
-/// marker is left as-is. Returns whether the marker was newly written (the
-/// caller then makes the new repo directory entry durable).
+/// Ensure `<repo…>` has a valid `oci-layout` marker, anchored no-follow beneath
+/// `root`. Idempotent. Returns whether the marker was newly written.
 #[cfg(unix)]
 pub(crate) async fn ensure_layout_beneath(
     root: &Path,
@@ -387,8 +312,6 @@ pub(crate) async fn ensure_layout_beneath(
     .await
 }
 
-/// Synchronous body of [`ensure_layout_beneath`], for callers already on a blocking
-/// thread (one hop for a whole operation).
 #[cfg(unix)]
 pub(crate) fn ensure_layout_beneath_sync(
     root: std::path::PathBuf,
@@ -399,7 +322,7 @@ pub(crate) fn ensure_layout_beneath_sync(
 
     use std::io::Write as _;
     let dirfd = dir_beneath(&root, &repo_rel, true)?;
-    // Idempotent: a pre-existing regular `oci-layout` is the steady state.
+    // Idempotent: existing regular oci-layout is the steady state.
     match rustix::fs::statat(&dirfd, "oci-layout", AtFlags::SYMLINK_NOFOLLOW) {
         Ok(st) if FileType::from_raw_mode(st.st_mode).is_file() => return Ok(false),
         Ok(_) => {
@@ -411,8 +334,7 @@ pub(crate) fn ensure_layout_beneath_sync(
         Err(rustix::io::Errno::NOENT) => {}
         Err(e) => return Err(io::Error::from(e)),
     }
-    // Write the marker to a temp in the repo dirfd, fsync, then no-replace
-    // rename into place (a racer creating it first is an idempotent win).
+    // Write marker to a temp, fsync, then no-replace rename.
     let mut rnd = [0u8; 8];
     getrandom::fill(&mut rnd).map_err(io::Error::other)?;
     let tmp = format!(".oci-layout.{}.tmp", hex::encode(rnd));
@@ -427,12 +349,11 @@ pub(crate) fn ensure_layout_beneath_sync(
     f.write_all(marker.as_bytes())?;
     f.sync_all()?;
     drop(f);
-    // A concurrent creator winning the race is still success (idempotent).
+    // Concurrent creator winning the race is idempotent success.
     promote_temp_noreplace(&dirfd, tmp.as_str(), "oci-layout", true).map(|()| true)
 }
 
-/// Async wrapper: open `rel` beneath `root` read-only, no-follow at every
-/// component (the symlink-escape backstop for blob reads).
+/// Open `rel` beneath `root` read-only, no-follow at every component.
 #[cfg(unix)]
 pub async fn open_beneath(root: &Path, rel: &Path) -> io::Result<tokio::fs::File> {
     use rustix::fs::OFlags;
@@ -445,9 +366,7 @@ pub async fn open_beneath(root: &Path, rel: &Path) -> io::Result<tokio::fs::File
     Ok(tokio::fs::File::from_std(f))
 }
 
-/// Async wrapper: open `rel` beneath `root` for appending, no-follow at every
-/// component (so a planted `uploads` *or* `uploads/<id>` symlink cannot redirect
-/// a PATCH append outside the store).
+/// Open `rel` beneath `root` for appending, no-follow at every component.
 #[cfg(unix)]
 pub async fn open_append_beneath(root: &Path, rel: &Path) -> io::Result<tokio::fs::File> {
     use rustix::fs::OFlags;
@@ -460,10 +379,8 @@ pub async fn open_append_beneath(root: &Path, rel: &Path) -> io::Result<tokio::f
     Ok(tokio::fs::File::from_std(f))
 }
 
-/// The kind of a CAS entry resolved beneath `root` with no symlink traversal:
-/// `Some(true)` = a regular file, `Some(false)` = present but not a regular
-/// file (symlink/dir/etc.), `None` = absent. Never follows a symlink at any
-/// path component.
+/// Stat a CAS entry beneath `root` with no symlink traversal:
+/// `Some((is_regular_file, size))` or `None` if absent.
 #[cfg(unix)]
 pub async fn stat_beneath(root: &Path, rel: &Path) -> io::Result<Option<(bool, u64)>> {
     let root = root.to_path_buf();
@@ -471,8 +388,6 @@ pub async fn stat_beneath(root: &Path, rel: &Path) -> io::Result<Option<(bool, u
     run_blocking("stat_beneath", move || stat_beneath_sync(root, rel)).await
 }
 
-/// Synchronous body of [`stat_beneath`], for callers already on a blocking
-/// thread (one hop for a whole operation).
 #[cfg(unix)]
 pub(crate) fn stat_beneath_sync(
     root: std::path::PathBuf,
@@ -480,7 +395,7 @@ pub(crate) fn stat_beneath_sync(
 ) -> io::Result<Option<(bool, u64)>> {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 
-    // Walk to the parent no-follow, then no-follow-stat the final component.
+    // Walk to the parent no-follow, then stat the leaf.
     let comps: Vec<&std::ffi::OsStr> = rel.iter().collect();
     let Some((last, parents)) = comps.split_last() else {
         return Ok(None);
@@ -494,21 +409,15 @@ pub(crate) fn stat_beneath_sync(
             Mode::empty(),
         ) {
             Ok(next) => dir = next,
-            // A missing, symlinked, or non-directory parent means the entry
-            // is not a valid CAS blob: report absent rather than error.
-            // (`O_NOFOLLOW` on a symlink yields `ELOOP` on Linux, `ENOTDIR`
-            // on macOS/BSD.) A genuine permission error (`EACCES`) is NOT
-            // swallowed — it surfaces as a 500, not a false 404.
+            // Missing/symlinked/non-dir parent → absent (not error).
+            // EACCES is NOT swallowed — surfaces as 500, not false 404.
             Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
                 return Ok(None)
             }
             Err(e) => return Err(io::Error::from(e)),
         }
     }
-    // Stat the leaf no-follow. A missing/symlinked leaf is absent; a genuine
-    // IO error propagates. In test, `FORCE_STAT_ERROR` injects a synthetic
-    // errno so this error arm is covered deterministically (a real leaf stat
-    // failure needs a fault a single-fs test cannot otherwise produce).
+    // Stat the leaf no-follow; FORCE_STAT_ERROR injects a fault in tests.
     let statted = if fault!(FORCE_STAT_ERROR) {
         Err(rustix::io::Errno::IO)
     } else {

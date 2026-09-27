@@ -1,8 +1,4 @@
-//! Integration tests verifying the telemetry spine emits expected span
-//! attributes (semconv) and metrics (Prometheus text).
-//!
-//! Each test installs its own global subscriber and lives in its own binary,
-//! so there is no cross-test poisoning of the global state.
+//! Telemetry semconv span attributes and Prometheus metrics.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -16,7 +12,6 @@ use tracing::field::{Field, Visit};
 use tracing::span::Attributes;
 use tracing::{Id, Subscriber};
 
-/// Collected span data from a custom subscriber.
 #[derive(Default)]
 struct Collected {
     spans: AtomicUsize,
@@ -104,7 +99,6 @@ async fn request_span_has_semconv_attributes() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // The span must carry semconv attributes.
     assert_eq!(
         collected.spans.load(Ordering::SeqCst),
         1,
@@ -125,7 +119,6 @@ async fn request_span_has_semconv_attributes() {
         1,
         "http.route present"
     );
-    // Completion event recorded the status.
     assert_eq!(
         collected.events.load(Ordering::SeqCst),
         1,

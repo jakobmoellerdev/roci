@@ -8,20 +8,16 @@ use super::common::*;
 #[tokio::test]
 async fn chunked_upload_and_manifest_tag_flow() {
     let (app, _d) = app();
-    // Begin session (end-4a).
     let loc = start_session(&app, "r").await;
 
-    // PATCH a chunk (end-5).
     let resp = send(&app, patch(&loc, "hello")).await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-    // PUT to finalize (end-6).
     let d = sha256_of(b"hello");
     let put_uri = format!("{loc}?digest={}", d.as_string());
     let resp = send(&app, put(&put_uri, Body::empty())).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // PUT a manifest by tag (end-7), then resolve + list (end-3, end-8).
     let manifest =
         br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
     let mdigest = sha256_of(manifest);
@@ -49,7 +45,6 @@ async fn chunked_upload_and_manifest_tag_flow() {
     let v = json_body(resp).await;
     assert_eq!(v["tags"], serde_json::json!(["v1"]));
 
-    // DELETE the manifest (end-9).
     let resp = send(&app, delete("/v2/r/manifests/v1")).await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 }
@@ -58,7 +53,6 @@ async fn chunked_upload_and_manifest_tag_flow() {
 async fn out_of_order_chunk_is_416() {
     let (app, _d) = app();
     let loc = start_session(&app, "r").await;
-    // A chunk claiming to start at offset 5 while the session is empty is rejected.
     let resp = send(
         &app,
         request(
@@ -78,7 +72,6 @@ async fn cross_mount_present_and_absent() {
     let data = b"mountable";
     let d = sha256_of(data);
     storage.put_blob("src", &d, data).await.unwrap();
-    // Mount from src → 201 at dest.
     let uri = format!("/v2/dest/blobs/uploads/?mount={d}&from=src");
     let resp = send(&app, post(&uri, Body::empty())).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -86,7 +79,6 @@ async fn cross_mount_present_and_absent() {
         hv(&resp, "docker-content-digest".parse().unwrap()).unwrap(),
         d.as_string()
     );
-    // Mount source absent → falls through to a normal upload session (202).
     let absent = sha256_of(b"nope");
     let uri = format!(
         "/v2/dest/blobs/uploads/?mount={}&from=elsewhere",
@@ -100,23 +92,18 @@ async fn cross_mount_present_and_absent() {
 #[tokio::test]
 async fn upload_status_and_finish_errors() {
     let (app, _d) = app();
-    // Begin a session.
     let loc = start_session(&app, "r").await;
-    // GET status → 204 with Range + Location + uuid.
     let resp = send(&app, get(&loc)).await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert!(resp.headers().get("range").is_some());
-    // Finish without a digest query → 400.
     assert_eq!(
         status_of(&app, put(&loc, Body::empty())).await,
         StatusCode::BAD_REQUEST
     );
-    // Finish with an invalid digest → 400.
     assert_eq!(
         status_of(&app, put(format!("{loc}?digest=notadigest"), Body::empty())).await,
         StatusCode::BAD_REQUEST
     );
-    // GET status on an unknown session → 404.
     assert_eq!(
         status_of(&app, get("/v2/r/blobs/uploads/ghost")).await,
         StatusCode::NOT_FOUND
@@ -126,12 +113,10 @@ async fn upload_status_and_finish_errors() {
 #[tokio::test]
 async fn monolithic_upload_with_bad_digest() {
     let (app, _d) = app();
-    // Invalid digest string on the monolithic POST → 400.
     assert_eq!(
         status_of(&app, post("/v2/r/blobs/uploads/?digest=notadigest", "x")).await,
         StatusCode::BAD_REQUEST
     );
-    // Well-formed digest that does not match the body → 400 (mismatch).
     let wrong = sha256_of(b"other");
     assert_eq!(
         status_of(
@@ -167,8 +152,6 @@ async fn patch_and_finish_on_directory_session_error() {
         ),
     )
     .await;
-    // finish_upload's non-regular-file guard rejects a directory session as
-    // a bad path (400 NAME_INVALID) before hashing, rather than a generic 500.
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -176,7 +159,6 @@ async fn patch_and_finish_on_directory_session_error() {
 async fn patch_with_valid_content_range_appends() {
     let (app, _d) = app();
     let loc = start_session(&app, "r").await;
-    // A Content-Range whose start equals the current offset (0) is accepted.
     let resp = send(
         &app,
         request(
@@ -197,9 +179,6 @@ async fn oversized_bodies_are_413() {
     cfg.limits.max_body = 4;
     cfg.limits.max_manifest = 4;
     let (app, _d) = app_with_config(cfg);
-    // A manifest over the configured request-body limit (4 bytes here) →
-    // 413 (payload too large), since the effective cap is the smaller of
-    // the configured limit and the fixed 4 MiB manifest cap.
     assert_eq!(
         status_of(
             &app,
@@ -213,7 +192,6 @@ async fn oversized_bodies_are_413() {
         .await,
         StatusCode::PAYLOAD_TOO_LARGE
     );
-    // monolithic upload oversized.
     let d = sha256_of(b"way too many bytes");
     assert_eq!(
         status_of(
@@ -226,13 +204,11 @@ async fn oversized_bodies_are_413() {
         .await,
         StatusCode::PAYLOAD_TOO_LARGE
     );
-    // chunked PATCH oversized.
     let loc = start_session(&app, "r").await;
     assert_eq!(
         status_of(&app, patch(&loc, "way too many bytes")).await,
         StatusCode::PAYLOAD_TOO_LARGE
     );
-    // finish (PUT) oversized body.
     assert_eq!(
         status_of(
             &app,
@@ -248,9 +224,6 @@ async fn oversized_bodies_are_413() {
 
 #[tokio::test]
 async fn broken_uploads_dir_surfaces_on_first_write() {
-    // `POST` does no filesystem work (the staging file is created by the
-    // session's first write), so a broken `<repo>/uploads` is only hit then:
-    // the no-follow resolver cannot create the file → no valid session (404).
     let (app, _d) = app_broken_uploads();
     let resp = send(&app, post("/v2/r/blobs/uploads/", Body::empty())).await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
@@ -280,10 +253,6 @@ async fn patch_upload_missing_session_is_404() {
 
 #[tokio::test]
 async fn monolithic_finish_error_is_404_and_leaves_no_session() {
-    // `<repo>/blobs` is a file, so promoting the streamed monolithic body into
-    // the CAS fails after it was staged. Like a chunked finalize, the no-follow
-    // resolver reports an unwalkable CAS path as absent (it cannot tell a broken
-    // store from a symlink attack), and the short-lived session is aborted.
     let (app, dir) = app();
     let repo = dir.path().join("r");
     std::fs::create_dir_all(&repo).unwrap();
@@ -300,9 +269,6 @@ async fn monolithic_finish_error_is_404_and_leaves_no_session() {
 
 #[tokio::test]
 async fn mount_put_blob_failure_falls_through() {
-    // Source has the blob, but the destination repo's `blobs` path is a file
-    // so the mount put_blob fails; start_upload falls through to a normal
-    // session (202) rather than 201.
     let (app, storage, dir) = app_with_storage();
     let data = b"mountme";
     let d = sha256_of(data);
@@ -330,87 +296,63 @@ async fn mount_with_malformed_digest_falls_through() {
 }
 
 #[tokio::test]
-async fn chunked_finish_with_trailing_body_appends_then_completes() {
+async fn finish_upload_variants() {
     let (app, _d) = app();
-    let loc = start_session(&app, "r").await;
-    let d = sha256_of(b"trailing");
-    let resp = send(
-        &app,
-        put(format!("{loc}?digest={}", d.as_string()), "trailing"),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    for (label, req) in [
+        ("chunked finish with trailing body", {
+            let loc = start_session(&app, "r").await;
+            let d = sha256_of(b"trailing");
+            put(format!("{loc}?digest={}", d.as_string()), "trailing")
+        }),
+        ("monolithic with body", {
+            let data = b"mono-body";
+            let d = sha256_of(data);
+            post(format!("/v2/r/blobs/uploads/?digest={d}"), data.to_vec())
+        }),
+        ("monolithic empty body", {
+            let d = sha256_of(b"");
+            post(format!("/v2/r/blobs/uploads/?digest={d}"), Body::empty())
+        }),
+    ] {
+        let resp = send(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "{label}");
+    }
 }
 
 #[tokio::test]
-async fn monolithic_with_body_appends_and_completes() {
-    let (app, _d) = app();
-    let data = b"mono-body";
-    let d = sha256_of(data);
-    let resp = send(
-        &app,
-        post(format!("/v2/r/blobs/uploads/?digest={d}"), data.to_vec()),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-}
-
-#[tokio::test]
-async fn monolithic_empty_body_upload() {
-    // A monolithic POST with an empty body and the digest of empty content:
-    // the append is skipped (body is empty) and finish stores the empty blob.
-    let (app, _d) = app();
-    let d = sha256_of(b"");
-    let resp = send(
-        &app,
-        post(format!("/v2/r/blobs/uploads/?digest={d}"), Body::empty()),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-}
-
-#[tokio::test]
-async fn chunked_upload_over_session_cap_is_413_and_drops_session() {
+async fn session_cap_exceeded_is_413_on_all_upload_paths() {
     let mut cfg = Config::default();
     cfg.limits.max_upload = 4;
     let (app, _d) = app_with_config(cfg);
-    // Open a session.
+
+    // Chunked PATCH exceeding the cap.
     let loc = start_session(&app, "r").await;
-    // A PATCH exceeding the 4-byte session cap → 413 SIZE_INVALID.
     let resp = send(&app, patch(&loc, "too many bytes")).await;
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "chunked patch"
+    );
     let v = json_body(resp).await;
-    assert_eq!(v["errors"][0]["code"], "SIZE_INVALID");
-    // The session was dropped: a status GET now 404s (BLOB_UPLOAD_UNKNOWN).
-    assert_eq!(status_of(&app, get(&loc)).await, StatusCode::NOT_FOUND);
-}
+    assert_eq!(v["errors"][0]["code"], "SIZE_INVALID", "chunked patch");
+    // The session was dropped.
+    assert_eq!(
+        status_of(&app, get(&loc)).await,
+        StatusCode::NOT_FOUND,
+        "session dropped"
+    );
 
-#[tokio::test]
-async fn finish_upload_over_session_cap_is_413() {
-    let mut cfg = Config::default();
-    cfg.limits.max_upload = 4;
-    let (app, _d) = app_with_config(cfg);
-    // Open a session, then a monolithic PUT whose trailing body exceeds the
-    // 4-byte session cap → 413 SIZE_INVALID (the finish-path cap branch).
-    let loc = start_session(&app, "r").await;
+    let loc2 = start_session(&app, "r").await;
     let d = sha256_of(b"too many bytes");
     let resp = send(
         &app,
-        put(format!("{loc}?digest={}", d.as_string()), "too many bytes"),
+        put(format!("{loc2}?digest={}", d.as_string()), "too many bytes"),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE, "finish put");
     let v = json_body(resp).await;
-    assert_eq!(v["errors"][0]["code"], "SIZE_INVALID");
-}
+    assert_eq!(v["errors"][0]["code"], "SIZE_INVALID", "finish put");
 
-#[tokio::test]
-async fn monolithic_upload_over_session_cap_is_413() {
-    // A monolithic POST ?digest= whose body exceeds max_upload → 413, even
-    // though it is under max_body (the cap applies to monolithic too).
-    let mut cfg = Config::default();
-    cfg.limits.max_upload = 4;
-    let (app, _d) = app_with_config(cfg);
     let data = b"way over the four byte cap";
     let d = sha256_of(data);
     let resp = send(
@@ -418,7 +360,11 @@ async fn monolithic_upload_over_session_cap_is_413() {
         post(format!("/v2/r/blobs/uploads/?digest={d}"), data.to_vec()),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "monolithic post"
+    );
     let v = json_body(resp).await;
-    assert_eq!(v["errors"][0]["code"], "SIZE_INVALID");
+    assert_eq!(v["errors"][0]["code"], "SIZE_INVALID", "monolithic post");
 }

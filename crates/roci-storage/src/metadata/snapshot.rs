@@ -1,28 +1,10 @@
 //! rkyv zero-copy mmap snapshot for O(1) cold start (ARCHITECTURE §Hyper-
 //! optimized OCI-layout ↔ index interaction, RESEARCH §9.4).
-//!
-//! The snapshot is an rkyv archive of the full metadata state, preceded by a
-//! fixed-size integrity header:
-//!
-//! ```text
-//!   [8 B magic] [4 B version] [8 B body_len] [32 B integrity] [body...]
-//! ```
-//!
-//! The `integrity` field is either a CRC32C (4 useful bytes, zero-padded to 32)
-//! or an HMAC-SHA256 (32 bytes) when a key is configured.
-//!
-//! The snapshot is written atomically (temp + fsync + rename + dir fsync) so a
-//! crash at any point leaves either the old snapshot or no snapshot — never a
-//! partially written one. On open, the header is verified **before** any
-//! zero-copy access; a snapshot that fails verification is discarded with a
-//! warning, and the store falls back to pure log replay.
 
 use super::wal_hmac::HmacKey;
 use rkyv::{Archive, Deserialize, Serialize};
 use std::io::{self, Write};
 use std::path::Path;
-
-// ---- Snapshot data model (named structs for rkyv derive) -------------------
 
 #[derive(Archive, Serialize, Deserialize, Debug, Default, Clone)]
 pub(crate) struct TagEntry {
@@ -73,10 +55,6 @@ pub(crate) struct ChecksumEntry {
     pub(crate) size: u64,
 }
 
-/// The serializable snapshot of the full metadata state.
-///
-/// Uses sorted `Vec`s so the archived form is a flat, binary-searchable array
-/// of entries — O(log n) lookup via `partition_point`.
 #[derive(Archive, Serialize, Deserialize, Debug, Default, Clone)]
 pub(crate) struct SnapshotState {
     pub(crate) tags: Vec<RepoTags>,
@@ -84,25 +62,17 @@ pub(crate) struct SnapshotState {
     pub(crate) referrers: Vec<SubjectReferrers>,
     pub(crate) backrefs: Vec<BackrefEntry>,
     pub(crate) checksums: Vec<ChecksumEntry>,
-    /// Monotonic generation counter; a log tail from a different generation is
-    /// stale and ignored on open.
+    /// Monotonic generation; mismatched-generation log tails are stale.
     pub(crate) generation: u64,
-    /// Byte offset in the same-generation WAL this snapshot covers through:
-    /// on open only records at or after it are replayed (the records before
-    /// it are the log image the snapshot was cut from — the fallback if the
-    /// snapshot is ever rejected).
+    /// WAL byte offset this snapshot covers through.
     pub(crate) log_offset: u64,
 }
 
-// -- Header layout -----------------------------------------------------------
-
 const MAGIC: &[u8; 8] = b"rocisnap";
 const VERSION: u32 = 1;
-/// 8 (magic) + 4 (version) + 8 (body_len) + 32 (integrity) + 4 (pad) = 56.
-/// Padded to 8-byte alignment so the rkyv body starts properly aligned.
+/// Header size (8-byte aligned for rkyv body).
 const HEADER_SIZE: usize = 56;
 
-/// Encode the header bytes for a snapshot body.
 pub(crate) fn encode_header(body: &[u8], hmac_key: Option<&HmacKey>) -> [u8; HEADER_SIZE] {
     let mut hdr = [0u8; HEADER_SIZE];
     hdr[..8].copy_from_slice(MAGIC);
@@ -151,8 +121,6 @@ fn verify_header<'a>(data: &'a [u8], hmac_key: Option<&HmacKey>) -> Result<&'a [
     Ok(body)
 }
 
-// -- Atomic write ------------------------------------------------------------
-
 pub(crate) fn write_atomic(path: &Path, header: &[u8; HEADER_SIZE], body: &[u8]) -> io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let tmp = path.with_extension("snap.tmp");
@@ -167,8 +135,6 @@ pub(crate) fn write_atomic(path: &Path, header: &[u8; HEADER_SIZE], body: &[u8])
     d.sync_all()?;
     Ok(())
 }
-
-// -- Mmap + verify -----------------------------------------------------------
 
 /// A verified, mmap'd snapshot.
 pub(crate) struct VerifiedSnapshot {
@@ -196,7 +162,7 @@ impl VerifiedSnapshot {
         // SAFETY: The snapshot file is written via atomic rename (never
         // modified in place). An external actor truncating/overwriting
         // the file after our open is a documented SIGBUS risk (same
-        // risk profile as LMDB/redb). The file descriptor is read-only.
+        // risk profile as LMDB). The file descriptor is read-only.
         #[allow(unsafe_code)]
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
@@ -204,7 +170,6 @@ impl VerifiedSnapshot {
             .map_err(|msg| io::Error::new(io::ErrorKind::InvalidData, msg))?;
         let body_len = body.len();
 
-        // Validate the rkyv archive with bytecheck.
         rkyv::access::<ArchivedSnapshotState, rkyv::rancor::Error>(body).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -264,156 +229,149 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_roundtrip_no_hmac() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("roci-meta.snapshot");
+    fn snapshot_roundtrip() {
         let state = sample_state();
         let body = rkyv::to_bytes::<rkyv::rancor::Error>(&state).unwrap();
-        let hdr = encode_header(&body, None);
-        write_atomic(&path, &hdr, &body).unwrap();
 
-        let snap = VerifiedSnapshot::open(&path, None).unwrap().unwrap();
-        let archived = snap.archived();
-        assert_eq!(archived.tags.len(), 1);
-        assert_eq!(archived.generation, 1);
-        assert_eq!(archived.checksums.len(), 1);
-    }
+        for (label, key) in [
+            ("no_hmac", None),
+            ("with_hmac", Some([0xABu8; 64].as_slice())),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("roci-meta.snapshot");
+            let hmac_key = key.map(|k| {
+                let p = dir.path().join("hmac.key");
+                std::fs::write(&p, k).unwrap();
+                HmacKey::load(&p).unwrap()
+            });
+            let hdr = encode_header(&body, hmac_key.as_ref());
+            write_atomic(&path, &hdr, &body).unwrap();
 
-    #[test]
-    fn snapshot_roundtrip_with_hmac() {
-        let dir = tempfile::tempdir().unwrap();
-        let key_path = dir.path().join("hmac.key");
-        std::fs::write(&key_path, [0xABu8; 64]).unwrap();
-        let key = HmacKey::load(&key_path).unwrap();
-
-        let path = dir.path().join("roci-meta.snapshot");
-        let state = sample_state();
-        let body = rkyv::to_bytes::<rkyv::rancor::Error>(&state).unwrap();
-        let hdr = encode_header(&body, Some(&key));
-        write_atomic(&path, &hdr, &body).unwrap();
-
-        let snap = VerifiedSnapshot::open(&path, Some(&key)).unwrap().unwrap();
-        assert_eq!(snap.archived().generation, 1);
-    }
-
-    #[test]
-    fn snapshot_rejects_corrupted_body() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("roci-meta.snapshot");
-        let state = sample_state();
-        let body = rkyv::to_bytes::<rkyv::rancor::Error>(&state).unwrap();
-        let hdr = encode_header(&body, None);
-        write_atomic(&path, &hdr, &body).unwrap();
-
-        let mut data = std::fs::read(&path).unwrap();
-        let idx = HEADER_SIZE + 2;
-        if idx < data.len() {
-            data[idx] ^= 0xFF;
+            let snap = VerifiedSnapshot::open(&path, hmac_key.as_ref())
+                .unwrap()
+                .unwrap();
+            let archived = snap.archived();
+            assert_eq!(archived.tags.len(), 1, "{label}");
+            assert_eq!(archived.generation, 1, "{label}");
+            assert_eq!(archived.checksums.len(), 1, "{label}");
         }
-        std::fs::write(&path, &data).unwrap();
-        let err = VerifiedSnapshot::open(&path, None).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
-    fn snapshot_rejects_wrong_hmac() {
-        let dir = tempfile::tempdir().unwrap();
-        let key_path = dir.path().join("hmac.key");
-        std::fs::write(&key_path, [0xABu8; 64]).unwrap();
-        let key = HmacKey::load(&key_path).unwrap();
-
-        let path = dir.path().join("roci-meta.snapshot");
+    fn snapshot_integrity_rejected() {
         let state = sample_state();
         let body = rkyv::to_bytes::<rkyv::rancor::Error>(&state).unwrap();
-        let hdr = encode_header(&body, Some(&key));
-        write_atomic(&path, &hdr, &body).unwrap();
 
-        let key2_path = dir.path().join("hmac2.key");
-        std::fs::write(&key2_path, [0xCDu8; 64]).unwrap();
-        let key2 = HmacKey::load(&key2_path).unwrap();
-        let err = VerifiedSnapshot::open(&path, Some(&key2)).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("roci-meta.snapshot");
+            let hdr = encode_header(&body, None);
+            write_atomic(&path, &hdr, &body).unwrap();
+            let mut data = std::fs::read(&path).unwrap();
+            let idx = HEADER_SIZE + 2;
+            if idx < data.len() {
+                data[idx] ^= 0xFF;
+            }
+            std::fs::write(&path, &data).unwrap();
+            let err = VerifiedSnapshot::open(&path, None).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "corrupted_body"
+            );
+        }
+
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("roci-meta.snapshot");
+            let key_path = dir.path().join("hmac.key");
+            std::fs::write(&key_path, [0xABu8; 64]).unwrap();
+            let key = HmacKey::load(&key_path).unwrap();
+            let hdr = encode_header(&body, Some(&key));
+            write_atomic(&path, &hdr, &body).unwrap();
+            let key2_path = dir.path().join("hmac2.key");
+            std::fs::write(&key2_path, [0xCDu8; 64]).unwrap();
+            let key2 = HmacKey::load(&key2_path).unwrap();
+            let err = VerifiedSnapshot::open(&path, Some(&key2)).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "wrong_hmac");
+        }
+
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("roci-meta.snapshot");
+            let key_path = dir.path().join("hmac3.key");
+            std::fs::write(&key_path, [0xABu8; 64]).unwrap();
+            let key = HmacKey::load(&key_path).unwrap();
+            let hdr = encode_header(&body, Some(&key));
+            write_atomic(&path, &hdr, &body).unwrap();
+            let err = VerifiedSnapshot::open(&path, None).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "hmac_when_no_key"
+            );
+        }
     }
 
     #[test]
-    fn snapshot_not_found_is_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing.snapshot");
-        assert!(VerifiedSnapshot::open(&path, None).unwrap().is_none());
-    }
-
-    #[test]
-    fn snapshot_rejects_hmac_when_no_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let key_path = dir.path().join("hmac.key");
-        std::fs::write(&key_path, [0xABu8; 64]).unwrap();
-        let key = HmacKey::load(&key_path).unwrap();
-
-        let path = dir.path().join("roci-meta.snapshot");
+    fn verify_header_edge_cases() {
         let state = sample_state();
         let body = rkyv::to_bytes::<rkyv::rancor::Error>(&state).unwrap();
-        let hdr = encode_header(&body, Some(&key));
-        write_atomic(&path, &hdr, &body).unwrap();
 
-        let err = VerifiedSnapshot::open(&path, None).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    }
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("too_small", vec![0u8; 10], "snapshot too small for header"),
+            (
+                "bad_magic",
+                {
+                    let mut data = vec![0u8; HEADER_SIZE + 8];
+                    data[..8].copy_from_slice(b"BADMAGIC");
+                    data
+                },
+                "bad snapshot magic",
+            ),
+            (
+                "bad_version",
+                {
+                    let mut data = vec![0u8; HEADER_SIZE + 8];
+                    data[..8].copy_from_slice(MAGIC);
+                    data[8..12].copy_from_slice(&99u32.to_le_bytes());
+                    data
+                },
+                "unsupported snapshot version",
+            ),
+            (
+                "truncated_body",
+                {
+                    let mut data = vec![0u8; HEADER_SIZE];
+                    data[..8].copy_from_slice(MAGIC);
+                    data[8..12].copy_from_slice(&VERSION.to_le_bytes());
+                    data[12..20].copy_from_slice(&999u64.to_le_bytes());
+                    data
+                },
+                "snapshot body truncated",
+            ),
+            (
+                "integrity_mismatch",
+                {
+                    let hdr = encode_header(&body, None);
+                    let mut data = Vec::new();
+                    data.extend_from_slice(&hdr);
+                    data.extend_from_slice(&body);
+                    data[20] ^= 0xFF;
+                    data
+                },
+                "snapshot integrity check failed",
+            ),
+        ];
 
-    #[test]
-    fn verify_header_too_small() {
-        // < HEADER_SIZE bytes → "snapshot too small for header" (line 130)
-        let result = verify_header(&[0u8; 10], None);
-        assert_eq!(result.unwrap_err(), "snapshot too small for header");
-    }
-
-    #[test]
-    fn verify_header_bad_magic() {
-        // Wrong magic bytes (line 133)
-        let mut data = [0u8; HEADER_SIZE + 8];
-        data[..8].copy_from_slice(b"BADMAGIC");
-        let result = verify_header(&data, None);
-        assert_eq!(result.unwrap_err(), "bad snapshot magic");
-    }
-
-    #[test]
-    fn verify_header_bad_version() {
-        // Wrong version (line 137)
-        let mut data = [0u8; HEADER_SIZE + 8];
-        data[..8].copy_from_slice(MAGIC);
-        data[8..12].copy_from_slice(&99u32.to_le_bytes()); // version 99
-        let result = verify_header(&data, None);
-        assert_eq!(result.unwrap_err(), "unsupported snapshot version");
-    }
-
-    #[test]
-    fn verify_header_truncated_body() {
-        // body_len exceeds available data (line 143)
-        let mut data = vec![0u8; HEADER_SIZE]; // exactly header, no body
-        data[..8].copy_from_slice(MAGIC);
-        data[8..12].copy_from_slice(&VERSION.to_le_bytes());
-        data[12..20].copy_from_slice(&999u64.to_le_bytes()); // body_len = 999
-        let result = verify_header(&data, None);
-        assert_eq!(result.unwrap_err(), "snapshot body truncated");
-    }
-
-    #[test]
-    fn verify_header_integrity_mismatch() {
-        // Valid structure but wrong integrity hash (line 149)
-        let state = sample_state();
-        let body = rkyv::to_bytes::<rkyv::rancor::Error>(&state).unwrap();
-        let hdr = encode_header(&body, None);
-        let mut data = Vec::new();
-        data.extend_from_slice(&hdr);
-        data.extend_from_slice(&body);
-        // Flip a byte in the integrity field
-        data[20] ^= 0xFF;
-        let result = verify_header(&data, None);
-        assert_eq!(result.unwrap_err(), "snapshot integrity check failed");
+        for (label, data, expected) in &cases {
+            let result = verify_header(data, None);
+            assert_eq!(result.unwrap_err(), *expected, "{label}");
+        }
     }
 
     #[test]
     fn verified_snapshot_debug() {
-        // Cover Debug impl (lines 181-185)
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("roci-meta.snapshot");
         let state = sample_state();
@@ -428,7 +386,6 @@ mod tests {
 
     #[test]
     fn snapshot_rejects_invalid_rkyv_archive() {
-        // Valid header but garbled rkyv body → rkyv validation error (lines 209-213)
         let garbage_body = vec![0xFFu8; 128];
         let hdr = encode_header(&garbage_body, None);
         let dir = tempfile::tempdir().unwrap();
@@ -445,12 +402,10 @@ mod tests {
 
     #[test]
     fn snapshot_open_io_error_propagates() {
-        // Open a path that exists but is a directory → non-NotFound error (line 193)
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("roci-meta.snapshot");
         std::fs::create_dir(&path).unwrap();
         let err = VerifiedSnapshot::open(&path, None).unwrap_err();
-        // Should NOT be NotFound; should propagate the directory-open error.
         assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }

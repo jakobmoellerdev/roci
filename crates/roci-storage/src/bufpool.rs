@@ -1,15 +1,10 @@
-//! Bounded pools of reusable I/O buffers for the blob read and upload paths.
-//!
-//! Streaming allocates a large buffer per chunk on one thread (a blocking-pool
-//! thread for reads, an async worker for upload batches) and frees it on
-//! another. With per-thread allocator heaps that cross-thread churn is retained
-//! rather than reused, ratcheting RSS up under load. Recycling a bounded set of
-//! buffers keeps the working set flat regardless of which thread frees them.
+//! Bounded pools of reusable I/O buffers (read + upload paths).
+//! Recycling keeps RSS flat regardless of cross-thread free patterns.
 
 use bytes::Bytes;
 use std::sync::Mutex;
 
-/// A fixed-size-class pool holding at most `max` idle buffers.
+/// Fixed-size-class pool holding at most `max` idle buffers.
 pub(crate) struct BufPool {
     capacity: usize,
     max: usize,
@@ -25,14 +20,12 @@ impl BufPool {
         }
     }
 
-    /// An empty buffer with at least the pool's capacity.
     pub(crate) fn get(&'static self) -> Vec<u8> {
         let reused = self.idle.lock().expect("buffer pool poisoned").pop();
         reused.unwrap_or_else(|| Vec::with_capacity(self.capacity))
     }
 
-    /// Return `buf` for reuse (dropped when the pool is full or it has shrunk
-    /// below the size class).
+    /// Return `buf` for reuse (dropped when pool is full or undersized).
     pub(crate) fn put(&'static self, mut buf: Vec<u8>) {
         if buf.capacity() < self.capacity {
             return;
@@ -44,8 +37,7 @@ impl BufPool {
         }
     }
 
-    /// Freeze `buf` into [`Bytes`] that return it to this pool when the last
-    /// reference (e.g. hyper, after writing it) drops.
+    /// Freeze `buf` into [`Bytes`] returned to this pool on drop.
     pub(crate) fn freeze(&'static self, buf: Vec<u8>) -> Bytes {
         Bytes::from_owner(Pooled {
             buf: Some(buf),
@@ -89,7 +81,6 @@ mod tests {
         drop(bytes);
         assert!(POOL.idle.lock().unwrap().is_empty(), "still referenced");
         drop(clone);
-        // The same allocation comes back, emptied.
         let b = POOL.get();
         assert_eq!((b.as_ptr(), b.len()), (ptr, 0));
     }

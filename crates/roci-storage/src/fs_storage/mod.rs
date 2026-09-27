@@ -1,6 +1,4 @@
-//! Filesystem [`Storage`] construction and shared internals. `FsStorage`
-//! itself is defined at the crate root (the CodeQL path-barrier model keys on
-//! `roci_storage::FsStorage`); this module and its children carry the impls.
+//! Filesystem [`Storage`] construction and shared internals.
 
 mod fast_restart;
 mod gc;
@@ -33,8 +31,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 impl FsStorage {
-    /// Create a store rooted at `root` under the default `[storage]` policy
-    /// and no quotas (see [`FsStorage::with_config`]).
+    /// Default store (no quotas). See [`FsStorage::with_config`].
     pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
         Self::with_config(
             root,
@@ -43,18 +40,9 @@ impl FsStorage {
         )
     }
 
-    /// Create a store rooted at `root` (created if absent) running the given
-    /// `[storage]` policy, charging writes to the shared `quota` tracker.
-    /// Opens (replaying) the metadata engine, then either restores in-memory
-    /// state from a valid fast-restart stamp (when `storage.fast_restart` is
-    /// true and a matching stamp exists) or walks the CAS once to seed the
-    /// blob-presence filter (complete, never false-negative), the dedupe
-    /// index, quota byte usage and the open upload-session count.
-    /// Tags/media-types/referrers are NOT walked at startup — a pre-existing
-    /// layout resolves via the `index.json` read-path fallbacks and the
-    /// metadata store warms on writes; the layout stays the source of truth.
-    /// Background maintenance (GC, scrub, metadata upkeep) starts only via
-    /// [`FsStorage::start_maintenance`].
+    /// Create a store rooted at `root` with the given policy.
+    /// Opens the metadata engine, then restores from a fast-restart stamp or
+    /// walks the CAS to seed presence/dedupe/quota/sessions.
     pub fn with_config(
         root: impl AsRef<Path>,
         config: &StorageConfig,
@@ -81,18 +69,14 @@ impl FsStorage {
             )),
             quota,
             dedupe: Arc::new(DedupeIndex::new(config.dedupe)),
-            upload_locks: Arc::new(StdMutex::new(HashMap::new())),
+            upload_locks: Arc::default(),
             pending_uploads: Arc::new(StdMutex::new(HashMap::new())),
-            blob_admit_locks: Arc::new(StdMutex::new(HashMap::new())),
+            blob_admit_locks: Arc::default(),
             index_dirty: Arc::new(StdMutex::new(HashMap::new())),
             index_notify: Arc::new(Notify::new()),
             _index_cancel: Arc::new(cancel_tx),
         };
 
-        // Try the fast-restart path: consume a valid stamp and skip the CAS
-        // walk + GC consistency check. On any mismatch, fall back to the full
-        // walk (the stamp is already consumed, so a crash here forces a full
-        // walk next time).
         let fast_restored = if config.fast_restart {
             let hmac_key = config
                 .metadata
@@ -128,20 +112,15 @@ impl FsStorage {
         Ok(store)
     }
 
-    /// The manifest digests currently recorded as referencing `blob` in `repo`
-    /// (GC liveness edges).
+    /// Backrefs for `blob` in `repo` (GC liveness edges).
     pub fn backrefs(&self, repo: &str, blob: &crate::Digest) -> Vec<String> {
         self.meta.backrefs(repo, &blob.as_string())
     }
 
-    /// One-time referrers enable-upgrade pass: walk every repo's `index.json`,
-    /// and for any descriptor carrying `subject` register it in the metadata
-    /// store so `list_referrers` sees pre-existing links. Call at startup when
-    /// the runtime (Tokio) is available.
+    /// One-time referrers upgrade: import `subject` links from each repo's
+    /// `index.json` into the metadata store.
     pub async fn warm_referrers_from_layout(&self) {
         for repo in discover_repos(&self.root) {
-            // No-follow beneath-root read: a symlinked `index.json` cannot inject
-            // descriptors from outside the store.
             let Ok(Some(index)) = Self::read_index_beneath(&self.root, &repo).await else {
                 continue;
             };
@@ -151,7 +130,6 @@ impl FsStorage {
                 else {
                     continue;
                 };
-                // Already known (log replay or live push): nothing to upgrade.
                 if self.meta.has_referrer(&repo, subject, referrer) {
                     continue;
                 }
@@ -170,22 +148,13 @@ impl FsStorage {
         }
     }
 
-    /// The async lock for one upload session, creating it on first use. Held
-    /// across `append`/`finish`/`abort` so those never interleave on one id.
-    /// The id is validated *before* an entry is created, so a stream of
-    /// syntactically-invalid ids cannot leak lock-map entries; a caller that
-    /// then finds no session drops the entry on its error path.
+    /// Session lock for one upload; id is validated to prevent map-entry leaks.
     fn session_lock(&self, repo: &str, id: &str) -> Result<crate::SessionLock, StorageError> {
         SafeComponent::new(id)?;
-        let mut locks = self.upload_locks.lock().expect("upload-locks poisoned");
-        Ok(Arc::clone(
-            locks
-                .entry((repo.to_string(), id.to_string()))
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None))),
-        ))
+        Ok(self.upload_locks.get(repo, id))
     }
 
-    /// Whether `(repo, id)` is a begun session with no staging file yet.
+    /// Whether `(repo, id)` is a pending (no staging file) session.
     fn is_pending(&self, repo: &str, id: &str) -> bool {
         self.pending_uploads
             .lock()
@@ -202,50 +171,7 @@ impl FsStorage {
             .is_some()
     }
 
-    /// Drop a finished/aborted session's lock entry so the map does not grow
-    /// unbounded across many uploads.
-    fn drop_session_lock(&self, repo: &str, id: &str) {
-        self.upload_locks
-            .lock()
-            .expect("upload-locks poisoned")
-            .remove(&(repo.to_string(), id.to_string()));
-    }
-
-    /// Per-`(repo, digest)` async lock serializing blob admission + publication.
-    /// Prevents two concurrent uploads of the same absent blob from both
-    /// charging quota while only one actually lands.
-    fn blob_admit_lock(&self, repo: &str, digest: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self
-            .blob_admit_locks
-            .lock()
-            .expect("blob-admit-locks poisoned");
-        Arc::clone(
-            locks
-                .entry((repo.to_string(), digest.to_string()))
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        )
-    }
-
-    /// Drop a blob-admission lock entry after publication.
-    /// Removed only when no other admission of the same blob holds or waits
-    /// on it (map + the caller's clone), so a waiter never races a fresh lock.
-    fn drop_blob_admit_lock(&self, repo: &str, digest: &str) {
-        let mut locks = self
-            .blob_admit_locks
-            .lock()
-            .expect("blob-admit-locks poisoned");
-        let key = (repo.to_string(), digest.to_string());
-        if locks.get(&key).is_some_and(|l| Arc::strong_count(l) <= 2) {
-            locks.remove(&key);
-        }
-    }
-
-    /// One startup walk over every CAS blob and staged upload: seeds the
-    /// blob-presence filter so a definite absence (filter miss) is
-    /// authoritative — the filter is complete, so a miss truly means "not
-    /// stored" and can 404 without a syscall (RESEARCH §8.5) — plus the dedupe
-    /// index, quota byte usage (one no-follow `lstat` per blob, only when a
-    /// byte cap is configured) and the open upload-session count.
+    /// Startup CAS walk: seed presence filter, dedupe index, quota usage, sessions.
     fn seed_from_cas(&self) {
         let track_bytes = self.quota.tracks_bytes();
         for_each_cas_blob(&self.root, |repo, digest, entry| {
@@ -253,7 +179,6 @@ impl FsStorage {
             self.presence.insert(repo, &digest);
             self.dedupe.insert(repo, &digest);
             if track_bytes {
-                // `DirEntry::metadata` does not follow a symlink leaf.
                 if let Ok(m) = entry.metadata() {
                     if m.is_file() {
                         self.quota.seed(repo, m.len());
@@ -269,12 +194,6 @@ impl FsStorage {
         self.quota.seed_sessions(sessions);
     }
 
-    /// Apply a metadata mutation bracketed by dirty marks. Marking *before*
-    /// the apply means a concurrent reader never observes the repo as clean
-    /// while the store is ahead of `index.json` (its fallback reads would
-    /// otherwise resurrect a just-deleted tag/referrer). Bumping the generation
-    /// again *after* the apply means a writer that snapshotted in between
-    /// cannot clear the entry for a rebuild that predates this mutation.
     fn apply_meta(&self, repo: &str, op: MetaOp) -> Result<(), StorageError> {
         self.mark_index_dirty(repo);
         let applied = self.meta.apply(op).map_err(StorageError::Io);
@@ -282,15 +201,9 @@ impl FsStorage {
         applied
     }
 
+    /// Anchor the layout marker beneath the root (no-follow); sync on first creation.
     async fn ensure_layout(&self, repo: &str) -> Result<(), StorageError> {
-        // Anchor the repo dir + `oci-layout` marker to a dirfd walked no-follow
-        // beneath the store root: a symlink planted at a repo path component
-        // cannot redirect the marker write outside the store (a path-based
-        // `create_dir_all`+`write` would follow it). Idempotent.
         let repo_rel = repo_rel(repo)?;
-        // On first creation only, persist the repo path entry itself (its
-        // parent dir) so a blob-only repository is discoverable after a crash.
-        // (Syncing on every call cost one fsync per upload.)
         if ensure_layout_beneath(&self.root, &repo_rel, OCI_LAYOUT_MARKER).await? {
             let repo_dir = self.repo_dir(repo)?;
             sync_dir(repo_dir.parent().unwrap_or(&repo_dir)).await?;

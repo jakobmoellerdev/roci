@@ -1,6 +1,3 @@
-//! Storage policies as clients see them: quota and session-cap rejections on
-//! the wire, and foreign layer media types (`tar+zstd`) served untouched.
-
 use axum::http::{header, Method, StatusCode};
 use axum::Router;
 use roci_config::{Config, StorageConfig};
@@ -81,7 +78,6 @@ async fn upload_session_cap_is_429_until_a_session_ends() {
         json_body(refused).await["errors"][0]["code"],
         "TOOMANYREQUESTS"
     );
-    // Completing the session frees its slot.
     let d = sha256_of(b"done");
     let sep = if first.contains('?') { '&' } else { '?' };
     assert_eq!(
@@ -98,7 +94,6 @@ async fn upload_session_cap_is_429_until_a_session_ends() {
 #[tokio::test]
 async fn tar_zstd_layers_are_accepted_and_served_byte_identical() {
     let (app, _d) = app();
-    // A zstd frame (magic 28 b5 2f fd) — roci never inspects layer bytes.
     let layer: Vec<u8> = [0x28, 0xb5, 0x2f, 0xfd]
         .into_iter()
         .chain((0..4096u32).map(|i| (i * 31 % 251) as u8))
@@ -133,7 +128,6 @@ async fn tar_zstd_layers_are_accepted_and_served_byte_identical() {
         Some("application/octet-stream")
     );
     assert_eq!(body_bytes(blob).await.as_ref(), layer.as_slice());
-    // Ranged reads of the compressed layer are served as stored.
     let ranged = send(
         &app,
         request(

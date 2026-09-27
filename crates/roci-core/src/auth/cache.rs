@@ -1,7 +1,4 @@
-//! Short-lived cache of successful Basic authentications, so a client that
-//! resends credentials on every request pays the bcrypt / LDAP cost once per
-//! TTL. Keyed by a SHA-256 of `user ‖ 0x00 ‖ password`: the password itself
-//! is never stored, and a changed password misses.
+//! Short-lived cache of successful Basic authentications (SHA-256 keyed).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -11,7 +8,6 @@ use sha2::{Digest as _, Sha256};
 
 use super::{AuthMethod, Principal};
 
-/// Entries held before the map is cleared wholesale (bounded memory).
 pub(super) const CAPACITY: usize = 4096;
 
 pub(super) struct CachedUser {
@@ -35,7 +31,6 @@ fn key(user: &str, password: &str) -> [u8; 32] {
 }
 
 impl CredentialCache {
-    /// `ttl == 0` disables caching.
     pub(crate) fn new(ttl: Duration) -> Self {
         Self {
             ttl,
@@ -61,7 +56,6 @@ impl CredentialCache {
         })
     }
 
-    /// Record a successful authentication and return its principal.
     pub(crate) fn insert(
         &self,
         user: &str,

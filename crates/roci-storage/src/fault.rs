@@ -1,10 +1,6 @@
-//! Test-only fault-injection switches (Linux only): process-global flags the
-//! fault tests flip to drive otherwise-unreachable syscall-error and
-//! copy/reflink-fallback arms deterministically on CI's single filesystem.
+//! Test-only fault-injection switches (Linux only).
 
-/// `fault!(FORCE_X)`: whether the test-only fault switch is set; constant
-/// `false` outside `cfg(all(test, target_os = "linux"))`, so release builds
-/// carry no seam.
+/// Constant `false` outside `cfg(all(test, target_os = "linux"))`.
 macro_rules! fault {
     ($flag:ident) => {{
         #[cfg(all(test, target_os = "linux"))]
@@ -18,12 +14,7 @@ macro_rules! fault {
     }};
 }
 
-/// Test-only switches: on a single filesystem a real `ioctl_ficlone`/`hard_link`
-/// neither fails (to exercise the copy fallback) nor succeeds (ext4 has no
-/// reflink), so both branches are otherwise unreachable. `FORCE_COPY_FALLBACK`
-/// makes the fast paths report failure; `FORCE_REFLINK_OK` makes `try_reflink`
-/// report success (after really transferring the bytes via the streaming copy,
-/// so the destination is correct). Zero cost and absent outside `cfg(test)`.
+/// Exercise copy/reflink fallbacks on single-filesystem CI.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) static FORCE_COPY_FALLBACK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -44,16 +35,12 @@ pub(crate) static FORCE_STAT_ERROR: std::sync::atomic::AtomicBool =
 pub(crate) static FORCE_SYSCALL_ERROR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Forces the portable per-component walk instead of the `openat2` fast path,
-/// so the walk (the only path on non-Linux / pre-5.6 kernels) stays covered.
+/// Force the portable per-component walk instead of `openat2`.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) static FORCE_NO_OPENAT2: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Serializes the fault-injection tests (which flip the process-global
-/// `FORCE_*` switches) against each other and against tests that assert on the
-/// real reflink/hard-link behavior, so a stray forced fallback cannot make a
-/// parallel test flaky. Held for the duration of each such test.
+/// Serializes fault-injection tests against each other.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) static FAULT_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));

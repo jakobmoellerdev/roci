@@ -1,8 +1,4 @@
-//! Identity-based access control: `[access_control]` compiled for lookup.
-//!
-//! Each repository is governed by exactly one rule — the most specific glob
-//! matching it (most literal bytes, then fewest wildcards, then earliest
-//! declared) — so a narrow rule can *remove* grants a broad one gives.
+//! Identity-based access control: compiled `[access_control]` for lookup.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -11,15 +7,11 @@ use roci_config::AccessControlConfig;
 
 use super::ActionSet;
 
-/// One glob token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tok {
     Lit(u8),
-    /// `*`: any run of bytes within one path component.
     Star,
-    /// `**` as the final component: any run of bytes, `/` included.
     AnyTail,
-    /// `**/` before another component: zero or more whole components.
     AnyDirs,
 }
 
@@ -49,11 +41,9 @@ fn tokenize(pattern: &str) -> Vec<Tok> {
     toks
 }
 
-/// Whether `name` matches the tokenized glob: an O(tokens · len) DP over
-/// suffixes, one row per token.
+/// Whether `name` matches the tokenized glob.
 fn glob_match(toks: &[Tok], name: &[u8]) -> bool {
     let n = name.len();
-    // next[j]: tokens after the current one match name[j..].
     let mut next = vec![false; n + 1];
     next[n] = true;
     let mut cur = vec![false; n + 1];
@@ -66,7 +56,6 @@ fn glob_match(toks: &[Tok], name: &[u8]) -> bool {
                 Tok::Star => next[j] || (name[j] != b'/' && cur[j + 1]),
                 Tok::AnyTail => next[j] || cur[j + 1],
                 Tok::AnyDirs => {
-                    // Consume `name[j..=k]` ending in `/` for some k ≥ j.
                     dirs = dirs || (name[j] == b'/' && next[j + 1]);
                     next[j] || dirs
                 }
@@ -80,21 +69,16 @@ fn glob_match(toks: &[Tok], name: &[u8]) -> bool {
 #[derive(Debug)]
 struct Rule {
     toks: Vec<Tok>,
-    /// Non-wildcard pattern bytes: the primary specificity key.
     literal_len: usize,
-    /// Wildcard tokens: the tie-break (fewer is more specific).
     stars: usize,
     anonymous: ActionSet,
     authenticated: ActionSet,
-    /// `(users, groups, actions)` per identity policy.
     policies: Vec<(HashSet<String>, HashSet<String>, ActionSet)>,
 }
 
-/// A compiled `[access_control]` section.
 #[derive(Debug)]
 pub(crate) struct AccessPolicy {
     admins: HashSet<String>,
-    /// Config `groups`, inverted: user → the groups listing them.
     user_groups: HashMap<String, Vec<String>>,
     rules: Vec<Rule>,
 }
@@ -258,22 +242,18 @@ mod tests {
                 rule("**", &[Action::Pull], vec![]),
                 rule("team/**", &[], vec![users(&["alice"], &[Action::Push])]),
                 rule("team/secret", &[], vec![]),
-                // Same literal count as `team/*x` but more wildcards: loses.
                 rule("team/*x*", &[Action::Delete], vec![]),
                 rule("team/*x", &[Action::Pull], vec![]),
             ],
             ..Default::default()
         };
         let p = AccessPolicy::compile(&ac);
-        // `**` alone governs `other`.
         assert_eq!(p.grants(None, &[], "other"), ActionSet::of(Action::Pull));
-        // `team/**` replaces `**`: anonymous loses pull, alice gains push.
         assert_eq!(p.grants(None, &[], "team/app"), ActionSet::NONE);
         assert_eq!(
             p.grants(Some("alice"), &[], "team/app"),
             ActionSet::of(Action::Push)
         );
-        // `team/secret` is more specific still and grants nothing.
         assert_eq!(p.grants(Some("alice"), &[], "team/secret"), ActionSet::NONE);
         assert_eq!(p.grants(None, &[], "team/ax"), ActionSet::of(Action::Pull));
     }
@@ -325,7 +305,6 @@ mod tests {
             p.grants(Some("carol"), &["cn=ops,dc=x".into()], "r"),
             ActionSet::from_actions(&[Action::Pull, Action::Delete])
         );
-        // Admins hold everything, even where no rule matches.
         assert_eq!(p.grants(Some("root"), &[], "unmatched"), ActionSet::ALL);
         assert_eq!(p.grants(Some("bob"), &[], "unmatched"), ActionSet::NONE);
     }

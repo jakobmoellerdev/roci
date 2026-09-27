@@ -1,5 +1,4 @@
-//! Serve-level auth tests: mTLS handshakes and identity propagation, leaf
-//! pinning, and `[access_control]` live reload.
+//! Serve-level auth tests: mTLS, leaf pinning, live reload.
 
 use super::*;
 use rcgen::{
@@ -10,8 +9,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// A CA, a server cert for `localhost`, and a client cert (CN `alice`,
-/// EKU clientAuth) issued by the CA — all written under `dir`.
 struct Pki {
     server_cert: PathBuf,
     server_key: PathBuf,
@@ -57,14 +54,6 @@ fn pki(dir: &std::path::Path) -> Pki {
     p
 }
 
-fn fingerprint(der: &[u8]) -> String {
-    use sha2::Digest as _;
-    sha2::Sha256::digest(der)
-        .iter()
-        .map(|b| format!("{b:02X}"))
-        .collect()
-}
-
 fn mtls_config(dir: &std::path::Path, p: &Pki, mode: ClientAuth, pins: Vec<String>) -> Config {
     let mut config: Config = toml::from_str("[access_control]\nadmins = [\"alice\"]\n").unwrap();
     config.http.listen = "127.0.0.1:0".parse().unwrap();
@@ -80,29 +69,7 @@ fn mtls_config(dir: &std::path::Path, p: &Pki, mode: ClientAuth, pins: Vec<Strin
     config
 }
 
-/// Run `serve` in the background; returns its address and a stop handle.
-async fn start(
-    config: Config,
-    config_path: Option<PathBuf>,
-) -> (
-    SocketAddr,
-    tokio::sync::oneshot::Sender<()>,
-    tokio::task::JoinHandle<anyhow::Result<()>>,
-) {
-    let (bind_tx, bind_rx) = tokio::sync::oneshot::channel();
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let handle = tokio::spawn(serve(
-        config,
-        config_path,
-        move |addr| {
-            let _ = bind_tx.send(addr);
-        },
-        async move {
-            let _ = stop_rx.await;
-        },
-    ));
-    (bind_rx.await.unwrap(), stop_tx, handle)
-}
+use super::tests::start;
 
 fn client_config(p: &Pki, with_cert: bool, tls12_only: bool) -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
@@ -174,7 +141,6 @@ async fn mtls_required_propagates_identity_and_rejects_certless_clients() {
             .0,
         200
     );
-    // `alice` is an admin only via the certificate's CN: push is allowed.
     assert_eq!(
         tls_request(addr, with_cert(), "POST", "/v2/r/blobs/uploads/")
             .await
@@ -222,12 +188,17 @@ async fn mtls_optional_without_certificate_is_anonymous() {
 async fn mtls_pins_gate_the_handshake() {
     let dir = tempfile::tempdir().unwrap();
     let p = pki(dir.path());
-    // Upper-case pin: fingerprints compare case-insensitively.
     let pinned = mtls_config(
         dir.path(),
         &p,
         ClientAuth::Required,
-        vec![fingerprint(&p.client_der)],
+        vec![{
+            use sha2::Digest as _;
+            sha2::Sha256::digest(&p.client_der)
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect()
+        }],
     );
     let (addr, stop, handle) = start(pinned, None).await;
     for tls12 in [false, true] {
@@ -292,7 +263,6 @@ fn client_verifier_config_errors() {
     }
 }
 
-/// Serve through the in-process router (no socket).
 async fn status(app: &axum::Router, uri: &str) -> u16 {
     let req = axum::http::Request::get(uri)
         .body(axum::body::Body::empty())
@@ -300,7 +270,6 @@ async fn status(app: &axum::Router, uri: &str) -> u16 {
     app.clone().call(req).await.unwrap().status().as_u16()
 }
 
-/// Poll until `uri` answers `want` (reload applies within a few intervals).
 async fn eventually(app: &axum::Router, uri: &str, want: u16) {
     let mut last = 0;
     for _ in 0..100 {
@@ -337,7 +306,6 @@ async fn access_control_reload_applies_valid_changes_only() {
     let uri = "/v2/team/app/tags/list";
     assert_eq!(status(&app, uri).await, 200);
 
-    // Invalid TOML: rejected, the open policy stays.
     std::fs::write(&path, "[[access_control.repositories]\n").unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(status(&app, uri).await, 200);
@@ -347,16 +315,13 @@ async fn access_control_reload_applies_valid_changes_only() {
     std::fs::write(&path, open).unwrap();
     eventually(&app, uri, 200).await;
 
-    // A change outside [access_control] is reported, not applied.
     std::fs::write(&path, format!("[log]\nlevel = \"debug\"\n{open}")).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(status(&app, uri).await, 200);
 
-    // Section removed: anonymous requests are denied.
     std::fs::write(&path, "[log]\nlevel = \"debug\"\n").unwrap();
     eventually(&app, uri, 403).await;
 
-    // An unreadable file is skipped.
     std::fs::remove_file(&path).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(status(&app, uri).await, 403);
@@ -393,7 +358,6 @@ async fn serve_enables_auth_and_starts_reload_from_config_file() {
     let _ = stop.send(());
     handle.await.unwrap().unwrap();
 
-    // An unreadable htpasswd file aborts startup, naming the field.
     let mut bad = Config::default();
     bad.auth.htpasswd = Some(roci_config::HtpasswdConfig {
         path: dir.path().join("missing"),
@@ -408,13 +372,10 @@ async fn serve_enables_auth_and_starts_reload_from_config_file() {
     );
 }
 
-/// A well-formed bcrypt hash; never verified by these tests (roci-cli has no
-/// bcrypt dependency to generate one).
 fn bcrypt_hash() -> &'static str {
     "$2b$04$KrtIV3GgqVN/zsz4cvWpFONOe0YjMr10VKF/qRxoPHtwSikBShbSm"
 }
 
-/// Plaintext `GET /v2/`; returns the response head.
 async fn raw_get_head(addr: SocketAddr) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();

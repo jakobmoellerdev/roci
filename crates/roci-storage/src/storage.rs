@@ -1,6 +1,4 @@
-//! The registry storage contract (`Storage` trait) and its value types: the
-//! resolved-reference [`ManifestRef`], the backend-agnostic [`BlobRead`], and
-//! the atomically-committed [`ManifestLinks`].
+//! Storage trait, [`ManifestRef`], [`BlobRead`], and [`ManifestLinks`].
 
 use crate::metadata::{Page, Referrer};
 use crate::upload_body::UploadBody;
@@ -11,11 +9,9 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use std::future::Future;
 use std::io;
+use tracing::Instrument;
 
-/// Bytes read per blocking-pool hop when streaming a local blob. Each hop is a
-/// thread hand-off costing tens of µs, so `ReaderStream`'s 4 KiB default made
-/// pulls hop-bound; 256 KiB amortizes it while bounding per-stream memory to
-/// two chunks (the one being sent + one read ahead).
+/// 256 KiB per blocking-pool hop: amortizes hop overhead while bounding per-stream memory.
 const FILE_CHUNK: u64 = 256 * 1024;
 
 /// Recycled full-size read chunks: at most 64 idle (16 MiB).
@@ -23,11 +19,7 @@ static READ_POOL: crate::bufpool::BufPool = crate::bufpool::BufPool::new(FILE_CH
 
 type ChunkRead = tokio::task::JoinHandle<io::Result<(std::fs::File, Bytes)>>;
 
-/// Read exactly `n` bytes (after seeking to `seek`, if given) on the blocking
-/// pool. The file is moved in and handed back, so no lock is needed and only
-/// one read per stream is ever in flight. The caller's `span` is entered on
-/// the blocking thread so the work is attributed to the request trace
-/// (storage-internal propagation).
+/// Read `n` bytes (optionally seeking first) on the blocking pool, propagating `span`.
 fn read_chunk(file: std::fs::File, seek: Option<u64>, n: u64, span: tracing::Span) -> ChunkRead {
     roci_telemetry::record_blocking_hop("read_chunk");
     tokio::task::spawn_blocking(move || {
@@ -37,9 +29,7 @@ fn read_chunk(file: std::fs::File, seek: Option<u64>, n: u64, span: tracing::Spa
         if let Some(start) = seek {
             file.seek(io::SeekFrom::Start(start))?;
         }
-        // Full-size chunks recycle through a bounded pool (steady RSS under
-        // load); a small tail/blob gets an exact allocation instead of pinning
-        // a pooled chunk.
+        // Full-size chunks recycle through a bounded pool; small tails get exact allocations.
         let pooled = n >= FILE_CHUNK / 4;
         let mut buf = if pooled {
             READ_POOL.get()
@@ -62,12 +52,8 @@ fn read_chunk(file: std::fs::File, seek: Option<u64>, n: u64, span: tracing::Spa
     })
 }
 
-/// Stream `[start, start + len)` of a local file in [`FILE_CHUNK`] pieces with
-/// one chunk of read-ahead: the next read runs while the current chunk is being
-/// written to the socket. Backpressure is async (an unpolled stream holds a
-/// finished chunk, never a blocking-pool thread), so slow clients cannot pin
-/// the pool. A read error ends the stream after yielding it. Each read-chunk
-/// hop enters `span` so storage I/O is attributed to the request trace.
+/// Stream `[start, start+len)` in [`FILE_CHUNK`] pieces with one read-ahead.
+/// Backpressure is async: an unpolled stream holds a finished chunk, never a pool thread.
 fn file_stream(file: std::fs::File, start: u64, len: u64, span: tracing::Span) -> BlobStream {
     let first = FILE_CHUNK.min(len);
     let pending = read_chunk(file, (start > 0).then_some(start), first, span.clone());
@@ -86,8 +72,7 @@ fn file_stream(file: std::fs::File, start: u64, len: u64, span: tracing::Span) -
     .boxed()
 }
 
-/// A resolved reference target: either a tag pointing at a manifest digest, or
-/// a direct manifest digest.
+/// A resolved tag-or-digest reference to a manifest.
 #[derive(Debug, Clone)]
 pub struct ManifestRef {
     pub digest: Digest,
@@ -95,17 +80,12 @@ pub struct ManifestRef {
     pub bytes: Vec<u8>,
 }
 
-/// A streamed blob body.
 pub type BlobStream = BoxStream<'static, io::Result<Bytes>>;
 
-/// Opens the byte range `[start, start + len)` of a remote blob as a stream.
 pub type RangeOpener =
     Box<dyn FnOnce(u64, u64) -> BoxFuture<'static, io::Result<BlobStream>> + Send>;
 
-/// A blob opened for a GET: its total size plus how its bytes are delivered —
-/// a local file (streamed, never buffered whole), a backend range reader, or a
-/// short-lived redirect URL the client fetches directly (remote backends above
-/// `redirect_min_size`, ARCHITECTURE §Storage trait & backends).
+/// A blob opened for GET: size + delivery mode (file, range reader, or redirect).
 pub struct BlobRead {
     size: u64,
     source: BlobSource,
@@ -118,7 +98,6 @@ enum BlobSource {
 }
 
 impl BlobRead {
-    /// A local file of `size` bytes.
     pub fn file(file: tokio::fs::File, size: u64) -> Self {
         Self {
             size,
@@ -126,7 +105,6 @@ impl BlobRead {
         }
     }
 
-    /// A remote blob of `size` bytes whose ranges `open` streams on demand.
     pub fn ranged(size: u64, open: RangeOpener) -> Self {
         Self {
             size,
@@ -134,7 +112,6 @@ impl BlobRead {
         }
     }
 
-    /// A blob the client should fetch from `url` (a `307`).
     pub fn redirect(size: u64, url: String) -> Self {
         Self {
             size,
@@ -142,12 +119,10 @@ impl BlobRead {
         }
     }
 
-    /// Total blob size in bytes.
     pub fn size(&self) -> u64 {
         self.size
     }
 
-    /// The redirect target, when the backend asks the client to fetch directly.
     pub fn redirect_url(&self) -> Option<&str> {
         match &self.source {
             BlobSource::Redirect(url) => Some(url),
@@ -155,19 +130,10 @@ impl BlobRead {
         }
     }
 
-    /// Stream `len` bytes starting at `start` (`start + len <= size`). A
-    /// redirect has no local body: [`io::ErrorKind::Unsupported`].
-    ///
-    /// On Linux/FreeBSD, issues `posix_fadvise` hints before streaming:
-    /// `Sequential` for a full-blob read, `WillNeed` over the requested window
-    /// for a range read. Errors from fadvise are advisory and silently ignored.
-    /// `DONTNEED` is intentionally *not* issued after a full read: a registry
-    /// repeatedly serves the same hot layers, and evicting their pages would
-    /// penalise concurrent and subsequent readers.
+    /// Stream `len` bytes from `start`. Redirect → [`io::ErrorKind::Unsupported`].
+    /// On Linux/FreeBSD issues `posix_fadvise` (Sequential or WillNeed); `DONTNEED`
+    /// intentionally not issued to preserve page cache for concurrent readers.
     pub async fn into_stream(self, start: u64, len: u64) -> io::Result<BlobStream> {
-        // Create a child span of the current (request) span for the blob body
-        // stream. The span is propagated into every blocking-pool read-chunk
-        // hop so storage I/O is attributed to the request trace.
         let span = tracing::info_span!("blob.stream", bytes = len, range.start = start,);
         match self.source {
             BlobSource::File(f) => {
@@ -184,19 +150,8 @@ impl BlobRead {
     }
 }
 
-/// Issue `posix_fadvise` hints for a blob about to be streamed.
-///
-/// Full-blob reads: `Sequential` — the kernel doubles its readahead window,
-/// reducing syscalls per stream.
-///
-/// Range reads (e.g. lazy-pull clients): `WillNeed` over the requested window,
-/// which initiates a background readahead for those pages without disturbing
-/// the default strategy for the rest of the file.
-///
-/// Errors from fadvise are advisory and silently ignored.
-/// `DONTNEED` is intentionally not issued: a registry repeatedly serves the
-/// same hot image layers, and evicting their pages would penalise concurrent
-/// and subsequent readers sharing the page cache.
+/// `posix_fadvise` hints: `Sequential` for full reads (doubles kernel readahead),
+/// `WillNeed` for range reads. `DONTNEED` not issued: hot layers share the page cache.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn advise_blob(file: &std::fs::File, start: u64, len: u64, total_size: u64) {
     use rustix::fs::{fadvise, Advice};
@@ -204,11 +159,8 @@ fn advise_blob(file: &std::fs::File, start: u64, len: u64, total_size: u64) {
 
     let is_full = start == 0 && len == total_size;
     if is_full {
-        // Sequential: kernel doubles readahead, optimal for a linear stream.
         let _ = fadvise(file, 0, None, Advice::Sequential);
     } else {
-        // Range read: advise WillNeed over the requested window so the kernel
-        // initiates readahead for those pages.
         if let Some(nz) = NonZeroU64::new(len) {
             let _ = fadvise(file, start, Some(nz), Advice::WillNeed);
         }
@@ -219,67 +171,45 @@ fn advise_blob(file: &std::fs::File, start: u64, len: u64, total_size: u64) {
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn advise_blob(_file: &std::fs::File, _start: u64, _len: u64, _total_size: u64) {}
 
-/// The derived links one manifest push commits **atomically with the manifest
-/// itself** (one WAL record — SECURITY §Storage boundary "GC as an integrity
-/// property"): backref edges and, for a manifest carrying `subject`, its
-/// referrer registration. A crash can never leave a stored manifest whose
-/// blobs look unreferenced to GC.
+/// Links committed atomically with a manifest (SECURITY §Storage boundary
+/// "GC as an integrity property"): backrefs and optional referrer registration.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ManifestLinks<'a> {
-    /// Every object the manifest references — config, layers, image-index
-    /// children, and `subject` — recorded as `object → manifest` backrefs.
+    /// All referenced objects, recorded as `object → manifest` backrefs.
     pub references: &'a [Digest],
-    /// The subset of `references` that MUST be present in the repository
-    /// (config + layers). The backend re-checks them under the GC fence held
-    /// through the metadata commit, so no sweep can remove one between the
-    /// client-facing existence check and the commit
-    /// ([`StorageError::MissingReference`] otherwise).
+    /// Subset of `references` that must exist; re-checked under the GC fence.
     pub required: &'a [Digest],
-    /// `(subject digest, referrer descriptor JSON)` when the manifest carries a
-    /// `subject`; the descriptor is stored with the subject link merged in.
+    /// Subject digest + referrer descriptor JSON when the manifest has a `subject`.
     pub subject: Option<(&'a Digest, &'a [u8])>,
 }
 
 /// The registry storage contract. AuthN/AuthZ is enforced *before* any call
 /// into this trait (ARCHITECTURE.md invariant 3).
 pub trait Storage: Send + Sync + 'static {
-    /// Whether a blob exists, returning its size.
     fn blob_size(
         &self,
         repo: &str,
         digest: &Digest,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send;
-    /// Whether a blob is present in the CAS. A dedicated presence check the
-    /// manifest push path uses to enforce referenced-blob existence; cheaper
-    /// than [`Storage::blob_size`] for the common absent case (the presence
-    /// filter answers a definite miss without a `stat`).
     fn blob_exists(
         &self,
         repo: &str,
         digest: &Digest,
     ) -> impl Future<Output = Result<bool, StorageError>> + Send;
-    /// Read a whole blob (used by manifests; large blobs stream via [`Storage::open_blob`]).
     fn read_blob(
         &self,
         repo: &str,
         digest: &Digest,
     ) -> impl Future<Output = Result<Vec<u8>, StorageError>> + Send;
-    /// Open a blob for a GET: its size plus a streamable body (or a redirect).
     fn open_blob(
         &self,
         repo: &str,
         digest: &Digest,
     ) -> impl Future<Output = Result<BlobRead, StorageError>> + Send;
-    /// Begin a chunked upload session, returning its id.
     fn begin_upload(&self, repo: &str)
         -> impl Future<Output = Result<String, StorageError>> + Send;
-    /// Stream `body` onto an upload session, returning the new total size. When
-    /// `expected_offset` is `Some(n)`, the current committed size MUST equal
-    /// `n` (a `Content-Range` precondition checked *inside* the session lock so
-    /// two concurrent PATCHes cannot both pass an out-of-lock check) — a
-    /// mismatch yields [`StorageError::RangeNotSatisfiable`]. A body over
-    /// `limit` bytes is [`StorageError::TooLarge`]; any failure leaves the
-    /// session exactly as it was (never whole-blob buffered, invariant 4).
+    /// Append `body` to a session, returning new size. `expected_offset` enforces
+    /// a `Content-Range` precondition under the session lock.
     fn append_upload(
         &self,
         repo: &str,
@@ -294,33 +224,22 @@ pub trait Storage: Send + Sync + 'static {
         repo: &str,
         id: &str,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send;
-    /// Abort an in-progress upload session, discarding its staging file.
-    /// Idempotent: returns `Ok(true)` if a session was removed, `Ok(false)` if
-    /// none existed.
+    /// Abort a session. Returns whether one was removed.
     fn abort_upload(
         &self,
         repo: &str,
         id: &str,
     ) -> impl Future<Output = Result<bool, StorageError>> + Send;
-    /// Mount a blob from `from_repo` into `to_repo` without re-uploading it
-    /// (dist-spec end-11 cross-repository blob mount). Returns `Ok(true)` when
-    /// the blob was present in `from_repo` and is now linked into `to_repo`;
-    /// `Ok(false)` when the source blob is absent or the backends cannot share
-    /// it (the caller falls back to a normal upload session). No blob bytes
-    /// pass through memory: the backend links or copies server-side.
+    /// Cross-repo blob mount (dist-spec end-11). `Ok(true)` = mounted;
+    /// `Ok(false)` = absent/incompatible (caller falls back to upload).
     fn mount_blob(
         &self,
         from_repo: &str,
         to_repo: &str,
         digest: &Digest,
     ) -> impl Future<Output = Result<bool, StorageError>> + Send;
-    /// Finalize an upload: under the session lock, stream `trailing` (a
-    /// monolithic PUT's body — at most `limit` bytes — empty for a plain
-    /// finalize) atomically with the
-    /// verify+promote so a concurrent PATCH cannot inject bytes between the
-    /// trailing append and the finalize hash; verify it hashes to `expected` and
-    /// does not exceed `max_size` bytes (the per-session cap, re-checked here
-    /// under the lock so a promote cannot race the cap); then move it into the CAS.
+    /// Finalize an upload: append `trailing`, verify digest, promote to CAS.
+    /// Atomically locked so a concurrent PATCH cannot inject bytes mid-finalize.
     fn finish_upload(
         &self,
         repo: &str,
@@ -343,9 +262,7 @@ pub trait Storage: Send + Sync + 'static {
         repo: &str,
         digest: &Digest,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
-    /// Store a manifest by digest, (optionally) associate a tag, and record its
-    /// [`ManifestLinks`] — manifest, tag, backrefs and referrer land in **one**
-    /// metadata record, so a crash never desynchronizes them.
+    /// Store a manifest + tag + [`ManifestLinks`] in one atomic metadata record.
     fn put_manifest(
         &self,
         repo: &str,
@@ -367,21 +284,14 @@ pub trait Storage: Send + Sync + 'static {
         repo: &str,
         digest: &Digest,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
-    /// One page of `repo`'s tags in lexical order: at most `limit` tags
-    /// strictly after `last` (from the start when `None`, whether or not
-    /// `last` itself still exists). Per-request work is bounded by the page,
-    /// not the repo (SECURITY inv. 14).
+    /// Paginated tags in lexical order, bounded per page (SECURITY inv. 14).
     fn list_tags(
         &self,
         repo: &str,
         last: Option<&str>,
         limit: usize,
     ) -> impl Future<Output = Result<Page<String>, StorageError>> + Send;
-    /// One page of the referrers recorded for `subject` as
-    /// `(referrer_digest, descriptor_json)`, ordered by referrer digest: at
-    /// most `limit` entries strictly after `last`, restricted to descriptors
-    /// whose `artifactType` equals `artifact_type` when given. Per-request work
-    /// is bounded by the page, not the subject's referrer set.
+    /// Paginated referrers for `subject`, optionally filtered by `artifact_type`.
     fn list_referrers(
         &self,
         repo: &str,
@@ -392,21 +302,13 @@ pub trait Storage: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Page<Referrer>, StorageError>> + Send;
 }
 
-/// The server-driven lifecycle of a concrete backend, on top of the request
-/// surface: startup recovery before any request is served, then background
-/// maintenance until shutdown. The routing layer fans both out to every
-/// backend of a multi-path registry.
+/// Backend lifecycle: recovery, maintenance, and shutdown.
 pub trait StorageBackend: Storage {
-    /// Startup recovery (e.g. referrers enable-upgrade, `index.json`
-    /// reconciliation with the replayed metadata log). Run once, before
-    /// serving.
+    /// One-time startup recovery (before serving).
     fn recover(&self) -> impl Future<Output = ()> + Send;
-    /// Start the enabled background subsystems (GC, scrub, metadata upkeep);
-    /// every task stops when `shutdown` becomes `true`.
+    /// Start background subsystems; each stops when `shutdown` becomes `true`.
     fn start_maintenance(&self, shutdown: tokio::sync::watch::Receiver<bool>);
-    /// Graceful-shutdown hook: persist state that speeds up the next start
-    /// (e.g. the fast-restart stamp). Best-effort: a failure is logged but
-    /// does not prevent the process from exiting.
+    /// Best-effort state persistence for faster restart.
     fn on_shutdown(&self) {}
     /// Readiness probe: returns `Ok(())` when the backend is ready to serve
     /// writes, or a [`StorageError`] describing why not. The default is
@@ -415,4 +317,36 @@ pub trait StorageBackend: Storage {
     fn ready(&self) -> impl Future<Output = Result<(), StorageError>> + Send {
         std::future::ready(Ok(()))
     }
+}
+
+/// Run `task` every `period` until `shutdown` flips; slow runs delay the next tick.
+pub fn spawn_periodic<S, F, Fut>(
+    store: S,
+    name: &'static str,
+    period: std::time::Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    task: F,
+) where
+    S: Clone + Send + 'static,
+    F: Fn(S) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ticks.tick() => {
+                    task(store.clone())
+                        .instrument(tracing::info_span!("storage.maintenance", task = name))
+                        .await;
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }

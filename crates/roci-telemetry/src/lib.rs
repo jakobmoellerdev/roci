@@ -1,20 +1,11 @@
-//! Telemetry setup for roci: tracing / logging / metrics initialization.
-//!
-//! **Minimal build** (no `otel` feature): structured `fmt` subscriber only,
-//! honoring `log.level` (RUST_LOG overrides) and `log.format` (text or JSON).
-//! Metrics endpoint unavailable — configured `telemetry.otlp` / `metrics.enabled`
-//! log a warning and are otherwise ignored.
-//!
-//! **`otel` feature**: OTLP export of traces + metrics + logs via
-//! `opentelemetry_sdk`, a Prometheus text scrape view of the same meters, and a
-//! `tracing-opentelemetry` bridge so every `tracing` span is an OTel span.
+//! Telemetry: tracing / logging / metrics initialization.
+//! Minimal build = `fmt` subscriber; `otel` feature adds OTLP export +
+//! Prometheus scrape.
 #![forbid(unsafe_code)]
 
 use roci_config::{Config, LogFormat};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
-
-// ── Metrics recording (cheap no-ops in minimal) ─────────────────────────
 
 #[cfg(feature = "otel")]
 mod metrics;
@@ -27,97 +18,37 @@ pub use metrics::{
     record_upload_active, record_upload_bytes, record_upload_finalize,
 };
 
-/// Record a completed request (duration histogram + error counter).
-/// No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_request(
-    _endpoint: &str,
-    _method: &str,
-    _status: u16,
-    _duration: std::time::Duration,
-) {
+/// No-op metric recorders for builds without `otel`.
+macro_rules! noop {
+    ($($name:ident($($arg:ty),*));* $(;)?) => {
+        $(
+            #[cfg(not(feature = "otel"))]
+            #[inline(always)]
+            #[allow(clippy::too_many_arguments)]
+            pub fn $name($(_: $arg),*) {}
+        )*
+    }
 }
 
-/// Increment the error counter. No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_error(_error_code: &str) {}
+noop! {
+    record_request(&str, &str, u16, std::time::Duration);
+    record_error(&str);
+    record_gc_collected(&str, u64);
+    record_scrub(&str, u64);
+    record_dedupe_link(&str, &str);
+    record_quota_rejection(&str);
+    record_blocking_hop(&'static str);
+    record_auth_decision(&str, &str);
+    record_meta_wal_append();
+    record_meta_wal_batch_size(u64);
+    record_meta_compaction(&str);
+    record_meta_snapshot(&str);
+    record_upload_active(i64);
+    record_upload_bytes(u64);
+    record_upload_finalize(&str);
+}
 
-/// Count one object reclaimed by GC (`kind` = `blob`/`upload`) and its bytes.
-/// No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_gc_collected(_kind: &str, _bytes: u64) {}
-
-/// Count one scrubbed blob by `result` (`ok`/`repaired`/`corrupt`) and the
-/// bytes read. No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_scrub(_result: &str, _bytes: u64) {}
-
-/// Count one cross-repo promotion by `op` (`mount`/`dedupe`) and `mechanism`
-/// (`reflink`/`hardlink`/`copy`/`existing`). No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_dedupe_link(_op: &str, _mechanism: &str) {}
-
-/// Count one write rejected by a quota (`repository`/`total`/`sessions`).
-/// No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_quota_rejection(_scope: &str) {}
-
-/// Count one hand-off to the blocking pool by `op`. No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_blocking_hop(_op: &'static str) {}
-
-/// Count one authentication/authorization decision by `method` and `result`.
-/// No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_auth_decision(_method: &str, _result: &str) {}
-
-/// Count one WAL record appended. No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_meta_wal_append() {}
-
-/// Record a group-commit batch size. No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_meta_wal_batch_size(_batch: u64) {}
-
-/// Count one metadata compaction by result. No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_meta_compaction(_result: &str) {}
-
-/// Count one metadata snapshot by result. No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_meta_snapshot(_result: &str) {}
-
-/// Adjust the active upload session gauge. No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_upload_active(_delta: i64) {}
-
-/// Count bytes received into an upload session. No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_upload_bytes(_bytes: u64) {}
-
-/// Count one upload finalization by result. No-op in minimal builds.
-#[cfg(not(feature = "otel"))]
-#[inline(always)]
-pub fn record_upload_finalize(_result: &str) {}
-
-// ── Guard ───────────────────────────────────────────────────────────────
-
-/// Holds OTel providers; flushes + shuts them down on drop. In minimal builds
-/// this is a zero-size token.
+/// OTel provider guard; flushes on drop. Zero-size without `otel`.
 pub struct TelemetryGuard {
     #[cfg(feature = "otel")]
     _trace_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
@@ -144,17 +75,8 @@ impl Drop for TelemetryGuard {
     }
 }
 
-// ── init ────────────────────────────────────────────────────────────────
-
-/// Initialize the tracing subscriber, optional OTel providers, and metrics.
-///
-/// - `RUST_LOG` overrides `config.log.level`.
-/// - `config.log.format` selects plain-text or JSON output.
-/// - With `otel`: OTLP export when `config.telemetry.otlp` is set; Prometheus
-///   scrape view when `config.telemetry.metrics.enabled`.
-///
-/// Returns a [`TelemetryGuard`] whose drop flushes providers. Call once at
-/// startup; a second call returns an error (global subscriber already set).
+/// Initialize tracing subscriber and optional OTel providers.
+/// Returns a [`TelemetryGuard`] whose drop flushes providers.
 pub fn init(config: &Config) -> anyhow::Result<TelemetryGuard> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log.level));
@@ -230,7 +152,6 @@ fn init_otel(config: &Config, filter: EnvFilter) -> anyhow::Result<TelemetryGuar
     // ── Log provider ────────────────────────────────────────────────
     let log_provider = build_log_provider(config, resource)?;
 
-    // ── Compose subscriber layers ───────────────────────────────────
     let otel_trace_layer = tracing_opentelemetry::layer().with_tracer(tracer);
     let otel_log_layer =
         opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&log_provider);
@@ -320,8 +241,6 @@ fn build_log_provider(
     Ok(builder.build())
 }
 
-// ── OTLP exporter builders ─────────────────────────────────────────────
-
 #[cfg(feature = "otel")]
 fn otlp_trace_exporter(
     otlp: &roci_config::OtlpConfig,
@@ -379,19 +298,13 @@ fn otlp_log_exporter(
     Ok(exporter)
 }
 
-/// OTLP/HTTP posts each signal to `<base>/v1/<signal>` (OTLP spec, as with
-/// `OTEL_EXPORTER_OTLP_ENDPOINT`); an explicit `with_endpoint` is used verbatim
-/// by the exporter, so the signal path is appended here.
+/// Append `/v1/{signal}` to the base OTLP endpoint (OTLP spec).
 #[cfg(feature = "otel")]
 fn http_signal_url(base: &str, signal: &str) -> String {
     format!("{}/v1/{signal}", base.trim_end_matches('/'))
 }
 
-// ── Metrics router (Prometheus scrape) ─────────────────────────────────
-
-/// Returns an axum [`Router`] serving the Prometheus text scrape endpoint
-/// when `otel` is enabled and `config.telemetry.metrics.enabled` is true.
-/// Otherwise returns an empty router (zero overhead on the request path).
+/// Prometheus text scrape router; empty without `otel` or when disabled.
 pub fn metrics_router(config: &Config) -> axum::Router {
     #[cfg(feature = "otel")]
     {
@@ -408,22 +321,14 @@ pub fn metrics_router(config: &Config) -> axum::Router {
     axum::Router::new()
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn minimal_init_text_format() {
-        // Each test process can only set the global subscriber once; this test
-        // verifies the non-otel path doesn't panic and returns a guard.
         let config = Config::default();
         let guard = init(&config);
-        // In multi-test binaries the second init may fail (subscriber already
-        // set), which is fine — we just care that the first one succeeds.
-        if let Ok(_g) = guard {
-            // Guard exists and is droppable.
-        }
+        if let Ok(_g) = guard {}
     }
 }

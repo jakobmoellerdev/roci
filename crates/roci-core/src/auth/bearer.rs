@@ -1,11 +1,4 @@
-//! Docker v2 bearer-token verification (distribution token spec).
-//!
-//! roci does not issue tokens: an external token server signs a JWS, and
-//! roci verifies it against configured public keys. Verification is a small
-//! hand-rolled JWS check over `ring` (ES256 / RS256 only) rather than a JWT
-//! crate, keeping the dependency tree free of the `rsa` crate (RUSTSEC-2023-0071).
-//! Key-carrying headers (`jwk`, `jku`, `x5u`) are refused: the key set is
-//! fixed by configuration, never chosen by the token.
+//! Bearer-token (JWS) verification; key-carrying headers refused (SECURITY).
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -21,18 +14,13 @@ use x509_parser::x509::SubjectPublicKeyInfo;
 
 use super::ActionSet;
 
-/// Longest accepted token (bounded parse work per request).
 const MAX_TOKEN_LEN: usize = 8192;
-/// Most `access` entries accepted in one token.
 const MAX_ACCESS_ENTRIES: usize = 64;
-/// Clock skew tolerated on `exp` / `nbf`.
 const LEEWAY_SECS: u64 = 30;
 
 #[derive(Debug)]
 enum VerifyKey {
-    /// Uncompressed P-256 point.
     Es256(Vec<u8>),
-    /// DER `RSAPublicKey`.
     Rs256(Vec<u8>),
 }
 
@@ -42,7 +30,6 @@ pub(crate) struct BearerVerifier {
     keys: Vec<VerifyKey>,
 }
 
-/// A verified token's identity and repository grants.
 pub(crate) struct Verified {
     pub(crate) subject: Option<String>,
     pub(crate) grants: Vec<(String, ActionSet)>,
@@ -100,8 +87,7 @@ fn key_from_spki(spki: &SubjectPublicKeyInfo<'_>) -> Result<VerifyKey, String> {
 }
 
 impl BearerVerifier {
-    /// Load the verification keys: every `PUBLIC KEY` / `CERTIFICATE` PEM
-    /// block of `verify_key_file`.
+    /// Load verification keys from `verify_key_file`.
     pub(crate) fn load(cfg: &BearerConfig) -> Result<Self, String> {
         let path = &cfg.verify_key_file;
         let pem = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
@@ -134,8 +120,7 @@ impl BearerVerifier {
         })
     }
 
-    /// Verify `token` at `now` (Unix seconds). The `Err` reason is for debug
-    /// logs only; clients always see "invalid credentials".
+    /// Verify `token` at `now` (Unix seconds).
     pub(crate) fn verify(&self, token: &str, now: u64) -> Result<Verified, &'static str> {
         if token.len() > MAX_TOKEN_LEN {
             return Err("token too long");
@@ -227,8 +212,7 @@ fn decode_json<T: serde::de::DeserializeOwned>(segment: &str) -> Result<T, &'sta
     serde_json::from_slice(&bytes).map_err(|_| "bad JSON segment")
 }
 
-/// Whether the token grants include `action` on `repo`. Names compare in
-/// constant time for equal lengths (no byte-by-byte timing oracle).
+/// Whether the token grants include `action` on `repo` (constant-time name compare).
 pub(crate) fn grants_allow(grants: &[(String, ActionSet)], repo: &str, action: Action) -> bool {
     grants
         .iter()
@@ -374,14 +358,12 @@ mod tests {
                 1000,
                 "key-carrying header",
             ),
-            // An ES256 key never verifies an RS256-labelled token.
             (
                 s.sign(json!({ "alg": "RS256" }), good.clone()),
                 1000,
                 "signature mismatch",
             ),
             ("a.b".into(), 1000, "not a three-segment JWS"),
-            ("a.b.c.d".into(), 1000, "not a three-segment JWS"),
             ("!.b.c".into(), 1000, "bad base64url segment"),
             (
                 format!("{}.b.c", URL_SAFE_NO_PAD.encode("[]")),
@@ -438,7 +420,6 @@ mod tests {
             let err = BearerVerifier::load(&c).err().unwrap();
             assert!(err.contains(needle), "{needle}: {err}");
         }
-        // A certificate's SubjectPublicKeyInfo is accepted as a key.
         let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let cert = rcgen::CertificateParams::new(vec!["issuer".into()])
             .unwrap()

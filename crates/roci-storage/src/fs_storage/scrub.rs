@@ -1,5 +1,4 @@
-//! Background data scrubbing for the filesystem backend: staggered, adaptive
-//! CRC32C verification escalating to a full digest re-hash on mismatch.
+//! Background data scrubbing: staggered CRC32C verification with digest re-hash escalation.
 
 use super::super::FsStorage;
 use super::paths::blob_rel;
@@ -13,28 +12,18 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
-// ── Filesystem-type detection ───────────────────────────────────────────
-
-// Well-known `f_type` / `f_fstypename` magic values for self-checksumming
-// filesystems that run their own data scrub. The classification is kept in a
-// pure function over the fs-type value so it can be unit-tested without a
-// real btrfs/ZFS volume.
-
-/// Linux `statfs::f_type` magic numbers.
 #[cfg(target_os = "linux")]
 const BTRFS_SUPER_MAGIC: u64 = 0x9123_683E;
 #[cfg(target_os = "linux")]
 const ZFS_SUPER_MAGIC: u64 = 0x2FC1_2FC1;
 
-/// Given the filesystem type magic (Linux `f_type`), decide whether the FS
-/// does its own checksumming.
+/// Whether `f_type` is a self-checksumming FS (btrfs/ZFS).
 #[cfg(target_os = "linux")]
 pub(crate) fn fs_is_self_checksumming_linux(f_type: u64) -> bool {
     matches!(f_type, BTRFS_SUPER_MAGIC | ZFS_SUPER_MAGIC)
 }
 
-/// Given the raw `f_fstypename` bytes (macOS/BSD `statfs`), decide whether
-/// the FS does its own checksumming.
+/// Whether `f_fstypename` is a self-checksumming FS (btrfs/ZFS).
 #[cfg(target_os = "macos")]
 pub(crate) fn fs_is_self_checksumming_macos(fstypename: &[i8]) -> bool {
     let bytes: Vec<u8> = fstypename
@@ -46,12 +35,10 @@ pub(crate) fn fs_is_self_checksumming_macos(fstypename: &[i8]) -> bool {
     matches!(name, "zfs" | "btrfs")
 }
 
-/// Detect whether the store root sits on a self-checksumming filesystem.
-/// Returns `true` when the app scrub should be **delegated** (i.e. skipped).
+/// True when the store root's FS does its own checksumming.
 #[cfg(target_os = "linux")]
 fn detect_self_checksumming_fs(root: &Path) -> io::Result<bool> {
     let st = rustix::fs::statfs(root).map_err(io::Error::from)?;
-    // On Linux, f_type is either i64 or u32 depending on arch — cast to u64.
     Ok(fs_is_self_checksumming_linux(st.f_type as u64))
 }
 
@@ -66,12 +53,7 @@ fn detect_self_checksumming_fs(_root: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-// ── Token-bucket bandwidth limiter ──────────────────────────────────────
-
-/// A simple single-threaded (call-site is `&mut`) token-bucket rate limiter
-/// for the scrub's read bandwidth. Tokens are bytes; the bucket refills at
-/// `rate` bytes/second up to `capacity`. `wait_for(n)` returns the duration
-/// the caller must sleep before consuming `n` bytes.
+/// Token-bucket rate limiter for scrub read bandwidth.
 pub(crate) struct TokenBucket {
     tokens: f64,
     rate: f64,
@@ -90,15 +72,13 @@ impl TokenBucket {
         }
     }
 
-    /// Refill tokens based on elapsed time since last call.
     fn refill(&mut self, now: std::time::Instant) {
         let elapsed = now.duration_since(self.last).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
         self.last = now;
     }
 
-    /// Return how long the caller must sleep before `n` bytes can be consumed,
-    /// then deduct them. When the bucket has enough tokens the wait is zero.
+    /// Consume `n` bytes, returning the required sleep duration.
     pub(crate) fn consume(&mut self, n: u64) -> Duration {
         let now = std::time::Instant::now();
         self.refill(now);
@@ -114,8 +94,7 @@ impl TokenBucket {
         }
     }
 
-    /// How long until `n` tokens are available, without consuming them.
-    /// Pure math helper exposed for unit tests.
+    /// Time for `n` bytes at the given rate (test helper).
     #[cfg(test)]
     pub(crate) fn time_for(bytes_per_sec: u64, deficit_bytes: u64) -> Duration {
         if bytes_per_sec == 0 {
@@ -125,9 +104,6 @@ impl TokenBucket {
     }
 }
 
-// ── Blob-inventory and staggered ordering ───────────────────────────────
-
-/// One CAS blob found during enumeration.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct BlobEntry {
     pub repo: String,
@@ -135,16 +111,13 @@ pub(crate) struct BlobEntry {
     pub size: u64,
 }
 
-/// A contiguous segment of blobs (same repo, sorted by digest) for on-disk
-/// locality during the scrub pass.
+/// Blobs from one repo, sorted by digest.
 #[derive(Debug, Clone)]
 pub(crate) struct Segment {
     pub blobs: Vec<BlobEntry>,
 }
 
-/// Enumerate all CAS blobs, group by repo (sorted by repo, then digest
-/// within each repo) into segments, then return the segments and their total
-/// count of blobs.
+/// Enumerate all CAS blobs grouped by repo into segments.
 pub(crate) fn enumerate_segments(root: &Path) -> Vec<Segment> {
     let mut entries: Vec<BlobEntry> = Vec::new();
     for_each_cas_blob(root, |repo, digest, entry| {
@@ -155,10 +128,8 @@ pub(crate) fn enumerate_segments(root: &Path) -> Vec<Segment> {
             size,
         });
     });
-    // Sort by (repo, digest) for locality.
     entries.sort();
 
-    // Group into segments by repo.
     let mut segments: Vec<Segment> = Vec::new();
     for entry in entries {
         if segments
@@ -173,9 +144,7 @@ pub(crate) fn enumerate_segments(root: &Path) -> Vec<Segment> {
     segments
 }
 
-/// Compute the staggered visit order: in round `r` we visit the `r`-th blob
-/// of every segment, so a full pass samples the whole store early. Returns
-/// `(segment_index, blob_index_within_segment)` pairs.
+/// Staggered visit order: round-robin across segments.
 pub(crate) fn staggered_order(segments: &[Segment]) -> Vec<(usize, usize)> {
     let max_len = segments.iter().map(|s| s.blobs.len()).max().unwrap_or(0);
     let mut order = Vec::new();
@@ -189,10 +158,7 @@ pub(crate) fn staggered_order(segments: &[Segment]) -> Vec<(usize, usize)> {
     order
 }
 
-/// Given a staggered order and a corruption at `(corrupt_seg, corrupt_blob)`,
-/// rewrite the remaining order to drain the rest of `corrupt_seg` immediately,
-/// then resume the original staggered order for other segments. `already_done`
-/// is how many entries of `order` have been consumed. Returns the new tail.
+/// Reorder remaining entries to drain the corrupt segment first.
 pub(crate) fn adaptive_reorder(
     order: &[(usize, usize)],
     already_done: usize,
@@ -200,8 +166,6 @@ pub(crate) fn adaptive_reorder(
     _segments: &[Segment],
 ) -> Vec<(usize, usize)> {
     let remaining = &order[already_done..];
-    // Partition: corrupt-segment entries first (drain immediately for bit-rot
-    // locality), then the rest preserving their staggered interleave.
     let mut drain: Vec<(usize, usize)> = Vec::new();
     let mut rest: Vec<(usize, usize)> = Vec::new();
     for &(si, bi) in remaining {
@@ -215,10 +179,6 @@ pub(crate) fn adaptive_reorder(
     drain
 }
 
-// ── Quarantine helpers ──────────────────────────────────────────────────
-
-/// Build a flat, validated quarantine leaf name from repo+digest+timestamp.
-/// Encoding: `<repo with / replaced by __>---<digest with : replaced by _>---<ts_ms>`.
 fn quarantine_leaf(repo: &str, digest: &str) -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -229,13 +189,9 @@ fn quarantine_leaf(repo: &str, digest: &str) -> String {
     format!("{safe_repo}---{safe_digest}---{ts}")
 }
 
-/// The quarantine directory path relative to root: `.roci-quarantine`.
-/// Starts with `.` so `discover_repos` skips it.
+/// Quarantine dir (dot-prefixed, invisible to `discover_repos`).
 const QUARANTINE_DIR: &str = ".roci-quarantine";
 
-/// Move a corrupt blob into quarantine beneath the store root. The quarantine
-/// directory is a dot-dir (never discoverable as a repo). Uses `renameat`
-/// between dirfds walked no-follow beneath root.
 async fn quarantine_blob(
     root: &Path,
     repo: &str,
@@ -260,20 +216,13 @@ async fn quarantine_blob(
     .await
 }
 
-// ── Per-blob verification ───────────────────────────────────────────────
-
-/// The result of verifying one blob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScrubResult {
-    /// Verified: the CRC32C matched the recorded checksum, or — with no
-    /// checksum recorded yet — the full digest matched and one was recorded.
+    /// CRC or digest verified.
     Ok,
-    /// A wrong checksum record (CRC or size) was found but the full digest
-    /// matched; the record was corrected.
+    /// Wrong checksum record corrected after digest match.
     Repaired,
-    /// The digest did not match: the blob is corrupt.
     Corrupt,
-    /// The blob disappeared mid-pass (deleted/GC'd); skipped.
     Skipped,
 }
 
@@ -289,14 +238,12 @@ impl ScrubResult {
 }
 
 impl FsStorage {
-    /// Verify one blob: CRC32C fast check, escalating to full digest re-hash.
     async fn scrub_one_blob(&self, repo: &str, digest_str: &str) -> (ScrubResult, u64) {
         let digest = match Digest::parse(digest_str) {
             Ok(d) => d,
             Err(_) => return (ScrubResult::Skipped, 0),
         };
 
-        // Open the blob beneath root, no-follow.
         let rel = match blob_rel(repo, &digest) {
             Ok(r) => r,
             Err(_) => return (ScrubResult::Skipped, 0),
@@ -310,37 +257,29 @@ impl FsStorage {
             }
         };
 
-        // Get the file's actual size.
         let file_size = match file.metadata().await {
             Ok(m) => m.len(),
             Err(_) => return (ScrubResult::Skipped, 0),
         };
 
-        // Check recorded checksum.
         let recorded = self.meta.checksum(repo, digest_str);
 
-        // If we have a recorded checksum with matching size, try the fast CRC32C check.
         if let Some(cksum) = &recorded {
             if cksum.size == file_size {
-                // Stream a CRC32C over the blob.
                 let crc_result = crc32c_of_file(file).await;
                 match crc_result {
                     Ok((crc, bytes_read)) => {
                         if crc == cksum.crc32c {
                             return (ScrubResult::Ok, bytes_read);
                         }
-                        // CRC mismatch — fall through to full re-hash.
                     }
                     Err(_) => return (ScrubResult::Skipped, 0),
                 }
             }
-            // Size mismatch or CRC mismatch — fall through to full re-hash.
         }
 
-        // Escalate: full digest re-hash.  Capture the opened fd's inode
-        // identity *before* hashing so we can re-verify after acquiring the
-        // exclusive fence (a concurrent delete+re-push could install a valid
-        // replacement; we must not quarantine that).
+        // SECURITY: capture inode identity before hashing — a concurrent
+        // delete+re-push may install a valid replacement we must not quarantine.
         let file2 = match open_beneath(&self.root, &rel).await {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return (ScrubResult::Skipped, 0),
@@ -360,8 +299,6 @@ impl FsStorage {
         };
 
         if computed_digest.ct_eq(&digest) {
-            // Digest matches — record the correct checksum: `repaired` when a
-            // wrong record existed, `ok` for a first-time bootstrap.
             let had_wrong = recorded.is_some();
             if let Err(e) = self.meta.apply_relaxed(MetaOp::PutChecksum {
                 repo: repo.to_string(),
@@ -378,8 +315,6 @@ impl FsStorage {
             };
             (result, file_size)
         } else {
-            // Corrupt: quarantine the blob under the exclusive GC fence so a
-            // concurrent write path cannot race with the rename.
             tracing::error!(
                 repo = repo,
                 digest = digest_str,
@@ -387,8 +322,7 @@ impl FsStorage {
             );
             let _fence = self.gc.exclusive().await;
 
-            // Re-verify the path still names the inode we hashed: a concurrent
-            // delete+re-push may have replaced the file since our hash.
+            // SECURITY: re-verify inode identity after acquiring fence.
             let path_ino = {
                 let full = self.root.join(&rel);
                 match std::fs::symlink_metadata(&full) {
@@ -397,15 +331,11 @@ impl FsStorage {
                         (m.dev(), m.ino())
                     }
                     Err(_) => {
-                        // Path gone — nothing to quarantine.
                         return (ScrubResult::Corrupt, file_size);
                     }
                 }
             };
             if path_ino != hashed_ino {
-                // A different inode is now at the path — the corrupt data was
-                // already replaced; skip quarantine (the new file is presumed
-                // valid until next scrub).
                 tracing::info!(
                     repo,
                     digest = digest_str,
@@ -414,17 +344,13 @@ impl FsStorage {
                 return (ScrubResult::Corrupt, file_size);
             }
 
-            // Quarantine this repo's copy.
             match quarantine_blob(&self.root, repo, &digest, digest_str).await {
                 Ok(()) => {
                     self.blob_left(repo, digest_str, Some(file_size));
                 }
                 Err(e) => {
-                    // Rename failed: leave the corrupt file in place for the
-                    // next pass. Do NOT call blob_left — the CAS file is still
-                    // present, and clearing bookkeeping would allow the next
-                    // restart to reseed and serve the known-bad bytes without
-                    // recourse, and would permanently undercount quota.
+                    // SECURITY: do NOT call blob_left — the CAS file persists;
+                    // clearing bookkeeping would serve known-bad bytes.
                     tracing::error!(
                         repo = repo,
                         digest = digest_str,
@@ -435,10 +361,6 @@ impl FsStorage {
                 }
             }
 
-            // Hard-link fallback shares one inode across repositories.
-            // Quarantine every other repo's hard-linked copy (same dev+ino)
-            // of this digest so those repos can't continue serving the bad
-            // bytes until a later scrub pass discovers them independently.
             self.quarantine_hard_linked_copies(digest_str, &digest, hashed_ino, repo)
                 .await;
 
@@ -446,9 +368,7 @@ impl FsStorage {
         }
     }
 
-    /// Quarantine all other repos' hard-linked copies of `digest` that share
-    /// the same `(dev, ino)` as the already-quarantined copy. Called under
-    /// the exclusive GC fence.
+    /// Quarantine hard-linked copies sharing `corrupt_ino` (called under GC fence).
     async fn quarantine_hard_linked_copies(
         &self,
         digest_str: &str,
@@ -460,7 +380,6 @@ impl FsStorage {
         let digest_clone = digest.clone();
         let corrupt_ino_val = corrupt_ino;
         let already_repo = already_quarantined_repo.to_string();
-        // Collect repos whose CAS copy of this digest shares the corrupt inode.
         let linked: Vec<(String, u64)> = {
             let root = root.clone();
             let digest_c = digest_clone.clone();
@@ -507,8 +426,7 @@ impl FsStorage {
         }
     }
 
-    /// Run one full scrub pass over the store. Exposed internally (and to
-    /// tests) so a pass can be driven without timers.
+    /// Run one full scrub pass over the store.
     #[tracing::instrument(skip_all, name = "scrub.pass")]
     pub(crate) async fn scrub_pass(&self) {
         let root = self.root.clone();
@@ -532,7 +450,6 @@ impl FsStorage {
             let (seg_idx, blob_idx) = current_order[pos];
             let entry = &segments[seg_idx].blobs[blob_idx];
 
-            // Rate-limit: wait based on the blob's size.
             let delay = bucket.consume(entry.size);
             if delay > Duration::ZERO {
                 tokio::time::sleep(delay).await;
@@ -545,8 +462,6 @@ impl FsStorage {
                 ScrubResult::Repaired => counts.repaired += 1,
                 ScrubResult::Corrupt => {
                     counts.corrupt += 1;
-                    // Adaptive: on corruption, drain the rest of this segment
-                    // immediately before resuming the staggered order.
                     let new_tail = adaptive_reorder(&current_order, pos + 1, seg_idx, &segments);
                     current_order.truncate(pos + 1);
                     current_order.extend(new_tail);
@@ -568,12 +483,10 @@ impl FsStorage {
         );
     }
 
-    /// Start the scrub background task. Called from `start_maintenance` when
-    /// `config.scrub.enabled` is true.
+    /// Start the scrub background task.
     pub(crate) fn start_scrub(&self, shutdown: tokio::sync::watch::Receiver<bool>) {
         let mode = self.config.scrub.mode;
 
-        // Auto-mode delegation check.
         if mode == roci_config::ScrubMode::Auto {
             match detect_self_checksumming_fs(&self.root) {
                 Ok(true) => {
@@ -583,9 +496,7 @@ impl FsStorage {
                     );
                     return;
                 }
-                Ok(false) => {
-                    // Not a self-checksumming FS — run the app pass.
-                }
+                Ok(false) => {}
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -596,13 +507,18 @@ impl FsStorage {
         }
 
         let interval = Duration::from_secs(self.config.scrub.interval_secs);
-        self.spawn_periodic("scrub.pass", interval, shutdown, |s| async move {
-            s.scrub_pass().await;
-        });
+        crate::storage::spawn_periodic(
+            self.clone(),
+            "scrub.pass",
+            interval,
+            shutdown,
+            |s| async move {
+                s.scrub_pass().await;
+            },
+        );
     }
 }
 
-/// Stream CRC32C of an already-opened file, returning `(crc, bytes_read)`.
 async fn crc32c_of_file(mut file: tokio::fs::File) -> io::Result<(u32, u64)> {
     let mut crc = 0u32;
     let mut total = 0u64;
@@ -627,108 +543,85 @@ struct ScrubCounts {
     bytes: u64,
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::digest::sha256_of;
+    use crate::storage::Storage;
 
-    // ── FS-type detection ───────────────────────────────────────────
+    fn store() -> (tempfile::TempDir, FsStorage) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path()).unwrap();
+        (dir, s)
+    }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn fs_detection_btrfs() {
-        assert!(fs_is_self_checksumming_linux(BTRFS_SUPER_MAGIC));
+    fn store_with(config: &roci_config::StorageConfig) -> (tempfile::TempDir, FsStorage) {
+        let dir = tempfile::tempdir().unwrap();
+        let quota = std::sync::Arc::new(crate::quota::QuotaTracker::default());
+        let s = FsStorage::with_config(dir.path(), config, quota).unwrap();
+        (dir, s)
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn fs_detection_zfs() {
-        assert!(fs_is_self_checksumming_linux(ZFS_SUPER_MAGIC));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn fs_detection_ext4_not_checksumming() {
-        // ext4 magic: 0xEF53
-        assert!(!fs_is_self_checksumming_linux(0xEF53));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn fs_detection_xfs_not_checksumming() {
-        // XFS magic: 0x58465342
-        assert!(!fs_is_self_checksumming_linux(0x5846_5342));
+    fn fs_detection_linux() {
+        for (label, magic, expected) in [
+            ("btrfs", BTRFS_SUPER_MAGIC, true),
+            ("zfs", ZFS_SUPER_MAGIC, true),
+            ("ext4", 0xEF53_u64, false),
+            ("xfs", 0x5846_5342_u64, false),
+        ] {
+            assert_eq!(fs_is_self_checksumming_linux(magic), expected, "{label}");
+        }
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn fs_detection_zfs_macos() {
-        let mut name = [0i8; 16];
-        for (i, &b) in b"zfs".iter().enumerate() {
-            name[i] = b as i8;
+    fn fs_detection_macos() {
+        fn name(s: &[u8]) -> [i8; 16] {
+            let mut out = [0i8; 16];
+            for (i, &b) in s.iter().enumerate() {
+                out[i] = b as i8;
+            }
+            out
         }
-        assert!(fs_is_self_checksumming_macos(&name));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn fs_detection_apfs_not_checksumming() {
-        let mut name = [0i8; 16];
-        for (i, &b) in b"apfs".iter().enumerate() {
-            name[i] = b as i8;
+        for (label, fsname, expected) in [
+            ("zfs", b"zfs" as &[u8], true),
+            ("apfs", b"apfs", false),
+            ("hfs", b"hfs", false),
+        ] {
+            assert_eq!(
+                fs_is_self_checksumming_macos(&name(fsname)),
+                expected,
+                "{label}"
+            );
         }
-        assert!(!fs_is_self_checksumming_macos(&name));
     }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn fs_detection_hfs_not_checksumming() {
-        let mut name = [0i8; 16];
-        for (i, &b) in b"hfs".iter().enumerate() {
-            name[i] = b as i8;
-        }
-        assert!(!fs_is_self_checksumming_macos(&name));
-    }
-
-    // ── Token bucket ────────────────────────────────────────────────
 
     #[test]
     fn token_bucket_immediate_when_enough() {
         let mut b = TokenBucket::new(1_000_000);
-        let d = b.consume(500_000);
-        assert_eq!(d, Duration::ZERO);
+        assert_eq!(b.consume(500_000), Duration::ZERO);
     }
 
     #[test]
     fn token_bucket_waits_when_deficit() {
         let mut b = TokenBucket::new(1_000_000);
-        // Drain the bucket.
         let _ = b.consume(1_000_000);
-        // Next consume should require a wait.
         let d = b.consume(500_000);
         assert!(d > Duration::ZERO);
-        // The wait should be approximately 0.5s at 1MB/s.
-        assert!(d.as_secs_f64() > 0.4);
-        assert!(d.as_secs_f64() < 0.7);
+        assert!(d.as_secs_f64() > 0.4 && d.as_secs_f64() < 0.7);
     }
 
     #[test]
     fn token_bucket_time_for_pure_math() {
-        let d = TokenBucket::time_for(1_000_000, 2_000_000);
-        assert!((d.as_secs_f64() - 2.0).abs() < 0.001);
-
-        let d = TokenBucket::time_for(64 * 1024 * 1024, 64 * 1024 * 1024);
-        assert!((d.as_secs_f64() - 1.0).abs() < 0.001);
+        assert!((TokenBucket::time_for(1_000_000, 2_000_000).as_secs_f64() - 2.0).abs() < 0.001);
+        assert!(
+            (TokenBucket::time_for(64 * 1024 * 1024, 64 * 1024 * 1024).as_secs_f64() - 1.0).abs()
+                < 0.001
+        );
+        assert_eq!(TokenBucket::time_for(0, 1000), Duration::ZERO);
     }
-
-    #[test]
-    fn token_bucket_zero_rate() {
-        let d = TokenBucket::time_for(0, 1000);
-        assert_eq!(d, Duration::ZERO);
-    }
-
-    // ── Staggered order ─────────────────────────────────────────────
 
     #[test]
     fn staggered_order_interleaves_segments() {
@@ -768,21 +661,12 @@ mod tests {
             },
         ];
         let order = staggered_order(&segments);
-        // Round 0: (0,0), (1,0)
-        // Round 1: (0,1), (1,1)
-        // Round 2: (0,2)
-        assert_eq!(order.len(), 5);
-        assert_eq!(order[0], (0, 0)); // seg 0, blob 0
-        assert_eq!(order[1], (1, 0)); // seg 1, blob 0
-        assert_eq!(order[2], (0, 1)); // seg 0, blob 1
-        assert_eq!(order[3], (1, 1)); // seg 1, blob 1
-        assert_eq!(order[4], (0, 2)); // seg 0, blob 2
+        assert_eq!(order, vec![(0, 0), (1, 0), (0, 1), (1, 1), (0, 2)]);
     }
 
     #[test]
     fn staggered_order_empty() {
-        let order = staggered_order(&[]);
-        assert!(order.is_empty());
+        assert!(staggered_order(&[]).is_empty());
     }
 
     #[test]
@@ -801,11 +685,8 @@ mod tests {
                 },
             ],
         }];
-        let order = staggered_order(&segments);
-        assert_eq!(order, vec![(0, 0), (0, 1)]);
+        assert_eq!(staggered_order(&segments), vec![(0, 0), (0, 1)]);
     }
-
-    // ── Adaptive reorder ────────────────────────────────────────────
 
     #[test]
     fn adaptive_reorder_drains_corrupt_segment_first() {
@@ -844,12 +725,8 @@ mod tests {
                 ],
             },
         ];
-        // Staggered: (0,0), (1,0), (0,1), (1,1), (0,2)
         let order = staggered_order(&segments);
-        // Suppose we just did (0,0) and (1,0) (pos=2 means next is (0,1)),
-        // and (1,0) was corrupt (seg 1). Reorder after pos=2.
         let new_tail = adaptive_reorder(&order, 2, 1, &segments);
-        // Expect: seg 1's remaining ((1,1)) first, then seg 0's remaining ((0,1), (0,2)).
         assert_eq!(new_tail, vec![(1, 1), (0, 1), (0, 2)]);
     }
 
@@ -862,87 +739,62 @@ mod tests {
                 size: 1,
             }],
         }];
-        let order = vec![(0, 0)];
-        let new_tail = adaptive_reorder(&order, 1, 0, &segments);
-        assert!(new_tail.is_empty());
+        assert!(adaptive_reorder(&[(0, 0)], 1, 0, &segments).is_empty());
     }
-
-    // ── Quarantine leaf encoding ────────────────────────────────────
 
     #[test]
     fn quarantine_leaf_encodes_correctly() {
         let leaf = quarantine_leaf("org/repo", "sha256:aabb");
         assert!(leaf.starts_with("org__repo---sha256_aabb---"));
-        // No `/` or `:` in the leaf.
         assert!(!leaf.contains('/'));
         assert!(!leaf.contains(':'));
     }
 
-    // ── Integration tests ───────────────────────────────────────────
-
-    use crate::digest::sha256_of;
-    use crate::storage::Storage;
-
-    fn test_store() -> (tempfile::TempDir, FsStorage) {
-        let dir = tempfile::tempdir().unwrap();
-        let s = FsStorage::new(dir.path()).unwrap();
-        (dir, s)
-    }
-
-    fn test_store_with_config(
-        config: &roci_config::StorageConfig,
-    ) -> (tempfile::TempDir, FsStorage) {
-        let dir = tempfile::tempdir().unwrap();
-        let quota = std::sync::Arc::new(crate::quota::QuotaTracker::default());
-        let s = FsStorage::with_config(dir.path(), config, quota).unwrap();
-        (dir, s)
+    #[test]
+    fn scrub_result_labels() {
+        for (variant, expected) in [
+            (ScrubResult::Ok, "ok"),
+            (ScrubResult::Repaired, "repaired"),
+            (ScrubResult::Corrupt, "corrupt"),
+            (ScrubResult::Skipped, "skipped"),
+        ] {
+            assert_eq!(variant.label(), expected, "{expected}");
+        }
     }
 
     #[tokio::test]
     async fn scrub_detects_and_quarantines_corruption() {
-        let (_dir, s) = test_store();
+        let (_dir, s) = store();
         let data = b"scrub test content";
         let d = sha256_of(data);
         s.put_blob("r", &d, data).await.unwrap();
-
-        // Run a scrub pass to bootstrap the checksum.
         s.scrub_pass().await;
         assert!(s.meta.checksum("r", &d.as_string()).is_some());
 
-        // Corrupt the blob on disk.
         let blob_path = _dir.path().join("r/blobs/sha256").join(d.hex());
         std::fs::write(&blob_path, b"CORRUPTED DATA HERE!!").unwrap();
-
-        // Run another scrub pass — should detect corruption.
         s.scrub_pass().await;
 
-        // The blob should now be gone (404).
         assert!(matches!(
             s.blob_size("r", &d).await,
             Err(crate::StorageError::NotFound)
         ));
-
-        // The quarantine directory should exist and have one entry.
         let q_dir = _dir.path().join(QUARANTINE_DIR);
         assert!(q_dir.is_dir());
         let entries: Vec<_> = std::fs::read_dir(&q_dir).unwrap().flatten().collect();
         assert_eq!(entries.len(), 1);
-        let q_name = entries[0].file_name().to_string_lossy().into_owned();
-        assert!(q_name.starts_with("r---"));
+        assert!(entries[0].file_name().to_string_lossy().starts_with("r---"));
 
-        // Re-push succeeds.
         s.put_blob("r", &d, data).await.unwrap();
         assert_eq!(s.blob_size("r", &d).await.unwrap(), data.len() as u64);
     }
 
     #[tokio::test]
     async fn scrub_repairs_wrong_checksum_without_quarantine() {
-        let (_dir, s) = test_store();
+        let (_dir, s) = store();
         let data = b"content with wrong checksum";
         let d = sha256_of(data);
         s.put_blob("r", &d, data).await.unwrap();
-
-        // Manually record a wrong checksum.
         s.meta
             .apply_relaxed(MetaOp::PutChecksum {
                 repo: "r".to_string(),
@@ -951,37 +803,22 @@ mod tests {
                 size: data.len() as u64,
             })
             .unwrap();
-        assert_eq!(
+
+        s.scrub_pass().await;
+        assert_eq!(s.blob_size("r", &d).await.unwrap(), data.len() as u64);
+        assert_ne!(
             s.meta.checksum("r", &d.as_string()).unwrap().crc32c,
             0xDEAD_BEEF
         );
-
-        // Run scrub — the blob is intact (digest matches), so it should be
-        // repaired (correct checksum recorded), NOT quarantined.
-        s.scrub_pass().await;
-
-        // Blob still accessible.
-        assert_eq!(s.blob_size("r", &d).await.unwrap(), data.len() as u64);
-
-        // Checksum should now be correct (not 0xDEADBEEF).
-        let cksum = s.meta.checksum("r", &d.as_string()).unwrap();
-        assert_ne!(cksum.crc32c, 0xDEAD_BEEF);
-
-        // No quarantine dir created.
-        let q_dir = _dir.path().join(QUARANTINE_DIR);
-        assert!(!q_dir.exists());
+        assert!(!_dir.path().join(QUARANTINE_DIR).exists());
     }
 
     #[tokio::test]
     async fn scrub_bootstraps_checksum_for_new_blob() {
-        let (_dir, s) = test_store();
+        let (_dir, s) = store();
         let data = b"bootstrap me";
         let d = sha256_of(data);
-
-        // `put_blob` records a checksum via `blob_entered`. Clear it manually
-        // so the scrub has to bootstrap it.
         s.put_blob("r", &d, data).await.unwrap();
-        // Delete the checksum record.
         s.meta
             .apply_relaxed(MetaOp::DeleteBlob {
                 repo: "r".to_string(),
@@ -990,28 +827,22 @@ mod tests {
             .unwrap();
         assert!(s.meta.checksum("r", &d.as_string()).is_none());
 
-        // Scrub should record the checksum.
         s.scrub_pass().await;
-
-        let cksum = s.meta.checksum("r", &d.as_string()).unwrap();
-        assert_eq!(cksum.size, data.len() as u64);
-        // Blob still intact.
+        assert_eq!(
+            s.meta.checksum("r", &d.as_string()).unwrap().size,
+            data.len() as u64
+        );
         assert_eq!(s.read_blob("r", &d).await.unwrap(), data);
     }
 
     #[tokio::test]
     async fn scrub_enumerate_segments_groups_by_repo() {
-        let (_dir, s) = test_store();
-        let d1 = sha256_of(b"a");
-        let d2 = sha256_of(b"b");
-        let d3 = sha256_of(b"c");
-        s.put_blob("repo1", &d1, b"a").await.unwrap();
-        s.put_blob("repo1", &d2, b"b").await.unwrap();
-        s.put_blob("repo2", &d3, b"c").await.unwrap();
-
+        let (_dir, s) = store();
+        s.put_blob("repo1", &sha256_of(b"a"), b"a").await.unwrap();
+        s.put_blob("repo1", &sha256_of(b"b"), b"b").await.unwrap();
+        s.put_blob("repo2", &sha256_of(b"c"), b"c").await.unwrap();
         let segments = enumerate_segments(_dir.path());
         assert_eq!(segments.len(), 2);
-        // Segments are sorted by repo name.
         assert_eq!(segments[0].blobs[0].repo, "repo1");
         assert_eq!(segments[0].blobs.len(), 2);
         assert_eq!(segments[1].blobs[0].repo, "repo2");
@@ -1020,108 +851,88 @@ mod tests {
 
     #[tokio::test]
     async fn scrub_quarantine_dir_not_in_discover_repos() {
-        let (_dir, s) = test_store();
-        let data = b"quarantine me";
-        let d = sha256_of(data);
-        s.put_blob("r", &d, data).await.unwrap();
-
-        // Create a quarantine dir with a dummy file.
+        let (_dir, s) = store();
+        let d = sha256_of(b"quarantine me");
+        s.put_blob("r", &d, b"quarantine me").await.unwrap();
         let q_dir = _dir.path().join(QUARANTINE_DIR);
         std::fs::create_dir_all(&q_dir).unwrap();
         std::fs::write(q_dir.join("dummy"), b"quarantined blob").unwrap();
-
-        // discover_repos should not include the quarantine directory.
         let repos = crate::layout::discover_repos(_dir.path());
         assert!(!repos.iter().any(|r| r.contains("roci-quarantine")));
         assert!(repos.contains(&"r".to_string()));
     }
 
     #[tokio::test]
-    async fn scrub_mode_auto_detects_fs() {
-        // Auto mode's filesystem detection works on the test root, and a pass
-        // bootstraps the missing checksum (meaning the pass ran).
-        let (_dir, s) = test_store();
-        let data = b"auto mode test";
-        let d = sha256_of(data);
-        s.put_blob("r", &d, data).await.unwrap();
-        // Clear the checksum so scrub must bootstrap it.
-        s.meta
-            .apply_relaxed(MetaOp::DeleteBlob {
-                repo: "r".to_string(),
-                digest: d.as_string(),
-            })
-            .unwrap();
-
-        // Detection must succeed on the test filesystem (the suite also runs
-        // on btrfs, where Auto would delegate); the pass itself runs either way.
-        detect_self_checksumming_fs(_dir.path()).unwrap();
-
-        s.scrub_pass().await;
-        assert!(s.meta.checksum("r", &d.as_string()).is_some());
-    }
-
-    #[tokio::test]
-    async fn scrub_mode_app_overrides_delegation() {
-        // mode = App always runs the pass. Just verify the pass runs.
-        let mut config = roci_config::StorageConfig::default();
-        config.scrub.enabled = true;
-        config.scrub.mode = roci_config::ScrubMode::App;
-        let (_dir, s) = test_store_with_config(&config);
-        let data = b"app mode";
-        let d = sha256_of(data);
-        s.put_blob("r", &d, data).await.unwrap();
-        // Clear checksum.
-        s.meta
-            .apply_relaxed(MetaOp::DeleteBlob {
-                repo: "r".to_string(),
-                digest: d.as_string(),
-            })
-            .unwrap();
-
-        s.scrub_pass().await;
-        assert!(s.meta.checksum("r", &d.as_string()).is_some());
+    async fn scrub_mode_auto_and_app_run_pass() {
+        for mode in [roci_config::ScrubMode::Auto, roci_config::ScrubMode::App] {
+            let (_dir, s) = if matches!(mode, roci_config::ScrubMode::App) {
+                let mut config = roci_config::StorageConfig::default();
+                config.scrub.enabled = true;
+                config.scrub.mode = roci_config::ScrubMode::App;
+                store_with(&config)
+            } else {
+                store()
+            };
+            let data = b"mode test";
+            let d = sha256_of(data);
+            s.put_blob("r", &d, data).await.unwrap();
+            s.meta
+                .apply_relaxed(MetaOp::DeleteBlob {
+                    repo: "r".to_string(),
+                    digest: d.as_string(),
+                })
+                .unwrap();
+            if matches!(mode, roci_config::ScrubMode::Auto) {
+                detect_self_checksumming_fs(_dir.path()).unwrap();
+            }
+            s.scrub_pass().await;
+            assert!(s.meta.checksum("r", &d.as_string()).is_some(), "{mode:?}");
+        }
     }
 
     #[tokio::test]
     async fn scrub_crc32c_ok_does_not_rehash() {
-        // When the CRC32C matches, the blob is `ok` — no full re-hash needed.
-        let (_dir, s) = test_store();
+        let (_dir, s) = store();
         let data = b"fast path content";
         let d = sha256_of(data);
         s.put_blob("r", &d, data).await.unwrap();
-
-        // After push, blob_entered recorded the checksum. Verify it's there.
-        let cksum = s.meta.checksum("r", &d.as_string()).unwrap();
-        assert_eq!(cksum.size, data.len() as u64);
-
-        // Run scrub — should be `Ok` (CRC matches).
+        assert_eq!(
+            s.meta.checksum("r", &d.as_string()).unwrap().size,
+            data.len() as u64
+        );
         let (result, bytes) = s.scrub_one_blob("r", &d.as_string()).await;
         assert_eq!(result, ScrubResult::Ok);
         assert_eq!(bytes, data.len() as u64);
     }
 
     #[tokio::test]
-    async fn scrub_skips_vanished_blob() {
-        let (_dir, s) = test_store();
-        // Reference a blob that doesn't exist.
-        let (result, bytes) = s
-            .scrub_one_blob(
+    async fn scrub_skips_unreachable_blobs() {
+        let (_dir, s) = store();
+        for (label, repo, digest) in [
+            (
+                "vanished",
                 "nonexistent",
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            )
-            .await;
-        assert_eq!(result, ScrubResult::Skipped);
-        assert_eq!(bytes, 0);
+            ),
+            ("invalid_digest", "r", "not-a-digest"),
+            (
+                "absent_repo",
+                "absent-repo",
+                &sha256_of(b"nobody").as_string(),
+            ),
+        ] {
+            let (result, bytes) = s.scrub_one_blob(repo, digest).await;
+            assert_eq!(result, ScrubResult::Skipped, "{label}");
+            assert_eq!(bytes, 0, "{label}");
+        }
     }
 
     #[tokio::test]
     async fn scrub_size_mismatch_escalates_to_rehash() {
-        let (_dir, s) = test_store();
+        let (_dir, s) = store();
         let data = b"size mismatch test";
         let d = sha256_of(data);
         s.put_blob("r", &d, data).await.unwrap();
-
-        // Record a checksum with wrong size — forces escalation.
         let real_cksum = s.meta.checksum("r", &d.as_string()).unwrap();
         s.meta
             .apply_relaxed(MetaOp::PutChecksum {
@@ -1131,127 +942,107 @@ mod tests {
                 size: 99999,
             })
             .unwrap();
-
         let (result, bytes) = s.scrub_one_blob("r", &d.as_string()).await;
-        // Content is intact, so rehash succeeds → Repaired.
         assert_eq!(result, ScrubResult::Repaired);
         assert_eq!(bytes, data.len() as u64);
-        // Checksum now correct.
-        let cksum = s.meta.checksum("r", &d.as_string()).unwrap();
-        assert_eq!(cksum.size, data.len() as u64);
+        assert_eq!(
+            s.meta.checksum("r", &d.as_string()).unwrap().size,
+            data.len() as u64
+        );
     }
 
     #[tokio::test]
-    async fn scrub_skips_invalid_digest_string() {
-        let (_dir, s) = test_store();
-        // An invalid digest string → Skipped, exercising line 296.
-        let (result, bytes) = s.scrub_one_blob("r", "not-a-digest").await;
-        assert_eq!(result, ScrubResult::Skipped);
-        assert_eq!(bytes, 0);
-    }
-
-    #[tokio::test]
-    async fn scrub_skips_absent_repo_notfound() {
-        let (_dir, s) = test_store();
-        // A valid digest but repo doesn't exist → open_beneath fails NotFound → Skipped (line 306).
-        let d = sha256_of(b"nobody");
-        let (result, bytes) = s.scrub_one_blob("absent-repo", &d.as_string()).await;
-        assert_eq!(result, ScrubResult::Skipped);
-        assert_eq!(bytes, 0);
-    }
-
-    #[test]
-    fn scrub_result_labels() {
-        // Cover all ScrubResult::label branches including Skipped (line 286).
-        assert_eq!(ScrubResult::Ok.label(), "ok");
-        assert_eq!(ScrubResult::Repaired.label(), "repaired");
-        assert_eq!(ScrubResult::Corrupt.label(), "corrupt");
-        assert_eq!(ScrubResult::Skipped.label(), "skipped");
-    }
-
-    #[tokio::test]
-    async fn start_scrub_auto_mode_on_non_checksumming_fs() {
-        // start_scrub with mode=Auto on CI (ext4/APFS) runs the app pass.
-        // We exercise start_scrub directly and shut it down — covering
-        // lines 460-461, 464-465, 473-477, 483, 485-489.
-        let config = roci_config::StorageConfig {
-            scrub: roci_config::ScrubConfig {
-                enabled: true,
-                mode: roci_config::ScrubMode::Auto,
-                interval_secs: 3600,
-                ..roci_config::ScrubConfig::default()
-            },
-            ..roci_config::StorageConfig::default()
-        };
-        let (_dir, s) = test_store_with_config(&config);
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        s.start_scrub(rx);
-        // Give a moment, then shut down.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let _ = tx.send(true);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[tokio::test]
-    async fn start_scrub_app_mode() {
-        // start_scrub with mode=App: always runs the app pass (no delegation check).
-        let config = roci_config::StorageConfig {
-            scrub: roci_config::ScrubConfig {
-                enabled: true,
-                mode: roci_config::ScrubMode::App,
-                interval_secs: 3600,
-                ..roci_config::ScrubConfig::default()
-            },
-            ..roci_config::StorageConfig::default()
-        };
-        let (_dir, s) = test_store_with_config(&config);
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        s.start_scrub(rx);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let _ = tx.send(true);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    async fn start_scrub_auto_and_app_modes() {
+        for mode in [roci_config::ScrubMode::Auto, roci_config::ScrubMode::App] {
+            let config = roci_config::StorageConfig {
+                scrub: roci_config::ScrubConfig {
+                    enabled: true,
+                    mode,
+                    interval_secs: 3600,
+                    ..roci_config::ScrubConfig::default()
+                },
+                ..roci_config::StorageConfig::default()
+            };
+            let (_dir, s) = store_with(&config);
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            s.start_scrub(rx);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = tx.send(true);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
     async fn scrub_quarantine_failure_still_does_blob_left() {
-        // When quarantine_blob fails (e.g. blob already gone between detect
-        // and rename), blob_left is still called — exercise lines 381-390.
-        let (_dir, s) = test_store();
+        let (_dir, s) = store();
         let data = b"quarantine-fail";
         let d = sha256_of(data);
         s.put_blob("r", &d, data).await.unwrap();
-
-        // Run a pass to bootstrap the checksum.
         s.scrub_pass().await;
-
-        // Corrupt the blob.
-        let blob_path = _dir.path().join("r/blobs/sha256").join(d.hex());
-        std::fs::write(&blob_path, b"X").unwrap();
-
-        // Remove the parent so the quarantine rename fails (the blob dir
-        // for quarantine_blob needs to find the blob at its original path).
-        // Actually: delete the blob between the verify and the quarantine
-        // by removing it now. The scrub will re-open to verify, see the
-        // corrupt data, but when it tries to quarantine via renameat, the
-        // source is gone. On real FS the rename fails.
-        //
-        // Simpler approach: just run the scrub; the quarantine succeeds
-        // normally, proving the corrupt path.
+        std::fs::write(_dir.path().join("r/blobs/sha256").join(d.hex()), b"X").unwrap();
         s.scrub_pass().await;
-
-        // After the scrub the blob is quarantined.
         assert!(matches!(
             s.blob_size("r", &d).await,
             Err(crate::StorageError::NotFound)
         ));
-        let q_dir = _dir.path().join(QUARANTINE_DIR);
-        assert!(q_dir.is_dir());
+        assert!(_dir.path().join(QUARANTINE_DIR).is_dir());
     }
 
     #[tokio::test]
+    async fn scrub_size_mismatch_bypasses_crc_shortcut() {
+        let (_dir, s) = store();
+        let data = b"size mismatch content";
+        let d = sha256_of(data);
+        s.put_blob("r", &d, data).await.unwrap();
+        s.meta
+            .apply_relaxed(MetaOp::PutChecksum {
+                repo: "r".to_string(),
+                digest: d.as_string(),
+                crc32c: crc32c::crc32c(data),
+                size: 9999,
+            })
+            .unwrap();
+        let (result, bytes) = s.scrub_one_blob("r", &d.as_string()).await;
+        assert_eq!(
+            result,
+            ScrubResult::Repaired,
+            "size mismatch triggers rehash → Repaired"
+        );
+        assert_eq!(bytes, data.len() as u64);
+        let ck = s.meta.checksum("r", &d.as_string()).unwrap();
+        assert_eq!(ck.size, data.len() as u64, "checksum repaired");
+    }
+
+    #[tokio::test]
+    async fn scrub_pass_adaptive_reorder_on_corruption() {
+        let (_dir, s) = store();
+        let ok_data = b"intact blob";
+        let ok_d = sha256_of(ok_data);
+        s.put_blob("r", &ok_d, ok_data).await.unwrap();
+        let bad_data = b"will corrupt";
+        let bad_d = sha256_of(bad_data);
+        s.put_blob("r", &bad_d, bad_data).await.unwrap();
+        s.scrub_pass().await;
+        let blob_path = _dir.path().join("r/blobs/sha256").join(bad_d.hex());
+        std::fs::write(&blob_path, b"EVIL").unwrap();
+        s.scrub_pass().await;
+        assert!(
+            matches!(
+                s.blob_size("r", &bad_d).await,
+                Err(crate::StorageError::NotFound)
+            ),
+            "corrupt blob quarantined"
+        );
+        assert_eq!(
+            s.blob_size("r", &ok_d).await.unwrap(),
+            ok_data.len() as u64,
+            "intact blob survives"
+        );
+    }
+    #[tokio::test]
     async fn corrupt_hard_linked_copies_are_quarantined_in_every_repo() {
         use std::os::unix::fs::MetadataExt;
-        let (dir, s) = test_store(); // dedupe on: the second push hard-links
+        let (dir, s) = store();
         let data = b"shared and then rotted";
         let d = sha256_of(data);
         s.put_blob("a", &d, data).await.unwrap();
@@ -1259,11 +1050,11 @@ mod tests {
         let pa = s.blob_path("a", &d).unwrap();
         let pb = s.blob_path("b", &d).unwrap();
         if std::fs::metadata(&pa).unwrap().ino() != std::fs::metadata(&pb).unwrap().ino() {
-            return; // reflink filesystem: copies are independent extents
+            return; // reflink filesystem
         }
         let mut bytes = std::fs::read(&pa).unwrap();
         bytes[0] ^= 0xFF;
-        std::fs::write(&pa, &bytes).unwrap(); // same inode → both names rot
+        std::fs::write(&pa, &bytes).unwrap();
         s.scrub_pass().await;
         for repo in ["a", "b"] {
             assert!(matches!(
@@ -1271,9 +1062,11 @@ mod tests {
                 Err(crate::StorageError::NotFound)
             ));
         }
-        let quarantined = std::fs::read_dir(dir.path().join(".roci-quarantine"))
-            .unwrap()
-            .count();
-        assert_eq!(quarantined, 2);
+        assert_eq!(
+            std::fs::read_dir(dir.path().join(".roci-quarantine"))
+                .unwrap()
+                .count(),
+            2
+        );
     }
 }

@@ -1,12 +1,5 @@
-//! OTel metric instruments and the Prometheus scrape handler.
-//!
-//! Instruments are created once from a global `MeterProvider` and cached in
-//! `OnceLock`s. The `record_*` functions are the public API called from
-//! `roci-core` middleware; they are no-ops before `install()`.
-//!
-//! The Prometheus text exposition is implemented directly over the SDK's
-//! `ManualReader` + `ResourceMetrics`, avoiding third-party exporter crates
-//! (supply-chain minimisation).
+//! OTel metric instruments and Prometheus scrape handler.
+//! `record_*` is the public API; direct Prometheus text exposition (no third-party crate).
 
 use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
 use opentelemetry::KeyValue;
@@ -16,11 +9,7 @@ use opentelemetry_sdk::metrics::ManualReader;
 use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
 
-// ── Cloneable ManualReader wrapper ──────────────────────────────────────
-
-/// A thin wrapper around `Arc<ManualReader>` that implements `MetricReader`
-/// so one clone can be registered with the `SdkMeterProvider` and another
-/// stored in a `OnceLock` for on-demand Prometheus scrape.
+/// `MetricReader` wrapper sharing one `ManualReader` between provider and scrape.
 #[derive(Clone, Debug)]
 pub(crate) struct SharedReader(Arc<ManualReader>);
 
@@ -54,13 +43,10 @@ impl MetricReader for SharedReader {
     }
 }
 
-// ── Singleton instrument handles ────────────────────────────────────────
-
 static REQUEST_DURATION: OnceLock<Histogram<f64>> = OnceLock::new();
 static ERROR_COUNTER: OnceLock<Counter<u64>> = OnceLock::new();
 static PROM_READER: OnceLock<SharedReader> = OnceLock::new();
-/// Storage-subsystem counters (GC, scrub, dedupe, quota) — defined once here
-/// so every label stays within the bounded cardinality set.
+/// Storage-subsystem counters (bounded cardinality).
 static STORAGE: OnceLock<StorageInstruments> = OnceLock::new();
 
 struct StorageInstruments {
@@ -72,12 +58,10 @@ struct StorageInstruments {
     quota_rejections: Counter<u64>,
     auth_decisions: Counter<u64>,
     blocking_hops: Counter<u64>,
-    // MetadataStore instruments
     meta_wal_appends: Counter<u64>,
     meta_wal_batch_size: Histogram<u64>,
     meta_compaction: Counter<u64>,
     meta_snapshot: Counter<u64>,
-    // Upload session instruments
     upload_active: UpDownCounter<i64>,
     upload_bytes: Counter<u64>,
     upload_finalize: Counter<u64>,
@@ -135,7 +119,6 @@ pub(crate) fn install(provider: opentelemetry_sdk::metrics::SdkMeterProvider) {
             "registry.blocking.hops",
             "Filesystem work handed to the blocking thread pool, by operation",
         ),
-        // MetadataStore instruments
         meta_wal_appends: counter(
             "registry.meta.wal.appends",
             "WAL records appended to the metadata log",
@@ -153,7 +136,6 @@ pub(crate) fn install(provider: opentelemetry_sdk::metrics::SdkMeterProvider) {
             "registry.meta.snapshot",
             "Metadata snapshots written by result",
         ),
-        // Upload session instruments
         upload_active: meter
             .i64_up_down_counter("registry.upload.active")
             .with_description("Currently active upload sessions")
@@ -169,10 +151,7 @@ pub(crate) fn install(provider: opentelemetry_sdk::metrics::SdkMeterProvider) {
     });
 }
 
-// ── Recording API ───────────────────────────────────────────────────────
-
-/// Record a completed HTTP request: duration histogram with
-/// `{endpoint, method, status_class}` labels.
+/// Record a completed HTTP request with duration and labels.
 pub fn record_request(endpoint: &str, method: &str, status: u16, duration: std::time::Duration) {
     if let Some(hist) = REQUEST_DURATION.get() {
         let status_class = match status {
@@ -192,14 +171,12 @@ pub fn record_request(endpoint: &str, method: &str, status: u16, duration: std::
     }
 }
 
-/// Increment the error counter with `{error_code}`.
 pub fn record_error(error_code: &str) {
     if let Some(counter) = ERROR_COUNTER.get() {
         counter.add(1, &[KeyValue::new("error_code", error_code.to_string())]);
     }
 }
 
-/// Count one object reclaimed by GC (`kind` = `blob`/`upload`) and its bytes.
 pub fn record_gc_collected(kind: &str, bytes: u64) {
     if let Some(s) = STORAGE.get() {
         let attrs = [KeyValue::new("kind", kind.to_string())];
@@ -208,8 +185,6 @@ pub fn record_gc_collected(kind: &str, bytes: u64) {
     }
 }
 
-/// Count one scrubbed blob by `result` (`ok`/`repaired`/`corrupt`) and the
-/// bytes read.
 pub fn record_scrub(result: &str, bytes: u64) {
     if let Some(s) = STORAGE.get() {
         s.scrub_checked
@@ -239,17 +214,14 @@ pub fn record_quota_rejection(scope: &str) {
     }
 }
 
-/// Count one hand-off of filesystem work to the blocking pool by `op` (a
-/// static function name: bounded cardinality, no allocation).
+/// Count one blocking-pool hand-off by `op`.
 pub fn record_blocking_hop(op: &'static str) {
     if let Some(s) = STORAGE.get() {
         s.blocking_hops.add(1, &[KeyValue::new("op", op)]);
     }
 }
 
-/// Count one authentication/authorization decision by `method`
-/// (`anonymous`/`htpasswd`/`ldap`/`bearer`/`mtls`) and `result`
-/// (`allowed`/`denied`/`unauthenticated`/`invalid`).
+/// Count one auth decision by `method` and `result`.
 pub fn record_auth_decision(method: &str, result: &str) {
     if let Some(s) = STORAGE.get() {
         s.auth_decisions.add(
@@ -262,9 +234,6 @@ pub fn record_auth_decision(method: &str, result: &str) {
     }
 }
 
-// ── MetadataStore recording API ─────────────────────────────────────────
-
-/// Count one WAL record appended to the metadata log.
 pub fn record_meta_wal_append() {
     if let Some(s) = STORAGE.get() {
         s.meta_wal_appends.add(1, &[]);
@@ -294,8 +263,6 @@ pub fn record_meta_snapshot(result: &str) {
     }
 }
 
-// ── Upload session recording API ────────────────────────────────────────
-
 /// Adjust the active upload session gauge (+1 on begin, −1 on end).
 pub fn record_upload_active(delta: i64) {
     if let Some(s) = STORAGE.get() {
@@ -303,7 +270,6 @@ pub fn record_upload_active(delta: i64) {
     }
 }
 
-/// Count bytes received into an upload session.
 pub fn record_upload_bytes(bytes: u64) {
     if let Some(s) = STORAGE.get() {
         s.upload_bytes.add(bytes, &[]);
@@ -318,10 +284,6 @@ pub fn record_upload_finalize(result: &str) {
     }
 }
 
-// ── Prometheus text exposition ──────────────────────────────────────────
-
-/// Axum handler: collects metrics from the `ManualReader` and encodes them in
-/// Prometheus text exposition format.
 pub(crate) async fn prometheus_handler() -> axum::response::Response {
     use axum::http::{header, StatusCode};
     use axum::response::IntoResponse;
@@ -356,57 +318,45 @@ fn encode_prometheus(rm: &ResourceMetrics) -> String {
 
 fn encode_metric(out: &mut String, prom_name: &str, desc: &str, data: &AggregatedMetrics) {
     if let AggregatedMetrics::F64(MetricData::Histogram(hist)) = data {
-        write_help_type(out, prom_name, desc, "histogram");
-        for dp in hist.data_points() {
-            let base_labels = collect_labels(dp.attributes());
-            let mut cumulative: u64 = 0;
-            let bounds: Vec<f64> = dp.bounds().collect();
-            let counts: Vec<u64> = dp.bucket_counts().collect();
-            for (i, count) in counts.iter().enumerate() {
-                cumulative += count;
-                let le = if i < bounds.len() {
-                    format!("{}", bounds[i])
-                } else {
-                    "+Inf".to_string()
-                };
-                let labels = format_labels_with(&base_labels, "le", &le);
-                let _ = writeln!(out, "{prom_name}_bucket{labels} {cumulative}");
-            }
-            let labels = format_labels(dp.attributes());
-            let _ = writeln!(out, "{prom_name}_sum{labels} {}", dp.sum());
-            let _ = writeln!(out, "{prom_name}_count{labels} {}", dp.count());
-        }
+        write_histogram(out, prom_name, desc, hist);
     } else if let AggregatedMetrics::U64(MetricData::Sum(sum)) = data {
         encode_u64_sum(out, prom_name, desc, sum);
     } else if let AggregatedMetrics::I64(MetricData::Sum(sum)) = data {
-        // UpDownCounter (non-monotonic): Prometheus gauge type.
         write_help_type(out, prom_name, desc, "gauge");
         for dp in sum.data_points() {
             let labels = format_labels(dp.attributes());
             let _ = writeln!(out, "{prom_name}{labels} {}", dp.value());
         }
     } else if let AggregatedMetrics::U64(MetricData::Histogram(hist)) = data {
-        // u64 histogram (e.g. batch-size counts).
-        write_help_type(out, prom_name, desc, "histogram");
-        for dp in hist.data_points() {
-            let base_labels = collect_labels(dp.attributes());
-            let mut cumulative: u64 = 0;
-            let bounds: Vec<f64> = dp.bounds().collect();
-            let counts: Vec<u64> = dp.bucket_counts().collect();
-            for (i, count) in counts.iter().enumerate() {
-                cumulative += count;
-                let le = if i < bounds.len() {
-                    format!("{}", bounds[i])
-                } else {
-                    "+Inf".to_string()
-                };
-                let labels = format_labels_with(&base_labels, "le", &le);
-                let _ = writeln!(out, "{prom_name}_bucket{labels} {cumulative}");
-            }
-            let labels = format_labels(dp.attributes());
-            let _ = writeln!(out, "{prom_name}_sum{labels} {}", dp.sum());
-            let _ = writeln!(out, "{prom_name}_count{labels} {}", dp.count());
+        write_histogram(out, prom_name, desc, hist);
+    }
+}
+
+fn write_histogram<T: Copy + std::fmt::Display>(
+    out: &mut String,
+    prom_name: &str,
+    desc: &str,
+    hist: &opentelemetry_sdk::metrics::data::Histogram<T>,
+) {
+    write_help_type(out, prom_name, desc, "histogram");
+    for dp in hist.data_points() {
+        let base_labels = collect_labels(dp.attributes());
+        let mut cumulative: u64 = 0;
+        let bounds: Vec<f64> = dp.bounds().collect();
+        let counts: Vec<u64> = dp.bucket_counts().collect();
+        for (i, count) in counts.iter().enumerate() {
+            cumulative += count;
+            let le = if i < bounds.len() {
+                format!("{}", bounds[i])
+            } else {
+                "+Inf".to_string()
+            };
+            let labels = format_labels_with(&base_labels, "le", &le);
+            let _ = writeln!(out, "{prom_name}_bucket{labels} {cumulative}");
         }
+        let labels = format_labels(dp.attributes());
+        let _ = writeln!(out, "{prom_name}_sum{labels} {}", dp.sum());
+        let _ = writeln!(out, "{prom_name}_count{labels} {}", dp.count());
     }
 }
 
@@ -456,7 +406,6 @@ fn format_labels<'a>(attrs: impl Iterator<Item = &'a KeyValue>) -> String {
             )
         })
         .collect();
-    // `name{} v` is valid exposition, so an (unused) unlabelled series needs no branch.
     format!("{{{}}}", pairs.join(","))
 }
 
@@ -479,9 +428,6 @@ fn escape_label_value(s: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Exercise SharedReader trait methods that the SDK doesn't call in our
-    /// usage path: `force_flush` (ManualReader no-op) and the full
-    /// `collect → encode` pipeline.
     #[test]
     fn shared_reader_force_flush_and_encode() {
         use opentelemetry::metrics::MeterProvider as _;
@@ -492,10 +438,8 @@ mod tests {
             .with_reader(reader.clone())
             .build();
 
-        // force_flush is a no-op on ManualReader but must not fail.
         reader.force_flush().expect("force_flush ok");
 
-        // Create and record an f64 histogram and a u64 counter.
         let meter = provider.meter("test");
         let hist = meter
             .f64_histogram("test.duration")
@@ -511,7 +455,6 @@ mod tests {
             .build();
         ctr.add(1, &[KeyValue::new("code", "X")]);
 
-        // Collect and encode.
         let mut rm = ResourceMetrics::default();
         reader.collect(&mut rm).expect("collect ok");
         let text = encode_prometheus(&rm);

@@ -30,12 +30,17 @@ rkyv.workspace = true
 memmap2.workspace = true
 hmac.workspace = true
 toml.workspace = true
-redb = { workspace = true, optional = true }
+heed3 = { workspace = true, optional = true }
+chacha20poly1305 = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
 
 [features]
 default = []
-# Embedded B-tree KV metadata engine (`storage.metadata.engine = "redb"`).
-redb = ["dep:redb"]
+# Embedded LMDB (heed3, mdb.master3) metadata engine
+# (`storage.metadata.engine = "lmdb"`). Brings in a C dependency
+# (lmdb-master3-sys) compiled via `cc`; the musl builder stage and CI
+# install musl-tools / musl-dev for this.
+lmdb = ["dep:heed3", "dep:chacha20poly1305", "dep:hkdf"]
 
 [dev-dependencies]
 tempfile.workspace = true

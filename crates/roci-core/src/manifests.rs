@@ -1,7 +1,6 @@
-//! Manifest endpoints: GET/HEAD (with cache validators), PUT (digest/tag,
-//! media-type + referenced-blob validation, referrers/backrefs), and DELETE.
+//! Manifest endpoints: GET/HEAD, PUT (validation + referrers/backrefs), DELETE.
 
-use crate::error::{not_found_as, ApiError};
+use crate::error::{not_found_as, ApiError, ErrorCode};
 use crate::http_util::{
     created, digest_value, etag_value, if_none_match_hit, not_modified, read_body_limited,
     CACHE_IMMUTABLE, DOCKER_CONTENT_DIGEST,
@@ -15,13 +14,9 @@ use roci_storage::{
     MEDIA_TYPE_IMAGE_MANIFEST,
 };
 
-/// Maximum JSON nesting depth accepted in a manifest body.
 pub(crate) const MAX_JSON_DEPTH: usize = 32;
 
-/// Returns true if `bytes` contains JSON bracket/brace nesting deeper than
-/// `max`. A cheap, allocation-free pre-scan that treats string literals
-/// (skipping escaped quotes) as opaque so `{`/`[` inside strings don't count.
-/// Non-JSON input never exceeds the limit.
+/// Allocation-free JSON nesting-depth check.
 pub(crate) fn json_depth_exceeds(bytes: &[u8], max: usize) -> bool {
     let mut depth: usize = 0;
     let mut in_string = false;
@@ -52,17 +47,11 @@ pub(crate) fn json_depth_exceeds(bytes: &[u8], max: usize) -> bool {
     false
 }
 
-/// The `digest` string of an OCI descriptor: `Some(&str)` only when `value` is
-/// a JSON object carrying a string `digest`. A non-object descriptor, or one
-/// missing a string `digest`, yields `None` — the caller treats that as a
-/// malformed descriptor. A descriptor field that is entirely absent is handled
-/// by the caller before calling this (an omitted `config`/`layers` is legal).
 pub(crate) fn descriptor_digest_str(value: &serde_json::Value) -> Option<&str> {
     value.as_object()?.get("digest")?.as_str()
 }
 
-/// Cache-Control for a manifest read: by-digest is immutable; by-tag must be
-/// revalidated (`no-cache`) since a tag can be repointed.
+/// Cache-Control: immutable by digest, no-cache by tag.
 pub(crate) fn manifest_cache_control(by_digest: bool) -> HeaderValue {
     if by_digest {
         HeaderValue::from_static(CACHE_IMMUTABLE)
@@ -71,15 +60,12 @@ pub(crate) fn manifest_cache_control(by_digest: bool) -> HeaderValue {
     }
 }
 
-/// Whether `reference` is a digest reference (contains `:`).
 fn is_digest_ref(reference: &str) -> bool {
     reference.contains(':')
 }
 
-/// Compute the content digest, verifying it against a digest reference.
-/// A digest reference must match the content (hashed with the reference's
-/// algorithm, constant-time); a tag hashes sha256. Returns the digest and,
-/// for a tag push, the tag string.
+/// Compute and verify content digest against a digest reference.
+/// Tag pushes hash sha256. Returns digest and optional tag.
 fn content_digest<'r>(
     reference: &'r str,
     body: &[u8],
@@ -99,9 +85,7 @@ fn content_digest<'r>(
     }
 }
 
-/// CVE-2021-41190: a present `mediaType` must be a string equal (bare type,
-/// `;`-params stripped) to Content-Type. A body with no `mediaType` skips the
-/// check — never inferred.
+/// CVE-2021-41190: validate `mediaType` matches Content-Type.
 fn check_media_type(content_type: &str, manifest: &serde_json::Value) -> Result<(), ApiError> {
     if let Some(mt) = manifest.get("mediaType") {
         let Some(body_mt) = mt.as_str() else {
@@ -119,8 +103,6 @@ fn check_media_type(content_type: &str, manifest: &serde_json::Value) -> Result<
     Ok(())
 }
 
-/// One descriptor's digest; `kind` is "config" or "layer" →
-/// "{kind} descriptor is malformed" / "{kind} digest is malformed".
 fn descriptor_digest(value: &serde_json::Value, kind: &str) -> Result<Digest, ApiError> {
     let s = descriptor_digest_str(value)
         .ok_or_else(|| ApiError::manifest_invalid(format!("{kind} descriptor is malformed")))?;
@@ -146,8 +128,6 @@ fn required_blobs(manifest: &serde_json::Value) -> Result<Vec<Digest>, ApiError>
     Ok(referenced)
 }
 
-/// Serialized referrer descriptor (mediaType, digest, size, artifactType
-/// fallback to config.mediaType, annotations).
 fn referrer_descriptor(
     manifest: &serde_json::Value,
     media_type: &str,
@@ -164,7 +144,6 @@ fn referrer_descriptor(
         serde_json::Value::String(digest.as_string()),
     );
     descriptor.insert("size".into(), serde_json::Value::Number(size.into()));
-    // artifactType falls back to the config mediaType when absent (OCI rule).
     let artifact_type = manifest
         .get("artifactType")
         .and_then(|v| v.as_str())
@@ -193,18 +172,17 @@ pub(crate) async fn get<S: Storage>(
     head: bool,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    // A digest reference names immutable content; a tag can be repointed. The
-    // `Accept` header is advisory — the stored media type is always returned
-    // (dist-spec: the registry serves the manifest's real Content-Type).
+    // Digest = immutable content; tag may be repointed.
     let by_digest = is_digest_ref(reference);
     let m = st
         .storage
         .get_manifest(repo, reference)
         .await
-        .map_err(not_found_as(ApiError::manifest_unknown))?;
+        .map_err(not_found_as(|| {
+            ApiError::new(ErrorCode::ManifestUnknown, "manifest unknown to registry")
+        }))?;
     let digest_str = m.digest.as_string();
-    // Conditional request: the ETag is the manifest digest. For a tag,
-    // a matching digest means the tag still resolves to the same content.
+    // ETag = manifest digest; conditional match → 304.
     if if_none_match_hit(headers, &digest_str) {
         return Ok(not_modified(&digest_str, manifest_cache_control(by_digest)));
     }
@@ -240,9 +218,7 @@ pub(crate) async fn put<S: Storage>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or(MEDIA_TYPE_IMAGE_MANIFEST)
         .to_string();
-    // Bound the manifest body by the smaller of the configured request-body
-    // limit and the configured manifest cap. Exceeding the body limit is
-    // a 413 (payload too large); exceeding only the manifest cap is MANIFEST_INVALID.
+    // Bound body by min(body_limit, manifest_cap).
     let max_manifest = st.max_manifest();
     let manifest_limit = st.max_body().min(max_manifest);
     let body = match read_body_limited(req, manifest_limit).await {
@@ -254,14 +230,12 @@ pub(crate) async fn put<S: Storage>(
             ))
         }
     };
-    // Reject pathologically nested JSON before handing bytes to serde_json
-    // (bounded-input guard; SECURITY.md inv. 14). A non-JSON body has depth 0.
+    // Reject deep nesting (SECURITY inv. 14).
     if json_depth_exceeds(&body, MAX_JSON_DEPTH) {
         return Err(ApiError::manifest_invalid("manifest JSON nesting too deep"));
     }
     let (digest, tag) = content_digest(reference, &body)?;
-    // Parse the manifest to extract subject/artifactType/annotations for the
-    // referrers index (best-effort; a non-JSON body simply has no subject).
+    // Parse manifest for subject/referrers.
     let parsed: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
     let subject_digest = parsed
@@ -272,10 +246,7 @@ pub(crate) async fn put<S: Storage>(
 
     check_media_type(&media_type, &parsed)?;
 
-    // Referenced-blob existence (MANIFEST_BLOB_UNKNOWN): for an image manifest,
-    // every blob it references (its `config` and each `layers` entry) MUST be
-    // present. A descriptor that is present but malformed (not an object, or no
-    // string `digest`) is a bad manifest → MANIFEST_INVALID.
+    // Referenced-blob existence check (MANIFEST_BLOB_UNKNOWN).
     let referenced = required_blobs(&parsed)?;
     for d in &referenced {
         match st.storage.blob_exists(repo, d).await {
@@ -290,12 +261,8 @@ pub(crate) async fn put<S: Storage>(
         }
     }
 
-    // Manifest, tag, backref edges (config, layers, index children, subject —
-    // everything GC must treat as reachable) and the referrer registration
-    // are committed together as one metadata record, so a crash can never
-    // leave a stored manifest whose blobs look unreferenced. Index children
-    // and a subject are recorded without being required to exist: a subject
-    // may reference an absent manifest per spec, and a child may come later.
+    // Manifest + tag + backrefs + referrer committed atomically so
+    // a crash never leaves unreferenced blobs.
     let references = manifest_references(&parsed);
     let referrer = subject_digest.as_ref().map(|s| {
         (
@@ -337,23 +304,28 @@ pub(crate) async fn delete<S: Storage>(
     reference: &str,
 ) -> Result<Response, ApiError> {
     if !st.can_delete() {
-        return Err(ApiError::unsupported());
+        return Err(ApiError::new(
+            ErrorCode::Unsupported,
+            "the operation is unsupported",
+        ));
     }
-    // Resolve tag → digest first so tag deletions work too. A `:`-form
-    // reference is a digest (grammar checked by Digest::parse → 400 on a
-    // malformed digest); otherwise it is a tag resolved via storage.
+    // Resolve tag → digest; digest references are parsed directly.
     let d = if is_digest_ref(reference) {
         Digest::parse(reference)?
     } else {
         st.storage
             .get_manifest(repo, reference)
             .await
-            .map_err(not_found_as(ApiError::manifest_unknown))?
+            .map_err(not_found_as(|| {
+                ApiError::new(ErrorCode::ManifestUnknown, "manifest unknown to registry")
+            }))?
             .digest
     };
     st.storage
         .delete_manifest(repo, &d)
         .await
-        .map_err(not_found_as(ApiError::manifest_unknown))?;
+        .map_err(not_found_as(|| {
+            ApiError::new(ErrorCode::ManifestUnknown, "manifest unknown to registry")
+        }))?;
     Ok(StatusCode::ACCEPTED.into_response())
 }

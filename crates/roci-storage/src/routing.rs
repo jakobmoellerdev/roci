@@ -1,19 +1,14 @@
-//! Multi-backend routing: [`Routed`] dispatches every [`Storage`] /
-//! [`StorageBackend`] call to the backend whose prefix is the longest
-//! component-boundary match for the repo name — like zot `subPaths`.
+//! Multi-backend routing: dispatches to the longest component-prefix match.
 
 use crate::metadata::{Page, Referrer};
 use crate::storage::{BlobRead, ManifestLinks, ManifestRef, Storage, StorageBackend};
 use crate::{Digest, StorageError};
 use tokio::sync::watch;
 
-/// A sorted route entry: `(prefix, backend)`, matched on a `/`-component
-/// boundary.  Sorted longest-first so the first match wins.
+/// Sorted route table: `(prefix, backend)`, longest-first.
 #[derive(Clone)]
 pub struct Routed<B> {
-    /// The default backend used for repos matching no prefix.
     default: B,
-    /// Routes sorted by descending prefix length (longest match first).
     routes: Vec<(String, B)>,
 }
 
@@ -33,18 +28,13 @@ impl<B> std::fmt::Debug for Routed<B> {
 }
 
 impl<B: StorageBackend + Clone> Routed<B> {
-    /// Build a routing table from a default backend and
-    /// `(prefix, backend)` entries.  Prefixes must be valid repository-name
-    /// component sequences (validated upstream in `roci-config`); empty entries
-    /// are silently ignored.  Routes are sorted longest-first.
+    /// Build a routing table; routes sorted longest-first.
     pub fn new(default: B, mut routes: Vec<(String, B)>) -> Self {
         routes.sort_by_key(|r| std::cmp::Reverse(r.0.len()));
         Self { default, routes }
     }
 
-    /// Return the backend that should serve `repo`, plus the index (None =
-    /// default).  Longest matching prefix wins; match means `repo == prefix`
-    /// or `repo` starts with `prefix` followed by `/`.
+    /// Return the backend serving `repo` (longest matching prefix).
     fn backend_for(&self, repo: &str) -> &B {
         for (prefix, backend) in &self.routes {
             if matches_prefix(repo, prefix) {
@@ -54,13 +44,11 @@ impl<B: StorageBackend + Clone> Routed<B> {
         &self.default
     }
 
-    /// Whether `from_repo` and `to_repo` resolve to the same backend instance.
-    /// True only when the route index is identical (same entry or both default).
+    /// Whether both repos resolve to the same backend.
     fn same_backend(&self, from_repo: &str, to_repo: &str) -> bool {
         self.route_index(from_repo) == self.route_index(to_repo)
     }
 
-    /// None = default; Some(i) = the i-th route entry.
     fn route_index(&self, repo: &str) -> Option<usize> {
         for (i, (prefix, _)) in self.routes.iter().enumerate() {
             if matches_prefix(repo, prefix) {
@@ -71,8 +59,7 @@ impl<B: StorageBackend + Clone> Routed<B> {
     }
 }
 
-/// `repo` matches `prefix` when it equals the prefix exactly or starts with
-/// the prefix followed by `/` (component-boundary match). Allocation-free.
+/// Component-boundary prefix match, allocation-free.
 #[inline]
 fn matches_prefix(repo: &str, prefix: &str) -> bool {
     repo == prefix
@@ -81,47 +68,23 @@ fn matches_prefix(repo: &str, prefix: &str) -> bool {
             && repo.as_bytes().starts_with(prefix.as_bytes()))
 }
 
+macro_rules! route {
+    ($method:ident(&self, repo: &str $(, $arg:ident : $ty:ty)*) -> $ret:ty) => {
+        async fn $method(&self, repo: &str $(, $arg: $ty)*) -> $ret {
+            self.backend_for(repo).$method(repo $(, $arg)*).await
+        }
+    };
+}
+
 impl<B: StorageBackend + Clone> Storage for Routed<B> {
-    async fn blob_size(&self, repo: &str, digest: &Digest) -> Result<u64, StorageError> {
-        self.backend_for(repo).blob_size(repo, digest).await
-    }
-
-    async fn blob_exists(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError> {
-        self.backend_for(repo).blob_exists(repo, digest).await
-    }
-
-    async fn read_blob(&self, repo: &str, digest: &Digest) -> Result<Vec<u8>, StorageError> {
-        self.backend_for(repo).read_blob(repo, digest).await
-    }
-
-    async fn open_blob(&self, repo: &str, digest: &Digest) -> Result<BlobRead, StorageError> {
-        self.backend_for(repo).open_blob(repo, digest).await
-    }
-
-    async fn begin_upload(&self, repo: &str) -> Result<String, StorageError> {
-        self.backend_for(repo).begin_upload(repo).await
-    }
-
-    async fn append_upload(
-        &self,
-        repo: &str,
-        id: &str,
-        body: crate::UploadBody,
-        expected_offset: Option<u64>,
-        limit: u64,
-    ) -> Result<u64, StorageError> {
-        self.backend_for(repo)
-            .append_upload(repo, id, body, expected_offset, limit)
-            .await
-    }
-
-    async fn upload_size(&self, repo: &str, id: &str) -> Result<u64, StorageError> {
-        self.backend_for(repo).upload_size(repo, id).await
-    }
-
-    async fn abort_upload(&self, repo: &str, id: &str) -> Result<bool, StorageError> {
-        self.backend_for(repo).abort_upload(repo, id).await
-    }
+    route!(blob_size(&self, repo: &str, digest: &Digest) -> Result<u64, StorageError>);
+    route!(blob_exists(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError>);
+    route!(read_blob(&self, repo: &str, digest: &Digest) -> Result<Vec<u8>, StorageError>);
+    route!(open_blob(&self, repo: &str, digest: &Digest) -> Result<BlobRead, StorageError>);
+    route!(begin_upload(&self, repo: &str) -> Result<String, StorageError>);
+    route!(append_upload(&self, repo: &str, id: &str, body: crate::UploadBody, expected_offset: Option<u64>, limit: u64) -> Result<u64, StorageError>);
+    route!(upload_size(&self, repo: &str, id: &str) -> Result<u64, StorageError>);
+    route!(abort_upload(&self, repo: &str, id: &str) -> Result<bool, StorageError>);
 
     async fn mount_blob(
         &self,
@@ -129,8 +92,6 @@ impl<B: StorageBackend + Clone> Storage for Routed<B> {
         to_repo: &str,
         digest: &Digest,
     ) -> Result<bool, StorageError> {
-        // Cross-backend mount is not supported: the client falls back to a
-        // normal upload session.  Within the same backend, delegate normally.
         if !self.same_backend(from_repo, to_repo) {
             return Ok(false);
         }
@@ -139,71 +100,14 @@ impl<B: StorageBackend + Clone> Storage for Routed<B> {
             .await
     }
 
-    async fn finish_upload(
-        &self,
-        repo: &str,
-        id: &str,
-        expected: &Digest,
-        max_size: u64,
-        trailing: crate::UploadBody,
-        limit: u64,
-    ) -> Result<(), StorageError> {
-        self.backend_for(repo)
-            .finish_upload(repo, id, expected, max_size, trailing, limit)
-            .await
-    }
-
-    async fn put_blob(&self, repo: &str, digest: &Digest, data: &[u8]) -> Result<(), StorageError> {
-        self.backend_for(repo).put_blob(repo, digest, data).await
-    }
-
-    async fn delete_blob(&self, repo: &str, digest: &Digest) -> Result<(), StorageError> {
-        self.backend_for(repo).delete_blob(repo, digest).await
-    }
-
-    async fn put_manifest(
-        &self,
-        repo: &str,
-        tag: Option<&str>,
-        digest: &Digest,
-        media_type: &str,
-        data: &[u8],
-        links: ManifestLinks<'_>,
-    ) -> Result<(), StorageError> {
-        self.backend_for(repo)
-            .put_manifest(repo, tag, digest, media_type, data, links)
-            .await
-    }
-
-    async fn get_manifest(&self, repo: &str, reference: &str) -> Result<ManifestRef, StorageError> {
-        self.backend_for(repo).get_manifest(repo, reference).await
-    }
-
-    async fn delete_manifest(&self, repo: &str, digest: &Digest) -> Result<(), StorageError> {
-        self.backend_for(repo).delete_manifest(repo, digest).await
-    }
-
-    async fn list_tags(
-        &self,
-        repo: &str,
-        last: Option<&str>,
-        limit: usize,
-    ) -> Result<Page<String>, StorageError> {
-        self.backend_for(repo).list_tags(repo, last, limit).await
-    }
-
-    async fn list_referrers(
-        &self,
-        repo: &str,
-        subject: &Digest,
-        artifact_type: Option<&str>,
-        last: Option<&str>,
-        limit: usize,
-    ) -> Result<Page<Referrer>, StorageError> {
-        self.backend_for(repo)
-            .list_referrers(repo, subject, artifact_type, last, limit)
-            .await
-    }
+    route!(finish_upload(&self, repo: &str, id: &str, expected: &Digest, max_size: u64, trailing: crate::UploadBody, limit: u64) -> Result<(), StorageError>);
+    route!(put_blob(&self, repo: &str, digest: &Digest, data: &[u8]) -> Result<(), StorageError>);
+    route!(delete_blob(&self, repo: &str, digest: &Digest) -> Result<(), StorageError>);
+    route!(put_manifest(&self, repo: &str, tag: Option<&str>, digest: &Digest, media_type: &str, data: &[u8], links: ManifestLinks<'_>) -> Result<(), StorageError>);
+    route!(get_manifest(&self, repo: &str, reference: &str) -> Result<ManifestRef, StorageError>);
+    route!(delete_manifest(&self, repo: &str, digest: &Digest) -> Result<(), StorageError>);
+    route!(list_tags(&self, repo: &str, last: Option<&str>, limit: usize) -> Result<Page<String>, StorageError>);
+    route!(list_referrers(&self, repo: &str, subject: &Digest, artifact_type: Option<&str>, last: Option<&str>, limit: usize) -> Result<Page<Referrer>, StorageError>);
 }
 
 impl<B: StorageBackend + Clone> StorageBackend for Routed<B> {
@@ -242,27 +146,33 @@ mod tests {
     use super::*;
     use crate::FsStorage;
 
-    #[test]
-    fn prefix_exact_match() {
+    fn routed_fixture() -> (tempfile::TempDir, Routed<FsStorage>) {
         let dir = tempfile::tempdir().unwrap();
         let default = FsStorage::new(dir.path().join("default")).unwrap();
         let team = FsStorage::new(dir.path().join("team")).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
-        // exact match
-        assert_eq!(routed.route_index("team"), Some(0));
-        // under the prefix
-        assert_eq!(routed.route_index("team/app"), Some(0));
+        (dir, Routed::new(default, vec![("team".into(), team)]))
     }
 
     #[test]
-    fn prefix_component_boundary() {
-        let dir = tempfile::tempdir().unwrap();
-        let default = FsStorage::new(dir.path().join("default")).unwrap();
-        let team = FsStorage::new(dir.path().join("team")).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
-        // "teams/x" must NOT match "team" — component boundary check
-        assert_eq!(routed.route_index("teams/x"), None);
-        assert_eq!(routed.route_index("teamster"), None);
+    fn prefix_matching_rules() {
+        let (_dir, routed) = routed_fixture();
+        assert_eq!(routed.route_index("team"), Some(0), "exact match");
+        assert_eq!(routed.route_index("team/app"), Some(0), "under prefix");
+        assert_eq!(
+            routed.route_index("teams/x"),
+            None,
+            "no partial component match"
+        );
+        assert_eq!(
+            routed.route_index("teamster"),
+            None,
+            "no partial component match 2"
+        );
+        let dir2 = tempfile::tempdir().unwrap();
+        let default2 = FsStorage::new(dir2.path().join("default")).unwrap();
+        let empty: Routed<FsStorage> = Routed::new(default2, vec![]);
+        assert_eq!(empty.route_index("anything"), None, "empty routes");
+        assert_eq!(empty.route_index("a/b/c"), None, "empty routes nested");
     }
 
     #[test]
@@ -275,35 +185,17 @@ mod tests {
             default,
             vec![("org".into(), org), ("org/team".into(), org_team)],
         );
-        // "org/team/app" matches the longer "org/team" prefix
-        assert_eq!(routed.route_index("org/team/app"), Some(0)); // sorted longest-first
+        assert_eq!(routed.route_index("org/team/app"), Some(0));
         assert_eq!(routed.route_index("org/team"), Some(0));
-        // "org/other" matches "org"
         assert_eq!(routed.route_index("org/other"), Some(1));
-        // "unrelated" falls to default
         assert_eq!(routed.route_index("unrelated"), None);
     }
 
     #[test]
-    fn default_when_no_routes() {
-        let dir = tempfile::tempdir().unwrap();
-        let default = FsStorage::new(dir.path().join("default")).unwrap();
-        let routed: Routed<FsStorage> = Routed::new(default, vec![]);
-        assert_eq!(routed.route_index("anything"), None);
-        assert_eq!(routed.route_index("a/b/c"), None);
-    }
-
-    #[test]
     fn same_backend_detection() {
-        let dir = tempfile::tempdir().unwrap();
-        let default = FsStorage::new(dir.path().join("default")).unwrap();
-        let team = FsStorage::new(dir.path().join("team")).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
-        // Same backend (both under "team")
+        let (_dir, routed) = routed_fixture();
         assert!(routed.same_backend("team/a", "team/b"));
-        // Same backend (both default)
         assert!(routed.same_backend("other/a", "other/b"));
-        // Different backends
         assert!(!routed.same_backend("team/a", "other/b"));
         assert!(!routed.same_backend("other/a", "team/b"));
     }
@@ -320,7 +212,6 @@ mod tests {
         let data = b"hello world";
         let digest = crate::sha256_of(data);
 
-        // Put a blob into "team/app" → should go into the team root
         routed.put_blob("team/app", &digest, data).await.unwrap();
         assert!(team_root
             .join(format!("team/app/blobs/sha256/{}", digest.hex()))
@@ -329,7 +220,6 @@ mod tests {
             .join(format!("team/app/blobs/sha256/{}", digest.hex()))
             .exists());
 
-        // Put a blob into "other/app" → should go into the default root
         routed.put_blob("other/app", &digest, data).await.unwrap();
         assert!(default_root
             .join(format!("other/app/blobs/sha256/{}", digest.hex()))
@@ -337,137 +227,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegation_manifests_in_correct_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let default_root = dir.path().join("default");
-        let team_root = dir.path().join("team");
-        let default = FsStorage::new(&default_root).unwrap();
-        let team = FsStorage::new(&team_root).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
-
-        // A minimal manifest (just enough to be valid JSON with a config blob
-        // and zero layers).
-        let config_data = b"{}";
-        let config_digest = crate::sha256_of(config_data);
-
-        let manifest = serde_json::json!({
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {
-                "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": config_digest.as_string(),
-                "size": config_data.len()
-            },
-            "layers": []
-        });
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        let manifest_digest = crate::sha256_of(&manifest_bytes);
-
-        // Store config blob first
-        routed
-            .put_blob("team/myrepo", &config_digest, config_data)
-            .await
-            .unwrap();
-
-        // Store manifest in "team/myrepo" → team root
-        let refs: Vec<Digest> = vec![config_digest.clone()];
-        let links = ManifestLinks {
-            references: &refs,
-            required: &[],
-            subject: None,
-        };
-        routed
-            .put_manifest(
-                "team/myrepo",
-                Some("latest"),
-                &manifest_digest,
-                "application/vnd.oci.image.manifest.v1+json",
-                &manifest_bytes,
-                links,
-            )
-            .await
-            .unwrap();
-
-        // The manifest blob lives in the team root
-        assert!(team_root
-            .join(format!(
-                "team/myrepo/blobs/sha256/{}",
-                manifest_digest.hex()
-            ))
-            .exists());
-
-        // Tag resolution works via the routed storage
-        let resolved = routed.get_manifest("team/myrepo", "latest").await.unwrap();
-        assert_eq!(resolved.digest, manifest_digest);
-    }
-
-    #[tokio::test]
-    async fn delegation_tags_in_correct_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let default_root = dir.path().join("default");
-        let team_root = dir.path().join("team");
-        let default = FsStorage::new(&default_root).unwrap();
-        let team = FsStorage::new(&team_root).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
-
-        // Put a minimal manifest so list_tags has something to return
-        let config_data = b"{}";
-        let config_digest = crate::sha256_of(config_data);
-        let manifest = serde_json::json!({
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {
-                "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": config_digest.as_string(),
-                "size": config_data.len()
-            },
-            "layers": []
-        });
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        let manifest_digest = crate::sha256_of(&manifest_bytes);
-
-        routed
-            .put_blob("team/app", &config_digest, config_data)
-            .await
-            .unwrap();
-        routed
-            .put_manifest(
-                "team/app",
-                Some("v1"),
-                &manifest_digest,
-                "application/vnd.oci.image.manifest.v1+json",
-                &manifest_bytes,
-                ManifestLinks {
-                    references: &[config_digest],
-                    required: &[],
-                    subject: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        let page = routed.list_tags("team/app", None, 100).await.unwrap();
-        assert_eq!(page.items, vec!["v1".to_string()]);
-
-        // An unrelated repo in the default root has no tags
-        let page = routed.list_tags("unrelated/app", None, 100).await.unwrap();
-        assert!(page.items.is_empty());
-    }
-
-    #[tokio::test]
     async fn cross_backend_mount_returns_false() {
-        let dir = tempfile::tempdir().unwrap();
-        let default = FsStorage::new(dir.path().join("default")).unwrap();
-        let team = FsStorage::new(dir.path().join("team")).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
+        let (_dir, routed) = routed_fixture();
 
         let data = b"cross-mount-test";
         let digest = crate::sha256_of(data);
-
-        // Put a blob in the default backend
         routed.put_blob("lib/base", &digest, data).await.unwrap();
 
-        // Cross-backend mount from default to "team/app" should return false
         let mounted = routed
             .mount_blob("lib/base", "team/app", &digest)
             .await
@@ -477,233 +243,34 @@ mod tests {
 
     #[tokio::test]
     async fn same_backend_mount_works() {
-        let dir = tempfile::tempdir().unwrap();
-        let default = FsStorage::new(dir.path().join("default")).unwrap();
-        let team = FsStorage::new(dir.path().join("team")).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
+        let (_dir, routed) = routed_fixture();
 
         let data = b"same-mount-test";
         let digest = crate::sha256_of(data);
-
-        // Put a blob in "team/src"
         routed.put_blob("team/src", &digest, data).await.unwrap();
 
-        // Mount within the same backend → should succeed
         let mounted = routed
             .mount_blob("team/src", "team/dst", &digest)
             .await
             .unwrap();
         assert!(mounted);
-
-        // The blob should be accessible in the destination
         let size = routed.blob_size("team/dst", &digest).await.unwrap();
         assert_eq!(size, data.len() as u64);
     }
 
     #[tokio::test]
-    async fn recover_fans_out() {
-        // Just verifies recover completes without panic on multiple backends.
-        let dir = tempfile::tempdir().unwrap();
-        let default = FsStorage::new(dir.path().join("default")).unwrap();
-        let team = FsStorage::new(dir.path().join("team")).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
+    async fn recover_and_ready_fan_out_to_all_backends() {
+        let (_dir, routed) = routed_fixture();
         routed.recover().await;
+        routed.ready().await.unwrap();
     }
 
     #[tokio::test]
-    async fn start_maintenance_fans_out() {
-        // Verifies start_maintenance completes without panic and tasks stop.
-        let dir = tempfile::tempdir().unwrap();
-        let default = FsStorage::new(dir.path().join("default")).unwrap();
-        let team = FsStorage::new(dir.path().join("team")).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
-        let (tx, rx) = watch::channel(false);
+    async fn on_shutdown_and_start_maintenance_fan_out() {
+        let (_dir, routed) = routed_fixture();
+        let (tx, rx) = tokio::sync::watch::channel(false);
         routed.start_maintenance(rx);
-        // Signal shutdown so the tasks don't leak.
-        let _ = tx.send(true);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[test]
-    fn debug_impl_shows_route_prefixes() {
-        let dir = tempfile::tempdir().unwrap();
-        let default = FsStorage::new(dir.path().join("default")).unwrap();
-        let team = FsStorage::new(dir.path().join("team")).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
-        let dbg = format!("{:?}", routed);
-        assert!(dbg.contains("Routed"));
-        assert!(dbg.contains("team"));
-    }
-
-    #[tokio::test]
-    async fn delegation_blob_exists_and_size() {
-        let dir = tempfile::tempdir().unwrap();
-        let default = FsStorage::new(dir.path().join("default")).unwrap();
-        let team = FsStorage::new(dir.path().join("team")).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
-
-        let data = b"exists-test";
-        let digest = crate::sha256_of(data);
-
-        routed.put_blob("team/app", &digest, data).await.unwrap();
-
-        // blob_exists and blob_size delegate to the right backend
-        assert!(routed.blob_exists("team/app", &digest).await.unwrap());
-        assert!(!routed.blob_exists("other/app", &digest).await.unwrap());
-        assert_eq!(
-            routed.blob_size("team/app", &digest).await.unwrap(),
-            data.len() as u64
-        );
-    }
-
-    #[tokio::test]
-    async fn delegation_read_and_open_blob() {
-        let dir = tempfile::tempdir().unwrap();
-        let default = FsStorage::new(dir.path().join("default")).unwrap();
-        let team = FsStorage::new(dir.path().join("team")).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
-
-        let data = b"read-open-test";
-        let digest = crate::sha256_of(data);
-        routed.put_blob("team/x", &digest, data).await.unwrap();
-
-        // read_blob
-        assert_eq!(routed.read_blob("team/x", &digest).await.unwrap(), data);
-
-        // open_blob
-        let blob_read = routed.open_blob("team/x", &digest).await.unwrap();
-        assert_eq!(blob_read.size(), data.len() as u64);
-    }
-
-    #[tokio::test]
-    async fn delegation_upload_lifecycle() {
-        let dir = tempfile::tempdir().unwrap();
-        let default = FsStorage::new(dir.path().join("default")).unwrap();
-        let team = FsStorage::new(dir.path().join("team")).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
-
-        let data = b"upload-lifecycle";
-        let digest = crate::sha256_of(data);
-
-        // begin_upload, append_upload, upload_size, finish_upload
-        let id = routed.begin_upload("team/up").await.unwrap();
-        let offset = routed
-            .append_upload("team/up", &id, crate::upload_body(data), None, u64::MAX)
-            .await
-            .unwrap();
-        assert_eq!(offset, data.len() as u64);
-        let size = routed.upload_size("team/up", &id).await.unwrap();
-        assert_eq!(size, data.len() as u64);
-        routed
-            .finish_upload(
-                "team/up",
-                &id,
-                &digest,
-                u64::MAX,
-                crate::upload_body(b""),
-                u64::MAX,
-            )
-            .await
-            .unwrap();
-        assert_eq!(routed.read_blob("team/up", &digest).await.unwrap(), data);
-
-        // abort_upload through the default backend
-        let id2 = routed.begin_upload("other/up").await.unwrap();
-        routed
-            .append_upload(
-                "other/up",
-                &id2,
-                crate::upload_body(b"junk"),
-                None,
-                u64::MAX,
-            )
-            .await
-            .unwrap();
-        assert!(routed.abort_upload("other/up", &id2).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn delegation_delete_blob() {
-        let dir = tempfile::tempdir().unwrap();
-        let default = FsStorage::new(dir.path().join("default")).unwrap();
-        let team = FsStorage::new(dir.path().join("team")).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
-
-        let data = b"to-delete";
-        let digest = crate::sha256_of(data);
-        routed.put_blob("team/del", &digest, data).await.unwrap();
-        assert!(routed.blob_exists("team/del", &digest).await.unwrap());
-        routed.delete_blob("team/del", &digest).await.unwrap();
-        assert!(!routed.blob_exists("team/del", &digest).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn delegation_delete_manifest() {
-        let dir = tempfile::tempdir().unwrap();
-        let default = FsStorage::new(dir.path().join("default")).unwrap();
-        let team = FsStorage::new(dir.path().join("team")).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
-
-        let config_data = b"{}";
-        let config_digest = crate::sha256_of(config_data);
-        let manifest = serde_json::json!({
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {
-                "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": config_digest.as_string(),
-                "size": config_data.len()
-            },
-            "layers": []
-        });
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        let manifest_digest = crate::sha256_of(&manifest_bytes);
-
-        routed
-            .put_blob("team/dm", &config_digest, config_data)
-            .await
-            .unwrap();
-        routed
-            .put_manifest(
-                "team/dm",
-                Some("v1"),
-                &manifest_digest,
-                "application/vnd.oci.image.manifest.v1+json",
-                &manifest_bytes,
-                ManifestLinks {
-                    references: &[config_digest],
-                    required: &[],
-                    subject: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        // get_manifest works through the router
-        let resolved = routed.get_manifest("team/dm", "v1").await.unwrap();
-        assert_eq!(resolved.digest, manifest_digest);
-
-        // delete_manifest
-        routed
-            .delete_manifest("team/dm", &manifest_digest)
-            .await
-            .unwrap();
-        assert!(routed.get_manifest("team/dm", "v1").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn delegation_list_referrers() {
-        let dir = tempfile::tempdir().unwrap();
-        let default = FsStorage::new(dir.path().join("default")).unwrap();
-        let team = FsStorage::new(dir.path().join("team")).unwrap();
-        let routed = Routed::new(default, vec![("team".into(), team)]);
-
-        // list_referrers on an empty repo returns an empty page
-        let d = crate::sha256_of(b"subject");
-        let page = routed
-            .list_referrers("team/ref", &d, None, None, 100)
-            .await
-            .unwrap();
-        assert!(page.items.is_empty());
+        routed.on_shutdown();
+        tx.send(true).unwrap();
     }
 }

@@ -1,8 +1,5 @@
-//! Configuration schema for roci. Zero-config by default; a single declarative
-//! TOML file overrides individual fields as the deployment grows
-//! (ARCHITECTURE.md §Configuration model). Every section and field is optional;
-//! unknown keys are rejected, and [`Config::validate`] runs on every load so a
-//! bad file fails fast with a field-qualified message.
+//! Configuration schema for roci (ARCHITECTURE.md §Configuration model).
+//! Zero-config by default; unknown keys rejected; [`Config::validate`] runs on every load.
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, HashSet};
@@ -11,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Top-level runtime configuration.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -22,8 +18,6 @@ pub struct Config {
     pub log: LogConfig,
     pub telemetry: TelemetryConfig,
     pub auth: AuthConfig,
-    /// `[access_control]` — identity-based repository policy; absent →
-    /// every authenticated identity may do everything, anonymous nothing.
     pub access_control: Option<AccessControlConfig>,
 }
 
@@ -31,9 +25,7 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HttpConfig {
-    /// Address the HTTP server binds to.
     pub listen: SocketAddr,
-    /// TLS termination; absent → plaintext (HTTP/1.1 + h2c).
     pub tls: Option<TlsConfig>,
     pub timeouts: TimeoutsConfig,
     pub rate_limit: RateLimitConfig,
@@ -50,45 +42,36 @@ impl Default for HttpConfig {
     }
 }
 
-/// `[http.tls]` — PEM server certificate chain + private key, plus optional
-/// mTLS client-certificate authentication.
+/// `[http.tls]` — PEM cert chain + key, optional mTLS.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     pub cert: PathBuf,
     pub key: PathBuf,
-    /// Request/require a client certificate chaining to `client_ca`.
     #[serde(default)]
     pub client_auth: ClientAuth,
-    /// PEM bundle of CAs trusted to issue client certificates.
     #[serde(default)]
     pub client_ca: Option<PathBuf>,
-    /// Optional pin list: SHA-256 fingerprints (hex) of accepted client leaf
-    /// certificates. Empty → any certificate chaining to `client_ca`.
     #[serde(default)]
     pub client_cert_sha256: Vec<String>,
 }
 
-/// `http.tls.client_auth` — mTLS mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClientAuth {
-    /// No client certificate is requested.
     #[default]
     None,
-    /// A certificate is requested; a connection without one is anonymous.
+    /// Requested; missing cert → anonymous.
     Optional,
-    /// The handshake fails without a trusted client certificate.
+    /// Required; handshake fails without it.
     Required,
 }
 
-/// `[http.timeouts]` — slow-loris / stalled-peer bounds (SECURITY inv. 14).
+/// `[http.timeouts]` — slow-loris bounds (SECURITY inv. 14).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TimeoutsConfig {
-    /// Max seconds to receive a complete request head.
     pub read_header_secs: u64,
-    /// Seconds an idle keep-alive connection is held open.
     pub idle_secs: u64,
 }
 
@@ -101,35 +84,23 @@ impl Default for TimeoutsConfig {
     }
 }
 
-/// `[http.rate_limit]` — token buckets; exhausted → `429 TOOMANYREQUESTS`.
-/// Disabled by default (zero-config local registry).
+/// `[http.rate_limit]` — token buckets; exhausted → `429`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RateLimitConfig {
     pub enabled: bool,
-    /// Bucket for methods without a `per_method` entry; `None` → unlimited.
     pub default: Option<Bucket>,
-    /// Per-HTTP-method buckets keyed by upper-case method (`GET`, `PUT`, …).
     pub per_method: BTreeMap<String, Bucket>,
-    /// Per-client buckets (keyed by authenticated principal or peer IP).
-    /// Absent → no per-client limiting (backward compatible).
     pub per_client: Option<PerClientConfig>,
 }
 
-/// `[http.rate_limit.per_client]` — per-client token bucket. The client key
-/// is the authenticated principal identity when auth succeeded, else the TCP
-/// peer IP (socket address, **not** `X-Forwarded-For`; behind a proxy all
-/// anonymous clients collapse onto the proxy IP). An LRU map with at most
-/// `max_clients` entries bounds memory; an evicted client restarts with a full
-/// bucket.
+/// `[http.rate_limit.per_client]` — per-client bucket keyed by
+/// principal or peer IP; LRU-bounded by `max_clients`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PerClientConfig {
-    /// Sustained requests per second per client.
     pub rate: u32,
-    /// Maximum burst capacity per client.
     pub burst: u32,
-    /// Maximum number of tracked clients (LRU eviction above this cap).
     #[serde(default = "default_max_clients")]
     pub max_clients: u32,
 }
@@ -138,7 +109,6 @@ fn default_max_clients() -> u32 {
     10_000
 }
 
-/// One token bucket: sustained `rate` requests/second, `burst` capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bucket {
@@ -146,41 +116,18 @@ pub struct Bucket {
     pub burst: u32,
 }
 
-/// `[storage]` — the default backend plus every storage subsystem knob.
+/// `[storage]` — default backend and subsystem knobs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
-    /// Root directory. For the filesystem backend it is the OCI-layout root;
-    /// with `s3` set it holds only local state (metadata log, upload staging).
     pub root: PathBuf,
-    /// Byte budget of the small-blob LRU content cache (0 disables it).
     pub cache_max_bytes: usize,
-    /// Maximum blob size (bytes) eligible for the small-blob content cache.
-    /// Blobs at or below this are cached in RAM on first read/write; larger
-    /// blobs go straight to streaming I/O and are never cached.
     pub small_blob_threshold: usize,
-    /// Cross-repo dedupe of uploaded blobs: a blob already stored in another
-    /// repo is linked (reflink → hard link) instead of kept as a second copy.
     pub dedupe: bool,
-    /// `fsync` blob data (and the directory entry that publishes it) before an
-    /// upload/mount is acknowledged. `false` (default, zot's `commit` default)
-    /// leaves blob bytes to the kernel's writeback: a power loss can leave a
-    /// blob torn under its digest name (the scrub's CRC32C catches it; the
-    /// client re-pushes). Manifests, the metadata WAL, `index.json` and the
-    /// layout marker are always synced regardless.
+    /// `fsync` blob data before ack; manifests/WAL always synced.
     pub commit: bool,
-    /// Skip the startup CAS walk when a valid stamp file from the previous
-    /// graceful shutdown is found. The stamp records the binary version,
-    /// config hash, metadata identity and all derived in-memory state
-    /// (presence filter, dedupe index, quota, GC candidates); a mismatch,
-    /// corruption or absence falls back to the full walk. Opt-in (zot
-    /// `fastRestart`). Filesystem backend only; S3's recovery is async and
-    /// lists remote objects, so this flag has no effect on the S3 backend.
     pub fast_restart: bool,
-    /// Remote object-store backend for this root (needs the `s3` build).
     pub s3: Option<S3Config>,
-    /// Repo-name prefix → backend routing (zot `subPaths`); the longest
-    /// matching prefix (on a `/` component boundary) wins.
     pub subpaths: BTreeMap<String, SubpathConfig>,
     pub gc: GcConfig,
     pub scrub: ScrubConfig,
@@ -207,53 +154,44 @@ impl Default for StorageConfig {
     }
 }
 
-/// `[storage.subpaths."<prefix>"]` — a separate backend for one repo prefix.
-/// Subsystem policies (`gc`, `scrub`, `quota`, `metadata`, `dedupe`) are
-/// shared with `[storage]`; only the backend location differs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubpathConfig {
-    /// Root directory (layout root, or local state dir when `s3` is set).
     pub root: PathBuf,
     #[serde(default)]
     pub s3: Option<S3Config>,
 }
 
-/// `s3 = { … }` — an S3-compatible object-store backend.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3Config {
     pub bucket: String,
     #[serde(default = "default_s3_region")]
     pub region: String,
-    /// Custom endpoint for S3-compatible stores (MinIO, R2, Ceph); absent →
-    /// AWS for `region`.
+    /// Custom endpoint (MinIO, R2, Ceph); absent → AWS.
     #[serde(default)]
     pub endpoint: Option<String>,
-    /// Key prefix inside the bucket (no leading/trailing `/`).
     #[serde(default)]
     pub prefix: String,
-    /// Static access key id; absent → the environment/instance credential chain.
+    /// Static access key; absent → env/instance credential chain.
     #[serde(default)]
     pub access_key_id: Option<String>,
-    /// File holding the secret access key (kept out of the config file so it
-    /// can carry stricter permissions / a Kubernetes Secret mount).
+    /// File holding the secret access key.
     #[serde(default)]
     pub secret_access_key_file: Option<PathBuf>,
-    /// Permit a plaintext `http://` endpoint (local MinIO); off by default.
+    /// Permit plaintext `http://` endpoint.
     #[serde(default)]
     pub allow_http: bool,
-    /// Blob GETs at or above this size are answered with a `307` to a
-    /// short-lived signed URL; smaller blobs are proxied. `0` disables.
+    /// Blob GETs ≥ this size redirect to signed URL; `0` disables.
     #[serde(default = "default_redirect_min_size")]
     pub redirect_min_size: u64,
-    /// Lifetime of a redirect's signed URL, `1..=60` seconds.
+    /// Signed URL lifetime, `1..=60`s.
     #[serde(default = "default_redirect_ttl_secs")]
     pub redirect_ttl_secs: u64,
     /// Multipart part size in bytes (≥ 5 MiB, the S3 minimum).
     #[serde(default = "default_multipart_part_size")]
     pub multipart_part_size: u64,
-    /// Parts transferred in parallel per multipart upload/copy.
+    /// Parallel parts per multipart upload.
     #[serde(default = "default_multipart_concurrency")]
     pub multipart_concurrency: usize,
     /// If `true`, create the S3 bucket at backend startup when it does not
@@ -284,18 +222,14 @@ fn default_multipart_concurrency() -> usize {
     8
 }
 
-/// The S3 multipart minimum part size (every part but the last).
 pub const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 
-/// `[storage.gc]` — online garbage collection (zot `gc`/`gcDelay`/`gcInterval`).
+/// `[storage.gc]` — online garbage collection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GcConfig {
     pub enabled: bool,
-    /// Grace period: an unreferenced blob is collected only after it has been
-    /// unreferenced and untouched for this long.
     pub delay_secs: u64,
-    /// Period between sweeps.
     pub interval_secs: u64,
 }
 
@@ -314,9 +248,7 @@ impl Default for GcConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ScrubConfig {
     pub enabled: bool,
-    /// Target period of one full pass over the store.
     pub interval_secs: u64,
-    /// Read-bandwidth ceiling for the scrub pass (bytes/second).
     pub max_bytes_per_sec: u64,
     pub mode: ScrubMode,
 }
@@ -335,11 +267,8 @@ impl Default for ScrubConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScrubMode {
-    /// Delegate to the filesystem's own scrub on btrfs/ZFS (app pass off);
-    /// run the application pass everywhere else.
     #[default]
     Auto,
-    /// Always run the application pass, even on a self-checksumming FS.
     App,
 }
 
@@ -347,12 +276,11 @@ pub enum ScrubMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QuotaConfig {
-    /// Per-repository byte cap; `0` = unlimited. Exceeded → `413`.
+    /// Per-repo byte cap; `0` = unlimited.
     pub max_repo_bytes: u64,
-    /// Registry-wide byte cap; `0` = unlimited. Exceeded → `507`.
+    /// Registry-wide byte cap; `0` = unlimited.
     pub max_total_bytes: u64,
-    /// Concurrent upload sessions across the registry; `0` = unlimited.
-    /// Exceeded → `429 TOOMANYREQUESTS`.
+    /// Concurrent upload sessions; `0` = unlimited.
     pub max_upload_sessions: usize,
 }
 
@@ -371,14 +299,15 @@ impl Default for QuotaConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct MetadataConfig {
     pub engine: MetadataEngine,
-    /// Serve the log engine's state from an rkyv `mmap` snapshot plus the
-    /// post-snapshot log tail (fast cold start, demand-paged RSS).
+    /// Serve from mmap snapshot + log tail (fast cold start).
     pub snapshot: bool,
     /// Compact the log (or cut a new snapshot) once it grows past this size.
     pub compact_threshold_bytes: u64,
-    /// File holding a per-deployment HMAC key authenticating every log record
-    /// and snapshot (compromised-storage-volume threat model).
+    /// HMAC key file for log/snapshot auth; with LMDB derives a
+    /// ChaCha20-Poly1305 encryption key.
     pub hmac_key_file: Option<PathBuf>,
+    /// Max LMDB mmap region; log engine ignores this.
+    pub map_size_bytes: u64,
 }
 
 impl Default for MetadataConfig {
@@ -388,6 +317,7 @@ impl Default for MetadataConfig {
             snapshot: false,
             compact_threshold_bytes: 64 * 1024 * 1024,
             hmac_key_file: None,
+            map_size_bytes: 68_719_476_736, // 64 GiB
         }
     }
 }
@@ -398,7 +328,10 @@ pub enum MetadataEngine {
     /// Append-only CRC32C-framed log + in-RAM maps (the minimal default).
     #[default]
     Log,
-    /// Embedded B-tree KV (redb) for out-of-RAM metadata (needs the `redb` build).
+    /// LMDB (heed3), optional encryption-at-rest.
+    Lmdb,
+    /// Removed — kept for a clear error on old configs.
+    #[doc(hidden)]
     Redb,
 }
 
@@ -406,13 +339,9 @@ pub enum MetadataEngine {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
-    /// Max accepted request-body bytes (one chunk / monolithic body).
     pub max_body: usize,
-    /// Max cumulative bytes of one upload session.
     pub max_upload: u64,
-    /// Max manifest bytes, checked before JSON parse.
     pub max_manifest: usize,
-    /// Server-side cap on `n` for tag/referrer pagination.
     pub max_page: usize,
 }
 
@@ -427,12 +356,10 @@ impl Default for LimitsConfig {
     }
 }
 
-/// `[delete]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeleteConfig {
-    /// When true, delete endpoints are accepted; false returns 405
-    /// (CVE-2026-41888 mitigation track).
+    /// Accept delete endpoints; false → 405.
     pub enabled: bool,
 }
 
@@ -442,11 +369,10 @@ impl Default for DeleteConfig {
     }
 }
 
-/// `[log]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LogConfig {
-    /// `EnvFilter` directive (e.g. `info`, `roci_core=debug`); `RUST_LOG` wins.
+    /// `EnvFilter` directive; `RUST_LOG` overrides.
     pub level: String,
     pub format: LogFormat,
 }
@@ -472,11 +398,9 @@ pub enum LogFormat {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TelemetryConfig {
-    /// OTLP export of traces+metrics+logs; absent → no export.
+    /// OTLP export; absent → none.
     pub otlp: Option<OtlpConfig>,
-    /// Head-sampling ratio in `[0, 1]` for root traces.
     pub sample_ratio: f64,
-    /// Prometheus scrape view over the same meters.
     pub metrics: MetricsConfig,
 }
 
@@ -493,7 +417,6 @@ impl Default for TelemetryConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OtlpConfig {
-    /// Collector endpoint, e.g. `http://localhost:4317` (gRPC) or `:4318` (HTTP).
     pub endpoint: String,
     #[serde(default)]
     pub protocol: OtlpProtocol,
@@ -510,7 +433,6 @@ pub enum OtlpProtocol {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricsConfig {
-    /// Serve `GET <path>` in Prometheus text format.
     pub enabled: bool,
     pub path: String,
 }
@@ -524,17 +446,15 @@ impl Default for MetricsConfig {
     }
 }
 
-/// `[auth]` — authentication mechanisms. All absent → no authentication
-/// (unless `[access_control]` or mTLS is configured).
+/// `[auth]` — authentication; all absent → unauthenticated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
-    /// Realm advertised in the `Basic` challenge.
     pub realm: String,
     pub htpasswd: Option<HtpasswdConfig>,
     pub ldap: Option<LdapConfig>,
     pub bearer: Option<BearerConfig>,
-    /// Lifetime of a cached successful Basic authentication; `0` disables.
+    /// Cached Basic auth TTL; `0` disables.
     pub cache_ttl_secs: u64,
 }
 
@@ -561,29 +481,21 @@ pub struct HtpasswdConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LdapConfig {
-    /// `ldaps://host:port`, or `ldap://host:port` with `start_tls = true`.
     pub url: String,
     #[serde(default)]
     pub start_tls: bool,
-    /// Service account used to look the user up.
     pub bind_dn: String,
-    /// File holding the service account password (trimmed).
     pub bind_password_file: PathBuf,
-    /// Subtree searched for the user entry.
     pub base_dn: String,
-    /// Attribute matched against the login name.
     #[serde(default = "default_ldap_user_attribute")]
     pub user_attribute: String,
-    /// Extra filter ANDed into the user search, e.g. `(objectClass=person)`.
     #[serde(default)]
     pub user_filter: Option<String>,
-    /// Attribute of the user entry listing its groups (e.g. `memberOf`).
     #[serde(default)]
     pub group_attribute: Option<String>,
-    /// PEM CA bundle trusted for the directory; absent → system roots.
+    /// PEM CA bundle; absent → system roots.
     #[serde(default)]
     pub ca_file: Option<PathBuf>,
-    /// Bound on one whole authentication exchange.
     #[serde(default = "default_ldap_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -595,17 +507,13 @@ fn default_ldap_timeout_secs() -> u64 {
     5
 }
 
-/// `[auth.bearer]` — verify Docker v2 bearer tokens from an external issuer.
+/// `[auth.bearer]` — Docker v2 bearer tokens.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BearerConfig {
-    /// Token endpoint advertised in the challenge.
     pub realm: String,
-    /// Service name: advertised in the challenge, required in `aud`.
     pub service: String,
-    /// Required `iss` claim.
     pub issuer: String,
-    /// PEM file with one or more `PUBLIC KEY` / `CERTIFICATE` blocks.
     pub verify_key_file: PathBuf,
 }
 
@@ -613,21 +521,18 @@ pub struct BearerConfig {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessControlConfig {
-    /// Users granted every action on every repository.
     #[serde(default)]
     pub admins: Vec<String>,
-    /// Named groups → member user names.
     #[serde(default)]
     pub groups: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub repositories: Vec<RepositoryPolicy>,
 }
 
-/// `[[access_control.repositories]]` — grants for repositories matching a glob.
+/// `[[access_control.repositories]]` — grants for matching repos.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryPolicy {
-    /// `*` matches within one path component, `**` across components.
     pub pattern: String,
     #[serde(default)]
     pub anonymous: Vec<Action>,
@@ -637,7 +542,6 @@ pub struct RepositoryPolicy {
     pub policies: Vec<IdentityPolicy>,
 }
 
-/// Grants `actions` to the listed users and groups.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityPolicy {
@@ -648,7 +552,6 @@ pub struct IdentityPolicy {
     pub actions: Vec<Action>,
 }
 
-/// A repository action subject to authorization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
@@ -657,7 +560,6 @@ pub enum Action {
     Delete,
 }
 
-/// Load/validation failure, carrying the offending field path.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("reading config {path}: {source}")]
@@ -681,10 +583,28 @@ fn invalid(field: impl Into<String>, reason: impl Into<String>) -> ConfigError {
     }
 }
 
+fn require_nonzero(fields: &[(&str, u64)]) -> Result<(), ConfigError> {
+    for &(field, v) in fields {
+        if v == 0 {
+            return Err(invalid(field, "must be > 0"));
+        }
+    }
+    Ok(())
+}
+
+fn require_nonempty(fields: &[(&str, &str)]) -> Result<(), ConfigError> {
+    for &(field, v) in fields {
+        if v.trim().is_empty() {
+            return Err(invalid(field, "must not be empty"));
+        }
+    }
+    Ok(())
+}
+
 const METHODS: [&str; 6] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
 
 impl Config {
-    /// Read, parse, and validate a TOML config file.
+    /// Load, parse, and validate a TOML config file.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
             path: path.to_path_buf(),
@@ -698,10 +618,10 @@ impl Config {
         Ok(config)
     }
 
-    /// Check cross-field invariants serde cannot express.
+    /// Validate cross-field invariants.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let l = &self.limits;
-        for (field, v) in [
+        require_nonzero(&[
             ("limits.max_body", l.max_body as u64),
             ("limits.max_upload", l.max_upload),
             ("limits.max_manifest", l.max_manifest as u64),
@@ -710,11 +630,7 @@ impl Config {
                 "http.timeouts.read_header_secs",
                 self.http.timeouts.read_header_secs,
             ),
-        ] {
-            if v == 0 {
-                return Err(invalid(field, "must be > 0"));
-            }
-        }
+        ])?;
         if l.max_manifest > l.max_body {
             return Err(invalid("limits.max_manifest", "must be <= limits.max_body"));
         }
@@ -750,12 +666,10 @@ impl Config {
                     "rate and burst must be > 0",
                 ));
             }
-            if pc.max_clients == 0 {
-                return Err(invalid(
-                    "http.rate_limit.per_client.max_clients",
-                    "must be > 0",
-                ));
-            }
+            require_nonzero(&[(
+                "http.rate_limit.per_client.max_clients",
+                pc.max_clients as u64,
+            )])?;
         }
         let t = &self.telemetry;
         if !(0.0..=1.0).contains(&t.sample_ratio) {
@@ -772,9 +686,7 @@ impl Config {
                 return Err(invalid("telemetry.otlp.endpoint", "must not be empty"));
             }
         }
-        if self.log.level.trim().is_empty() {
-            return Err(invalid("log.level", "must not be empty"));
-        }
+        require_nonempty(&[("log.level", &self.log.level)])?;
         if let Some(tls) = &self.http.tls {
             tls.validate()?;
         }
@@ -786,7 +698,6 @@ impl Config {
     }
 }
 
-/// Whether `s` is safe to embed in a quoted `WWW-Authenticate` parameter.
 fn is_quotable(s: &str) -> bool {
     !s.is_empty() && !s.chars().any(|c| c == '"' || c == '\\' || c.is_control())
 }
@@ -873,14 +784,10 @@ impl LdapConfig {
                 "plaintext ldap:// requires start_tls = true",
             ));
         }
-        for (field, v) in [
+        require_nonempty(&[
             ("auth.ldap.bind_dn", &self.bind_dn),
             ("auth.ldap.base_dn", &self.base_dn),
-        ] {
-            if v.trim().is_empty() {
-                return Err(invalid(field, "must not be empty"));
-            }
-        }
+        ])?;
         let a = self.user_attribute.as_bytes();
         if a.is_empty()
             || !a[0].is_ascii_alphabetic()
@@ -899,9 +806,7 @@ impl LdapConfig {
                 ));
             }
         }
-        if self.timeout_secs == 0 {
-            return Err(invalid("auth.ldap.timeout_secs", "must be > 0"));
-        }
+        require_nonzero(&[("auth.ldap.timeout_secs", self.timeout_secs)])?;
         Ok(())
     }
 }
@@ -933,8 +838,6 @@ impl AccessControlConfig {
     }
 }
 
-/// Whether `s` is an access-control glob: `/`-separated components, each
-/// `**` or a non-empty run of `[a-z0-9._-*]` (`**` only as a whole component).
 fn is_repo_pattern(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 255
@@ -948,9 +851,7 @@ fn is_repo_pattern(s: &str) -> bool {
         })
 }
 
-/// Whether `host` (a hostname or IP literal, optionally `[bracketed]`) names
-/// a loopback, private, link-local, or otherwise non-public destination — an
-/// SSRF target a registry must never direct a client or itself to.
+/// Whether `host` is loopback/private/link-local (SSRF guard).
 pub fn is_internal_host(host: &str) -> bool {
     let h = host
         .trim_start_matches('[')
@@ -983,7 +884,6 @@ pub fn is_internal_host(host: &str) -> bool {
     }
 }
 
-/// The host of an `scheme://host[:port]/…` URL (brackets kept for IPv6).
 fn url_host(url: &str) -> Option<&str> {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     let authority = rest.split(['/', '?', '#']).next()?;
@@ -997,8 +897,7 @@ fn url_host(url: &str) -> Option<&str> {
 }
 
 impl StorageConfig {
-    /// Cross-field storage invariants: subsystem periods, S3 bounds, subpath
-    /// grammar, and pairwise-disjoint backend roots.
+    /// Validate storage cross-field invariants.
     fn validate(&self) -> Result<(), ConfigError> {
         if self.gc.enabled {
             for (field, v) in [
@@ -1010,18 +909,17 @@ impl StorageConfig {
                 }
             }
         }
-        // small_blob_threshold: must be in (0, 8 MiB].
         const MAX_THRESHOLD: usize = 8 * 1024 * 1024;
-        if self.small_blob_threshold == 0 {
-            return Err(invalid("storage.small_blob_threshold", "must be > 0"));
-        }
+        require_nonzero(&[(
+            "storage.small_blob_threshold",
+            self.small_blob_threshold as u64,
+        )])?;
         if self.small_blob_threshold > MAX_THRESHOLD {
             return Err(invalid(
                 "storage.small_blob_threshold",
                 format!("must be <= {MAX_THRESHOLD} (8 MiB)"),
             ));
         }
-        // When the cache is enabled, the threshold must not exceed the cache budget.
         if self.cache_max_bytes > 0 && self.small_blob_threshold > self.cache_max_bytes {
             return Err(invalid(
                 "storage.small_blob_threshold",
@@ -1042,26 +940,24 @@ impl StorageConfig {
             }
         }
         let m = &self.metadata;
-        if m.compact_threshold_bytes == 0 {
+        if m.engine == MetadataEngine::Redb {
             return Err(invalid(
-                "storage.metadata.compact_threshold_bytes",
-                "must be > 0",
+                "storage.metadata.engine",
+                "the redb engine has been removed; \
+                 use \"lmdb\" instead — metadata is rebuilt from the layout",
             ));
         }
-        if m.engine != MetadataEngine::Log {
-            if m.snapshot {
-                return Err(invalid(
-                    "storage.metadata.snapshot",
-                    "requires engine = \"log\"",
-                ));
-            }
-            if m.hmac_key_file.is_some() {
-                return Err(invalid(
-                    "storage.metadata.hmac_key_file",
-                    "requires engine = \"log\"",
-                ));
-            }
+        require_nonzero(&[(
+            "storage.metadata.compact_threshold_bytes",
+            m.compact_threshold_bytes,
+        )])?;
+        if m.engine != MetadataEngine::Log && m.snapshot {
+            return Err(invalid(
+                "storage.metadata.snapshot",
+                "requires engine = \"log\"",
+            ));
         }
+        require_nonzero(&[("storage.metadata.map_size_bytes", m.map_size_bytes)])?;
         if let Some(s3) = &self.s3 {
             s3.validate("storage.s3")?;
         }
@@ -1079,8 +975,7 @@ impl StorageConfig {
             }
             roots.push((format!("{field}.root"), &sub.root));
         }
-        // Backend roots must be pairwise disjoint: a root nested in another
-        // would surface one backend's layouts as repos of the other.
+        // Roots must be pairwise disjoint.
         for (i, (fa, a)) in roots.iter().enumerate() {
             for (fb, b) in &roots[i + 1..] {
                 if a.starts_with(b) || b.starts_with(a) {
@@ -1097,9 +992,8 @@ impl StorageConfig {
 
 impl S3Config {
     fn validate(&self, field: &str) -> Result<(), ConfigError> {
-        if self.bucket.trim().is_empty() {
-            return Err(invalid(format!("{field}.bucket"), "must not be empty"));
-        }
+        let bucket_field = format!("{field}.bucket");
+        require_nonempty(&[(&bucket_field, &self.bucket)])?;
         if self.prefix.starts_with('/') || self.prefix.ends_with('/') {
             return Err(invalid(
                 format!("{field}.prefix"),
@@ -1118,12 +1012,8 @@ impl S3Config {
                 format!("must be >= {S3_MIN_PART_SIZE} (the S3 minimum part size)"),
             ));
         }
-        if self.multipart_concurrency == 0 {
-            return Err(invalid(
-                format!("{field}.multipart_concurrency"),
-                "must be > 0",
-            ));
-        }
+        let concurrency_field = format!("{field}.multipart_concurrency");
+        require_nonzero(&[(&concurrency_field, self.multipart_concurrency as u64)])?;
         if let Some(ep) = &self.endpoint {
             let plaintext = ep.starts_with("http://");
             if !(plaintext || ep.starts_with("https://")) {
@@ -1159,8 +1049,7 @@ impl S3Config {
     }
 }
 
-/// Whether `s` is a repository-name prefix: `/`-separated components, each
-/// matching the dist-spec component grammar `[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*`.
+/// Valid repository-name prefix.
 fn is_repo_prefix(s: &str) -> bool {
     fn component(c: &str) -> bool {
         let b = c.as_bytes();
@@ -1174,7 +1063,6 @@ fn is_repo_prefix(s: &str) -> bool {
                 i += 1;
                 continue;
             }
-            // A separator run: `.`, `_`, `__`, or one-or-more `-`.
             let start = i;
             while i < b.len() && !alnum(b[i]) {
                 i += 1;
@@ -1335,13 +1223,10 @@ mod tests {
 
     #[test]
     fn subsystem_checks_apply_only_when_relevant() {
-        // Periods are only checked for an enabled subsystem, snapshot/HMAC
-        // only restrict the redb engine when set, and an https endpoint needs
-        // no `allow_http`.
         for ok in [
             "[storage.gc]\nenabled = false\ndelay_secs = 0\ninterval_secs = 0",
             "[storage.scrub]\nenabled = false\ninterval_secs = 0",
-            "[storage.metadata]\nengine = \"redb\"",
+            "[storage.metadata]\nengine = \"lmdb\"",
             "[storage.s3]\nbucket = \"b\"\nendpoint = \"https://s3.example\"",
             "[storage.s3]\nbucket = \"b\"",
         ] {
@@ -1422,12 +1307,16 @@ mod tests {
                 "compact_threshold_bytes",
             ),
             (
-                "[storage.metadata]\nengine = \"redb\"\nsnapshot = true",
+                "[storage.metadata]\nengine = \"redb\"",
+                "storage.metadata.engine",
+            ),
+            (
+                "[storage.metadata]\nengine = \"lmdb\"\nsnapshot = true",
                 "storage.metadata.snapshot",
             ),
             (
-                "[storage.metadata]\nengine = \"redb\"\nhmac_key_file = \"/k\"",
-                "storage.metadata.hmac_key_file",
+                "[storage.metadata]\nmap_size_bytes = 0",
+                "storage.metadata.map_size_bytes",
             ),
             ("[storage.s3]\nbucket = \" \"", "storage.s3.bucket"),
             (
@@ -1575,12 +1464,10 @@ mod tests {
 
     #[test]
     fn per_client_rate_limit_defaults_and_absent() {
-        // Absent per_client is backward compatible (no per-client limiting).
         let c = parse("[http.rate_limit]\nenabled = true\ndefault = { rate = 10, burst = 20 }")
             .unwrap();
         assert!(c.http.rate_limit.per_client.is_none());
 
-        // max_clients defaults to 10_000 when omitted.
         let c = parse("[http.rate_limit]\nper_client = { rate = 5, burst = 10 }").unwrap();
         let pc = c.http.rate_limit.per_client.unwrap();
         assert_eq!(pc.rate, 5);

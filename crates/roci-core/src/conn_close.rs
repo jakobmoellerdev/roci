@@ -1,13 +1,5 @@
-//! `Connection: close` on HTTP/1 responses sent before the request body was
-//! read to its end (authentication rejections, limit and validation errors).
-//!
-//! hyper cannot keep such a connection alive — the unread body bytes are still
-//! in flight — so it closes the socket after the response, but without saying
-//! so. A client that pools the connection once it has read the response (Go's
-//! `net/http`, e.g. the OCI conformance suite retrying a `401` upload with
-//! credentials) then writes its next request into the closed socket and fails
-//! with `EOF`; behind NAT or a proxy (a Kubernetes Service) that race is lost
-//! routinely. Announcing the close makes the client open a fresh connection.
+//! `Connection: close` on HTTP/1 responses sent before the body was read.
+//! Without it, a client pooling the connection writes into a closed socket.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +13,6 @@ use axum::middleware::Next;
 use axum::response::Response;
 use http_body::{Frame, SizeHint};
 
-/// Request body that records whether it was read to its end.
 struct TrackedBody {
     inner: Body,
     done: Arc<AtomicBool>,
@@ -55,9 +46,7 @@ impl HttpBody for TrackedBody {
     }
 }
 
-/// Mark HTTP/1 responses `Connection: close` when the handler (or an earlier
-/// layer) left the request body unread. HTTP/2 multiplexes streams and forbids
-/// the header, so it is left alone, as are requests without a body.
+/// Mark HTTP/1 `Connection: close` when the body was left unread.
 pub(crate) async fn close_on_unread_body(req: Request, next: Next) -> Response {
     let http1 = matches!(
         req.version(),
@@ -80,4 +69,31 @@ pub(crate) async fn close_on_unread_body(req: Request, next: Next) -> Response {
             .insert(header::CONNECTION, HeaderValue::from_static("close"));
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracked_body_is_end_stream_sets_done() {
+        let done = Arc::new(AtomicBool::new(false));
+        let body = TrackedBody {
+            inner: Body::empty(),
+            done: Arc::clone(&done),
+        };
+        assert!(body.is_end_stream(), "empty body should be end_stream");
+        assert!(done.load(Ordering::Relaxed), "done flag set");
+    }
+
+    #[test]
+    fn tracked_body_is_end_stream_non_empty() {
+        let done = Arc::new(AtomicBool::new(false));
+        let body = TrackedBody {
+            inner: Body::from("hello"),
+            done: Arc::clone(&done),
+        };
+        assert!(!body.is_end_stream(), "non-empty body");
+        assert!(!done.load(Ordering::Relaxed), "done flag unset");
+    }
 }

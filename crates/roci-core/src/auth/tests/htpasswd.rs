@@ -1,5 +1,3 @@
-//! htpasswd parsing and verification.
-
 use std::path::Path;
 
 use crate::auth::htpasswd::{Htpasswd, HtpasswdResult};
@@ -45,6 +43,5 @@ async fn verify_outcomes() {
         file.verify("mallory", "pw").await,
         HtpasswdResult::UnknownUser
     ));
-    // An empty file still yields a dummy hash at the default cost.
     assert!(Htpasswd::parse("").unwrap().dummy.starts_with("$2b$10$"));
 }

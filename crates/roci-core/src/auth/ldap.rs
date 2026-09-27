@@ -1,10 +1,5 @@
 //! LDAP bind authentication (`ldap` feature).
-//!
-//! Search-then-bind: a service account finds the user's entry (the login
-//! name is filter-escaped), then a bind as that entry's DN with the supplied
-//! password proves the credential. Transport is always TLS (`ldaps://` or
-//! StartTLS) with certificate verification; the configured CA bundle, else
-//! the system roots, anchors trust.
+//! Search-then-bind with TLS (ldaps or StartTLS).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,12 +62,9 @@ impl LdapAuthenticator {
         })
     }
 
-    /// Authenticate `user`/`password`: `Some(groups)` on success, `None` for
-    /// unknown user, wrong password, or an unreachable directory (the latter
-    /// logged at `warn`). Bounded by `timeout_secs` end to end.
+    /// Authenticate `user`/`password`; `None` on failure.
     pub(crate) async fn authenticate(&self, user: &str, password: &str) -> Option<Vec<String>> {
-        // An empty password is an "unauthenticated bind" (RFC 4513 §5.1.2),
-        // which many servers accept as success: never send one.
+        // Reject empty password (RFC 4513 §5.1.2 unauthenticated bind).
         if password.is_empty() {
             return None;
         }
@@ -119,7 +111,6 @@ impl LdapAuthenticator {
             .search(&self.cfg.base_dn, Scope::Subtree, &filter, attrs)
             .await?
             .success()?;
-        // Exactly one entry, or the login name is ambiguous/unknown.
         let Ok([entry]) = <[_; 1]>::try_from(entries) else {
             let _ = ldap.unbind().await;
             return Ok(None);

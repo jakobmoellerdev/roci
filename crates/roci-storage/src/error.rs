@@ -1,9 +1,8 @@
-//! Storage error type and IO-error mapping helper.
+//! Storage error types.
 
 use std::io;
 use thiserror::Error;
 
-/// Errors surfaced by the storage layer.
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("not found")]
@@ -20,17 +19,14 @@ pub enum StorageError {
     RangeNotSatisfiable { expected: u64, got: u64 },
     #[error("upload size {actual} exceeds maximum {limit}")]
     TooLarge { limit: u64, actual: u64 },
-    /// Admitting a blob would push a quota past its cap.
     #[error("{scope} quota of {limit} bytes exceeded ({requested} bytes requested)")]
     QuotaExceeded {
         scope: QuotaScope,
         limit: u64,
         requested: u64,
     },
-    /// A manifest's required blob is absent at commit time.
     #[error("referenced blob {0} is not present")]
     MissingReference(String),
-    /// The concurrent upload-session cap is reached.
     #[error("too many concurrent upload sessions (limit {limit})")]
     TooManySessions { limit: usize },
     /// The storage backend is temporarily unavailable (e.g. bucket not yet
@@ -39,7 +35,6 @@ pub enum StorageError {
     Unavailable(String),
 }
 
-/// Which storage quota a rejected write would exceed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaScope {
     /// The per-repository cap (`storage.quota.max_repo_bytes`) → `413`.

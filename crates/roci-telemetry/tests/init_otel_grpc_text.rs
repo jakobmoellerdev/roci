@@ -1,15 +1,10 @@
 //! Test: `init` with OTel + gRPC OTLP + text log format.
-//! Exercises init_otel → build_trace_provider (OTLP branch),
-//! build_meter_provider (OTLP branch), build_log_provider (OTLP branch),
-//! otlp_trace_exporter (Grpc), otlp_metrics_exporter (Grpc),
-//! otlp_log_exporter (Grpc), and the TelemetryGuard drop/shutdown.
 #![cfg(feature = "otel")]
 
 use roci_config::{Config, OtlpConfig, OtlpProtocol};
 
 #[test]
 fn init_otel_grpc_text() {
-    // gRPC (tonic) exporter needs a tokio runtime for the background channel.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

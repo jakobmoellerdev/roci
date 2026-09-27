@@ -1,10 +1,7 @@
-//! Object key construction and validation. Every untrusted component (repo
-//! name, digest) is validated before reaching an object key, mirroring the
-//! filesystem backend's `SafeComponent` discipline (SECURITY inv. 8).
+//! Object key construction and validation (SECURITY inv. 8).
 
 use roci_storage::{Digest, StorageError};
 
-/// Validate a repository name component (no `.`, `..`, NUL, backslash).
 fn validate_component(s: &str) -> Result<(), StorageError> {
     if s.is_empty() || s == "." || s == ".." || s.bytes().any(|b| b == b'\\' || b == 0) {
         return Err(StorageError::BadPath(s.to_string()));
@@ -12,7 +9,6 @@ fn validate_component(s: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Validate every `/`-component of a repo name.
 pub(crate) fn validate_repo(repo: &str) -> Result<(), StorageError> {
     for c in repo.split('/') {
         validate_component(c)?;
@@ -20,7 +16,6 @@ pub(crate) fn validate_repo(repo: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// The object-key prefix for a repository: `<prefix>/<repo>` (no leading `/`).
 pub(crate) fn repo_prefix(prefix: &str, repo: &str) -> Result<String, StorageError> {
     validate_repo(repo)?;
     if prefix.is_empty() {
@@ -30,10 +25,8 @@ pub(crate) fn repo_prefix(prefix: &str, repo: &str) -> Result<String, StorageErr
     }
 }
 
-/// Object key for a blob: `<prefix>/<repo>/blobs/<alg>/<hex>`.
 pub(crate) fn blob_key(prefix: &str, repo: &str, digest: &Digest) -> Result<String, StorageError> {
     let rp = repo_prefix(prefix, repo)?;
-    // Digest is already validated by Digest::parse (alg + hex only).
     Ok(format!(
         "{rp}/blobs/{}/{}",
         digest.algorithm(),
@@ -41,13 +34,11 @@ pub(crate) fn blob_key(prefix: &str, repo: &str, digest: &Digest) -> Result<Stri
     ))
 }
 
-/// Object key for `index.json`: `<prefix>/<repo>/index.json`.
 pub(crate) fn index_key(prefix: &str, repo: &str) -> Result<String, StorageError> {
     let rp = repo_prefix(prefix, repo)?;
     Ok(format!("{rp}/index.json"))
 }
 
-/// Object key for `oci-layout`: `<prefix>/<repo>/oci-layout`.
 pub(crate) fn layout_key(prefix: &str, repo: &str) -> Result<String, StorageError> {
     let rp = repo_prefix(prefix, repo)?;
     Ok(format!("{rp}/oci-layout"))

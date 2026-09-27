@@ -1,42 +1,26 @@
 use std::collections::BTreeMap;
 
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
-use http_body_util::BodyExt;
+use axum::http::StatusCode;
 use roci_config::{Bucket, Config, RateLimitConfig};
-use roci_core::{build_router, AppState};
-use roci_storage::FsStorage;
 use tempfile::TempDir;
-use tower::ServiceExt;
+
+use super::common::*;
 
 fn bucket(rate: u32, burst: u32) -> Bucket {
     Bucket { rate, burst }
 }
 
-/// Build a router with the given rate-limit config.
 fn app_with_rl(rl: RateLimitConfig) -> (axum::Router, TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = FsStorage::new(dir.path()).unwrap();
     let mut config = Config::default();
     config.http.rate_limit = rl;
-    let state = AppState::new_with(storage, config);
-    (build_router(state), dir)
+    app_with_config(config)
 }
 
-fn get_v2() -> Request<Body> {
-    Request::builder()
-        .method(Method::GET)
-        .uri("/v2/")
-        .body(Body::empty())
-        .unwrap()
-}
-
-fn put_v2() -> Request<Body> {
-    Request::builder()
-        .method(Method::PUT)
-        .uri("/v2/repo/manifests/tag")
-        .body(Body::empty())
-        .unwrap()
+fn get_v2_with_peer(ip: std::net::IpAddr) -> axum::http::Request<Body> {
+    let mut req = get("/v2/");
+    req.extensions_mut().insert(roci_core::PeerAddr(ip));
+    req
 }
 
 #[tokio::test(start_paused = true)]
@@ -49,23 +33,17 @@ async fn burst_n_pass_then_429() {
     };
     let (app, _d) = app_with_rl(rl);
 
-    // First 3 (burst) should succeed
     for i in 0..3 {
-        let resp = app.clone().oneshot(get_v2()).await.unwrap();
+        let resp = send(&app, get("/v2/")).await;
         assert_eq!(resp.status(), StatusCode::OK, "request {i} should pass");
     }
 
-    // 4th should be 429
-    let resp = app.clone().oneshot(get_v2()).await.unwrap();
+    let resp = send(&app, get("/v2/")).await;
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-
-    // Check TOOMANYREQUESTS error body
-    let body: serde_json::Value =
-        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let body = json_body(resp).await;
     assert_eq!(body["errors"][0]["code"], "TOOMANYREQUESTS");
 
-    // Check Retry-After header is present
-    let resp = app.clone().oneshot(get_v2()).await.unwrap();
+    let resp = send(&app, get("/v2/")).await;
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     let retry_after = resp
         .headers()
@@ -85,18 +63,15 @@ async fn tokens_refill_after_time_advance() {
     };
     let (app, _d) = app_with_rl(rl);
 
-    // Consume the one token
-    let resp = app.clone().oneshot(get_v2()).await.unwrap();
+    let resp = send(&app, get("/v2/")).await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // Exhausted
-    let resp = app.clone().oneshot(get_v2()).await.unwrap();
+    let resp = send(&app, get("/v2/")).await;
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 
-    // Advance time by 1 second, token refills
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
 
-    let resp = app.clone().oneshot(get_v2()).await.unwrap();
+    let resp = send(&app, get("/v2/")).await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
@@ -112,26 +87,21 @@ async fn per_method_independent_of_default() {
     };
     let (app, _d) = app_with_rl(rl);
 
-    // Exhaust PUT bucket
-    let resp = app.clone().oneshot(put_v2()).await.unwrap();
-    // PUT to manifests without content → could be 4xx from handler, but rate
-    // limit only fires on *exhausted* bucket. The first PUT consumes a token,
-    // let's check the second is 429.
+    let resp = send(&app, put("/v2/repo/manifests/tag", Body::empty())).await;
     assert_ne!(
         resp.status(),
         StatusCode::TOO_MANY_REQUESTS,
         "first PUT should pass"
     );
 
-    let resp = app.clone().oneshot(put_v2()).await.unwrap();
+    let resp = send(&app, put("/v2/repo/manifests/tag", Body::empty())).await;
     assert_eq!(
         resp.status(),
         StatusCode::TOO_MANY_REQUESTS,
         "second PUT should be rate-limited"
     );
 
-    // GET still works (uses default bucket with burst=100)
-    let resp = app.clone().oneshot(get_v2()).await.unwrap();
+    let resp = send(&app, get("/v2/")).await;
     assert_eq!(
         resp.status(),
         StatusCode::OK,
@@ -151,9 +121,8 @@ async fn unlisted_method_no_default_unlimited() {
     };
     let (app, _d) = app_with_rl(rl);
 
-    // GET has no per-method entry and no default → unlimited
     for _ in 0..50 {
-        let resp = app.clone().oneshot(get_v2()).await.unwrap();
+        let resp = send(&app, get("/v2/")).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }
@@ -168,21 +137,10 @@ async fn disabled_config_never_429s() {
     };
     let (app, _d) = app_with_rl(rl);
 
-    // Even with burst=1, disabled means no rate limiting
     for _ in 0..50 {
-        let resp = app.clone().oneshot(get_v2()).await.unwrap();
+        let resp = send(&app, get("/v2/")).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
-}
-
-fn get_v2_with_peer(ip: std::net::IpAddr) -> Request<Body> {
-    let mut req = Request::builder()
-        .method(Method::GET)
-        .uri("/v2/")
-        .body(Body::empty())
-        .unwrap();
-    req.extensions_mut().insert(roci_core::PeerAddr(ip));
-    req
 }
 
 #[tokio::test(start_paused = true)]
@@ -201,14 +159,12 @@ async fn per_client_independent_buckets() {
     let ip_a: std::net::IpAddr = "10.0.0.1".parse().unwrap();
     let ip_b: std::net::IpAddr = "10.0.0.2".parse().unwrap();
 
-    // Client A exhausts its burst.
-    let resp = app.clone().oneshot(get_v2_with_peer(ip_a)).await.unwrap();
+    let resp = send(&app, get_v2_with_peer(ip_a)).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let resp = app.clone().oneshot(get_v2_with_peer(ip_a)).await.unwrap();
+    let resp = send(&app, get_v2_with_peer(ip_a)).await;
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 
-    // Client B still has its own full bucket.
-    let resp = app.clone().oneshot(get_v2_with_peer(ip_b)).await.unwrap();
+    let resp = send(&app, get_v2_with_peer(ip_b)).await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
@@ -229,20 +185,17 @@ async fn per_client_lru_eviction_resets_bucket() {
     let ip_b: std::net::IpAddr = "10.0.0.2".parse().unwrap();
     let ip_c: std::net::IpAddr = "10.0.0.3".parse().unwrap();
 
-    // Exhaust A and B.
-    let resp = app.clone().oneshot(get_v2_with_peer(ip_a)).await.unwrap();
+    let resp = send(&app, get_v2_with_peer(ip_a)).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let resp = app.clone().oneshot(get_v2_with_peer(ip_a)).await.unwrap();
+    let resp = send(&app, get_v2_with_peer(ip_a)).await;
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-    let resp = app.clone().oneshot(get_v2_with_peer(ip_b)).await.unwrap();
+    let resp = send(&app, get_v2_with_peer(ip_b)).await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // C enters → evicts A (LRU, A was least recently used).
-    let resp = app.clone().oneshot(get_v2_with_peer(ip_c)).await.unwrap();
+    let resp = send(&app, get_v2_with_peer(ip_c)).await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // A was evicted — gets a fresh bucket.
-    let resp = app.clone().oneshot(get_v2_with_peer(ip_a)).await.unwrap();
+    let resp = send(&app, get_v2_with_peer(ip_a)).await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
@@ -257,9 +210,8 @@ async fn per_client_absent_means_no_per_client_limiting() {
     let (app, _d) = app_with_rl(rl);
     let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
 
-    // No per-client limiting means unlimited (global unlimited too since no default).
     for _ in 0..50 {
-        let resp = app.clone().oneshot(get_v2_with_peer(ip)).await.unwrap();
+        let resp = send(&app, get_v2_with_peer(ip)).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }

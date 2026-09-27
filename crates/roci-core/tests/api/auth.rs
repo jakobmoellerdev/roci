@@ -1,5 +1,3 @@
-//! Authentication / authorization through the HTTP surface (Phase 6).
-
 use std::path::{Path, PathBuf};
 
 use axum::body::Body;
@@ -16,21 +14,6 @@ use serde_json::json;
 
 use super::common::*;
 
-const ROCI_BASIC: &str = "Basic realm=\"roci\"";
-
-/// Write an htpasswd file (bcrypt cost 4) for `users`.
-fn htpasswd(dir: &Path, users: &[(&str, &str)]) -> PathBuf {
-    let path = dir.join("htpasswd");
-    let lines: Vec<String> = users
-        .iter()
-        .map(|(u, p)| format!("{u}:{}", bcrypt::hash(p, 4).unwrap()))
-        .collect();
-    std::fs::write(&path, lines.join("\n")).unwrap();
-    path
-}
-
-/// A config with htpasswd users `alice:pw`, `bob:pw`, `admin:pw` plus the
-/// extra TOML `tail` (e.g. an `[access_control]` section).
 fn htpasswd_config(dir: &Path, tail: &str) -> Config {
     let path = htpasswd(dir, &[("alice", "pw"), ("bob", "pw"), ("admin", "pw")]);
     let text = format!(
@@ -40,27 +23,6 @@ fn htpasswd_config(dir: &Path, tail: &str) -> Config {
     let config: Config = toml::from_str(&text).unwrap();
     config.validate().unwrap();
     config
-}
-
-fn basic(user: &str, pw: &str) -> String {
-    format!("Basic {}", STANDARD.encode(format!("{user}:{pw}")))
-}
-
-fn as_user(
-    method: Method,
-    uri: impl AsRef<str>,
-    auth: &str,
-    body: impl Into<Body>,
-) -> Request<Body> {
-    request(method, uri, &[(header::AUTHORIZATION, auth)], body)
-}
-
-async fn error_code(resp: axum::response::Response) -> (String, String) {
-    let v = json_body(resp).await;
-    (
-        v["errors"][0]["code"].as_str().unwrap().to_string(),
-        v["errors"][0]["message"].as_str().unwrap().to_string(),
-    )
 }
 
 const TEAM_POLICY: &str = r#"
@@ -92,7 +54,6 @@ async fn htpasswd_challenge_and_credential_checks() {
 
     let ok = as_user(Method::GET, "/v2/", &basic("alice", "pw"), Body::empty());
     assert_eq!(status_of(&app, ok).await, StatusCode::OK);
-    // Cached on the second request: still accepted.
     let ok = as_user(Method::GET, "/v2/", &basic("alice", "pw"), Body::empty());
     assert_eq!(status_of(&app, ok).await, StatusCode::OK);
 
@@ -115,7 +76,6 @@ async fn htpasswd_challenge_and_credential_checks() {
             ("UNAUTHORIZED".into(), "invalid credentials".into())
         );
     }
-    // A non-ASCII header value is invalid too.
     let mut req = get("/v2/");
     req.headers_mut().insert(
         header::AUTHORIZATION,
@@ -123,8 +83,6 @@ async fn htpasswd_challenge_and_credential_checks() {
     );
     assert_eq!(status_of(&app, req).await, StatusCode::UNAUTHORIZED);
 
-    // No `[access_control]`: any authenticated user may do everything,
-    // anonymous nothing.
     let push = as_user(
         Method::POST,
         "/v2/any/blobs/uploads/",
@@ -143,12 +101,10 @@ async fn repository_policy_grants_and_denials() {
     let (app, _auth, _d) = app_with_auth(htpasswd_config(dir.path(), TEAM_POLICY));
     let alice = basic("alice", "pw");
 
-    // Anonymous pull passes authorization (an unknown repo lists no tags).
     assert_eq!(
         status_of(&app, get("/v2/team/app/tags/list")).await,
         StatusCode::OK
     );
-    // An empty Basic pair (containers/image without credentials) is anonymous.
     let empty = basic("", "");
     let pull = as_user(Method::GET, "/v2/team/app/tags/list", &empty, Body::empty());
     assert_eq!(status_of(&app, pull).await, StatusCode::OK);
@@ -158,7 +114,6 @@ async fn repository_policy_grants_and_denials() {
         ("UNAUTHORIZED".into(), "authentication required".into())
     );
 
-    // Anonymous push → 401 challenge.
     let resp = send(&app, post("/v2/team/app/blobs/uploads/", Body::empty())).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(hv(&resp, header::WWW_AUTHENTICATE), Some(ROCI_BASIC));
@@ -167,7 +122,6 @@ async fn repository_policy_grants_and_denials() {
         ("UNAUTHORIZED".into(), "authentication required".into())
     );
 
-    // A full chunked upload: every session endpoint requires push.
     let start = as_user(
         Method::POST,
         "/v2/team/app/blobs/uploads/",
@@ -192,7 +146,6 @@ async fn repository_policy_grants_and_denials() {
     );
     assert_eq!(status_of(&app, finish).await, StatusCode::CREATED);
 
-    // bob authenticates but holds no push grant → 403, not 401.
     let push = as_user(
         Method::POST,
         "/v2/team/app/blobs/uploads/",
@@ -221,7 +174,6 @@ async fn repository_policy_grants_and_denials() {
     );
     assert_eq!(status_of(&app, other).await, StatusCode::FORBIDDEN);
 
-    // Unknown shapes keep NAME_UNKNOWN without an authorization decision.
     let resp = send(&app, post("/v2/team/app/tags/list", Body::empty())).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
@@ -289,7 +241,6 @@ policies = [{{ users = ["alice"], actions = [{src_actions}] }}]
             Body::empty(),
         )
     };
-    // No pull on `src`: a plain session, no mount, no existence oracle.
     assert_eq!(status_of(&app, mount("src")).await, StatusCode::ACCEPTED);
     let probe = || {
         as_user(
@@ -300,7 +251,6 @@ policies = [{{ users = ["alice"], actions = [{src_actions}] }}]
         )
     };
     assert_eq!(status_of(&app, probe()).await, StatusCode::NOT_FOUND);
-    // A malformed source name falls through the same way.
     assert_eq!(status_of(&app, mount("Bad!")).await, StatusCode::ACCEPTED);
 
     let granted: Config = toml::from_str(&policy("\"pull\"")).unwrap();
@@ -309,7 +259,7 @@ policies = [{{ users = ["alice"], actions = [{src_actions}] }}]
     assert_eq!(status_of(&app, probe()).await, StatusCode::OK);
 }
 
-/// ES256 + RS256 signers whose public keys share one `verify_key_file`.
+/// ES256 + RS256 signers sharing one `verify_key_file`.
 struct Issuer {
     es: EcdsaKeyPair,
     rs: RsaKeyPair,
@@ -439,7 +389,6 @@ async fn bearer_tokens_authorize_by_access_claims() {
         assert_eq!(status_of(&app, base).await, StatusCode::OK);
     }
 
-    // Outside the token's scope → 401 insufficient_scope (a new token helps).
     let token = iss.token("ES256", json!({}), claims(access.clone()));
     let resp = send(
         &app,
@@ -471,12 +420,10 @@ async fn bearer_tokens_authorize_by_access_claims() {
         .unwrap()
         .contains("scope=\"repository:team/app:delete\""));
 
-    // Anonymous pull: challenge scope asks for `pull` only.
     let resp = send(&app, get("/v2/team/app/tags/list")).await;
     assert!(hv(&resp, header::WWW_AUTHENTICATE)
         .unwrap()
         .ends_with("scope=\"repository:team/app:pull\""));
-    // Anonymous push: challenge carries the needed scope.
     let resp = send(&app, post("/v2/team/app/blobs/uploads/", Body::empty())).await;
     assert_eq!(
         hv(&resp, header::WWW_AUTHENTICATE),
@@ -486,7 +433,6 @@ async fn bearer_tokens_authorize_by_access_claims() {
         )
     );
 
-    // Invalid tokens: 401 + a scope-less challenge.
     let mut expired = claims(access.clone());
     expired["exp"] = json!(now() - 3600);
     let mut wrong_iss = claims(access.clone());
@@ -494,7 +440,6 @@ async fn bearer_tokens_authorize_by_access_claims() {
     let mut wrong_aud = claims(access.clone());
     wrong_aud["aud"] = json!(["other"]);
     let good = iss.token("ES256", json!({}), claims(access.clone()));
-    // Flip the signature's first character (always a full 6 data bits).
     let sig_at = good.rfind('.').unwrap() + 1;
     let flipped = if &good[sig_at..=sig_at] == "A" {
         "B"
@@ -558,8 +503,6 @@ async fn client_certificate_identity_and_header_precedence() {
 
     let push = with_cert(post("/v2/r/blobs/uploads/", Body::empty()), "alice");
     assert_eq!(status_of(&app, push).await, StatusCode::ACCEPTED);
-    // No header mechanism: anonymous `/v2/` is open, anonymous repo access
-    // denied by policy (403, nothing to challenge for).
     assert_eq!(status_of(&app, get("/v2/")).await, StatusCode::OK);
     let resp = send(&app, get("/v2/r/tags/list")).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -567,7 +510,6 @@ async fn client_certificate_identity_and_header_precedence() {
         error_code(resp).await,
         ("DENIED".into(), "anonymous access denied by policy".into())
     );
-    // A present Authorization header decides, even beside a valid cert.
     let req = with_cert(
         as_user(
             Method::POST,
@@ -580,7 +522,6 @@ async fn client_certificate_identity_and_header_precedence() {
     let resp = send(&app, req).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(hv(&resp, header::WWW_AUTHENTICATE), None);
-    // A certificate identity outside the policy is an authenticated user.
     let push = with_cert(post("/v2/r/blobs/uploads/", Body::empty()), "carol");
     assert_eq!(status_of(&app, push).await, StatusCode::FORBIDDEN);
 }
@@ -647,15 +588,12 @@ async fn access_control_reload_takes_effect_on_the_same_router() {
     };
     assert_eq!(status_of(&app, push()).await, StatusCode::FORBIDDEN);
 
-    // Section removed: authenticated users may do everything again.
     auth.reload_access_control(None);
     assert_eq!(status_of(&app, push()).await, StatusCode::ACCEPTED);
     assert_eq!(status_of(&app, anon_pull()).await, StatusCode::UNAUTHORIZED);
 }
 
-/// An upload rejected before its body is read must announce `Connection:
-/// close` on HTTP/1: hyper closes the socket anyway, and a client that pooled
-/// it would send its authenticated retry into a dead connection (EOF).
+/// Rejected upload must set `Connection: close` on HTTP/1 (SECURITY: prevents reuse of dead socket).
 #[tokio::test]
 async fn unread_request_body_closes_http1_connection() {
     let dir = tempfile::tempdir().unwrap();
@@ -666,24 +604,20 @@ async fn unread_request_body_closes_http1_connection() {
         roci_storage::sha256_of(&data)
     );
 
-    // Anonymous upload: 401 before the body is read.
     let resp = send(&app, post(&upload, data.clone())).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(hv(&resp, header::CONNECTION), Some("close"));
 
-    // Same rejection over HTTP/2: the header is illegal there, never sent.
     let mut h2 = post(&upload, data.clone());
     *h2.version_mut() = axum::http::Version::HTTP_2;
     let resp = send(&app, h2).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(hv(&resp, header::CONNECTION), None);
 
-    // A body-less rejection leaves nothing unread: keep-alive stays.
     let resp = send(&app, get("/v2/r/tags/list")).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(hv(&resp, header::CONNECTION), None);
 
-    // The authenticated upload consumes its body: keep-alive stays.
     let ok = as_user(Method::POST, &upload, &basic("alice", "pw"), data);
     let resp = send(&app, ok).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
