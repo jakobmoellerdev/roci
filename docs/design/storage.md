@@ -23,7 +23,7 @@ Online and O(garbage): roci tracks only the blobs that are currently unreference
 The metadata index is a cache of the layout behind one engine-neutral interface:
 
 - **Log engine (default):** in-RAM maps mirrored to an append-only, CRC32C-framed write-ahead log with group commit. The log is compacted in the background; optionally the state is served from an rkyv `mmap` snapshot plus the log tail (fast cold start, demand-paged memory), and every record and snapshot can be HMAC-authenticated with a per-deployment key.
-- **LMDB engine (`lmdb` build):** an embedded B-tree KV (heed3/LMDB) for metadata that outgrows RAM, with optional ChaCha20-Poly1305 encryption at rest when `hmac_key_file` is configured. **[changed — heed3 migration]**
+- **LMDB engine (`lmdb` build):** an embedded B-tree KV (heed/LMDB, stable mdb.master) for metadata that outgrows RAM. At-rest confidentiality is delegated to volume encryption (LUKS/dm-crypt, cloud volume encryption). **[changed — heed migration]**
 
 Switching between engines is lossless: `open_metadata` detects the active engine from a `roci-meta.engine` marker file (or by probing for existing artifacts) and, when the configured engine differs, exports the full state, writes a verified copy to a temp location, and atomically swaps it in. The marker flip is the commit point; a crash before it leaves the source active for a rerun. Old artifacts are preserved as `*.migrated-<timestamp>`, never deleted.
 

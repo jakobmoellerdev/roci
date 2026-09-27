@@ -303,8 +303,11 @@ pub struct MetadataConfig {
     pub snapshot: bool,
     /// Compact the log (or cut a new snapshot) once it grows past this size.
     pub compact_threshold_bytes: u64,
-    /// HMAC key file for log/snapshot auth; with LMDB derives a
-    /// ChaCha20-Poly1305 encryption key.
+    /// File holding a per-deployment HMAC key authenticating every log record
+    /// and snapshot (compromised-storage-volume threat model). With `engine =
+    /// "lmdb"` the key is accepted (so engine switches are lossless) but LMDB
+    /// does not use it — at-rest confidentiality is delegated to volume
+    /// encryption (LUKS/dm-crypt, cloud volume encryption).
     pub hmac_key_file: Option<PathBuf>,
     /// Max LMDB mmap region; log engine ignores this.
     pub map_size_bytes: u64,
@@ -328,7 +331,8 @@ pub enum MetadataEngine {
     /// Append-only CRC32C-framed log + in-RAM maps (the minimal default).
     #[default]
     Log,
-    /// LMDB (heed3), optional encryption-at-rest.
+    /// Embedded LMDB (heed, stable mdb.master) for out-of-RAM metadata
+    /// (needs the `lmdb` build feature).
     Lmdb,
     /// Removed — kept for a clear error on old configs.
     #[doc(hidden)]

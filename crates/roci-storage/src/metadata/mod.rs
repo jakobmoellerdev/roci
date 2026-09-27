@@ -183,12 +183,8 @@ fn marker_path(root: &Path) -> PathBuf {
 }
 
 fn format_label(config: &MetadataConfig) -> &'static str {
-    if config.hmac_key_file.is_some() {
-        match config.engine {
-            MetadataEngine::Log => "hmac",
-            MetadataEngine::Lmdb => "chacha20poly1305-v1",
-            MetadataEngine::Redb => "plain",
-        }
+    if config.hmac_key_file.is_some() && config.engine == MetadataEngine::Log {
+        "hmac"
     } else {
         "plain"
     }
@@ -354,20 +350,6 @@ fn migrate(
             return Ok(store);
         }
     };
-
-    // Check if the marker reveals both engine AND key/format changed.
-    if let Some(m) = read_marker(root)? {
-        let current_format = format_label(config);
-        if m.format != current_format {
-            tracing::warn!(
-                old_format = %m.format,
-                new_format = %current_format,
-                "both the metadata engine and the encryption/key changed; \
-                 for safety, consider changing the key and the engine in \
-                 separate restarts"
-            );
-        }
-    }
 
     // Build the destination in a temp location.
     let (temp_artifact, dest_final) = temp_and_final_paths(root, dest_engine);
@@ -1390,17 +1372,6 @@ mod engine_tests {
         LmdbMetadataStore::open(root, &MetadataConfig::default()).unwrap()
     });
 
-    #[cfg(feature = "lmdb")]
-    engine_tests!(lmdb_encrypted_engine, |root: &Path| {
-        let key_path = root.join("hmac-test.key");
-        std::fs::write(&key_path, b"test-key-material-32-bytes-long!").unwrap();
-        let config = MetadataConfig {
-            hmac_key_file: Some(key_path),
-            ..MetadataConfig::default()
-        };
-        LmdbMetadataStore::open(root, &config).unwrap()
-    });
-
     #[test]
     fn open_metadata_dispatches() {
         let dir = tempfile::tempdir().unwrap();
@@ -1793,7 +1764,7 @@ mod engine_tests {
             seed_ops(&*store);
         }
 
-        // Switch to encrypted lmdb.
+        // Switch to lmdb (key configured but LMDB does not use it).
         let lmdb_config = MetadataConfig {
             engine: roci_config::MetadataEngine::Lmdb,
             hmac_key_file: Some(key_path.clone()),
@@ -1803,7 +1774,7 @@ mod engine_tests {
 
         let marker = read_marker(dir.path()).unwrap().unwrap();
         assert_eq!(marker.engine, "lmdb");
-        assert_eq!(marker.format, "chacha20poly1305-v1");
+        assert_eq!(marker.format, "plain");
 
         // Switch back to log.
         drop(lmdb_store);
@@ -2172,7 +2143,7 @@ mod engine_tests {
                 hmac_key_file: Some(key.clone()),
                 ..MetadataConfig::default()
             };
-            assert_eq!(format_label(&lmdb_hmac), "chacha20poly1305-v1");
+            assert_eq!(format_label(&lmdb_hmac), "plain");
         }
 
         let redb_hmac = MetadataConfig {
@@ -2509,7 +2480,7 @@ mod engine_tests {
 
         let new_marker = read_marker(dir.path()).unwrap().unwrap();
         assert_eq!(new_marker.engine, "lmdb");
-        assert_eq!(new_marker.format, "chacha20poly1305-v1");
+        assert_eq!(new_marker.format, "plain");
     }
 
     #[cfg(feature = "lmdb")]

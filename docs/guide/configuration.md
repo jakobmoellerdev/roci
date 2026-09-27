@@ -75,10 +75,10 @@ max_total_bytes = 0           # registry-wide, across every storage path → 507
 max_upload_sessions = 1024    # concurrent upload sessions → 429 TOOMANYREQUESTS
 
 [storage.metadata]
-engine = "log"                # log: append-only WAL + in-RAM maps; lmdb: embedded B-tree KV (`lmdb` build, optional encryption at rest)
+engine = "log"                # log: append-only WAL + in-RAM maps; lmdb: embedded B-tree KV (`lmdb` build; for LMDB use volume encryption)
 snapshot = false              # log engine: serve from an rkyv mmap snapshot + WAL tail
 compact_threshold_bytes = 67108864  # compact the WAL / cut a snapshot past this size
-# hmac_key_file = "/etc/roci/meta.key"  # ≥ 32-byte key authenticating WAL records + snapshot; with engine = "lmdb" also enables ChaCha20-Poly1305 encryption at rest
+# hmac_key_file = "/etc/roci/meta.key"  # ≥ 32-byte key authenticating WAL records + snapshot; with engine = "lmdb" the key is accepted (lossless engine switches) but LMDB does not use it — use volume encryption for LMDB at rest
 # map_size_bytes = 68719476736  # lmdb engine: LMDB mmap address-space reservation (default 64 GiB); must be > 0
 
 # Route a repository prefix to its own storage path or backend (zot `subPaths`).
