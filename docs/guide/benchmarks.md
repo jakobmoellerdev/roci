@@ -47,6 +47,20 @@ The `scale` phase pushes many small manifests (reusing one shared config blob + 
 
 The scale parameters are configured per profile in `bench/config.toml` under `[profiles.<name>.scale]`.
 
+#### Reference run (100k tags)
+
+> **NON-AUTHORITATIVE: Docker Desktop VM (Apple M-series, 6 CPUs), `quick`, 1 rep.** zot saturated at ~435 rps under the 3,200 rps tag-resolve load, so its latency there is queueing.
+
+| 100k tags | roci-log | roci-snapshot | roci-lmdb | zot |
+|---|---|---|---|---|
+| scale push (images/s) | 2845 | 1305 | 2109 | 74 |
+| tag resolve p50 / p99 (ms) | 0.24 / 11.8 | 0.25 / 778 | 0.21 / 1.1 | 2793 / 7030 |
+| anon RSS after reads (MiB) | 664 | 662 | 480 | 129 |
+| restart with the corpus (ms) | 8093 | 3649 | 973 | 112 |
+| metadata on disk (MB) | 89 | 222 | 215 | — |
+
+LMDB has the flattest tail latency and the fastest restart; the log engine is the fastest pusher; heap at this scale is dominated by something other than the metadata engine. Analysis and follow-ups: [RESEARCH §9.9](https://github.com/jakobmoellerdev/roci/blob/main/RESEARCH.md).
+
 ## Fairness & parity
 
 - **Pinned inputs:** image digests per arch in `bench/config.toml`, pinned tool versions in `bench/Containerfile.runner` (zb checksum-verified).
