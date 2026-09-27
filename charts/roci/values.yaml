@@ -148,6 +148,20 @@ s3:
   multipartPartSize: 16777216
   # Parts transferred in parallel per multipart upload.
   multipartConcurrency: 8
+  # If true, roci creates the bucket at startup with a SigV4-signed PUT.
+  # Treats 200/409 (BucketAlreadyOwnedByYou) as success and retries transport
+  # errors with backoff. The bucket-init Job remains the primary mechanism for
+  # RustFS (it probes every pod after creation); enable this for non-RustFS S3
+  # backends or as a belt-and-suspenders complement. Default false.
+  createBucket: false
+  # Mount a CA bundle Secret so roci trusts a private-CA S3 endpoint (e.g.
+  # cert-manager-issued). The Secret key must contain PEM-encoded certificates.
+  # Rendered into the roci config as `ca_file`. Leave empty to use system roots.
+  caSecret:
+    # Name of the Kubernetes Secret.
+    name: ""
+    # Key inside the Secret holding the PEM bundle.
+    key: ca.crt
 
 # Volume for the metadata WAL and upload staging (plus blobs in filesystem
 # mode). Required in both modes.

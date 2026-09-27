@@ -7,7 +7,7 @@
 
 # roci
 
-![coverage](https://img.shields.io/badge/coverage-97.06%25-brightgreen)
+![coverage](https://img.shields.io/badge/coverage-97.22%25-brightgreen)
 
 **roci** is a Rust implementation of the [OCI Distribution Specification](spec/distribution-spec/spec.md) — an OCI container registry.
 
@@ -262,6 +262,9 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [ ] Swagger-based API documentation
 - [x] Fast cold start (rkyv mmap snapshot, opt-in `fast_restart` stamp) and low-fragmentation allocator
 - [x] Hardened Helm chart (PSS restricted, NetworkPolicies, optional HA S3 storage on RustFS), e2e-tested on k0s
+- [x] Health endpoints (`/readyz`, `/livez`) for Kubernetes probes — unauthenticated, rate-limit-free
+- [x] S3 bucket auto-creation (`create_bucket`) and private-CA trust (`ca_file` / chart `s3.caSecret`)
+- [ ] RustFS client-cert mTLS (blocked: `object_store` lacks client-cert API; RustFS subchart has no server-TLS-only mode)
 
 ## License
 

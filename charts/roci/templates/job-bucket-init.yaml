@@ -7,6 +7,14 @@ the other RustFS pods asynchronously (a pod can answer NoSuchBucket to
 PutObject seconds after creation), so the hook then writes and deletes a
 probe object on every pod until each accepts it. Credentials reach curl
 through a config on stdin, never argv.
+
+Why both this Job and s3.createBucket (roci's own create_bucket config)?
+The Job probes each individual RustFS pod through the headless Service,
+ensuring every pod in the erasure set has propagated the bucket before roci
+starts serving. roci's create_bucket targets the RustFS Service VIP and
+cannot verify per-pod propagation. For RustFS deployments, the Job is the
+primary mechanism; create_bucket is useful for non-RustFS S3 backends
+where per-pod probing is not needed.
 */}}
 {{- $fullname := include "roci.fullname" . }}
 apiVersion: batch/v1

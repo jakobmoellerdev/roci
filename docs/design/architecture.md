@@ -41,8 +41,7 @@ One TOML file (`roci --config`) with `http` (including mTLS fields), `auth` (htp
 - **Horizontal** — clustered instances with repo sharding via consistent hashing (HRW + bounded-load) and a peer proxy.
 
 ## Kubernetes deployment
-
-A hardened Helm chart (`charts/roci/`) deploys roci as a single-replica StatefulSet with optional HA S3 storage on RustFS. See [Kubernetes deployment (Helm chart)](https://github.com/jakobmoellerdev/roci/blob/main/ARCHITECTURE.md#kubernetes-deployment-helm-chart) in the canonical doc.
+A hardened Helm chart (`charts/roci/`) deploys roci as a single-replica StatefulSet with optional HA S3 storage on RustFS. The chart uses dedicated health endpoints (`/readyz`, `/livez`) for Kubernetes probes — unauthenticated and rate-limit-free. `s3.createBucket` triggers bucket creation at startup; `s3.caSecret` mounts a private-CA bundle for HTTPS S3 endpoints. See [Kubernetes deployment (Helm chart)](https://github.com/jakobmoellerdev/roci/blob/main/ARCHITECTURE.md#kubernetes-deployment-helm-chart) in the canonical doc.
 
 ## Architectural invariants
 

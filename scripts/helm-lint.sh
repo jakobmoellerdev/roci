@@ -34,7 +34,7 @@ expect_fail() {
 
 expect_fail 'set auth.allowAnonymous=true to run an open registry'
 expect_fail 'rustfs.secret.allowInsecureDefaults is not permitted' -f "$S3" --set rustfs.secret.allowInsecureDefaults=true
-expect_fail 'rustfs.mtls.enabled is unsupported' -f "$S3" --set rustfs.mtls.enabled=true
+expect_fail 'rustfs.mtls.enabled is unsupported - roci' -f "$S3" --set rustfs.mtls.enabled=true
 expect_fail 'rustfs.replicaCount must be >= 4' -f "$S3" --set rustfs.replicaCount=3
 expect_fail 'S3 mode requires RustFS distributed mode' -f "$S3" --set rustfs.mode.standalone.enabled=true
 expect_fail 's3.accessKeyId is required' -f "$S3" --set rustfs.secret.existingSecret=creds

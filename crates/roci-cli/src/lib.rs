@@ -148,6 +148,14 @@ impl StorageBackend for AnyBackend {
             AnyBackend::S3(inner) => inner.on_shutdown(),
         }
     }
+
+    async fn ready(&self) -> Result<(), StorageError> {
+        match self {
+            AnyBackend::Fs(inner) => inner.ready().await,
+            #[cfg(feature = "s3")]
+            AnyBackend::S3(inner) => inner.ready().await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,16 +248,19 @@ pub async fn serve(
         Auth::from_config(&config).map_err(|e| anyhow::anyhow!("invalid auth config: {e}"))?;
     let storage = build_storage(&config)?;
 
+    let state = AppState::new_with(storage.clone(), config.clone()).with_auth(auth);
+
     // Startup recovery before accepting requests: register pre-existing
     // `subject` links (referrers upgrade) and reconcile `index.json` with the
     // replayed metadata log (write-behind crash recovery, foreign-tag import).
     storage.recover().await;
+    state.set_recovered();
 
     // Graceful-shutdown signal shared by the listener and background tasks.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     storage.start_maintenance(shutdown_rx.clone());
 
-    if let Some(auth) = &auth {
+    if let Some(auth) = state.auth() {
         let header_mechanism = config.auth.htpasswd.is_some()
             || config.auth.ldap.is_some()
             || config.auth.bearer.is_some();
@@ -270,8 +281,7 @@ pub async fn serve(
     }
 
     let storage_for_shutdown = storage.clone();
-    let app = build_router(AppState::new_with(storage, config.clone()).with_auth(auth))
-        .merge(roci_telemetry::metrics_router(&config));
+    let app = build_router(state).merge(roci_telemetry::metrics_router(&config));
 
     let listener = TcpListener::bind(config.http.listen).await?;
     let local = listener.local_addr()?;
@@ -1805,6 +1815,8 @@ max_body = 0
             redirect_ttl_secs: 60,
             multipart_part_size: 16 * 1024 * 1024,
             multipart_concurrency: 8,
+            create_bucket: false,
+            ca_file: None,
         });
         let err = build_storage(&config).unwrap_err();
         let msg = err.to_string();
@@ -1837,6 +1849,8 @@ max_body = 0
                     redirect_ttl_secs: 60,
                     multipart_part_size: 16 * 1024 * 1024,
                     multipart_concurrency: 8,
+                    create_bucket: false,
+                    ca_file: None,
                 }),
             },
         );
@@ -1948,6 +1962,8 @@ max_body = 0
             redirect_ttl_secs: 60,
             multipart_part_size: 16 * 1024 * 1024,
             multipart_concurrency: 4,
+            create_bucket: false,
+            ca_file: None,
         }
     }
 

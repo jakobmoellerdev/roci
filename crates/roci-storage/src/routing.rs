@@ -227,6 +227,14 @@ impl<B: StorageBackend + Clone> StorageBackend for Routed<B> {
             backend.on_shutdown();
         }
     }
+
+    async fn ready(&self) -> Result<(), StorageError> {
+        self.default.ready().await?;
+        for (_, backend) in &self.routes {
+            backend.ready().await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

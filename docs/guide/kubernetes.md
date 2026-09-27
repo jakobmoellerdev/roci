@@ -61,7 +61,24 @@ With 4 pods and default parity, the cluster survives one pod loss. To increase t
 
 ### Bucket bootstrap
 
-RustFS creates no buckets at startup. The bucket-init Job (`post-install,post-upgrade` hook) creates `s3.bucket` with a curl SigV4 `PUT`, retrying until RustFS has formed its erasure set; a `409` on upgrade counts as success. A new bucket reaches the other RustFS pods asynchronously, and a pod can reject `PutObject` with `NoSuchBucket` for seconds after creation. The Job therefore also writes and deletes a `.roci-bucket-init-probe` object on every RustFS pod (via the headless Service) and completes only once each pod accepts it. roci itself starts before the bucket exists: startup recovery lists the bucket, tolerates the miss, and binds (it waits out S3 client retries, up to about a minute, while RustFS is still unreachable).
+RustFS creates no buckets at startup. Two complementary mechanisms handle bucket creation:
+
+1. **Bucket-init Job** (primary for RustFS). The `post-install,post-upgrade` hook Job creates `s3.bucket` with a curl SigV4 `PUT`, retrying until RustFS has formed its erasure set; a `409` on upgrade counts as success. Because a new bucket reaches RustFS pods asynchronously (a pod can reject `PutObject` with `NoSuchBucket` for seconds after creation), the Job writes and deletes a `.roci-bucket-init-probe` object on every individual pod (via the headless Service) and completes only once each pod accepts it.
+
+2. **`s3.createBucket`** (chart value, rendered as `create_bucket` in the roci config). When true, roci creates the bucket at S3 backend startup via the Service VIP, treating `200`/`409` as success and retrying any other outcome with backoff for up to 60 s (then `/readyz` stays `503` until the bucket is writable). This cannot verify per-pod propagation, so for RustFS the Job remains essential. Use `createBucket` for non-RustFS S3 backends or as a belt-and-suspenders complement (default `false`).
+
+### Private-CA trust (`s3.caSecret`)
+
+To connect to an S3 endpoint serving a certificate from a private CA (e.g. cert-manager-issued), set:
+
+```yaml
+s3:
+  caSecret:
+    name: my-ca-bundle    # Kubernetes Secret name
+    key: ca.crt           # key inside the Secret (PEM-encoded certificates)
+```
+
+The chart mounts the Secret into the roci container and sets `ca_file` in the config so `object_store` trusts it. Leave `caSecret.name` empty (the default) to use only system roots.
 
 ### redirect_min_size = 0
 
@@ -70,6 +87,14 @@ The chart forces `redirect_min_size = 0` in the roci config. Clients cannot reac
 ### External S3
 
 External S3 endpoints are out of scope for the chart: it templates, fences and e2e-tests only the bundled RustFS subchart.
+
+## Health endpoints
+
+The chart uses dedicated health endpoints for kubelet probes:
+
+- **`GET /readyz`** (startup + readiness) — returns `200 ok` when startup recovery has finished and a storage write probe has succeeded, `503` with a fixed reason (`not ready: recovery in progress` or `not ready: storage unavailable`) otherwise. One storage check is bounded at 2 s so a hung backend reads as `503`, not a probe timeout. These endpoints are outside `/v2/`, require **no authentication**, and are not subject to rate limiting.
+- **`GET /livez`** (liveness) — returns `200` unconditionally once the listener is bound.
+- Both accept `HEAD` in addition to `GET`.
 
 ## Hardening summary
 
@@ -88,6 +113,7 @@ External S3 endpoints are out of scope for the chart: it templates, fences and e
 | Auth guard | Rendering fails without auth configuration or explicit `allowAnonymous`; RustFS default credentials rejected |
 | Images | RustFS, busybox and curl are digest-pinned (`tag@sha256:...`); pin roci with `image.digest` (else the `appVersion` tag) |
 | `/metrics` | Off by default; when enabled it is unauthenticated on the registry port. `networkPolicy.ingressFrom` restricts who reaches that port |
+| `/readyz` / `/livez` | Unauthenticated health endpoints; expose only a readiness flag and a short reason string — no internal state or version info |
 
 ## Helm test
 
@@ -103,4 +129,4 @@ The upstream RustFS chart's test pod lacks the security context required by PSS 
 
 - **Single replica.** roci runs as exactly one replica (ARCHITECTURE invariant 7: each repository has one writing instance). The S3 backend keeps metadata and upload staging on a local PVC, so a second replica would diverge. Clustering is planned for Phase 8.
 - **Bundled RustFS only.** The chart does not template external S3 endpoints.
-- **RustFS mTLS unsupported.** roci's S3 client cannot trust a private RustFS CA; in-cluster traffic is plaintext and confined by NetworkPolicy.
+- **RustFS mTLS unsupported.** The RustFS 1.0.0 subchart's `mtls.enabled` bundles server TLS and client-certificate authentication into a single `RUSTFS_SERVER_MTLS_ENABLE` flag — there is no server-TLS-only mode. `object_store` (roci's S3 client) has no client-certificate identity API, so roci cannot present a client cert. In-cluster S3 traffic remains plaintext, confined by NetworkPolicy. The chart rejects `rustfs.mtls.enabled` with this explanation. Private-CA trust for an external S3 endpoint is supported via `s3.caSecret`.

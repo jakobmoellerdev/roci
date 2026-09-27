@@ -12,7 +12,7 @@ every message.
 {{- fail "roci: rustfs.secret.allowInsecureDefaults is not permitted - set rustfs.secret.rustfs.access_key/secret_key or rustfs.secret.existingSecret" }}
 {{- end }}
 {{- if dig "mtls" "enabled" false .Values.rustfs }}
-{{- fail "roci: rustfs.mtls.enabled is unsupported - roci's S3 client cannot trust the private RustFS CA; in-cluster S3 traffic is plaintext and confined by NetworkPolicy" }}
+{{- fail "roci: rustfs.mtls.enabled is unsupported - roci's S3 client (object_store) has no client-certificate identity API, so it cannot present a client cert to RustFS; the RustFS subchart's mtls.enabled bundles server TLS and client cert auth together (RUSTFS_SERVER_MTLS_ENABLE), offering no server-TLS-only mode; in-cluster S3 traffic is plaintext and confined by NetworkPolicy" }}
 {{- end }}
 {{- if or (dig "mode" "standalone" "enabled" false .Values.rustfs) (not (dig "mode" "distributed" "enabled" true .Values.rustfs)) }}
 {{- fail "roci: S3 mode requires RustFS distributed mode (rustfs.mode.distributed.enabled=true, rustfs.mode.standalone.enabled=false)" }}

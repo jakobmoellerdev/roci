@@ -408,4 +408,11 @@ pub trait StorageBackend: Storage {
     /// (e.g. the fast-restart stamp). Best-effort: a failure is logged but
     /// does not prevent the process from exiting.
     fn on_shutdown(&self) {}
+    /// Readiness probe: returns `Ok(())` when the backend is ready to serve
+    /// writes, or a [`StorageError`] describing why not. The default is
+    /// always-ready (filesystem backend). Remote backends (S3) override this
+    /// to probe actual write accessibility (bucket reachability).
+    fn ready(&self) -> impl Future<Output = Result<(), StorageError>> + Send {
+        std::future::ready(Ok(()))
+    }
 }

@@ -82,27 +82,25 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           startupProbe:
-            tcpSocket:
+            httpGet:
+              path: /readyz
               port: http
+              scheme: {{ $scheme }}
             periodSeconds: 5
             failureThreshold: 60
           livenessProbe:
-            tcpSocket:
+            httpGet:
+              path: /livez
               port: http
+              scheme: {{ $scheme }}
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
           readinessProbe:
-            {{- if include "roci.authHtpasswd" . }}
-            {{- /* /v2/ answers 401 once Basic auth is on: fall back to TCP. */}}
-            tcpSocket:
-              port: http
-            {{- else }}
             httpGet:
-              path: /v2/
+              path: /readyz
               port: http
               scheme: {{ $scheme }}
-            {{- end }}
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
@@ -130,6 +128,11 @@ spec:
             {{- if .Values.rustfs.enabled }}
             - name: s3-credentials
               mountPath: /etc/roci/s3
+              readOnly: true
+            {{- end }}
+            {{- if .Values.s3.caSecret.name }}
+            - name: s3-ca
+              mountPath: /etc/roci/s3-ca
               readOnly: true
             {{- end }}
       volumes:
@@ -174,6 +177,15 @@ spec:
             items:
               - key: RUSTFS_SECRET_KEY
                 path: secret-access-key
+        {{- end }}
+        {{- if .Values.s3.caSecret.name }}
+        - name: s3-ca
+          secret:
+            secretName: {{ .Values.s3.caSecret.name }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.s3.caSecret.key }}
+                path: {{ .Values.s3.caSecret.key }}
         {{- end }}
   volumeClaimTemplates:
     - apiVersion: v1

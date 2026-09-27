@@ -91,7 +91,10 @@ compact_threshold_bytes = 67108864  # compact the WAL / cut a snapshot past this
 # root = "/var/lib/roci/mirror-state"
 # s3 = { bucket = "roci", region = "eu-central-1", prefix = "registry",
 #        secret_access_key_file = "/run/secrets/s3", access_key_id = "AKIA…",
-#        redirect_min_size = 1048576, redirect_ttl_secs = 60 }
+#        redirect_min_size = 1048576, redirect_ttl_secs = 60,
+#        create_bucket = false, ca_file = "/etc/roci/s3-ca/ca.crt" }
+# create_bucket: if true, roci creates the bucket at startup (signed CreateBucket; 200/409 = success; retries up to 60 s).
+# ca_file: PEM CA bundle for a private-CA S3 endpoint; omit to use system roots only.
 
 [limits]
 max_body = 268435456          # one request body (chunk or monolithic upload)

@@ -27,8 +27,15 @@ pub use error::{ApiError, ErrorCode};
 pub use names::RepositoryName;
 pub use ratelimit::PeerAddr;
 use roci_config::Config;
-use roci_storage::Storage;
+use roci_storage::{Storage, StorageBackend, StorageError};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+
+/// Type-erased async readiness check, populated by `build_router` from a
+/// concrete `StorageBackend`. The `/readyz` handler calls this.
+type ReadyFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send>> + Send + Sync>;
 
 /// Shared handler state.
 pub struct AppState<S: Storage> {
@@ -37,6 +44,10 @@ pub struct AppState<S: Storage> {
     pub config: Config,
     /// Authentication/authorization engine; `None` → open registry.
     auth: Option<Arc<auth::Auth>>,
+    /// Flipped to `true` after startup recovery (`recover()`) completes.
+    recovered: Arc<std::sync::atomic::AtomicBool>,
+    /// Type-erased storage readiness probe (from StorageBackend::ready).
+    ready_fn: ReadyFn,
 }
 
 // Manual Clone: `Arc<S>` + `Config` are both cloneable regardless of whether
@@ -47,22 +58,37 @@ impl<S: Storage> Clone for AppState<S> {
             storage: Arc::clone(&self.storage),
             config: self.config.clone(),
             auth: self.auth.clone(),
+            recovered: Arc::clone(&self.recovered),
+            ready_fn: Arc::clone(&self.ready_fn),
         }
     }
 }
 
 impl<S: Storage> AppState<S> {
     /// Wrap a storage backend with default size limits and a default config.
-    pub fn new(storage: S) -> Self {
+    pub fn new(storage: S) -> Self
+    where
+        S: StorageBackend,
+    {
         Self::new_with(storage, Config::default())
     }
 
     /// Wrap a storage backend with an explicit config.
-    pub fn new_with(storage: S, config: Config) -> Self {
+    pub fn new_with(storage: S, config: Config) -> Self
+    where
+        S: StorageBackend,
+    {
+        let st = Arc::new(storage);
+        let st2 = Arc::clone(&st);
         Self {
-            storage: Arc::new(storage),
+            storage: st,
             config,
             auth: None,
+            recovered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ready_fn: Arc::new(move || {
+                let s = Arc::clone(&st2);
+                Box::pin(async move { s.ready().await })
+            }),
         }
     }
 
@@ -72,7 +98,24 @@ impl<S: Storage> AppState<S> {
         self
     }
 
-    pub(crate) fn auth(&self) -> Option<&Arc<auth::Auth>> {
+    /// Mark recovery as complete (called after `recover()` finishes).
+    pub fn set_recovered(&self) {
+        self.recovered
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Replace the `/readyz` storage check (default: `StorageBackend::ready`),
+    /// e.g. to gate readiness on a dependency the backend cannot see.
+    pub fn with_ready_check<F, Fut>(mut self, check: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), StorageError>> + Send + 'static,
+    {
+        self.ready_fn = Arc::new(move || Box::pin(check()));
+        self
+    }
+
+    pub fn auth(&self) -> Option<&Arc<auth::Auth>> {
         self.auth.as_ref()
     }
 
@@ -149,10 +192,19 @@ pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
         ));
     }
 
+    // Health-check routes: outside auth/rate-limit, so they bypass
+    // authentication entirely. `/livez` is always 200 once listening;
+    // `/readyz` probes recovery + storage write readiness.
+    let health_routes = Router::new()
+        .route("/livez", get(livez).head(livez))
+        .route("/readyz", get(readyz::<S>).head(readyz::<S>))
+        .with_state(state.clone());
+
     // Layers wrap outward: at runtime a request passes connection-close →
     // span → early-data → global rate limit → authn → per-client rate limit →
-    // handler.
+    // handler. Health routes are merged AFTER auth layers so they bypass them.
     router
+        .merge(health_routes)
         .layer(axum::middleware::from_fn(
             auth::middleware::early_data_middleware,
         ))
@@ -164,9 +216,59 @@ pub fn build_router<S: Storage>(state: AppState<S>) -> Router {
         .layer(axum::middleware::from_fn(conn_close::close_on_unread_body))
         .with_state(state)
 }
+
+/// `GET /livez`: always `200 ok` once the server is listening.
+async fn livez() -> axum::http::StatusCode {
+    axum::http::StatusCode::OK
+}
+
+/// `GET /readyz`: `200 ok` when startup recovery is done AND the storage
+/// backend reports ready; `503 not ready: <reason>` otherwise.
+async fn readyz<S: Storage>(
+    axum::extract::State(st): axum::extract::State<AppState<S>>,
+) -> Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    if !st.recovered.load(std::sync::atomic::Ordering::Acquire) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not ready: recovery in progress",
+        )
+            .into_response();
+    }
+    // Bounded below the kubelet's 3 s probe timeout: a hung backend must read
+    // as 503, not as a timed-out probe.
+    match tokio::time::timeout(READYZ_PROBE_TIMEOUT, (st.ready_fn)()).await {
+        Ok(Ok(())) => (StatusCode::OK, "ok").into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "readiness probe: storage not ready");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "not ready: storage unavailable",
+            )
+                .into_response()
+        }
+        Err(_) => {
+            tracing::warn!("readiness probe: storage check timed out");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "not ready: storage unavailable",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Upper bound on one `/readyz` storage check.
+const READYZ_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Classify a request path into a low-cardinality endpoint label for metrics.
 /// Never the raw path (cardinality discipline — ARCHITECTURE.md §Observability).
 fn classify_endpoint(path: &str) -> &'static str {
+    // Health probes — outside /v2/, no auth.
+    if path == "/livez" || path == "/readyz" {
+        return "health";
+    }
     // /v2/ base, /v2/<name>/blobs/*, /v2/<name>/manifests/*, etc.
     if path == "/v2/" || path == "/v2" {
         return "base";

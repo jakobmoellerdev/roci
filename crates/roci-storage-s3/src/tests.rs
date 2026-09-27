@@ -928,6 +928,8 @@ fn from_config_secret_file_read() {
         redirect_ttl_secs: 60,
         multipart_part_size: 16 * 1024 * 1024,
         multipart_concurrency: 8,
+        create_bucket: false,
+        ca_file: None,
     };
     let client = S3Client::from_config(&s3).unwrap();
     assert_eq!(client.prefix, "pfx");
@@ -949,6 +951,8 @@ fn from_config_missing_secret_file() {
         redirect_ttl_secs: 60,
         multipart_part_size: 16 * 1024 * 1024,
         multipart_concurrency: 8,
+        create_bucket: false,
+        ca_file: None,
     };
     let err = S3Client::from_config(&s3).err().expect("expected error");
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
@@ -969,6 +973,8 @@ fn from_config_key_id_without_file() {
         redirect_ttl_secs: 60,
         multipart_part_size: 16 * 1024 * 1024,
         multipart_concurrency: 8,
+        create_bucket: false,
+        ca_file: None,
     };
     let err = S3Client::from_config(&s3).err().expect("expected error");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -994,6 +1000,8 @@ fn from_config_allow_http_and_path_style() {
         redirect_ttl_secs: 60,
         multipart_part_size: 5 * 1024 * 1024,
         multipart_concurrency: 4,
+        create_bucket: false,
+        ca_file: None,
     };
     // Should succeed: allow_http + path-style (endpoint provided)
     let client = S3Client::from_config(&s3).unwrap();
@@ -1015,6 +1023,8 @@ fn from_config_no_credentials() {
         redirect_ttl_secs: 60,
         multipart_part_size: 16 * 1024 * 1024,
         multipart_concurrency: 8,
+        create_bucket: false,
+        ca_file: None,
     };
     let client = S3Client::from_config(&s3).unwrap();
     assert!(client.signer.is_some());
@@ -3067,6 +3077,8 @@ fn redirect_guard_from_config_aws_default() {
         redirect_ttl_secs: 60,
         multipart_part_size: 16 * 1024 * 1024,
         multipart_concurrency: 8,
+        create_bucket: false,
+        ca_file: None,
     };
     let guard = RedirectGuard::from_config(&s3);
     // Both path-style and virtual-hosted-style hosts are permitted.
@@ -3093,6 +3105,8 @@ fn redirect_guard_from_config_custom_endpoint() {
         redirect_ttl_secs: 60,
         multipart_part_size: 16 * 1024 * 1024,
         multipart_concurrency: 8,
+        create_bucket: false,
+        ca_file: None,
     };
     let guard = RedirectGuard::from_config(&s3);
     let ok = url::Url::parse("https://minio.example:9000/b/key?sig=abc").unwrap();
@@ -3157,4 +3171,276 @@ async fn open_blob_redirect_rejected_by_guard_falls_back_to_proxy() {
         .collect();
     let bytes: Vec<u8> = collected.into_iter().flat_map(|b| b.to_vec()).collect();
     assert_eq!(bytes, data);
+}
+
+// ── readiness probe ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn ready_succeeds_with_in_memory_store() {
+    let (_dir, s) = test_store();
+    // InMemory always accepts writes, so ready should succeed.
+    s.ready().await.unwrap();
+}
+
+#[tokio::test]
+async fn ready_caches_success() {
+    let (_dir, s) = test_store();
+    // First call probes.
+    s.ready().await.unwrap();
+    // Second call within 10 s should hit cache (fast path).
+    s.ready().await.unwrap();
+    // Verify the cache is populated.
+    let cache = s.readiness_cache.lock().expect("poisoned");
+    assert!(
+        cache.is_some(),
+        "cache should be populated after a successful probe"
+    );
+}
+
+// ── write-path NotFound → Unavailable ──────────────────────────────────
+
+#[test]
+fn obj_err_write_maps_not_found_to_unavailable() {
+    use roci_storage::StorageError;
+    let err = object_store::Error::NotFound {
+        path: "some/key".to_string(),
+        source: "test".into(),
+    };
+    let mapped = crate::storage_impl::obj_err_write(err);
+    match mapped {
+        StorageError::Unavailable(msg) => {
+            assert!(
+                msg.contains("NotFound"),
+                "message should mention NotFound: {msg}"
+            );
+        }
+        other => panic!("expected Unavailable, got: {other:?}"),
+    }
+}
+
+#[test]
+fn obj_err_read_maps_not_found_to_not_found() {
+    use roci_storage::StorageError;
+    let err = object_store::Error::NotFound {
+        path: "some/key".to_string(),
+        source: "test".into(),
+    };
+    let mapped = crate::storage_impl::obj_err(err);
+    assert!(
+        matches!(mapped, StorageError::NotFound),
+        "read-path NotFound should map to StorageError::NotFound"
+    );
+}
+
+#[test]
+fn obj_err_write_passes_through_other_errors() {
+    use roci_storage::StorageError;
+    let err = object_store::Error::Generic {
+        store: "test",
+        source: "some error".into(),
+    };
+    let mapped = crate::storage_impl::obj_err_write(err);
+    assert!(
+        matches!(mapped, StorageError::Io(_)),
+        "non-NotFound errors should map to Io"
+    );
+}
+
+// ── create_bucket / ensure_bucket ──────────────────────────────────────
+
+/// Build a test store with `create_bucket = true`.
+fn test_store_create_bucket() -> (tempfile::TempDir, S3Storage) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StorageConfig::default();
+    let mem = Arc::new(InMemory::new());
+    let signer = build_test_signer();
+    let client = S3Client::in_memory(
+        mem,
+        signer,
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    );
+    let mut s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    s.create_bucket = true;
+    (dir, s)
+}
+
+/// Minimal HTTP server answering each connection with the next scripted
+/// status (repeating the last). Records `METHOD PATH` of every request.
+async fn scripted_s3(statuses: Vec<u16>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        let mut i = 0;
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let line = String::from_utf8_lossy(&buf)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let mut parts = line.split(' ');
+            let (m, p) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            let path = p.split('?').next().unwrap_or("").to_string();
+            log.lock().unwrap().push(format!("{m} {path}"));
+            let status = statuses[i.min(statuses.len() - 1)];
+            i += 1;
+            let resp =
+                format!("HTTP/1.1 {status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            let _ = sock.write_all(resp.as_bytes()).await;
+        }
+    });
+    (format!("http://{addr}"), seen)
+}
+
+/// S3Storage whose signer and bucket HTTP client target `endpoint`.
+fn store_against(endpoint: &str) -> (tempfile::TempDir, S3Storage) {
+    use object_store::aws::AmazonS3Builder;
+    use object_store::client::HttpConnector;
+    crate::client::install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let opts = object_store::ClientOptions::default().with_allow_http(true);
+    let aws = AmazonS3Builder::new()
+        .with_bucket_name("smoke")
+        .with_region("us-east-1")
+        .with_access_key_id("AKIDEXAMPLE")
+        .with_secret_access_key("secret")
+        .with_endpoint(endpoint)
+        .with_virtual_hosted_style_request(false)
+        .with_client_options(opts.clone())
+        .build()
+        .unwrap();
+    let http = object_store::client::ReqwestConnector::default()
+        .connect(&opts)
+        .unwrap();
+    let client = S3Client::in_memory(
+        Arc::new(InMemory::new()),
+        Some(Arc::new(aws)),
+        String::new(),
+        0,
+        Duration::from_secs(60),
+        16 * 1024 * 1024,
+        8,
+    )
+    .with_bucket_http(http);
+    let s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &StorageConfig::default(),
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    (dir, s)
+}
+
+#[tokio::test]
+async fn ensure_bucket_sends_create_bucket_and_accepts_200() {
+    let (ep, seen) = scripted_s3(vec![200]).await;
+    let (_dir, s) = store_against(&ep);
+    s.ensure_bucket_within(Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(*seen.lock().unwrap(), vec!["PUT /smoke/".to_string()]);
+}
+
+#[tokio::test]
+async fn ensure_bucket_accepts_409_already_owned() {
+    let (ep, _) = scripted_s3(vec![409]).await;
+    let (_dir, s) = store_against(&ep);
+    s.ensure_bucket_within(Duration::from_secs(5))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn ensure_bucket_retries_until_backend_accepts() {
+    let (ep, seen) = scripted_s3(vec![503, 503, 200]).await;
+    let (_dir, s) = store_against(&ep);
+    s.ensure_bucket_within(Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn ensure_bucket_gives_up_as_unavailable_at_deadline() {
+    let (ep, _) = scripted_s3(vec![403]).await;
+    let (_dir, s) = store_against(&ep);
+    let err = s
+        .ensure_bucket_within(Duration::from_millis(100))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, roci_storage::StorageError::Unavailable(m) if m.contains("403")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn ensure_bucket_without_http_client_is_rejected() {
+    let (_dir, s) = test_store_create_bucket();
+    assert!(s.ensure_bucket().await.is_err());
+}
+
+#[tokio::test]
+async fn recover_skips_ensure_bucket_when_flag_unset() {
+    // create_bucket = false: recover must not attempt CreateBucket (the
+    // store has no bucket HTTP client, so an attempt would log an error).
+    let (_dir, s) = test_store();
+    assert!(!s.create_bucket);
+    s.recover().await;
+}
+
+// ── ca_file PEM validation ─────────────────────────────────────────────
+
+#[test]
+fn ca_file_bad_pem_rejected_at_startup() {
+    use roci_config::S3Config;
+    crate::client::install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let bad_pem = dir.path().join("bad.pem");
+    std::fs::write(&bad_pem, "this is not a valid PEM certificate").unwrap();
+    let s3 = S3Config {
+        bucket: "test".into(),
+        region: "us-east-1".into(),
+        endpoint: Some("http://localhost:9000".into()),
+        prefix: String::new(),
+        access_key_id: None,
+        secret_access_key_file: None,
+        allow_http: true,
+        redirect_min_size: 0,
+        redirect_ttl_secs: 15,
+        multipart_part_size: 16 * 1024 * 1024,
+        multipart_concurrency: 8,
+        create_bucket: false,
+        ca_file: Some(bad_pem),
+    };
+    let err = S3Client::from_config(&s3);
+    assert!(err.is_err(), "bad PEM should be rejected at startup");
+    let msg = err.err().expect("expected an error").to_string();
+    assert!(
+        msg.contains("PEM") || msg.contains("pem") || msg.contains("ca_file"),
+        "error should mention PEM or ca_file: {msg}"
+    );
 }
