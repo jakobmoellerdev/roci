@@ -71,7 +71,7 @@ The Helm chart at `charts/roci/` applies these controls; `values.schema.json` an
 - **Pinned images.** RustFS, its init image, and the hook (curl) image use `tag@sha256:…` pins; the roci image is pinned by `image.digest` when set, else the chart `appVersion` tag.
 - **`/metrics` note.** The Prometheus `/metrics` endpoint shares the registry port and is unauthenticated when enabled (off by default); `networkPolicy.ingressFrom` restricts which peers reach the registry port as a whole.
 - **Unauthenticated `/readyz` and `/livez`.** The health endpoints are outside `/v2/`, require no authentication, and expose only a binary readiness state plus a fixed reason string (`not ready: recovery in progress` / `not ready: storage unavailable`; backend errors are logged, never returned). They are used as kubelet probe targets. No internal state, configuration, or version information is disclosed.
-- **Private-CA TLS to S3.** The `s3.caSecret` chart value mounts a PEM CA bundle Secret and sets `ca_file` in the roci config, enabling the S3 client to trust a private-CA endpoint. The CA bundle is a 0440 file mount like other secrets. RustFS client-cert mTLS is not supported (the `object_store` crate has no client-certificate identity API); in-cluster S3 traffic is plaintext and confined by NetworkPolicy.
+- **Private-CA TLS to S3.** The roci config key `ca_file` (a PEM bundle) makes the S3 client trust a private-CA endpoint; the CreateBucket client shares the same TLS roots. The chart has no CA value, because its only S3 endpoint is the in-cluster RustFS. RustFS client-cert mTLS is not supported (the `object_store` crate has no client-certificate identity API); in-cluster S3 traffic is plaintext and confined by NetworkPolicy.
 
 ### Enforcement point
 

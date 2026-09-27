@@ -71,6 +71,8 @@ pub struct S3Storage {
     readiness_cache: Arc<StdMutex<Option<std::time::Instant>>>,
     /// Create the S3 bucket if it does not exist at startup.
     create_bucket: bool,
+    /// A CreateBucket attempt has succeeded (only meaningful with `create_bucket`).
+    bucket_ensured: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl S3Storage {
@@ -118,6 +120,7 @@ impl S3Storage {
             admit_locks: Arc::new(StdMutex::new(HashMap::new())),
             readiness_cache: Arc::new(StdMutex::new(None)),
             create_bucket: false,
+            bucket_ensured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 

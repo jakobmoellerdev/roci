@@ -61,24 +61,14 @@ With 4 pods and default parity, the cluster survives one pod loss. To increase t
 
 ### Bucket bootstrap
 
-RustFS creates no buckets at startup. Two complementary mechanisms handle bucket creation:
+RustFS creates no buckets at startup. Two steps handle it, in this order:
 
-1. **Bucket-init Job** (primary for RustFS). The `post-install,post-upgrade` hook Job creates `s3.bucket` with a curl SigV4 `PUT`, retrying until RustFS has formed its erasure set; a `409` on upgrade counts as success. Because a new bucket reaches RustFS pods asynchronously (a pod can reject `PutObject` with `NoSuchBucket` for seconds after creation), the Job writes and deletes a `.roci-bucket-init-probe` object on every individual pod (via the headless Service) and completes only once each pod accepts it.
+1. **roci creates the bucket.** The chart always sets `create_bucket = true` in the roci config. At startup roci sends a signed CreateBucket through the RustFS Service. `200` and `409` count as success; anything else is retried with backoff for up to 60 s. After that, each `/readyz` check makes one more attempt until one succeeds. `/readyz` stays `503` until the bucket is writable, so `helm install --wait` blocks until then. roci cannot rely on a hook for this: Helm runs `post-install` hooks only after `--wait` sees roci Ready.
+2. **The bucket-init Job confirms every RustFS pod.** A new bucket reaches the RustFS pods asynchronously, and a pod can reject `PutObject` with `NoSuchBucket` for seconds after creation. roci only sees the Service. The `post-install,post-upgrade` hook Job therefore PUTs the bucket (idempotent) and writes and deletes a `.roci-bucket-init-probe` object on every pod through the headless Service. It completes only once each pod accepts the write, so `helm install` returns only after all pods know the bucket.
 
-2. **`s3.createBucket`** (chart value, rendered as `create_bucket` in the roci config). When true, roci creates the bucket at S3 backend startup via the Service VIP, treating `200`/`409` as success and retrying any other outcome with backoff for up to 60 s (then `/readyz` stays `503` until the bucket is writable). This cannot verify per-pod propagation, so for RustFS the Job remains essential. Use `createBucket` for non-RustFS S3 backends or as a belt-and-suspenders complement (default `false`).
+### Private-CA trust
 
-### Private-CA trust (`s3.caSecret`)
-
-To connect to an S3 endpoint serving a certificate from a private CA (e.g. cert-manager-issued), set:
-
-```yaml
-s3:
-  caSecret:
-    name: my-ca-bundle    # Kubernetes Secret name
-    key: ca.crt           # key inside the Secret (PEM-encoded certificates)
-```
-
-The chart mounts the Secret into the roci container and sets `ca_file` in the config so `object_store` trusts it. Leave `caSecret.name` empty (the default) to use only system roots.
+The chart has no CA setting: its only S3 endpoint is the in-cluster RustFS, which is plaintext (see Limitations). For roci deployed outside the chart against a private-CA HTTPS endpoint, such as a cert-manager-issued one, set `ca_file` in `[storage.s3]` (see [Configuration](./configuration.md)).
 
 ### redirect_min_size = 0
 
@@ -129,4 +119,4 @@ The upstream RustFS chart's test pod lacks the security context required by PSS 
 
 - **Single replica.** roci runs as exactly one replica (ARCHITECTURE invariant 7: each repository has one writing instance). The S3 backend keeps metadata and upload staging on a local PVC, so a second replica would diverge. Clustering is planned for Phase 8.
 - **Bundled RustFS only.** The chart does not template external S3 endpoints.
-- **RustFS mTLS unsupported.** The RustFS 1.0.0 subchart's `mtls.enabled` bundles server TLS and client-certificate authentication into a single `RUSTFS_SERVER_MTLS_ENABLE` flag — there is no server-TLS-only mode. `object_store` (roci's S3 client) has no client-certificate identity API, so roci cannot present a client cert. In-cluster S3 traffic remains plaintext, confined by NetworkPolicy. The chart rejects `rustfs.mtls.enabled` with this explanation. Private-CA trust for an external S3 endpoint is supported via `s3.caSecret`.
+- **RustFS mTLS unsupported.** The RustFS 1.0.0 subchart's `mtls.enabled` bundles server TLS and client-certificate authentication into a single `RUSTFS_SERVER_MTLS_ENABLE` flag — there is no server-TLS-only mode. `object_store` (roci's S3 client) has no client-certificate identity API, so roci cannot present a client cert. In-cluster S3 traffic remains plaintext, confined by NetworkPolicy. The chart rejects `rustfs.mtls.enabled` with this explanation. For a private-CA S3 endpoint outside the chart, set `ca_file`.

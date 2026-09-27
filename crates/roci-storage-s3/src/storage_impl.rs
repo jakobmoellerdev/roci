@@ -655,8 +655,12 @@ impl Storage for S3Storage {
 impl StorageBackend for S3Storage {
     async fn recover(&self) {
         if self.create_bucket {
-            if let Err(e) = self.ensure_bucket().await {
-                tracing::error!(error = %e, "create_bucket failed");
+            match self.ensure_bucket().await {
+                Ok(()) => self
+                    .bucket_ensured
+                    .store(true, std::sync::atomic::Ordering::Release),
+                // `ready()` keeps retrying, so /readyz heals once S3 accepts it.
+                Err(e) => tracing::error!(error = %e, "create_bucket failed"),
             }
         }
         self.recover_from_remote_indexes().await;
@@ -733,6 +737,18 @@ impl StorageBackend for S3Storage {
                     return Ok(());
                 }
             }
+        }
+
+        // Startup CreateBucket gave up (backend slow to form): one more attempt
+        // per readiness check until it succeeds.
+        if self.create_bucket
+            && !self
+                .bucket_ensured
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.ensure_bucket_within(Duration::ZERO).await?;
+            self.bucket_ensured
+                .store(true, std::sync::atomic::Ordering::Release);
         }
 
         // Probe: PUT then DELETE a sentinel object.

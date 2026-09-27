@@ -7,7 +7,7 @@ shim over the fully-covered library). Any uncovered lines are listed at gate
 time for triage; the few that remain are unreachable-in-CI defensive
 syscall-error arms in the beneath-root storage path.
 
-Current line coverage: **97.22%** (33090/34036 lines).
+Current line coverage: **97.18%** (33102/34061 lines).
 
 Regenerate with `just coverage` (or on every commit via the pre-commit hook).
 Inspect region-level gaps with `just coverage-report`.
@@ -45,9 +45,9 @@ Filename                                                                        
 .omp/wt/wt-20260925-201653-db2a42c/crates/roci-ext-sync/src/lib.rs                                       3                 0   100.00%           1                 0   100.00%           3                 0   100.00%           0                 0         -
 .omp/wt/wt-20260925-201653-db2a42c/crates/roci-storage-s3/src/client.rs                                328                38    88.41%          26                 5    80.77%         256                34    86.72%           0                 0         -
 .omp/wt/wt-20260925-201653-db2a42c/crates/roci-storage-s3/src/keys.rs                                  117                 2    98.29%          12                 0   100.00%          64                 0   100.00%           0                 0         -
-.omp/wt/wt-20260925-201653-db2a42c/crates/roci-storage-s3/src/lib.rs                                   270                13    95.19%          20                 0   100.00%         156                 0   100.00%           0                 0         -
-.omp/wt/wt-20260925-201653-db2a42c/crates/roci-storage-s3/src/storage_impl.rs                         5115              1071    79.06%         318                68    78.62%        2773               539    80.56%           0                 0         -
-.omp/wt/wt-20260925-201653-db2a42c/crates/roci-storage-s3/src/tests.rs                                7682                55    99.28%         345                 1    99.71%        4659                12    99.74%           0                 0         -
+.omp/wt/wt-20260925-201653-db2a42c/crates/roci-storage-s3/src/lib.rs                                   281                13    95.37%          21                 0   100.00%         162                 0   100.00%           0                 0         -
+.omp/wt/wt-20260925-201653-db2a42c/crates/roci-storage-s3/src/storage_impl.rs                         5134              1080    78.96%         320                69    78.44%        2790               547    80.39%           0                 0         -
+.omp/wt/wt-20260925-201653-db2a42c/crates/roci-storage-s3/src/tests.rs                                7709                56    99.27%         347                 1    99.71%        4677                12    99.74%           0                 0         -
 .omp/wt/wt-20260925-201653-db2a42c/crates/roci-storage-s3/src/uploads.rs                               608                70    88.49%          47                 3    93.62%         342                27    92.11%           0                 0         -
 .omp/wt/wt-20260925-201653-db2a42c/crates/roci-storage/src/beneath.rs                                 1264               127    89.95%          89                 0   100.00%         766                40    94.78%           0                 0         -
 .omp/wt/wt-20260925-201653-db2a42c/crates/roci-storage/src/bufpool.rs                                   96                 6    93.75%           9                 1    88.89%          55                 7    87.27%           0                 0         -
@@ -149,5 +149,5 @@ SAPDevelop/roci/crates/roci-telemetry/tests/metrics_disabled.rs                 
 SAPDevelop/roci/crates/roci-telemetry/tests/metrics_recording.rs                                        77                 0   100.00%           2                 0   100.00%          39                 0   100.00%           0                 0         -
 SAPDevelop/roci/target/llvm-cov-target/debug/build/oid-registry-8c94d684189c2587/out/oid_db.rs         616               616     0.00%           8                 8     0.00%         172               172     0.00%           0                 0         -
 --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-TOTAL                                                                                                88794              5082    94.28%        4873               215    95.59%       49673              1989    96.00%           0                 0         -
+TOTAL                                                                                                88851              5092    94.27%        4878               216    95.57%       49714              1997    95.98%           0                 0         -
 ```

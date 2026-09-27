@@ -3404,6 +3404,27 @@ async fn ensure_bucket_without_http_client_is_rejected() {
 }
 
 #[tokio::test]
+async fn ready_retries_create_bucket_until_it_succeeds() {
+    // Startup CreateBucket gave up; each readiness check tries once more, and
+    // stops trying after the first success.
+    let (ep, seen) = scripted_s3(vec![503, 200]).await;
+    let (_dir, mut s) = store_against(&ep);
+    s.create_bucket = true;
+    assert!(matches!(
+        s.ready().await,
+        Err(roci_storage::StorageError::Unavailable(_))
+    ));
+    s.ready().await.unwrap();
+    *s.readiness_cache.lock().unwrap() = None;
+    s.ready().await.unwrap();
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "no CreateBucket after success"
+    );
+}
+
+#[tokio::test]
 async fn recover_skips_ensure_bucket_when_flag_unset() {
     // create_bucket = false: recover must not attempt CreateBucket (the
     // store has no bucket HTTP client, so an attempt would log an error).

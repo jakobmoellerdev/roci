@@ -130,11 +130,6 @@ spec:
               mountPath: /etc/roci/s3
               readOnly: true
             {{- end }}
-            {{- if .Values.s3.caSecret.name }}
-            - name: s3-ca
-              mountPath: /etc/roci/s3-ca
-              readOnly: true
-            {{- end }}
       volumes:
         - name: config
           secret:
@@ -177,15 +172,6 @@ spec:
             items:
               - key: RUSTFS_SECRET_KEY
                 path: secret-access-key
-        {{- end }}
-        {{- if .Values.s3.caSecret.name }}
-        - name: s3-ca
-          secret:
-            secretName: {{ .Values.s3.caSecret.name }}
-            defaultMode: 0440
-            items:
-              - key: {{ .Values.s3.caSecret.key }}
-                path: {{ .Values.s3.caSecret.key }}
         {{- end }}
   volumeClaimTemplates:
     - apiVersion: v1

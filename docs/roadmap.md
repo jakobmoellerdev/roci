@@ -81,5 +81,5 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [x] Fast cold start (rkyv mmap snapshot, opt-in `fast_restart` stamp) and low-fragmentation allocator
 - [x] Hardened Helm chart (PSS restricted, NetworkPolicies, optional HA S3 storage on RustFS), e2e-tested on k0s
 - [x] Health endpoints (`/readyz`, `/livez`) for Kubernetes probes — unauthenticated, rate-limit-free
-- [x] S3 bucket auto-creation (`create_bucket`) and private-CA trust (`ca_file` / chart `s3.caSecret`)
+- [x] S3 bucket auto-creation (`create_bucket`, always on in the chart's RustFS mode) and private-CA trust (`ca_file`)
 - [ ] RustFS client-cert mTLS (blocked: `object_store` lacks client-cert API; RustFS subchart has no server-TLS-only mode)
