@@ -2385,7 +2385,7 @@ async fn hash_staging_unsupported_algorithm() {
     let err = s.hash_staging("repo", &id, "md5").await;
     assert!(
         matches!(err, Err(roci_storage::StorageError::BadDigest(_))),
-        "unsupported algorithm should be rejected: {err:?}"
+        "unsupported algorithm should be rejected"
     );
 }
 
