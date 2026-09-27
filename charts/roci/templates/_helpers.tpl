@@ -148,6 +148,21 @@ In-cluster RustFS S3 endpoint (upstream Service "<fullname>-svc").
 {{- end }}
 
 {{/*
+Per-pod RustFS S3 endpoints (upstream StatefulSet pods behind the
+"<fullname>-headless" Service), space-separated.
+*/}}
+{{- define "roci.rustfsPodEndpoints" -}}
+{{- $fullname := include "roci.rustfsFullname" . }}
+{{- $domain := dig "clusterDomain" "cluster.local" .Values.rustfs }}
+{{- $port := include "roci.rustfsPort" . }}
+{{- $endpoints := list }}
+{{- range $i := until (int .Values.rustfs.replicaCount) }}
+{{- $endpoints = append $endpoints (printf "http://%s-%d.%s-headless.%s.svc.%s:%v" $fullname $i $fullname $.Release.Namespace $domain $port) }}
+{{- end }}
+{{- join " " $endpoints }}
+{{- end }}
+
+{{/*
 S3 region shared by RustFS, roci and the bucket-init Job.
 */}}
 {{- define "roci.s3Region" -}}
