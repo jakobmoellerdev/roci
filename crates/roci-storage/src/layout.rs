@@ -502,4 +502,122 @@ mod tests {
             index_from_meta(&*s.meta, "r", Some(serde_json::Value::Null), |_| None).unwrap();
         assert_eq!(rebuilt3["schemaVersion"], 2, "null existing handled");
     }
+
+    #[test]
+    fn for_each_cas_blob_skips_non_file_and_bad_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("repo/blobs/sha256")).unwrap();
+        // discover_repos needs an oci-layout or index.json to find the repo.
+        std::fs::write(
+            root.join("repo/oci-layout"),
+            r#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        let valid_hex = "a".repeat(64);
+        std::fs::write(root.join(format!("repo/blobs/sha256/{valid_hex}")), b"ok").unwrap();
+        // directory inside sha256/ → skipped (not a file)
+        std::fs::create_dir(root.join("repo/blobs/sha256/subdir_not_a_file")).unwrap();
+        // file with non-digest name → Digest::parse fails → skipped
+        std::fs::write(root.join("repo/blobs/sha256/not-a-hex"), b"x").unwrap();
+        // non-dir inside blobs/ → algorithm dir loop skips it
+        std::fs::write(root.join("repo/blobs/stray_file"), b"x").unwrap();
+
+        let mut found = Vec::new();
+        for_each_cas_blob(root, |repo, digest, _entry| {
+            found.push((repo.to_string(), digest.as_string()));
+        });
+        assert_eq!(found.len(), 1, "only the valid blob discovered");
+        assert_eq!(found[0].0, "repo");
+        assert!(found[0].1.contains(&valid_hex), "correct digest");
+    }
+
+    #[tokio::test]
+    async fn index_from_meta_merges_referrer_annotations_and_unknown_keys() {
+        let (_dir, s) = store();
+        let body = br#"{"schemaVersion":2}"#;
+        let d = sha256_of(body);
+        s.put_manifest(
+            "r",
+            Some("latest"),
+            &d,
+            "application/vnd.oci.image.manifest.v1+json",
+            body,
+            ManifestLinks::default(),
+        )
+        .await
+        .unwrap();
+
+        let subject = sha256_of(b"subj");
+        let ref_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        // Referrer descriptor with annotations and an unknown key ("customField")
+        let descriptor = serde_json::json!({
+            "digest": ref_digest,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "size": 100,
+            "annotations": {
+                "org.opencontainers.image.ref.name": "should-be-skipped",
+                "custom.key": "custom-value"
+            },
+            "customField": "extra-data"
+        });
+        s.meta
+            .apply(MetaOp::PutReferrer {
+                repo: "r".to_string(),
+                subject: subject.as_string(),
+                referrer: ref_digest.to_string(),
+                descriptor: serde_json::to_vec(&descriptor).unwrap(),
+            })
+            .unwrap();
+
+        let rebuilt = index_from_meta(&*s.meta, "r", None, |_| None).unwrap();
+        let ms = rebuilt["manifests"].as_array().unwrap();
+        let ref_entry = ms
+            .iter()
+            .find(|e| e.get("digest").and_then(|v| v.as_str()) == Some(ref_digest))
+            .expect("referrer entry present");
+        // Unknown key "customField" is forwarded (line 347/351)
+        assert_eq!(
+            ref_entry.get("customField").and_then(|v| v.as_str()),
+            Some("extra-data"),
+            "unknown keys forwarded"
+        );
+        // Annotations merged: custom.key present, ref.name stripped
+        let ann = ref_entry["annotations"].as_object().unwrap();
+        assert!(ann.contains_key("custom.key"), "custom annotation merged");
+        assert!(
+            !ann.contains_key("org.opencontainers.image.ref.name"),
+            "ref.name annotation stripped"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_from_meta_annotations_with_non_object_values() {
+        let (_dir, s) = store();
+        let subject = sha256_of(b"subj2");
+        let ref_digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        // Referrer where "annotations" is a non-object (string) → continue (line 342)
+        let descriptor = serde_json::json!({
+            "digest": ref_digest,
+            "annotations": "not-an-object"
+        });
+        s.meta
+            .apply(MetaOp::PutReferrer {
+                repo: "r".to_string(),
+                subject: subject.as_string(),
+                referrer: ref_digest.to_string(),
+                descriptor: serde_json::to_vec(&descriptor).unwrap(),
+            })
+            .unwrap();
+
+        let rebuilt = index_from_meta(&*s.meta, "r", None, |_| None).unwrap();
+        let ms = rebuilt["manifests"].as_array().unwrap();
+        let ref_entry = ms
+            .iter()
+            .find(|e| e.get("digest").and_then(|v| v.as_str()) == Some(ref_digest));
+        assert!(
+            ref_entry.is_some(),
+            "entry still emitted despite bad annotations"
+        );
+    }
 }

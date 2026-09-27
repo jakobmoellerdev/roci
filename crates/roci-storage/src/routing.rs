@@ -257,4 +257,20 @@ mod tests {
         let size = routed.blob_size("team/dst", &digest).await.unwrap();
         assert_eq!(size, data.len() as u64);
     }
+
+    #[tokio::test]
+    async fn recover_and_ready_fan_out_to_all_backends() {
+        let (_dir, routed) = routed_fixture();
+        routed.recover().await;
+        routed.ready().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn on_shutdown_and_start_maintenance_fan_out() {
+        let (_dir, routed) = routed_fixture();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        routed.start_maintenance(rx);
+        routed.on_shutdown();
+        tx.send(true).unwrap();
+    }
 }

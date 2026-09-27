@@ -1486,4 +1486,417 @@ mod tests {
             assert_eq!(bc.size, 999);
         }
     }
+
+    #[test]
+    fn prefix_successor_all_0xff() {
+        let all_ff = vec![0xFFu8; 4];
+        assert_eq!(prefix_successor(&all_ff), None);
+    }
+
+    #[test]
+    fn prefix_successor_trailing_0xff() {
+        let input = vec![0x01, 0xFF, 0xFF];
+        let result = prefix_successor(&input).unwrap();
+        assert_eq!(result, vec![0x02]);
+    }
+
+    #[test]
+    fn prefix_successor_normal() {
+        let input = vec![0x01, 0x02];
+        let result = prefix_successor(&input).unwrap();
+        assert_eq!(result, vec![0x01, 0x03]);
+    }
+
+    #[test]
+    fn map_heed_err_map_full() {
+        let err = io::Error::other("MDB_MAP_FULL something");
+        let mapped = map_heed_err(heed3::Error::Io(err));
+        let mapped_msg = mapped.to_string();
+        assert!(
+            mapped_msg.contains("map_size_bytes") || mapped_msg.contains("MDB_MAP_FULL"),
+            "should mention map full: {mapped_msg}"
+        );
+    }
+
+    #[test]
+    fn open_at_format_mismatch_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let lmdb_dir = dir.path().join("lmdb-at");
+        std::fs::create_dir_all(&lmdb_dir).unwrap();
+        std::fs::write(lmdb_dir.join("roci-format"), "chacha20poly1305-v1").unwrap();
+        let config = make_config();
+        match LmdbMetadataStore::open_at(&lmdb_dir, &config) {
+            Err(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+                assert!(
+                    err.to_string().contains("format mismatch"),
+                    "expected format mismatch: {err}"
+                );
+            }
+            Ok(_) => panic!("expected InvalidData error"),
+        }
+    }
+
+    #[test]
+    fn maintain_calls_force_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_config();
+        let store = LmdbMetadataStore::open(dir.path(), &config).unwrap();
+        store
+            .apply(MetaOp::PutManifest {
+                repo: "r".into(),
+                digest: "sha256:a".into(),
+                media_type: "mt".into(),
+                tag: Some("v1".into()),
+                references: vec![],
+                referrer: None,
+            })
+            .unwrap();
+        store.maintain().unwrap();
+        assert!(store.resolve_tag("r", "v1").is_some());
+    }
+
+    #[test]
+    fn export_round_trip_all_op_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_config();
+        let store = LmdbMetadataStore::open(dir.path(), &config).unwrap();
+
+        store
+            .apply(MetaOp::PutManifest {
+                repo: "r".into(),
+                digest: "sha256:m1".into(),
+                media_type: "mt".into(),
+                tag: Some("v1".into()),
+                references: vec!["sha256:blob1".into()],
+                referrer: None,
+            })
+            .unwrap();
+        store
+            .apply(MetaOp::PutManifest {
+                repo: "r".into(),
+                digest: "sha256:m2".into(),
+                media_type: "mt2".into(),
+                tag: None,
+                references: vec![],
+                referrer: None,
+            })
+            .unwrap();
+        let desc = br#"{"artifactType":"sbom","digest":"sha256:ref","size":10}"#;
+        store
+            .apply(MetaOp::PutReferrer {
+                repo: "r".into(),
+                subject: "sha256:subj".into(),
+                referrer: "sha256:ref".into(),
+                descriptor: desc.to_vec(),
+            })
+            .unwrap();
+        store
+            .apply(MetaOp::PutChecksum {
+                repo: "r".into(),
+                digest: "sha256:blob1".into(),
+                crc32c: 0xABCD,
+                size: 1024,
+            })
+            .unwrap();
+
+        let mut ops = Vec::new();
+        store
+            .export(&mut |op| {
+                ops.push(op);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!ops.is_empty(), "export should produce ops");
+
+        let has_tagged = ops
+            .iter()
+            .any(|op| matches!(op, MetaOp::PutManifest { tag: Some(_), .. }));
+        let has_untagged = ops
+            .iter()
+            .any(|op| matches!(op, MetaOp::PutManifest { tag: None, .. }));
+        let has_backref = ops
+            .iter()
+            .any(|op| matches!(op, MetaOp::PutBackrefs { .. }));
+        let has_referrer = ops
+            .iter()
+            .any(|op| matches!(op, MetaOp::PutReferrer { .. }));
+        let has_checksum = ops
+            .iter()
+            .any(|op| matches!(op, MetaOp::PutChecksum { .. }));
+        assert!(has_tagged, "should export tagged manifest");
+        assert!(has_untagged, "should export untagged manifest");
+        assert!(has_backref, "should export backrefs");
+        assert!(has_referrer, "should export referrer");
+        assert!(has_checksum, "should export checksum");
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2 = LmdbMetadataStore::open(dir2.path(), &config).unwrap();
+        for op in ops {
+            store2.apply(op).unwrap();
+        }
+
+        assert_eq!(store.repos(), store2.repos());
+        assert_eq!(store.manifests("r"), store2.manifests("r"));
+        assert_eq!(store.tags_snapshot("r"), store2.tags_snapshot("r"));
+        assert_eq!(
+            store.checksum("r", "sha256:blob1"),
+            store2.checksum("r", "sha256:blob1")
+        );
+    }
+
+    #[test]
+    fn key_file_read_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig {
+            hmac_key_file: Some(dir.path().join("nonexistent.key")),
+            ..MetadataConfig::default()
+        };
+        match LmdbMetadataStore::open(dir.path(), &config) {
+            Err(err) => assert!(
+                err.to_string().contains("hmac_key_file"),
+                "should mention key file: {err}"
+            ),
+            Ok(_) => panic!("expected error for missing key file"),
+        }
+    }
+
+    #[test]
+    fn redb_warning_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let redb_path = dir.path().join("roci-meta.redb");
+        std::fs::write(&redb_path, b"fake redb").unwrap();
+
+        let config = make_config();
+        let store = LmdbMetadataStore::open(dir.path(), &config).unwrap();
+        assert!(redb_path.exists(), "redb file not deleted");
+        drop(store);
+    }
+
+    #[test]
+    fn tags_page_cursor_past_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_config();
+        let store = LmdbMetadataStore::open(dir.path(), &config).unwrap();
+        store
+            .apply(MetaOp::PutManifest {
+                repo: "r".into(),
+                digest: "sha256:m".into(),
+                media_type: "mt".into(),
+                tag: Some("a".into()),
+                references: vec![],
+                referrer: None,
+            })
+            .unwrap();
+        let page = store.tags_page("r", Some("z"), 10).unwrap();
+        assert!(page.items.is_empty());
+    }
+
+    #[test]
+    fn referrers_page_with_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_config();
+        let store = LmdbMetadataStore::open(dir.path(), &config).unwrap();
+
+        for i in 0..3 {
+            let desc = serde_json::json!({
+                "digest": format!("sha256:r{i}"),
+                "size": 10,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json"
+            })
+            .to_string()
+            .into_bytes();
+            store
+                .apply(MetaOp::PutReferrer {
+                    repo: "r".into(),
+                    subject: "sha256:s".into(),
+                    referrer: format!("sha256:r{i}"),
+                    descriptor: desc,
+                })
+                .unwrap();
+        }
+
+        let p1 = store
+            .referrers_page("r", "sha256:s", None, None, 2)
+            .unwrap();
+        assert_eq!(p1.items.len(), 2);
+        assert!(p1.more);
+
+        let cursor = &p1.items[1].0;
+        let p2 = store
+            .referrers_page("r", "sha256:s", None, Some(cursor), 10)
+            .unwrap();
+        assert_eq!(p2.items.len(), 1);
+        assert!(!p2.more);
+    }
+
+    #[test]
+    fn referrers_page_typed_no_match_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_config();
+        let store = LmdbMetadataStore::open(dir.path(), &config).unwrap();
+
+        let desc = serde_json::json!({
+            "artifactType": "sbom",
+            "digest": "sha256:r1",
+            "size": 10,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json"
+        })
+        .to_string()
+        .into_bytes();
+        store
+            .apply(MetaOp::PutReferrer {
+                repo: "r".into(),
+                subject: "sha256:s".into(),
+                referrer: "sha256:r1".into(),
+                descriptor: desc,
+            })
+            .unwrap();
+
+        let p = store
+            .referrers_page("r", "sha256:s", Some("nonexistent"), None, 10)
+            .unwrap();
+        assert!(p.items.is_empty(), "no match for nonexistent type");
+    }
+
+    #[test]
+    fn referrers_page_typed_with_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_config();
+        let store = LmdbMetadataStore::open(dir.path(), &config).unwrap();
+
+        for i in 0..3 {
+            let desc = serde_json::json!({
+                "artifactType": "sbom",
+                "digest": format!("sha256:r{i}"),
+                "size": 10,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json"
+            })
+            .to_string()
+            .into_bytes();
+            store
+                .apply(MetaOp::PutReferrer {
+                    repo: "r".into(),
+                    subject: "sha256:s".into(),
+                    referrer: format!("sha256:r{i}"),
+                    descriptor: desc,
+                })
+                .unwrap();
+        }
+
+        let p1 = store
+            .referrers_page("r", "sha256:s", Some("sbom"), None, 1)
+            .unwrap();
+        assert_eq!(p1.items.len(), 1);
+        assert!(p1.more);
+
+        let cursor = &p1.items[0].0;
+        let p2 = store
+            .referrers_page("r", "sha256:s", Some("sbom"), Some(cursor), 10)
+            .unwrap();
+        assert_eq!(p2.items.len(), 2);
+        assert!(!p2.more);
+    }
+
+    #[test]
+    fn repos_includes_referrer_only_repos() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_config();
+        let store = LmdbMetadataStore::open(dir.path(), &config).unwrap();
+
+        store
+            .apply(MetaOp::PutManifest {
+                repo: "r1".into(),
+                digest: "sha256:m".into(),
+                media_type: "mt".into(),
+                tag: None,
+                references: vec![],
+                referrer: None,
+            })
+            .unwrap();
+
+        let desc = br#"{"digest":"sha256:ref","size":10}"#;
+        store
+            .apply(MetaOp::PutReferrer {
+                repo: "r2".into(),
+                subject: "sha256:s".into(),
+                referrer: "sha256:ref".into(),
+                descriptor: desc.to_vec(),
+            })
+            .unwrap();
+
+        let repos = store.repos();
+        assert!(repos.contains(&"r1".to_string()), "r1 via media_types");
+        assert!(repos.contains(&"r2".to_string()), "r2 via referrers");
+    }
+
+    #[test]
+    fn referrers_snapshot_structure() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_config();
+        let store = LmdbMetadataStore::open(dir.path(), &config).unwrap();
+
+        let desc = serde_json::json!({
+            "artifactType": "sbom",
+            "digest": "sha256:r1",
+            "size": 10,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json"
+        })
+        .to_string()
+        .into_bytes();
+
+        store
+            .apply(MetaOp::PutReferrer {
+                repo: "r".into(),
+                subject: "sha256:s1".into(),
+                referrer: "sha256:r1".into(),
+                descriptor: desc.clone(),
+            })
+            .unwrap();
+        store
+            .apply(MetaOp::PutReferrer {
+                repo: "r".into(),
+                subject: "sha256:s1".into(),
+                referrer: "sha256:r2".into(),
+                descriptor: desc,
+            })
+            .unwrap();
+
+        let snap = store.referrers_snapshot("r");
+        assert_eq!(snap.len(), 1, "one subject");
+        assert_eq!(snap[0].0, "sha256:s1");
+        assert_eq!(snap[0].1.len(), 2, "two referrers");
+    }
+
+    #[test]
+    fn bulk_apply_multiple_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_config();
+        let store = LmdbMetadataStore::open(dir.path(), &config).unwrap();
+
+        let ops = vec![
+            MetaOp::PutManifest {
+                repo: "r".into(),
+                digest: "sha256:m1".into(),
+                media_type: "mt".into(),
+                tag: Some("v1".into()),
+                references: vec![],
+                referrer: None,
+            },
+            MetaOp::PutManifest {
+                repo: "r".into(),
+                digest: "sha256:m2".into(),
+                media_type: "mt".into(),
+                tag: Some("v2".into()),
+                references: vec![],
+                referrer: None,
+            },
+        ];
+        store.bulk_apply(&ops).unwrap();
+        store.force_sync_public().unwrap();
+
+        assert!(store.resolve_tag("r", "v1").is_some());
+        assert!(store.resolve_tag("r", "v2").is_some());
+    }
 }

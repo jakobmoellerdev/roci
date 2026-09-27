@@ -380,4 +380,25 @@ mod tests {
         let resp = ApiError::name_invalid("bad").into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[test]
+    fn too_early_renders_425_denied() {
+        let e = ApiError::TooEarly;
+        assert_eq!(e.status(), StatusCode::from_u16(425).unwrap(), "status");
+        assert_eq!(e.code(), "DENIED", "code");
+    }
+
+    #[test]
+    fn missing_reference_maps_to_manifest_blob_unknown() {
+        let e = ApiError::from(StorageError::MissingReference("sha256:abc".into()));
+        assert_eq!(e.status(), StatusCode::BAD_REQUEST, "status");
+        assert_eq!(e.code(), "MANIFEST_BLOB_UNKNOWN", "code");
+    }
+
+    #[test]
+    fn unavailable_maps_to_503() {
+        let e = ApiError::from(StorageError::Unavailable("s3 down".into()));
+        assert_eq!(e.status(), StatusCode::SERVICE_UNAVAILABLE, "status");
+        assert_eq!(e.code(), "UNKNOWN", "code");
+    }
 }

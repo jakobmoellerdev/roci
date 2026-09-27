@@ -989,6 +989,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scrub_size_mismatch_bypasses_crc_shortcut() {
+        let (_dir, s) = store();
+        let data = b"size mismatch content";
+        let d = sha256_of(data);
+        s.put_blob("r", &d, data).await.unwrap();
+        s.meta
+            .apply_relaxed(MetaOp::PutChecksum {
+                repo: "r".to_string(),
+                digest: d.as_string(),
+                crc32c: crc32c::crc32c(data),
+                size: 9999,
+            })
+            .unwrap();
+        let (result, bytes) = s.scrub_one_blob("r", &d.as_string()).await;
+        assert_eq!(
+            result,
+            ScrubResult::Repaired,
+            "size mismatch triggers rehash → Repaired"
+        );
+        assert_eq!(bytes, data.len() as u64);
+        let ck = s.meta.checksum("r", &d.as_string()).unwrap();
+        assert_eq!(ck.size, data.len() as u64, "checksum repaired");
+    }
+
+    #[tokio::test]
+    async fn scrub_pass_adaptive_reorder_on_corruption() {
+        let (_dir, s) = store();
+        let ok_data = b"intact blob";
+        let ok_d = sha256_of(ok_data);
+        s.put_blob("r", &ok_d, ok_data).await.unwrap();
+        let bad_data = b"will corrupt";
+        let bad_d = sha256_of(bad_data);
+        s.put_blob("r", &bad_d, bad_data).await.unwrap();
+        s.scrub_pass().await;
+        let blob_path = _dir.path().join("r/blobs/sha256").join(bad_d.hex());
+        std::fs::write(&blob_path, b"EVIL").unwrap();
+        s.scrub_pass().await;
+        assert!(
+            matches!(
+                s.blob_size("r", &bad_d).await,
+                Err(crate::StorageError::NotFound)
+            ),
+            "corrupt blob quarantined"
+        );
+        assert_eq!(
+            s.blob_size("r", &ok_d).await.unwrap(),
+            ok_data.len() as u64,
+            "intact blob survives"
+        );
+    }
+    #[tokio::test]
     async fn corrupt_hard_linked_copies_are_quarantined_in_every_repo() {
         use std::os::unix::fs::MetadataExt;
         let (dir, s) = store();

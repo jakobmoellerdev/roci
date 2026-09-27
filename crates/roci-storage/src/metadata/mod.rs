@@ -2119,4 +2119,423 @@ mod engine_tests {
 
         assert_stores_equal(&store, &store2);
     }
+
+    #[test]
+    fn open_metadata_redb_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig {
+            engine: roci_config::MetadataEngine::Redb,
+            ..MetadataConfig::default()
+        };
+        match open_metadata(dir.path(), &config) {
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
+                assert!(e.to_string().contains("redb"), "{e}");
+            }
+            Ok(_) => panic!("expected Unsupported error"),
+        }
+    }
+
+    #[test]
+    fn read_marker_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(MARKER_FILE), b"not valid json").unwrap();
+        let err = read_marker(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains(MARKER_FILE), "{err}");
+    }
+
+    #[test]
+    fn marker_to_engine_unknown_returns_none() {
+        assert!(marker_to_engine("unknown_engine").is_none());
+    }
+
+    #[test]
+    fn format_label_covers_all_engines() {
+        let plain = MetadataConfig::default();
+        assert_eq!(format_label(&plain), "plain");
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("k");
+        std::fs::write(&key, b"key").unwrap();
+
+        let log_hmac = MetadataConfig {
+            hmac_key_file: Some(key.clone()),
+            ..MetadataConfig::default()
+        };
+        assert_eq!(format_label(&log_hmac), "hmac");
+
+        #[cfg(feature = "lmdb")]
+        {
+            let lmdb_hmac = MetadataConfig {
+                engine: roci_config::MetadataEngine::Lmdb,
+                hmac_key_file: Some(key.clone()),
+                ..MetadataConfig::default()
+            };
+            assert_eq!(format_label(&lmdb_hmac), "chacha20poly1305-v1");
+        }
+
+        let redb_hmac = MetadataConfig {
+            engine: roci_config::MetadataEngine::Redb,
+            hmac_key_file: Some(key),
+            ..MetadataConfig::default()
+        };
+        assert_eq!(format_label(&redb_hmac), "plain");
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn open_engine_redb_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig::default();
+        match open_engine(dir.path(), MetadataEngine::Redb, &config) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}"),
+            Ok(_) => panic!("expected Unsupported error"),
+        }
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn verify_migration_manifests_mismatch() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = LogMetadataStore::open(dir_a.path()).unwrap();
+        let b = LogMetadataStore::open(dir_b.path()).unwrap();
+
+        a.apply(MetaOp::PutManifest {
+            repo: "r".into(),
+            digest: "sha256:m1".into(),
+            media_type: "mt".into(),
+            tag: Some("v1".into()),
+            references: vec![],
+            referrer: None,
+        })
+        .unwrap();
+
+        b.apply(MetaOp::PutManifest {
+            repo: "r".into(),
+            digest: "sha256:m1".into(),
+            media_type: "mt".into(),
+            tag: Some("v1".into()),
+            references: vec![],
+            referrer: None,
+        })
+        .unwrap();
+        b.apply(MetaOp::PutManifest {
+            repo: "r".into(),
+            digest: "sha256:m2".into(),
+            media_type: "mt".into(),
+            tag: None,
+            references: vec![],
+            referrer: None,
+        })
+        .unwrap();
+
+        let err = verify_migration(&a, &b).unwrap_err();
+        assert!(
+            err.to_string().contains("manifests differ"),
+            "expected manifests mismatch: {err}"
+        );
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn verify_migration_tags_mismatch() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = LogMetadataStore::open(dir_a.path()).unwrap();
+        let b = LogMetadataStore::open(dir_b.path()).unwrap();
+
+        a.apply(MetaOp::PutManifest {
+            repo: "r".into(),
+            digest: "sha256:m1".into(),
+            media_type: "mt".into(),
+            tag: Some("v1".into()),
+            references: vec![],
+            referrer: None,
+        })
+        .unwrap();
+
+        b.apply(MetaOp::PutManifest {
+            repo: "r".into(),
+            digest: "sha256:m1".into(),
+            media_type: "mt".into(),
+            tag: Some("v2".into()),
+            references: vec![],
+            referrer: None,
+        })
+        .unwrap();
+
+        let err = verify_migration(&a, &b).unwrap_err();
+        assert!(
+            err.to_string().contains("tags differ"),
+            "expected tags mismatch: {err}"
+        );
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn verify_migration_referrers_mismatch() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = LogMetadataStore::open(dir_a.path()).unwrap();
+        let b = LogMetadataStore::open(dir_b.path()).unwrap();
+
+        let desc = descriptor(Some("sbom"));
+        for s in [&a as &dyn MetadataStore, &b] {
+            s.apply(MetaOp::PutManifest {
+                repo: "r".into(),
+                digest: "sha256:m1".into(),
+                media_type: "mt".into(),
+                tag: Some("v1".into()),
+                references: vec![],
+                referrer: None,
+            })
+            .unwrap();
+        }
+
+        a.apply(MetaOp::PutReferrer {
+            repo: "r".into(),
+            subject: "sha256:s".into(),
+            referrer: "sha256:ref1".into(),
+            descriptor: desc,
+        })
+        .unwrap();
+
+        let err = verify_migration(&a, &b).unwrap_err();
+        assert!(
+            err.to_string().contains("referrers differ"),
+            "expected referrers mismatch: {err}"
+        );
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn source_open_failure_falls_back_to_fresh_dest() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let lmdb_config = MetadataConfig {
+            engine: roci_config::MetadataEngine::Lmdb,
+            ..MetadataConfig::default()
+        };
+        {
+            let store = open_metadata(dir.path(), &lmdb_config).unwrap();
+            seed_ops(&*store);
+        }
+
+        let lmdb_dir = dir.path().join("roci-meta.lmdb");
+        for entry in std::fs::read_dir(&lmdb_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().ends_with(".mdb") {
+                std::fs::write(entry.path(), b"corrupt").unwrap();
+            }
+        }
+
+        let log_config = MetadataConfig::default();
+        let store = open_metadata(dir.path(), &log_config).unwrap();
+        assert_eq!(store.repos(), Vec::<String>::new(), "fresh dest is empty");
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn clean_migrating_leftovers_both_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let lmdb_leftover = dir.path().join("roci-meta.lmdb.migrating");
+        std::fs::create_dir_all(&lmdb_leftover).unwrap();
+        std::fs::write(lmdb_leftover.join("stale"), b"junk").unwrap();
+
+        let log_leftover = dir.path().join("roci-meta.log.migrating");
+        std::fs::write(&log_leftover, b"stale file").unwrap();
+
+        let verify_leftover = dir.path().join("roci-meta.log.migrating.verify");
+        std::fs::create_dir_all(&verify_leftover).unwrap();
+
+        clean_migrating_leftovers(dir.path());
+
+        assert!(!lmdb_leftover.exists(), "lmdb dir cleaned");
+        assert!(!log_leftover.exists(), "log file cleaned");
+        assert!(!verify_leftover.exists(), "verify dir cleaned");
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn move_stale_destination_aside_log_with_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+
+        std::fs::write(dir.path().join("roci-meta.log"), b"old log").unwrap();
+        std::fs::write(dir.path().join("roci-meta.snapshot"), b"old snap").unwrap();
+
+        move_stale_destination_aside(dir.path(), MetadataEngine::Log).unwrap();
+
+        assert!(!dir.path().join("roci-meta.log").exists(), "log moved");
+        assert!(
+            !dir.path().join("roci-meta.snapshot").exists(),
+            "snapshot moved"
+        );
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("roci-meta.log.migrated-")
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "log moved to migrated");
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn move_stale_destination_aside_lmdb() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let lmdb_dir = dir.path().join("roci-meta.lmdb");
+        std::fs::create_dir_all(&lmdb_dir).unwrap();
+        std::fs::write(lmdb_dir.join("data.mdb"), b"fake").unwrap();
+
+        move_stale_destination_aside(dir.path(), MetadataEngine::Lmdb).unwrap();
+
+        assert!(!lmdb_dir.exists(), "lmdb dir moved");
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("roci-meta.lmdb.migrated-")
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "lmdb moved to migrated");
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn move_stale_destination_aside_nonexistent_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        move_stale_destination_aside(dir.path(), MetadataEngine::Log).unwrap();
+        move_stale_destination_aside(dir.path(), MetadataEngine::Lmdb).unwrap();
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn temp_and_final_paths_both_engines() {
+        let root = Path::new("/fake/root");
+
+        let (tmp, fin) = temp_and_final_paths(root, MetadataEngine::Lmdb);
+        assert_eq!(tmp, root.join("roci-meta.lmdb.migrating"));
+        assert_eq!(fin, root.join("roci-meta.lmdb"));
+
+        let (tmp, fin) = temp_and_final_paths(root, MetadataEngine::Log);
+        assert_eq!(tmp, root.join("roci-meta.log.migrating"));
+        assert_eq!(fin, root.join("roci-meta.log"));
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn move_old_source_log_moves_log_and_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("roci-meta.log"), b"log").unwrap();
+        std::fs::write(dir.path().join("roci-meta.snapshot"), b"snap").unwrap();
+
+        move_old_source(dir.path(), MetadataEngine::Log, 12345).unwrap();
+
+        assert!(!dir.path().join("roci-meta.log").exists());
+        assert!(!dir.path().join("roci-meta.snapshot").exists());
+        assert!(dir.path().join("roci-meta.log.migrated-12345").exists());
+        assert!(dir
+            .path()
+            .join("roci-meta.snapshot.migrated-12345")
+            .exists());
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn move_old_source_lmdb_moves_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let lmdb_dir = dir.path().join("roci-meta.lmdb");
+        std::fs::create_dir_all(&lmdb_dir).unwrap();
+
+        move_old_source(dir.path(), MetadataEngine::Lmdb, 99).unwrap();
+
+        assert!(!lmdb_dir.exists());
+        assert!(dir.path().join("roci-meta.lmdb.migrated-99").exists());
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn write_marker_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig {
+            engine: roci_config::MetadataEngine::Lmdb,
+            ..MetadataConfig::default()
+        };
+        write_marker(dir.path(), &config).unwrap();
+        let m = read_marker(dir.path()).unwrap().unwrap();
+        assert_eq!(m.engine, "lmdb");
+        assert_eq!(m.format, "plain");
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn migration_log_to_lmdb_with_key_change_warns_format_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let key_path = dir.path().join("hmac.key");
+        std::fs::write(&key_path, b"test-key-material-32-bytes-long!").unwrap();
+
+        let log_config = MetadataConfig {
+            hmac_key_file: Some(key_path.clone()),
+            ..MetadataConfig::default()
+        };
+
+        {
+            let store = open_metadata(dir.path(), &log_config).unwrap();
+            seed_ops(&*store);
+        }
+
+        let marker = read_marker(dir.path()).unwrap().unwrap();
+        assert_eq!(marker.format, "hmac");
+
+        let lmdb_config = MetadataConfig {
+            engine: roci_config::MetadataEngine::Lmdb,
+            hmac_key_file: Some(key_path),
+            ..MetadataConfig::default()
+        };
+
+        let store = open_metadata(dir.path(), &lmdb_config).unwrap();
+        assert!(store.resolve_tag("r", "v1").is_some(), "data migrated");
+
+        let new_marker = read_marker(dir.path()).unwrap().unwrap();
+        assert_eq!(new_marker.engine, "lmdb");
+        assert_eq!(new_marker.format, "chacha20poly1305-v1");
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn migration_lmdb_to_log_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let lmdb_config = MetadataConfig {
+            engine: roci_config::MetadataEngine::Lmdb,
+            ..MetadataConfig::default()
+        };
+        {
+            let store = open_metadata(dir.path(), &lmdb_config).unwrap();
+            seed_ops(&*store);
+        }
+
+        let log_config = MetadataConfig::default();
+        let store = open_metadata(dir.path(), &log_config).unwrap();
+
+        assert!(store.resolve_tag("r", "v1").is_some(), "tag preserved");
+        assert!(
+            store.resolve_tag("other/repo", "stable").is_some(),
+            "other repo tag preserved"
+        );
+
+        let marker = read_marker(dir.path()).unwrap().unwrap();
+        assert_eq!(marker.engine, "log");
+    }
 }

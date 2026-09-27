@@ -70,6 +70,43 @@ async fn fast_restart_restores_all_state() {
     // GC candidates + roots restored.
     assert!(s2.gc.is_ready());
     assert!(!s2.gc.is_empty());
+
+    // GC roots, unsafe repos also restored.
+    let s3 = reopen(dir.path(), QuotaLimits::default());
+    // Push a tagged manifest to generate a root.
+    let manifest_body = make_manifest(&d, &[]);
+    let md = sha256_of(&manifest_body);
+    let refs = manifest_references(&serde_json::from_slice(&manifest_body).unwrap());
+    s3.put_manifest(
+        "repo",
+        Some("v1"),
+        &md,
+        MEDIA_TYPE_IMAGE_MANIFEST,
+        &manifest_body,
+        ManifestLinks {
+            references: &refs,
+            required: &[],
+            subject: None,
+        },
+    )
+    .await
+    .unwrap();
+    s3.gc_consistency_check().await;
+    s3.gc.mark_unsafe("unsafe-repo");
+    s3.write_fast_restart_stamp().unwrap();
+    drop(s3);
+
+    let s4 = reopen(dir.path(), QuotaLimits::default());
+    assert!(s4.gc.is_ready(), "GC ready after stamp with roots");
+    assert!(s4.gc.is_unsafe("unsafe-repo"), "unsafe repo restored");
+    assert!(
+        s4.gc.is_root("repo", &md.as_string())
+            || s4
+                .meta
+                .manifest_media_type("repo", &md.as_string())
+                .is_some(),
+        "root or manifest media type restored"
+    );
 }
 
 #[tokio::test]

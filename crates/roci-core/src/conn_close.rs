@@ -70,3 +70,30 @@ pub(crate) async fn close_on_unread_body(req: Request, next: Next) -> Response {
     }
     resp
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracked_body_is_end_stream_sets_done() {
+        let done = Arc::new(AtomicBool::new(false));
+        let body = TrackedBody {
+            inner: Body::empty(),
+            done: Arc::clone(&done),
+        };
+        assert!(body.is_end_stream(), "empty body should be end_stream");
+        assert!(done.load(Ordering::Relaxed), "done flag set");
+    }
+
+    #[test]
+    fn tracked_body_is_end_stream_non_empty() {
+        let done = Arc::new(AtomicBool::new(false));
+        let body = TrackedBody {
+            inner: Body::from("hello"),
+            done: Arc::clone(&done),
+        };
+        assert!(!body.is_end_stream(), "non-empty body");
+        assert!(!done.load(Ordering::Relaxed), "done flag unset");
+    }
+}

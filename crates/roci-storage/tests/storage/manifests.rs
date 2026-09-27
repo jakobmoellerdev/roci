@@ -291,6 +291,84 @@ async fn generic_manifest_cases() {
 }
 
 #[tokio::test]
+async fn put_manifest_rejects_missing_required_reference() {
+    let (_dir, s) = store();
+    let body = br#"{"schemaVersion":2}"#;
+    let d = sha256_of(body);
+    let phantom = sha256_of(b"never-uploaded");
+    let result = s
+        .put_manifest(
+            "r",
+            Some("fail"),
+            &d,
+            "application/json",
+            body,
+            ManifestLinks {
+                references: std::slice::from_ref(&phantom),
+                required: std::slice::from_ref(&phantom),
+                subject: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(result, Err(StorageError::MissingReference(_))),
+        "missing required ref: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_referrers_returns_empty_for_malformed_tag_blob() {
+    let (_dir, s) = store();
+    let subject = sha256_of(b"malformed-ref-subject");
+    // Store non-JSON content under the referrer tag
+    let junk = b"this is not json at all";
+    let jd = sha256_of(junk);
+    let tag = format!("sha256-{}", &subject.as_string()[7..]);
+    s.put_manifest(
+        "r",
+        Some(&tag),
+        &jd,
+        "application/json",
+        junk,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
+    let listed = s
+        .list_referrers("r", &subject, None, None, usize::MAX)
+        .await
+        .unwrap();
+    assert!(listed.items.is_empty(), "malformed JSON → empty referrers");
+}
+
+#[tokio::test]
+async fn list_referrers_returns_empty_for_missing_manifests_key() {
+    let (_dir, s) = store();
+    let subject = sha256_of(b"no-manifests-key");
+    let idx = br#"{"schemaVersion": 2}"#; // valid JSON, no "manifests" key
+    let id = sha256_of(idx);
+    let tag = format!("sha256-{}", &subject.as_string()[7..]);
+    s.put_manifest(
+        "r",
+        Some(&tag),
+        &id,
+        "application/vnd.oci.image.index.v1+json",
+        idx,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
+    let listed = s
+        .list_referrers("r", &subject, None, None, usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        listed.items.is_empty(),
+        "no manifests key → empty referrers"
+    );
+}
+
+#[tokio::test]
 async fn generic_quota_cases() {
     use roci_storage::quota::{QuotaLimits, QuotaTracker};
     let dir = tempfile::tempdir().unwrap();

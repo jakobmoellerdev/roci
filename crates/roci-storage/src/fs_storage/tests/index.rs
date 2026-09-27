@@ -732,3 +732,65 @@ async fn reconcile_sweeps_stale_tmp_but_not_symlinks_or_dirs() {
         "directory matching .tmp pattern should NOT be removed"
     );
 }
+
+#[tokio::test]
+async fn reconcile_marks_dirty_when_index_diverges_from_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = br#"{"schemaVersion":2}"#;
+    let d = sha256_of(body);
+    let s = FsStorage::new(dir.path()).unwrap();
+    s.put_manifest(
+        "r",
+        Some("v1"),
+        &d,
+        "application/json",
+        body,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
+    // Wait for background write to flush.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Manually overwrite index.json with stale content.
+    std::fs::write(
+        dir.path().join("r/index.json"),
+        r#"{"schemaVersion":2,"manifests":[]}"#,
+    )
+    .unwrap();
+    // Reconcile should detect the divergence.
+    s.reconcile_index_json().await;
+    // After reconcile+flush, index.json should contain our tag again.
+    let idx: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("r/index.json")).unwrap()).unwrap();
+    let tags: Vec<_> = idx["manifests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(descriptor_tag)
+        .collect();
+    assert!(
+        tags.contains(&"v1"),
+        "tag restored after reconcile: {tags:?}"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_handles_meta_only_repo_without_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = FsStorage::new(dir.path()).unwrap();
+    let body = br#"{"schemaVersion":2}"#;
+    let d = sha256_of(body);
+    // Apply metadata without creating any files
+    s.meta
+        .apply(MetaOp::PutManifest {
+            repo: "phantom".into(),
+            digest: d.as_string(),
+            media_type: "application/json".into(),
+            tag: Some("v1".into()),
+            references: Vec::new(),
+            referrer: None,
+        })
+        .unwrap();
+    // reconcile should mark dirty and try to flush (repo dir may not exist)
+    s.reconcile_index_json().await;
+}

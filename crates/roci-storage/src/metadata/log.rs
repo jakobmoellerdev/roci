@@ -2810,4 +2810,159 @@ mod tests {
         let s2 = LogMetadataStore::open(dir.path()).unwrap();
         assert!(s2.checksum("r", "sha256:b1").is_none(), "after replay");
     }
+
+    #[test]
+    fn snapshot_base_referrer_typed_removal_cleans_by_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = snapshot_cfg();
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+
+        s.apply(MetaOp::PutReferrer {
+            repo: "r".into(),
+            subject: "sha256:s".into(),
+            referrer: "sha256:r1".into(),
+            descriptor: br#"{"artifactType":"sig","digest":"sha256:r1"}"#.to_vec(),
+        })
+        .unwrap();
+        s.maintain().unwrap();
+
+        s.apply(MetaOp::PutReferrer {
+            repo: "r".into(),
+            subject: "sha256:s".into(),
+            referrer: "sha256:r1".into(),
+            descriptor: br#"{"artifactType":"sbom","digest":"sha256:r1"}"#.to_vec(),
+        })
+        .unwrap();
+
+        let page = s
+            .referrers_page("r", "sha256:s", Some("sig"), None, 10)
+            .unwrap();
+        assert!(page.items.is_empty(), "old type gone after re-insert");
+        let page2 = s
+            .referrers_page("r", "sha256:s", Some("sbom"), None, 10)
+            .unwrap();
+        assert_eq!(page2.items.len(), 1, "new type present");
+    }
+
+    #[test]
+    fn snapshot_base_delta_referrers_page_filtered() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = snapshot_cfg();
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+
+        s.apply(MetaOp::PutReferrer {
+            repo: "r".into(),
+            subject: "sha256:s".into(),
+            referrer: "sha256:r1".into(),
+            descriptor: br#"{"artifactType":"sig","digest":"sha256:r1"}"#.to_vec(),
+        })
+        .unwrap();
+        s.apply(MetaOp::PutReferrer {
+            repo: "r".into(),
+            subject: "sha256:s".into(),
+            referrer: "sha256:r2".into(),
+            descriptor: br#"{"artifactType":"sbom","digest":"sha256:r2"}"#.to_vec(),
+        })
+        .unwrap();
+        s.maintain().unwrap();
+
+        s.apply(MetaOp::PutReferrer {
+            repo: "r".into(),
+            subject: "sha256:s".into(),
+            referrer: "sha256:r3".into(),
+            descriptor: br#"{"artifactType":"sig","digest":"sha256:r3"}"#.to_vec(),
+        })
+        .unwrap();
+
+        let page = s
+            .referrers_page("r", "sha256:s", Some("sig"), None, 10)
+            .unwrap();
+        assert_eq!(page.items.len(), 2, "r1 from base + r3 from delta");
+
+        let ref_snap = s.referrers_snapshot("r");
+        assert_eq!(ref_snap.len(), 1, "one subject");
+        assert_eq!(ref_snap[0].1.len(), 3, "total 3 referrers");
+    }
+
+    #[test]
+    fn snapshot_base_tags_page_with_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = snapshot_cfg();
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+
+        for tag in ["alpha", "beta", "gamma"] {
+            s.apply(put("r", &format!("sha256:{tag}"), Some(tag)))
+                .unwrap();
+        }
+        s.maintain().unwrap();
+
+        s.apply(put("r", "sha256:delta", Some("delta"))).unwrap();
+
+        let p1 = s.tags_page("r", None, 2).unwrap();
+        assert_eq!(p1.items.len(), 2);
+        assert!(p1.more);
+
+        let p2 = s.tags_page("r", Some(&p1.items[1]), 2).unwrap();
+        assert_eq!(p2.items.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_base_resolve_tag_from_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = snapshot_cfg();
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.apply(put("r2", "sha256:bb", Some("v2"))).unwrap();
+        s.maintain().unwrap();
+
+        let (d, _) = s.resolve_tag("r", "v1").unwrap();
+        assert_eq!(d, "sha256:aa", "tag from base");
+
+        assert_eq!(s.resolve_tag("r", "v_missing"), None, "missing tag");
+        assert_eq!(s.resolve_tag("r3", "v1"), None, "missing repo");
+
+        let (d2, _) = s.resolve_tag("r2", "v2").unwrap();
+        assert_eq!(d2, "sha256:bb", "second repo from base");
+    }
+
+    #[test]
+    fn raw_record_with_hmac_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = make_key(dir.path());
+        let key = HmacKey::load(&key_path).unwrap();
+
+        let payload = b"test payload";
+        let record = raw_record(payload, None, Some(&key));
+
+        let expected_len = 4 + 4 + payload.len() + 32;
+        assert_eq!(record.len(), expected_len, "should include HMAC tag");
+    }
+
+    #[test]
+    fn compaction_install_log_with_parent_dir_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetadataConfig {
+            snapshot: false,
+            compact_threshold_bytes: 1,
+            ..Default::default()
+        };
+        let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
+
+        s.apply(put("r", "sha256:aa", Some("v1"))).unwrap();
+        s.apply(put("r", "sha256:bb", Some("v2"))).unwrap();
+
+        s.maintain().unwrap();
+
+        assert_eq!(
+            s.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
+            Some("sha256:aa"),
+            "v1 after compaction"
+        );
+        assert_eq!(
+            s.resolve_tag("r", "v2").map(|(d, _)| d).as_deref(),
+            Some("sha256:bb"),
+            "v2 after compaction"
+        );
+    }
 }

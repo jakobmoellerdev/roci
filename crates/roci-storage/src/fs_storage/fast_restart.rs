@@ -384,4 +384,48 @@ mod tests {
         assert_eq!(back.presence, stamp.presence);
         assert_eq!(back.gc_candidates, stamp.gc_candidates);
     }
+
+    #[test]
+    fn try_consume_stamp_rejects_format_version_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = roci_config::StorageConfig {
+            fast_restart: true,
+            ..Default::default()
+        };
+        let mut stamp = Stamp {
+            format_version: FORMAT_VERSION + 1,
+            binary_version: BINARY_VERSION.to_string(),
+            config_hash: config_hash(&config),
+            metadata_generation: 0,
+            metadata_log_len: 0,
+            presence: vec![],
+            dedupe: vec![],
+            quota_per_repo: vec![],
+            quota_sessions: 0,
+            gc_candidates: vec![],
+            gc_roots: vec![],
+            gc_unsafe_repos: vec![],
+        };
+        let body = serde_json::to_vec(&stamp).unwrap();
+        let wire = wrap(&body, None);
+        write_atomic(&stamp_path(dir.path()), &wire).unwrap();
+        let result = FsStorage::try_consume_stamp(dir.path(), &config, None, 0, 0);
+        assert!(
+            matches!(result, Err(StampReject::FormatVersion { .. })),
+            "format version mismatch"
+        );
+
+        // Now test binary version mismatch
+        let dir2 = tempfile::tempdir().unwrap();
+        stamp.format_version = FORMAT_VERSION;
+        stamp.binary_version = "0.0.0-fake".to_string();
+        let body2 = serde_json::to_vec(&stamp).unwrap();
+        let wire2 = wrap(&body2, None);
+        write_atomic(&stamp_path(dir2.path()), &wire2).unwrap();
+        let result2 = FsStorage::try_consume_stamp(dir2.path(), &config, None, 0, 0);
+        assert!(
+            matches!(result2, Err(StampReject::BinaryVersion { .. })),
+            "binary version mismatch"
+        );
+    }
 }

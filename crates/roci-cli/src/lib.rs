@@ -1563,4 +1563,18 @@ listen = "0.0.0.0:9876"
             "error should mention the feature: {msg}"
         );
     }
+
+    #[tokio::test]
+    async fn activity_io_write_touches_activity() {
+        use tokio::io::AsyncWriteExt;
+        let (reader, writer) = tokio::io::duplex(1024);
+        let mut aio = ActivityIo::new(writer);
+        let activity = aio.activity();
+        let before = activity.last_ms.load(std::sync::atomic::Ordering::Relaxed);
+        aio.write_all(b"hello").await.unwrap();
+        aio.flush().await.unwrap();
+        let after = activity.last_ms.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after >= before, "write should touch activity");
+        drop(reader);
+    }
 }

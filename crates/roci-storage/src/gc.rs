@@ -345,4 +345,67 @@ mod tests {
         assert!(gc.is_unsafe("r"));
         assert!(!gc.is_unsafe("other"));
     }
+
+    #[test]
+    fn touch_unknown_digest_is_noop() {
+        let gc = GcTracker::new(true, Duration::from_secs(60));
+        gc.mark("r", "sha256:a");
+        gc.touch("r", "sha256:nonexistent");
+        assert_eq!(gc.len(), 1, "only the original candidate remains");
+    }
+
+    #[tokio::test]
+    async fn rebuild_backrefs_marks_unsafe_on_missing_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = crate::open_metadata(dir.path(), &Default::default()).unwrap();
+        let gc = GcTracker::new(true, Duration::ZERO);
+        let roots: HashSet<String> =
+            ["sha256:0000000000000000000000000000000000000000000000000000000000000001".into()]
+                .into_iter()
+                .collect();
+        rebuild_backrefs("r", &*meta, &gc, roots, |_d| async { Ok(None) }).await;
+        assert!(gc.is_unsafe("r"), "missing manifest → GC-unsafe");
+    }
+
+    #[tokio::test]
+    async fn rebuild_backrefs_marks_unsafe_on_read_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = crate::open_metadata(dir.path(), &Default::default()).unwrap();
+        let gc = GcTracker::new(true, Duration::ZERO);
+        let roots: HashSet<String> =
+            ["sha256:0000000000000000000000000000000000000000000000000000000000000002".into()]
+                .into_iter()
+                .collect();
+        rebuild_backrefs("r", &*meta, &gc, roots, |_d| async {
+            Err(std::io::Error::other("disk fault"))
+        })
+        .await;
+        assert!(gc.is_unsafe("r"), "read error → GC-unsafe");
+    }
+
+    #[tokio::test]
+    async fn rebuild_backrefs_marks_unsafe_on_unparseable_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = crate::open_metadata(dir.path(), &Default::default()).unwrap();
+        let gc = GcTracker::new(true, Duration::ZERO);
+        let roots: HashSet<String> =
+            ["sha256:0000000000000000000000000000000000000000000000000000000000000003".into()]
+                .into_iter()
+                .collect();
+        rebuild_backrefs("r", &*meta, &gc, roots, |_d| async {
+            Ok(Some(b"not valid json {{{".to_vec()))
+        })
+        .await;
+        assert!(gc.is_unsafe("r"), "bad JSON → GC-unsafe");
+    }
+
+    #[tokio::test]
+    async fn rebuild_backrefs_skips_unparseable_digest_in_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = crate::open_metadata(dir.path(), &Default::default()).unwrap();
+        let gc = GcTracker::new(true, Duration::ZERO);
+        let roots: HashSet<String> = ["garbage-not-a-digest".into()].into_iter().collect();
+        rebuild_backrefs("r", &*meta, &gc, roots, |_d| async { Ok(None) }).await;
+        assert!(!gc.is_unsafe("r"), "invalid digest string just skipped");
+    }
 }

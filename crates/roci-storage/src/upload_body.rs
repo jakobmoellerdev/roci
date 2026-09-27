@@ -212,3 +212,48 @@ async fn append_inner(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_hash_len_empty_and_finish() {
+        let h = StagedHash::new();
+        assert!(h.is_empty(), "new hash is empty");
+        assert_eq!(h.len(), 0);
+
+        let mut h2 = StagedHash::default();
+        h2.update(b"hello");
+        assert!(!h2.is_empty());
+        assert_eq!(h2.len(), 5);
+
+        let (digest, crc) = h2.finish();
+        let expected = crate::sha256_of(b"hello");
+        assert!(digest.ct_eq(&expected), "digest matches sha256 of input");
+        assert_eq!(crc, crc32c::crc32c(b"hello"), "crc32c matches");
+    }
+
+    #[tokio::test]
+    async fn deferred_write_tail_commits_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staging");
+        let f = std::fs::File::create(&path).unwrap();
+        let file = std::sync::Arc::new(f);
+        let mut h = StagedHash::new();
+        h.update(b"prefix");
+        let deferred = Deferred {
+            len: 10,
+            hash: Some(h),
+            tail: b"tail-data".to_vec(),
+            tail_at: 0,
+            file,
+        };
+        let result = deferred.write_tail().unwrap();
+        assert!(result.is_some(), "hash returned");
+        let h = result.unwrap();
+        assert_eq!(h.len(), 6 + 9, "prefix + tail length");
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(&written, b"tail-data");
+    }
+}

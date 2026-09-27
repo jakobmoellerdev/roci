@@ -760,3 +760,118 @@ async fn oversized_root_manifest_makes_repo_unsafe_without_buffering_it() {
     s.sweep_at(Instant::now() + Duration::from_secs(10)).await;
     assert!(s.blob_exists("r", &layer).await.unwrap());
 }
+
+#[tokio::test]
+async fn sweep_skips_root_blob_and_clears_candidate() {
+    let (_dir, s) = gc_store_cfg(0, None);
+    let data = b"root-blob";
+    let d = sha256_of(data);
+    s.put_blob("r", &d, data).await.unwrap();
+    s.gc.add_root("r", &d.as_string());
+    s.gc.set_ready();
+    s.sweep_at(Instant::now() + Duration::from_secs(10)).await;
+    assert!(s.blob_exists("r", &d).await.unwrap(), "root blob survives");
+    assert!(!s.gc.is_due(
+        "r",
+        &d.as_string(),
+        Instant::now() + Duration::from_secs(100)
+    ));
+}
+
+#[tokio::test]
+async fn sweep_skips_unsafe_repo() {
+    let (_dir, s) = gc_store_cfg(0, None);
+    let data = b"unsafe-repo-blob";
+    let d = sha256_of(data);
+    s.put_blob("r", &d, data).await.unwrap();
+    s.gc.mark_unsafe("r");
+    s.gc.set_ready();
+    s.sweep_at(Instant::now() + Duration::from_secs(10)).await;
+    assert!(
+        s.blob_exists("r", &d).await.unwrap(),
+        "blob in unsafe repo survives"
+    );
+}
+
+#[tokio::test]
+async fn sweep_skips_blob_with_backrefs() {
+    let (_dir, s) = gc_store_cfg(0, None);
+    let config_data = b"cfg-for-backref-test";
+    let config_d = sha256_of(config_data);
+    let layer_data = b"lyr-for-backref-test";
+    let layer_d = sha256_of(layer_data);
+    s.put_blob("r", &config_d, config_data).await.unwrap();
+    s.put_blob("r", &layer_d, layer_data).await.unwrap();
+    let manifest_body = make_manifest(&config_d, &[&layer_d]);
+    let manifest_d = sha256_of(&manifest_body);
+    let refs = manifest_references(&serde_json::from_slice(&manifest_body).unwrap());
+    s.put_manifest(
+        "r",
+        Some("v1"),
+        &manifest_d,
+        MEDIA_TYPE_IMAGE_MANIFEST,
+        &manifest_body,
+        ManifestLinks {
+            references: &refs,
+            required: &[],
+            subject: None,
+        },
+    )
+    .await
+    .unwrap();
+    // Manually mark config as GC candidate even though it has backrefs.
+    s.gc.mark("r", &config_d.as_string());
+    s.gc.set_ready();
+    s.sweep_at(Instant::now() + Duration::from_secs(10)).await;
+    assert!(
+        s.blob_exists("r", &config_d).await.unwrap(),
+        "blob with backrefs survives"
+    );
+}
+
+#[tokio::test]
+async fn sweep_skips_blob_that_is_a_manifest() {
+    let (_dir, s) = gc_store_cfg(0, None);
+    let body = br#"{"schemaVersion":2}"#;
+    let d = sha256_of(body);
+    s.put_manifest(
+        "r",
+        Some("v1"),
+        &d,
+        "application/json",
+        body,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
+    // The manifest blob is also stored, manually mark it as candidate.
+    s.gc.mark("r", &d.as_string());
+    s.gc.set_ready();
+    s.sweep_at(Instant::now() + Duration::from_secs(10)).await;
+    assert!(
+        s.blob_exists("r", &d).await.unwrap(),
+        "manifest blob survives sweep"
+    );
+}
+
+#[tokio::test]
+async fn consistency_check_adds_meta_only_repos() {
+    let (_dir, s) = gc_store_cfg(0, None);
+    let body = br#"{"schemaVersion":2}"#;
+    let d = sha256_of(body);
+    // Put manifest in "r" → metadata has "r"
+    s.put_manifest(
+        "r",
+        Some("v1"),
+        &d,
+        "application/json",
+        body,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
+    // Delete the repo dir (metadata still has "r")
+    let _ = std::fs::remove_dir_all(_dir.path().join("r"));
+    // Consistency check should not panic on metadata-only repos.
+    s.gc_consistency_check().await;
+}

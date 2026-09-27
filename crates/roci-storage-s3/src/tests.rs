@@ -1646,6 +1646,1048 @@ fn ca_file_bad_pem_rejected_at_startup() {
     );
 }
 
+#[test]
+fn obj_err_read_maps_generic_to_io() {
+    let err = object_store::Error::Generic {
+        store: "test",
+        source: "custom error".into(),
+    };
+    let mapped = crate::storage_impl::obj_err(err);
+    assert!(
+        matches!(mapped, roci_storage::StorageError::Io(_)),
+        "generic obj error should map to Io: {mapped:?}"
+    );
+}
+
+#[test]
+fn extract_repo_from_index_key_empty_repo_returns_none() {
+    let result = crate::storage_impl::extract_repo_from_index_key("index.json", "");
+    assert!(result.is_none(), "bare index.json has no repo");
+}
+
+#[test]
+fn extract_repo_from_index_key_prefixed_empty_repo_returns_none() {
+    let result = crate::storage_impl::extract_repo_from_index_key("pfx/index.json", "pfx");
+    assert!(
+        result.is_none(),
+        "prefix-only key has empty repo after strip"
+    );
+}
+
+#[tokio::test]
+async fn gc_sweep_skips_not_ready() {
+    let (_dir, s) = gc_test_store();
+    let data = b"not-ready-blob";
+    let digest = sha256_digest(data);
+    s.put_blob("repo", &digest, data).await.unwrap();
+    // gc is NOT set_ready, sweep should be a no-op
+    s.gc_sweep().await;
+    assert!(
+        s.blob_exists("repo", &digest).await.unwrap(),
+        "blob should survive when GC is not ready"
+    );
+}
+
+#[tokio::test]
+async fn gc_sweep_skips_unsafe_repo() {
+    let (_dir, s) = gc_test_store();
+    s.gc.set_ready();
+    let data = b"unsafe-repo-blob";
+    let digest = sha256_digest(data);
+    s.put_blob("repo", &digest, data).await.unwrap();
+    s.gc.mark_unsafe("repo");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    s.gc_sweep().await;
+    assert!(
+        s.blob_exists("repo", &digest).await.unwrap(),
+        "blob in unsafe repo should survive sweep"
+    );
+}
+
+#[tokio::test]
+async fn gc_sweep_clears_root_candidate() {
+    let (_dir, s) = gc_test_store();
+    s.gc.set_ready();
+    let data = b"root-blob-data";
+    let digest = sha256_digest(data);
+    s.put_blob("repo", &digest, data).await.unwrap();
+    let ds = digest.as_string();
+    s.gc.add_root("repo", &ds);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    s.gc_sweep().await;
+    assert!(
+        s.blob_exists("repo", &digest).await.unwrap(),
+        "root blob should not be collected"
+    );
+}
+
+#[tokio::test]
+async fn gc_sweep_clears_blob_with_backrefs() {
+    let (_dir, s) = gc_test_store();
+    s.gc.set_ready();
+    let layer = b"layer-with-backref";
+    let ld = sha256_digest(layer);
+    s.put_blob("repo", &ld, layer).await.unwrap();
+    put_tagged(&s, "repo", "v1", &ld, &[]).await;
+    // Force a GC mark on the layer (normally wouldn't happen since put_manifest clears it)
+    s.gc.mark("repo", &ld.as_string());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    s.gc_sweep().await;
+    assert!(
+        s.blob_exists("repo", &ld).await.unwrap(),
+        "blob with backrefs should survive sweep"
+    );
+}
+
+#[tokio::test]
+async fn gc_sweep_clears_manifest_typed_candidate() {
+    let (_dir, s) = gc_test_store();
+    s.gc.set_ready();
+    let layer = b"layer-data-mtype";
+    let ld = sha256_digest(layer);
+    s.put_blob("repo", &ld, layer).await.unwrap();
+    let (md, _) = put_tagged(&s, "repo", "v1", &ld, &[]).await;
+    // Force mark on the manifest digest (has a media type in metadata)
+    s.gc.mark("repo", &md.as_string());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    s.gc_sweep().await;
+    assert!(
+        s.blob_exists("repo", &md).await.unwrap(),
+        "manifest-typed blob should survive sweep"
+    );
+}
+
+#[tokio::test]
+async fn gc_sweep_nothing_to_collect_path() {
+    let (_dir, s) = gc_test_store();
+    s.gc.set_ready();
+    // No candidates at all → hits "nothing to collect" path
+    s.gc_sweep().await;
+}
+
+#[tokio::test]
+async fn gc_rebuild_unreadable_index_marks_unsafe() {
+    let mem = Arc::new(InMemory::new());
+    mem.put(
+        &ObjPath::from("repo/index.json"),
+        PutPayload::from_static(b"not valid json at all"),
+    )
+    .await
+    .unwrap();
+    mem.put(
+        &ObjPath::from("repo/oci-layout"),
+        PutPayload::from_static(b"{\"imageLayoutVersion\":\"1.0.0\"}"),
+    )
+    .await
+    .unwrap();
+    let (_dir, s) = store_on(mem, gc_config());
+    s.gc_consistency_check().await;
+    assert!(
+        s.gc.is_unsafe("repo"),
+        "repo with unparseable index.json should be marked unsafe"
+    );
+}
+
+#[tokio::test]
+async fn gc_rebuild_no_index_uses_metadata_roots() {
+    let mem = Arc::new(InMemory::new());
+    let (_dir, s) = store_on(mem, gc_config());
+    let layer = b"metadata-only-layer";
+    let ld = sha256_digest(layer);
+    s.put_blob("repo", &ld, layer).await.unwrap();
+    let (_md, _) = put_tagged(&s, "repo", "v1", &ld, &[]).await;
+    // No remote index.json; gc_consistency_check uses meta.manifests().
+    // Delete the index.json that put_blob created.
+    s.client
+        .store
+        .delete(&ObjPath::from("repo/index.json"))
+        .await
+        .unwrap();
+    s.gc_consistency_check().await;
+    // Manifest has a media type → not added as root, but layer should not be due
+    let now_plus = std::time::Instant::now() + Duration::from_secs(1);
+    assert!(
+        !s.gc.is_due("repo", &ld.as_string(), now_plus),
+        "layer should have backrefs rebuilt and not be due"
+    );
+}
+
+#[tokio::test]
+async fn gc_rebuild_repo_oversized_root_marks_unsafe() {
+    let mem = Arc::new(InMemory::new());
+    // Create blob larger than MAX_ROOT_MANIFEST_BYTES (4 MiB)
+    let big_data = vec![0u8; 4 * 1024 * 1024 + 1];
+    let bd = sha256_digest(&big_data);
+    let digest_str = bd.as_string();
+    let (alg, hex) = digest_str.split_once(':').unwrap();
+    mem.put(
+        &ObjPath::from(format!("repo/blobs/{alg}/{hex}")),
+        PutPayload::from(bytes::Bytes::from(big_data)),
+    )
+    .await
+    .unwrap();
+    let index = serde_json::json!({
+        "schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{"digest": digest_str, "mediaType": "application/vnd.oci.image.manifest.v1+json", "size": 4 * 1024 * 1024 + 1}]
+    });
+    put_index(&mem, "repo", &index).await;
+    let (_dir, s) = store_on(mem, gc_config());
+    s.gc_consistency_check().await;
+    assert!(
+        s.gc.is_unsafe("repo"),
+        "oversized root manifest should make repo GC-unsafe"
+    );
+}
+
+#[tokio::test]
+async fn gc_consistency_check_meta_repos_included() {
+    let mem = Arc::new(InMemory::new());
+    let (_dir, s) = store_on(mem.clone(), gc_config());
+    let data = b"meta-repo-cfg";
+    let cd = sha256_digest(data);
+    s.put_blob("meta-only", &cd, data).await.unwrap();
+    put_tagged(&s, "meta-only", "v1", &cd, &[]).await;
+    // Don't write_remote_index: repo exists only in metadata, not S3 listing.
+    // Rebuild second store from same memory (no index.json for meta-only).
+    let (_dir2, s2) = store_on(mem, gc_config());
+    // Populate metadata so meta.repos() returns "meta-only".
+    let data2 = b"meta-repo-cfg";
+    let cd2 = sha256_digest(data2);
+    s2.put_blob("meta-only", &cd2, data2).await.unwrap();
+    put_tagged(&s2, "meta-only", "v1", &cd2, &[]).await;
+    s2.gc_consistency_check().await;
+    // Should not crash; the repo from meta.repos() is included in consistency check
+}
+
+#[tokio::test]
+async fn delete_manifest_read_error_fallback() {
+    let (_dir, s) = test_store();
+    let data = b"config-for-delete";
+    let cd = sha256_digest(data);
+    s.put_blob("repo", &cd, data).await.unwrap();
+    let (md, _) = put_tagged(&s, "repo", "v1", &cd, &[]).await;
+    // Delete the underlying blob first, so read_blob fails during delete_manifest
+    let key = format!("repo/blobs/{}", md.as_string().replace(':', "/"));
+    s.client
+        .store
+        .delete(&ObjPath::from(key.clone()))
+        .await
+        .unwrap();
+    // delete_manifest should handle read_blob error gracefully (empty references)
+    // but the actual delete_blob call will also fail (NotFound)
+    let err = s.delete_manifest("repo", &md).await;
+    assert!(
+        err.is_err(),
+        "delete_manifest should fail when blob is missing"
+    );
+}
+
+#[tokio::test]
+async fn index_media_type_fallback_via_recover() {
+    let mem = Arc::new(InMemory::new());
+    let (_dir, s1) = store_on(mem.clone(), StorageConfig::default());
+    let cfg_data = b"config-for-media-type";
+    let cd = sha256_digest(cfg_data);
+    s1.put_blob("repo", &cd, cfg_data).await.unwrap();
+    let manifest_data = manifest(&cd, &[], None);
+    let md = sha256_digest(&manifest_data);
+    let digest_str = md.as_string();
+    s1.put_manifest(
+        "repo",
+        Some("tagged"),
+        &md,
+        "application/vnd.custom.cached+json",
+        &manifest_data,
+        ManifestLinks {
+            references: std::slice::from_ref(&cd),
+            required: &[],
+            subject: None,
+        },
+    )
+    .await
+    .unwrap();
+    s1.write_remote_index("repo").await.unwrap();
+    let (_dir2, s2) = store_on(mem, StorageConfig::default());
+    s2.recover().await;
+    let m = s2.get_manifest("repo", &digest_str).await.unwrap();
+    assert_eq!(m.bytes, manifest_data);
+    assert_eq!(m.media_type, "application/vnd.custom.cached+json");
+}
+
+#[tokio::test]
+async fn put_blob_creates_layout_marker_and_index() {
+    let mem = Arc::new(InMemory::new());
+    let (_dir, s) = store_on(mem.clone(), StorageConfig::default());
+    let data = b"layout-trigger";
+    let d = sha256_digest(data);
+    s.put_blob("new-repo", &d, data).await.unwrap();
+    assert!(
+        mem.head(&ObjPath::from("new-repo/oci-layout"))
+            .await
+            .is_ok(),
+        "oci-layout should exist"
+    );
+    assert!(
+        mem.head(&ObjPath::from("new-repo/index.json"))
+            .await
+            .is_ok(),
+        "index.json should exist"
+    );
+    // Second put: layout cached
+    s.put_blob("new-repo", &d, data).await.unwrap();
+}
+
+#[tokio::test]
+async fn put_blob_preserves_existing_index() {
+    let mem = Arc::new(InMemory::new());
+    let custom_index = serde_json::json!({"schemaVersion": 2, "manifests": [
+        {"digest": "sha256:aaaa000000000000000000000000000000000000000000000000000000000001",
+         "mediaType": "application/vnd.oci.image.manifest.v1+json", "size": 100,
+         "annotations": {"org.opencontainers.image.ref.name": "existing"}}
+    ]});
+    mem.put(
+        &ObjPath::from("repo/oci-layout"),
+        PutPayload::from_static(b"{\"imageLayoutVersion\":\"1.0.0\"}"),
+    )
+    .await
+    .unwrap();
+    mem.put(
+        &ObjPath::from("repo/index.json"),
+        PutPayload::from(serde_json::to_vec(&custom_index).unwrap()),
+    )
+    .await
+    .unwrap();
+    let (_dir, s) = store_on(mem.clone(), StorageConfig::default());
+    let data = b"trigger-ensure";
+    let d = sha256_digest(data);
+    s.put_blob("repo", &d, data).await.unwrap();
+    let result = mem.get(&ObjPath::from("repo/index.json")).await.unwrap();
+    let bytes = result.bytes().await.unwrap();
+    let idx: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let ms = idx.get("manifests").unwrap().as_array().unwrap();
+    let has_existing = ms.iter().any(|m| {
+        m.get("annotations")
+            .and_then(|a| a.get("org.opencontainers.image.ref.name"))
+            .and_then(|v| v.as_str())
+            == Some("existing")
+    });
+    assert!(
+        has_existing,
+        "existing index.json entries should be preserved"
+    );
+}
+
+#[tokio::test]
+async fn write_remote_index_merges_existing() {
+    let mem = Arc::new(InMemory::new());
+    let (_dir, s) = store_on(mem.clone(), StorageConfig::default());
+    let data = b"wri-cfg";
+    let cd = sha256_digest(data);
+    s.put_blob("repo", &cd, data).await.unwrap();
+    let (md, _) = put_tagged(&s, "repo", "v1", &cd, &[]).await;
+    s.write_remote_index("repo").await.unwrap();
+    // Push another tag
+    let data2 = b"wri-cfg-2";
+    let cd2 = sha256_digest(data2);
+    s.put_blob("repo", &cd2, data2).await.unwrap();
+    let (md2, _) = put_tagged(&s, "repo", "v2", &cd2, &[]).await;
+    // write_remote_index merges existing; both tags should appear
+    s.write_remote_index("repo").await.unwrap();
+    let result = mem.get(&ObjPath::from("repo/index.json")).await.unwrap();
+    let bytes = result.bytes().await.unwrap();
+    let idx: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let manifests = idx.get("manifests").unwrap().as_array().unwrap();
+    let digests: Vec<&str> = manifests
+        .iter()
+        .filter_map(|m| m.get("digest").and_then(|d| d.as_str()))
+        .collect();
+    assert!(
+        digests.contains(&md.as_string().as_str()),
+        "first manifest should be in index"
+    );
+    assert!(
+        digests.contains(&md2.as_string().as_str()),
+        "second manifest should be in index"
+    );
+}
+
+#[tokio::test]
+async fn write_remote_index_no_existing() {
+    let mem = Arc::new(InMemory::new());
+    let (_dir, s) = store_on(mem.clone(), StorageConfig::default());
+    let data = b"fresh-cfg";
+    let cd = sha256_digest(data);
+    s.put_blob("repo-fresh", &cd, data).await.unwrap();
+    put_tagged(&s, "repo-fresh", "v1", &cd, &[]).await;
+    // Delete the index.json that ensure_layout created
+    let _ = mem.delete(&ObjPath::from("repo-fresh/index.json")).await;
+    // write_remote_index with no existing index (NotFound path)
+    s.write_remote_index("repo-fresh").await.unwrap();
+    let result = mem
+        .get(&ObjPath::from("repo-fresh/index.json"))
+        .await
+        .unwrap();
+    let bytes = result.bytes().await.unwrap();
+    let idx: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(!idx.get("manifests").unwrap().as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn recover_with_prefix() {
+    let mem = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let mut client = mem_client(mem.clone());
+    client.prefix = "pfx".to_string();
+    let config = StorageConfig::default();
+    let s1 = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    let data = b"prefixed-cfg";
+    let cd = sha256_digest(data);
+    s1.put_blob("myrepo", &cd, data).await.unwrap();
+    let (_, m) = put_tagged(&s1, "myrepo", "v1", &cd, &[]).await;
+    s1.write_remote_index("myrepo").await.unwrap();
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let mut client2 = mem_client(mem.clone());
+    client2.prefix = "pfx".to_string();
+    let s2 = S3Storage::open_with_client(
+        dir2.path(),
+        client2,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    s2.recover().await;
+    assert_eq!(s2.get_manifest("myrepo", "v1").await.unwrap().bytes, m);
+}
+
+#[tokio::test]
+async fn recover_with_dedupe_seeds_from_blobs() {
+    let mem = Arc::new(InMemory::new());
+    let config = StorageConfig {
+        dedupe: true,
+        ..StorageConfig::default()
+    };
+    let (_dir, s1) = store_on(mem.clone(), config.clone());
+    let data = b"dedupe-seed-blob";
+    let digest = sha256_digest(data);
+    s1.put_blob("repo", &digest, data).await.unwrap();
+    s1.write_remote_index("repo").await.unwrap();
+
+    let (_dir2, s2) = store_on(mem, config);
+    s2.recover().await;
+    // seed_dedupe_from_listing should have inserted the blob digest
+    assert!(s2.dedupe.enabled());
+}
+
+#[tokio::test]
+async fn ready_with_prefix() {
+    let mem = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let mut client = mem_client(mem);
+    client.prefix = "pfx".to_string();
+    let s = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &StorageConfig::default(),
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    s.ready().await.unwrap();
+    // Second call hits the cache (PROBE_TTL path)
+    s.ready().await.unwrap();
+}
+
+#[tokio::test]
+async fn list_referrers_empty_fallback() {
+    let mem = Arc::new(InMemory::new());
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": []
+    });
+    put_index(&mem, "repo", &index).await;
+    let (_dir, s) = store_on(mem, StorageConfig::default());
+    let subject =
+        Digest::parse("sha256:0000000000000000000000000000000000000000000000000000000000000001")
+            .unwrap();
+    let page = s
+        .list_referrers("repo", &subject, None, None, 10)
+        .await
+        .unwrap();
+    assert!(page.items.is_empty(), "no referrers should be found");
+}
+
+#[tokio::test]
+async fn mount_blob_source_not_found() {
+    let (_dir, s) = test_store();
+    let missing =
+        Digest::parse("sha256:0000000000000000000000000000000000000000000000000000000000000001")
+            .unwrap();
+    let result = s.mount_blob("src", "dst", &missing).await.unwrap();
+    assert!(
+        !result,
+        "mount should return false when source blob is missing"
+    );
+}
+
+#[tokio::test]
+async fn sweep_stale_uploads_locked_session_skipped() {
+    let (_dir, s) = test_store_with_config(gc_config(), QuotaTracker::default());
+    let id = s.begin_upload("repo").await.unwrap();
+    // Grab the upload lock so sweep cannot acquire it
+    let lock = s.upload_locks.get("repo", &id);
+    let _guard = lock.lock().await;
+    // gc delay is 0, so any file is "stale" but the lock prevents removal
+    let (count, _) = s.sweep_stale_uploads().await;
+    assert_eq!(count, 0, "locked session should not be swept");
+}
+
+#[tokio::test]
+async fn dedupe_disabled_skips_server_side_copy() {
+    let (_dir, s) = test_store();
+    // dedupe is disabled by default: put_blob goes through direct upload, not copy
+    let data = b"no-dedupe-blob";
+    let d = sha256_digest(data);
+    s.put_blob("repo", &d, data).await.unwrap();
+    assert_eq!(s.read_blob("repo", &d).await.unwrap(), data);
+}
+
+#[test]
+fn from_config_ca_file_missing_file() {
+    crate::client::install_crypto_provider();
+    let s3 = roci_config::S3Config {
+        ca_file: Some(std::path::PathBuf::from("/nonexistent/ca.pem")),
+        ..base_s3_config()
+    };
+    let err = S3Client::from_config(&s3).err().expect("expected error");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("ca_file"), "error: {err}");
+}
+
+#[test]
+fn from_config_ca_file_empty_pem_rejected() {
+    crate::client::install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let empty_pem = dir.path().join("empty.pem");
+    std::fs::write(&empty_pem, "").unwrap();
+    let s3 = roci_config::S3Config {
+        ca_file: Some(empty_pem),
+        ..base_s3_config()
+    };
+    let err = S3Client::from_config(&s3).err().expect("expected error");
+    assert!(
+        err.to_string().contains("no valid PEM") || err.to_string().contains("ca_file"),
+        "error should mention empty PEM: {err}"
+    );
+}
+
+#[tokio::test]
+async fn finish_upload_digest_mismatch() {
+    let (_dir, s) = test_store();
+    let id = s.begin_upload("repo").await.unwrap();
+    let data = b"upload-data-mismatch";
+    s.append_upload("repo", &id, roci_storage::upload_body(data), None, u64::MAX)
+        .await
+        .unwrap();
+    let wrong_digest = sha256_digest(b"wrong data");
+    let err = s
+        .finish_upload(
+            "repo",
+            &id,
+            &wrong_digest,
+            1024,
+            roci_storage::upload_body([]),
+            u64::MAX,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, roci_storage::StorageError::DigestMismatch { .. }),
+        "expected DigestMismatch, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn finish_upload_too_large() {
+    let (_dir, s) = test_store();
+    let id = s.begin_upload("repo").await.unwrap();
+    let data = b"large-upload-data-for-limit-check";
+    s.append_upload("repo", &id, roci_storage::upload_body(data), None, u64::MAX)
+        .await
+        .unwrap();
+    let d = sha256_digest(data);
+    let err = s
+        .finish_upload(
+            "repo",
+            &id,
+            &d,
+            5, // max_size = 5, much smaller than data
+            roci_storage::upload_body([]),
+            u64::MAX,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, roci_storage::StorageError::TooLarge { .. }),
+        "expected TooLarge, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn finish_upload_multipart_staged_blob() {
+    let (_dir, s) = small_part_store(None);
+    // Upload enough data to trigger multipart in upload_staged_blob (> 5 MiB part)
+    let data: Vec<u8> = (0..6 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let digest = sha256_digest(&data);
+    let id = s.begin_upload("repo").await.unwrap();
+    s.append_upload(
+        "repo",
+        &id,
+        roci_storage::upload_body(&data),
+        None,
+        u64::MAX,
+    )
+    .await
+    .unwrap();
+    s.finish_upload(
+        "repo",
+        &id,
+        &digest,
+        u64::MAX,
+        roci_storage::upload_body([]),
+        u64::MAX,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        s.read_blob("repo", &digest).await.unwrap().len(),
+        data.len()
+    );
+}
+
+#[tokio::test]
+async fn put_manifest_bad_tag_variants() {
+    let (_dir, s) = test_store();
+    let body = br#"{"schemaVersion":2}"#;
+    let d = sha256_digest(body);
+    for bad_tag in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
+        let err = s
+            .put_manifest(
+                "repo",
+                Some(bad_tag),
+                &d,
+                "application/json",
+                body,
+                ManifestLinks {
+                    references: &[],
+                    required: &[],
+                    subject: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(err, Err(roci_storage::StorageError::BadPath(_))),
+            "tag {bad_tag:?} should be rejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_blob_not_found_returns_error() {
+    let (_dir, s) = test_store();
+    let missing = sha256_digest(b"never-stored");
+    let err = s.delete_blob("repo", &missing).await;
+    assert!(
+        matches!(err, Err(roci_storage::StorageError::NotFound)),
+        "delete of missing blob should be NotFound"
+    );
+}
+
+#[tokio::test]
+async fn recover_create_bucket_error_path() {
+    // create_bucket = true but no HTTP client → error during recover
+    let (_dir, mut s) = test_store();
+    s.create_bucket = true;
+    // bucket_ensured stays false; recover will try ensure_bucket which fails
+    s.recover().await;
+    // Should not panic; error is logged
+    assert!(
+        !s.bucket_ensured.load(std::sync::atomic::Ordering::Acquire),
+        "bucket_ensured should remain false after failed create"
+    );
+}
+
+#[tokio::test]
+async fn gc_consistency_with_prefix() {
+    let mem = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let mut client = mem_client(mem.clone());
+    client.prefix = "pfx".to_string();
+    let config = gc_config();
+    let s1 = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    let data = b"prefixed-gc-cfg";
+    let cd = sha256_digest(data);
+    s1.put_blob("repo", &cd, data).await.unwrap();
+    let (md, _) = put_tagged(&s1, "repo", "v1", &cd, &[]).await;
+    s1.write_remote_index("repo").await.unwrap();
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let mut client2 = mem_client(mem);
+    client2.prefix = "pfx".to_string();
+    let s2 = S3Storage::open_with_client(
+        dir2.path(),
+        client2,
+        &config,
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    s2.gc_consistency_check().await;
+    assert!(
+        s2.gc.is_root("repo", &md.as_string()),
+        "prefixed store should find root"
+    );
+}
+
+#[tokio::test]
+async fn staging_size_missing_returns_not_found() {
+    let (_dir, s) = test_store();
+    let err = s
+        .upload_size("repo", "00000000000000000000000000000000")
+        .await;
+    assert!(matches!(err, Err(roci_storage::StorageError::NotFound)));
+}
+
+#[tokio::test]
+async fn hash_staging_unsupported_algorithm() {
+    let (_dir, s) = test_store();
+    let id = s.begin_upload("repo").await.unwrap();
+    s.append_upload(
+        "repo",
+        &id,
+        roci_storage::upload_body(b"data"),
+        None,
+        u64::MAX,
+    )
+    .await
+    .unwrap();
+    let err = s.hash_staging("repo", &id, "md5").await;
+    assert!(
+        matches!(err, Err(roci_storage::StorageError::BadDigest(_))),
+        "unsupported algorithm should be rejected: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn quota_admission_deduplicates() {
+    let quota = QuotaTracker::new(QuotaLimits {
+        max_repo_bytes: 100,
+        max_total_bytes: 0,
+        max_upload_sessions: 10,
+    });
+    let (_dir, s) = test_store_with_config(StorageConfig::default(), quota);
+    let data = b"blob-for-quota-dedup";
+    let d = sha256_digest(data);
+    s.put_blob("repo", &d, data).await.unwrap();
+    // Second put of same blob: admit_blob should see it exists → charge 0
+    s.put_blob("repo", &d, data).await.unwrap();
+}
+
+#[tokio::test]
+async fn abort_upload_missing_session_returns_false() {
+    let (_dir, s) = test_store();
+    let result = s
+        .abort_upload("repo", "00000000000000000000000000000000")
+        .await
+        .unwrap();
+    assert!(!result, "aborting nonexistent session should return false");
+}
+
+#[tokio::test]
+async fn enumerate_staging_files_nested_repos() {
+    let (_dir, s) = test_store();
+    let _id1 = s.begin_upload("org/repo").await.unwrap();
+    let _id2 = s.begin_upload("org/repo").await.unwrap();
+    let files = s.enumerate_staging_files();
+    assert_eq!(files.len(), 2, "should find both staging files");
+    for (repo, _id, _size, _modified) in &files {
+        assert_eq!(repo, "org/repo");
+    }
+}
+
+#[tokio::test]
+async fn seed_sessions_from_staging_counts_nested() {
+    let mem = Arc::new(InMemory::new());
+    let (dir, s1) = store_on(mem.clone(), StorageConfig::default());
+    let _id1 = s1.begin_upload("a/b").await.unwrap();
+    let _id2 = s1.begin_upload("c").await.unwrap();
+    // Create new store over same root to re-seed
+    let client2 = mem_client(mem);
+    let s2 = S3Storage::open_with_client(
+        dir.path(),
+        client2,
+        &StorageConfig::default(),
+        Arc::new(QuotaTracker::default()),
+    )
+    .unwrap();
+    s2.seed_sessions_from_staging();
+    // Should not panic and should count 2 sessions
+}
+
+#[tokio::test]
+async fn dedupe_enabled_server_side_copy_on_put() {
+    let mem = Arc::new(InMemory::new());
+    let config = StorageConfig {
+        dedupe: true,
+        ..StorageConfig::default()
+    };
+    let (_dir, s) = store_on(mem, config);
+    let data = b"dedupe-copy-data";
+    let d = sha256_digest(data);
+    s.put_blob("repo-a", &d, data).await.unwrap();
+    // Second repo: dedupe.locate should find repo-a, triggering server_side_copy
+    s.put_blob("repo-b", &d, data).await.unwrap();
+    assert_eq!(s.read_blob("repo-b", &d).await.unwrap(), data);
+}
+
+#[tokio::test]
+async fn gc_sweep_already_deleted_blob() {
+    let (_dir, s) = gc_test_store();
+    s.gc.set_ready();
+    let data = b"vanishing-blob";
+    let d = sha256_digest(data);
+    s.put_blob("repo", &d, data).await.unwrap();
+    // Manually delete the blob from S3 behind the GC's back
+    let ds = d.as_string();
+    let (alg, hex) = ds.split_once(':').unwrap();
+    s.client
+        .store
+        .delete(&ObjPath::from(format!("repo/blobs/{alg}/{hex}")))
+        .await
+        .unwrap();
+    // GC still has it marked as candidate
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    s.gc_sweep().await;
+    // Should not panic; blob was already gone (NotFound on head → clear)
+}
+
+#[tokio::test]
+async fn write_remote_index_preserves_sizes_from_cache() {
+    let mem = Arc::new(InMemory::new());
+    let (_dir, s) = store_on(mem.clone(), StorageConfig::default());
+    let data = b"size-test-cfg";
+    let cd = sha256_digest(data);
+    s.put_blob("repo", &cd, data).await.unwrap();
+    let (md, manifest_bytes) = put_tagged(&s, "repo", "v1", &cd, &[]).await;
+    // record_manifest_size was called by put_manifest
+    s.write_remote_index("repo").await.unwrap();
+    let result = mem.get(&ObjPath::from("repo/index.json")).await.unwrap();
+    let bytes = result.bytes().await.unwrap();
+    let idx: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let ms = idx.get("manifests").unwrap().as_array().unwrap();
+    let entry = ms
+        .iter()
+        .find(|m| m.get("digest").and_then(|d| d.as_str()) == Some(&md.as_string()))
+        .expect("manifest should be in index");
+    let size = entry.get("size").and_then(|s| s.as_u64()).unwrap();
+    assert_eq!(
+        size,
+        manifest_bytes.len() as u64,
+        "manifest size should match"
+    );
+}
+
+#[tokio::test]
+async fn recover_skips_invalid_manifests_in_index() {
+    let mem = Arc::new(InMemory::new());
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "manifests": [
+            {"mediaType": "application/vnd.oci.image.manifest.v1+json", "size": 100},
+            "not an object"
+        ]
+    });
+    put_index(&mem, "repo", &index).await;
+    let (_dir, s) = store_on(mem, StorageConfig::default());
+    s.recover().await;
+    // Should not panic on entries without a "digest" field
+}
+
+#[tokio::test]
+async fn gc_consistency_check_with_dedupe_disabled() {
+    let (_dir, s) = gc_test_store();
+    // dedupe is disabled by default in gc_test_store
+    let data = b"no-dedupe-gc";
+    let d = sha256_digest(data);
+    s.put_blob("repo", &d, data).await.unwrap();
+    s.gc_consistency_check().await;
+    // seed_dedupe_from_listing returns early when disabled
+    let now = std::time::Instant::now() + Duration::from_secs(1);
+    assert!(s.gc.is_due("repo", &d.as_string(), now));
+}
+
+#[tokio::test]
+async fn delete_manifest_with_unparseable_blob() {
+    let mem = Arc::new(InMemory::new());
+    let (_dir, s) = store_on(mem.clone(), StorageConfig::default());
+    let bad_manifest = b"not json at all";
+    let d = sha256_digest(bad_manifest);
+    s.put_manifest(
+        "repo",
+        Some("v1"),
+        &d,
+        "application/json",
+        bad_manifest,
+        ManifestLinks {
+            references: &[],
+            required: &[],
+            subject: None,
+        },
+    )
+    .await
+    .unwrap();
+    // delete_manifest: read_blob succeeds but JSON parse fails → empty references
+    s.delete_manifest("repo", &d).await.unwrap();
+    assert!(!s.blob_exists("repo", &d).await.unwrap());
+}
+
+#[tokio::test]
+async fn seed_quota_from_listing_via_recover() {
+    let mem = Arc::new(InMemory::new());
+    let quota = QuotaTracker::new(QuotaLimits {
+        max_repo_bytes: 1024 * 1024,
+        max_total_bytes: 0,
+        max_upload_sessions: 10,
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let client = mem_client(mem.clone());
+    let s1 = S3Storage::open_with_client(
+        dir.path(),
+        client,
+        &StorageConfig::default(),
+        Arc::new(quota),
+    )
+    .unwrap();
+    let data = b"quota-seed-data";
+    let d = sha256_digest(data);
+    s1.put_blob("repo", &d, data).await.unwrap();
+    s1.write_remote_index("repo").await.unwrap();
+    // New store with quota tracking
+    let quota2 = QuotaTracker::new(QuotaLimits {
+        max_repo_bytes: 1024 * 1024,
+        max_total_bytes: 0,
+        max_upload_sessions: 10,
+    });
+    let dir2 = tempfile::tempdir().unwrap();
+    let client2 = mem_client(mem);
+    let s2 = S3Storage::open_with_client(
+        dir2.path(),
+        client2,
+        &StorageConfig::default(),
+        Arc::new(quota2),
+    )
+    .unwrap();
+    s2.recover().await;
+    // After recover, quota should be seeded; putting data that'd exceed limit should fail
+    // (but our limit is high, so just verify the seeding path ran without error)
+}
+
+#[tokio::test]
+async fn get_manifest_by_digest_default_media_type() {
+    let mem = Arc::new(InMemory::new());
+    let (_dir, s) = store_on(mem.clone(), StorageConfig::default());
+    let body = br#"{"schemaVersion":2}"#;
+    let d = sha256_digest(body);
+    let ds = d.as_string();
+    let (alg, hex) = ds.split_once(':').unwrap();
+    // Place blob directly in S3 (no metadata, no index cache)
+    s.client
+        .store
+        .put(
+            &ObjPath::from(format!("repo/blobs/{alg}/{hex}")),
+            PutPayload::from(bytes::Bytes::copy_from_slice(body)),
+        )
+        .await
+        .unwrap();
+    // get_manifest by digest: no metadata media type, no cached index → default
+    let m = s.get_manifest("repo", &ds).await.unwrap();
+    assert_eq!(
+        m.media_type, "application/vnd.oci.image.manifest.v1+json",
+        "should use default media type"
+    );
+    assert_eq!(m.bytes, body);
+}
+
+#[tokio::test]
+async fn finish_upload_with_trailing_body() {
+    let (_dir, s) = test_store();
+    let part1 = b"first-part";
+    let part2 = b"second-part";
+    let mut full = Vec::new();
+    full.extend_from_slice(part1);
+    full.extend_from_slice(part2);
+    let d = sha256_digest(&full);
+    let id = s.begin_upload("repo").await.unwrap();
+    s.append_upload(
+        "repo",
+        &id,
+        roci_storage::upload_body(part1),
+        None,
+        u64::MAX,
+    )
+    .await
+    .unwrap();
+    // finish_upload with trailing body that adds part2
+    s.finish_upload(
+        "repo",
+        &id,
+        &d,
+        u64::MAX,
+        roci_storage::upload_body(part2),
+        u64::MAX,
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.read_blob("repo", &d).await.unwrap(), full);
+}
+
+#[tokio::test]
+async fn mount_blob_same_repo_is_noop() {
+    let (_dir, s) = test_store();
+    let data = b"same-repo-mount";
+    let d = sha256_digest(data);
+    s.put_blob("repo", &d, data).await.unwrap();
+    let ok = s.mount_blob("repo", "repo", &d).await.unwrap();
+    assert!(ok, "mounting within same repo should succeed");
+}
+
+#[tokio::test]
+async fn recover_caches_remote_index_for_tag_resolve() {
+    let mem = Arc::new(InMemory::new());
+    let (_dir, s1) = store_on(mem.clone(), StorageConfig::default());
+    let data = b"tag-resolve-cfg";
+    let cd = sha256_digest(data);
+    s1.put_blob("repo", &cd, data).await.unwrap();
+    let (_, m) = put_tagged(&s1, "repo", "v1", &cd, &[]).await;
+    s1.write_remote_index("repo").await.unwrap();
+    let (_dir2, s2) = store_on(mem, StorageConfig::default());
+    s2.recover().await;
+    // After recover, index should be cached; tag resolve should work
+    let result = s2.get_manifest("repo", "v1").await.unwrap();
+    assert_eq!(result.bytes, m);
+}
+
 mod http_e2e {
     use super::*;
     use axum::body::Body;

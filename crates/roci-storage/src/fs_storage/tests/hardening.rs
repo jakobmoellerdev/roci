@@ -322,3 +322,40 @@ async fn dir_beneath_race_replace_with_symlink() {
     let err = crate::beneath::dir_beneath(root, Path::new("link/sub"), true).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }
+
+// blob_size returns NotFound when CAS entry is a directory (not a regular file).
+#[cfg(unix)]
+#[tokio::test]
+async fn blob_size_returns_not_found_for_directory_at_blob_path() {
+    let (_dir, s) = store();
+    let data = b"will-be-replaced-by-dir";
+    let d = sha256_of(data);
+    s.put_blob("r", &d, data).await.unwrap();
+    // Remove the checksum so blob_size falls through to stat_beneath.
+    s.meta
+        .apply_relaxed(crate::MetaOp::DeleteBlob {
+            repo: "r".to_string(),
+            digest: d.as_string(),
+        })
+        .unwrap();
+    // Replace the blob file with a directory.
+    let blob_path = s.blob_path("r", &d).unwrap();
+    std::fs::remove_file(&blob_path).unwrap();
+    std::fs::create_dir(&blob_path).unwrap();
+    assert!(matches!(
+        s.blob_size("r", &d).await,
+        Err(StorageError::NotFound)
+    ));
+}
+
+// stat_beneath with missing parent directory → Ok(None).
+#[cfg(unix)]
+#[tokio::test]
+async fn stat_beneath_missing_parent_returns_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Path with missing parent: "no_such_parent/leaf"
+    let rel = std::path::PathBuf::from("no_such_parent/leaf");
+    let result = crate::beneath::stat_beneath(root, &rel).await.unwrap();
+    assert_eq!(result, None, "missing parent → None");
+}

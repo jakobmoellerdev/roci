@@ -479,3 +479,77 @@ async fn concurrent_duplicate_uploads_are_charged_once() {
     s.delete_blob("r", &d).await.unwrap();
     assert_eq!(s.quota.repo_bytes("r"), 0);
 }
+
+#[tokio::test]
+async fn put_manifest_rejected_by_quota() {
+    let (_dir, s) = store_with(repo_cap(10), false);
+    // Fill quota close to the limit.
+    let filler = b"fill-bytes";
+    s.put_blob("r", &sha256_of(filler), filler).await.unwrap();
+    // Manifest exceeds remaining quota.
+    let body = br#"{"schemaVersion":2,"config":{}}"#;
+    let d = sha256_of(body);
+    let err = s
+        .put_manifest(
+            "r",
+            Some("v1"),
+            &d,
+            "application/json",
+            body,
+            ManifestLinks::default(),
+        )
+        .await;
+    assert!(
+        matches!(err, Err(StorageError::QuotaExceeded { .. })),
+        "manifest should be rejected by quota: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn store_with_zero_cache_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = StorageConfig {
+        cache_max_bytes: 0,
+        ..StorageConfig::default()
+    };
+    let s = FsStorage::with_config(dir.path(), &cfg, Arc::new(QuotaTracker::default())).unwrap();
+    let body = br#"{"schemaVersion":2}"#;
+    let d = sha256_of(body);
+    s.put_manifest(
+        "r",
+        Some("v1"),
+        &d,
+        "application/json",
+        body,
+        ManifestLinks::default(),
+    )
+    .await
+    .unwrap();
+    let m = s.get_manifest("r", "v1").await.unwrap();
+    assert_eq!(m.digest, d);
+}
+
+#[tokio::test]
+async fn store_with_byte_quota_seeds_on_construction() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = StorageConfig::default();
+    let limits = QuotaLimits {
+        max_repo_bytes: 100_000,
+        ..QuotaLimits::default()
+    };
+    let s = FsStorage::with_config(dir.path(), &cfg, Arc::new(QuotaTracker::new(limits))).unwrap();
+    let data = b"seeding-test";
+    let d = sha256_of(data);
+    s.put_blob("r", &d, data).await.unwrap();
+    let bytes_after_put = s.quota.repo_bytes("r");
+    assert!(bytes_after_put > 0, "quota tracked");
+    drop(s);
+
+    // Reopen: seed_from_cas should restore quota.
+    let s2 = FsStorage::with_config(dir.path(), &cfg, Arc::new(QuotaTracker::new(limits))).unwrap();
+    assert_eq!(
+        s2.quota.repo_bytes("r"),
+        bytes_after_put,
+        "quota restored on cold start"
+    );
+}

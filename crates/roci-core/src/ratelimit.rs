@@ -351,4 +351,17 @@ mod tests {
             assert_eq!(&client_key_from(&req), expected, "{label}");
         }
     }
+
+    #[test]
+    fn client_key_no_peer_addr_falls_back_to_unspecified() {
+        let req = Request::builder()
+            .uri("/v2/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            client_key_from(&req),
+            ClientKey::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            "no PeerAddr → 0.0.0.0"
+        );
+    }
 }
