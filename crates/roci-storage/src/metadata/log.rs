@@ -918,6 +918,15 @@ impl MetadataStore for LogMetadataStore {
             .collect()
     }
 
+    fn export(&self, sink: &mut dyn FnMut(MetaOp) -> io::Result<()>) -> io::Result<()> {
+        let state = self.inner.lock().expect("metadata lock poisoned");
+        let base = self.snap_base.lock().expect("snap lock poisoned");
+        let full = state.materialize(base.as_ref());
+        drop(base);
+        drop(state);
+        export_state(&full, sink)
+    }
+
     fn maintain(&self) -> io::Result<()> {
         self.do_maintain()
     }
@@ -1256,18 +1265,80 @@ fn state_to_snapshot(state: &State, generation: u64, log_offset: u64) -> Snapsho
     }
 }
 
+/// Emit the minimal `MetaOp` image reproducing `state` — reuses the same
+/// iteration order as `write_log_image` (compaction): one PutManifest per tag,
+/// one PutManifest per untagged manifest, one PutBackrefs per edge, one
+/// PutReferrer per referrer, one PutChecksum per checksum.
+fn export_state(full: &State, sink: &mut dyn FnMut(MetaOp) -> io::Result<()>) -> io::Result<()> {
+    use std::collections::BTreeSet;
+    let mut tagged: BTreeSet<(&str, &str)> = BTreeSet::new();
+    for (repo, tags) in &full.tags {
+        for (tag, (digest, media_type)) in tags {
+            sink(MetaOp::PutManifest {
+                repo: repo.clone(),
+                digest: digest.clone(),
+                media_type: media_type.clone(),
+                tag: Some(tag.clone()),
+                references: Vec::new(),
+                referrer: None,
+            })?;
+            tagged.insert((repo, digest));
+        }
+    }
+    for ((repo, digest), media_type) in &full.media_types {
+        if !tagged.contains(&(repo.as_str(), digest.as_str())) {
+            sink(MetaOp::PutManifest {
+                repo: repo.clone(),
+                digest: digest.clone(),
+                media_type: media_type.clone(),
+                tag: None,
+                references: Vec::new(),
+                referrer: None,
+            })?;
+        }
+    }
+    for ((repo, blob), manifests) in &full.backrefs {
+        for m in manifests {
+            sink(MetaOp::PutBackrefs {
+                repo: repo.clone(),
+                manifest: m.clone(),
+                blobs: vec![blob.clone()],
+            })?;
+        }
+    }
+    for ((repo, subject), refs) in &full.referrers {
+        for (referrer, (_, descriptor)) in &refs.by_digest {
+            sink(MetaOp::PutReferrer {
+                repo: repo.clone(),
+                subject: subject.clone(),
+                referrer: referrer.clone(),
+                descriptor: descriptor.clone(),
+            })?;
+        }
+    }
+    for ((repo, digest), ck) in &full.checksums {
+        sink(MetaOp::PutChecksum {
+            repo: repo.clone(),
+            digest: digest.clone(),
+            crc32c: ck.crc32c,
+            size: ck.size,
+        })?;
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Log framing: encode, replay, compatibility checking
 // ============================================================================
 
 /// Encode a MetaOp as a framed record.
-fn encode(op: &MetaOp, hmac_key: Option<&HmacKey>) -> Vec<u8> {
+pub(crate) fn encode_record(op: &MetaOp, hmac_key: Option<&HmacKey>) -> Vec<u8> {
     let payload = serialize_op(op);
-    encode_raw(&payload, hmac_key)
+    encode_record_raw(&payload, hmac_key)
 }
 
 /// Encode raw payload bytes as a framed record.
-fn encode_raw(payload: &[u8], hmac_key: Option<&HmacKey>) -> Vec<u8> {
+pub(crate) fn encode_record_raw(payload: &[u8], hmac_key: Option<&HmacKey>) -> Vec<u8> {
     let crc = crc32c::crc32c(payload);
     let hmac_tag = hmac_key.map(|k| k.tag(payload));
     let total = 8 + payload.len() + if hmac_tag.is_some() { 32 } else { 0 };
@@ -1279,6 +1350,14 @@ fn encode_raw(payload: &[u8], hmac_key: Option<&HmacKey>) -> Vec<u8> {
         out.extend_from_slice(&tag);
     }
     out
+}
+
+/// Backwards-compat: internal callers still use `encode` / `encode_raw`.
+fn encode(op: &MetaOp, hmac_key: Option<&HmacKey>) -> Vec<u8> {
+    encode_record(op, hmac_key)
+}
+fn encode_raw(payload: &[u8], hmac_key: Option<&HmacKey>) -> Vec<u8> {
+    encode_record_raw(payload, hmac_key)
 }
 
 /// Result of checking the first record of a log for framing compatibility.

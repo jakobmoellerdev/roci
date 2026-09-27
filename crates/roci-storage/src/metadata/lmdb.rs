@@ -915,6 +915,272 @@ impl LmdbMetadataStore {
     }
 }
 
+impl LmdbMetadataStore {
+    /// Open an LMDB env at an arbitrary directory (used for migration temp).
+    pub(crate) fn open_at(dir: &Path, config: &MetadataConfig) -> io::Result<Self> {
+        // `open` builds the path as root.join("roci-meta.lmdb"). For open_at
+        // we *are* given the lmdb dir itself, so we create a shim.
+        std::fs::create_dir_all(dir)?;
+
+        let encrypted = config.hmac_key_file.is_some();
+        let expected_format = if encrypted {
+            FORMAT_ENCRYPTED
+        } else {
+            FORMAT_PLAIN
+        };
+
+        let format_path = dir.join("roci-format");
+        if format_path.exists() {
+            let existing = std::fs::read_to_string(&format_path).unwrap_or_default();
+            let existing = existing.trim();
+            if !existing.is_empty() && existing != expected_format {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "LMDB format mismatch at {}: found {existing}, expected {expected_format}",
+                        dir.display()
+                    ),
+                ));
+            }
+        }
+
+        let map_size = config.map_size_bytes as usize;
+        let inner = if let Some(ref key_file) = config.hmac_key_file {
+            let key_bytes = std::fs::read(key_file).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("reading hmac_key_file {}: {e}", key_file.display()),
+                )
+            })?;
+            let derived = derive_encryption_key(&key_bytes)?;
+            let aead_key = chacha20poly1305::Key::from(derived);
+
+            let mut opts = EnvOpenOptions::new().read_txn_without_tls();
+            opts.map_size(map_size);
+            opts.max_dbs(DB_COUNT);
+            #[allow(unsafe_code)]
+            unsafe {
+                opts.flags(EnvFlags::NO_SYNC);
+            }
+            #[allow(unsafe_code)]
+            let env = unsafe {
+                opts.open_encrypted::<chacha20poly1305::ChaCha20Poly1305, _>(aead_key, dir)
+            }
+            .map_err(map_heed_err)?;
+
+            let mut wtxn = env.write_txn().map_err(map_heed_err)?;
+            let mut dbs_arr: [Option<EncDb>; 10] = Default::default();
+            for (i, name) in DB_NAMES.iter().enumerate() {
+                let db = if is_dup_sort(i) {
+                    env.database_options()
+                        .types::<Bytes, Bytes>()
+                        .name(name)
+                        .flags(DatabaseFlags::DUP_SORT)
+                        .create(&mut wtxn)
+                        .map_err(map_heed_err)?
+                } else {
+                    env.create_database(&mut wtxn, Some(name))
+                        .map_err(map_heed_err)?
+                };
+                dbs_arr[i] = Some(db);
+            }
+            wtxn.commit().map_err(map_heed_err)?;
+            let dbs = dbs_arr.map(|o| o.expect("all dbs created"));
+            Inner::Encrypted { env, dbs }
+        } else {
+            let mut opts = EnvOpenOptions::new().read_txn_without_tls();
+            opts.map_size(map_size);
+            opts.max_dbs(DB_COUNT);
+            #[allow(unsafe_code)]
+            unsafe {
+                opts.flags(EnvFlags::NO_SYNC);
+            }
+            #[allow(unsafe_code)]
+            let env = unsafe { opts.open(dir) }.map_err(map_heed_err)?;
+
+            let mut wtxn = env.write_txn().map_err(map_heed_err)?;
+            let mut dbs_arr: [Option<PlainDb>; 10] = Default::default();
+            for (i, name) in DB_NAMES.iter().enumerate() {
+                let db = if is_dup_sort(i) {
+                    env.database_options()
+                        .types::<Bytes, Bytes>()
+                        .name(name)
+                        .flags(DatabaseFlags::DUP_SORT)
+                        .create(&mut wtxn)
+                        .map_err(map_heed_err)?
+                } else {
+                    env.create_database(&mut wtxn, Some(name))
+                        .map_err(map_heed_err)?
+                };
+                dbs_arr[i] = Some(db);
+            }
+            wtxn.commit().map_err(map_heed_err)?;
+            let dbs = dbs_arr.map(|o| o.expect("all dbs created"));
+            Inner::Plain { env, dbs }
+        };
+
+        std::fs::write(&format_path, expected_format)?;
+
+        Ok(Self {
+            inner,
+            write_lock: Mutex::new(()),
+        })
+    }
+
+    /// Apply a batch of ops in one RwTxn (for migration bulk load).
+    pub(crate) fn bulk_apply(&self, ops: &[MetaOp]) -> io::Result<()> {
+        let _guard = self.write_lock.lock().expect("lmdb write lock poisoned");
+        let mut txn = self.inner.write_txn().map_err(map_heed_err)?;
+        for op in ops {
+            self.apply_op(&mut txn, op)?;
+        }
+        txn.commit().map_err(map_heed_err)?;
+        Ok(())
+    }
+
+    /// Force sync (public wrapper for migration).
+    pub(crate) fn force_sync_public(&self) -> io::Result<()> {
+        self.inner.force_sync().map_err(map_heed_err)
+    }
+
+    /// Walk all LMDB tables in one read txn and emit MetaOp ops via the sink.
+    fn export_impl(&self, sink: &mut dyn FnMut(MetaOp) -> io::Result<()>) -> io::Result<()> {
+        let mut rtx = self.inner.read_txn().map_err(map_heed_err)?;
+
+        // Collect all tags to know which digests are tagged.
+        let mut tagged = std::collections::BTreeSet::<(String, String)>::new();
+
+        // 1. Tags → PutManifest with tag
+        {
+            let entries = self
+                .inner
+                .iter_owned(&mut rtx, I_TAGS)
+                .map_err(map_heed_err)?;
+            for (k, v) in &entries {
+                let parts = split_key(k);
+                if parts.len() < 2 {
+                    continue;
+                }
+                let repo = std::str::from_utf8(parts[0]).unwrap_or("");
+                let tag = std::str::from_utf8(parts[1]).unwrap_or("");
+                let sep = match v.iter().position(|&b| b == 0) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let digest = std::str::from_utf8(&v[..sep]).unwrap_or("");
+                let media_type = std::str::from_utf8(&v[sep + 1..]).unwrap_or("");
+                tagged.insert((repo.to_string(), digest.to_string()));
+                sink(MetaOp::PutManifest {
+                    repo: repo.to_string(),
+                    digest: digest.to_string(),
+                    media_type: media_type.to_string(),
+                    tag: Some(tag.to_string()),
+                    references: Vec::new(),
+                    referrer: None,
+                })?;
+            }
+        }
+
+        // 2. Untagged manifests (media_types not in tagged set) → PutManifest
+        {
+            let entries = self
+                .inner
+                .iter_owned(&mut rtx, I_MEDIA_TYPES)
+                .map_err(map_heed_err)?;
+            for (k, v) in &entries {
+                let parts = split_key(k);
+                if parts.len() < 2 {
+                    continue;
+                }
+                let repo = std::str::from_utf8(parts[0]).unwrap_or("");
+                let digest = std::str::from_utf8(parts[1]).unwrap_or("");
+                if tagged.contains(&(repo.to_string(), digest.to_string())) {
+                    continue;
+                }
+                let media_type = std::str::from_utf8(v).unwrap_or("");
+                sink(MetaOp::PutManifest {
+                    repo: repo.to_string(),
+                    digest: digest.to_string(),
+                    media_type: media_type.to_string(),
+                    tag: None,
+                    references: Vec::new(),
+                    referrer: None,
+                })?;
+            }
+        }
+
+        // 3. Backrefs → PutBackrefs
+        {
+            let entries = self
+                .inner
+                .iter_owned(&mut rtx, I_BACKREFS)
+                .map_err(map_heed_err)?;
+            for (k, v) in &entries {
+                let parts = split_key(k);
+                if parts.len() < 2 {
+                    continue;
+                }
+                let repo = std::str::from_utf8(parts[0]).unwrap_or("");
+                let blob = std::str::from_utf8(parts[1]).unwrap_or("");
+                let manifest = std::str::from_utf8(v).unwrap_or("");
+                sink(MetaOp::PutBackrefs {
+                    repo: repo.to_string(),
+                    manifest: manifest.to_string(),
+                    blobs: vec![blob.to_string()],
+                })?;
+            }
+        }
+
+        // 4. Referrers → PutReferrer
+        {
+            let entries = self
+                .inner
+                .iter_owned(&mut rtx, I_REFERRERS)
+                .map_err(map_heed_err)?;
+            for (k, v) in &entries {
+                let parts = split_key(k);
+                if parts.len() < 3 {
+                    continue;
+                }
+                let repo = std::str::from_utf8(parts[0]).unwrap_or("");
+                let subject = std::str::from_utf8(parts[1]).unwrap_or("");
+                let referrer = std::str::from_utf8(parts[2]).unwrap_or("");
+                sink(MetaOp::PutReferrer {
+                    repo: repo.to_string(),
+                    subject: subject.to_string(),
+                    referrer: referrer.to_string(),
+                    descriptor: v.clone(),
+                })?;
+            }
+        }
+
+        // 5. Checksums → PutChecksum
+        {
+            let entries = self
+                .inner
+                .iter_owned(&mut rtx, I_CHECKSUMS)
+                .map_err(map_heed_err)?;
+            for (k, v) in &entries {
+                let parts = split_key(k);
+                if parts.len() < 2 {
+                    continue;
+                }
+                let repo = std::str::from_utf8(parts[0]).unwrap_or("");
+                let digest = std::str::from_utf8(parts[1]).unwrap_or("");
+                let ck = decode_checksum(v);
+                sink(MetaOp::PutChecksum {
+                    repo: repo.to_string(),
+                    digest: digest.to_string(),
+                    crc32c: ck.crc32c,
+                    size: ck.size,
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl MetadataStore for LmdbMetadataStore {
     fn resolve_tag(&self, repo: &str, tag: &str) -> Option<(String, String)> {
         let mut rtx = self.inner.read_txn().ok()?;
@@ -1245,6 +1511,10 @@ impl MetadataStore for LmdbMetadataStore {
 
     fn log_len(&self) -> u64 {
         0
+    }
+
+    fn export(&self, sink: &mut dyn FnMut(MetaOp) -> io::Result<()>) -> io::Result<()> {
+        self.export_impl(sink)
     }
 }
 

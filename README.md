@@ -7,7 +7,7 @@
 
 # roci
 
-![coverage](https://img.shields.io/badge/coverage-97.48%25-brightgreen)
+![coverage](https://img.shields.io/badge/coverage-96.21%25-brightgreen)
 
 **roci** is a Rust implementation of the [OCI Distribution Specification](spec/distribution-spec/spec.md) — an OCI container registry.
 
@@ -242,6 +242,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [x] Per-repo / per-total storage quotas and a concurrent upload-session cap
 - [x] In-memory small-blob content cache (byte-capped LRU, configurable `small_blob_threshold`)
 - [x] Embedded metadata index — append-log + in-RAM maps default (compaction, rkyv mmap snapshot, optional HMAC), LMDB (heed3) B-tree KV upgrade, optional encryption at rest
+- [x] Lossless engine switching (log ↔ lmdb) — marker-based detection, verified migration at startup
 
 ### Replication
 

@@ -266,3 +266,56 @@ async fn referrers_tag_schema_fallback() {
         .items
         .is_empty());
 }
+
+/// Push a manifest under the log engine, then reopen with lmdb — the tag
+/// resolves immediately from the migrated metadata, without waiting for the
+/// background `index.json` writer.
+#[cfg(feature = "lmdb")]
+#[tokio::test]
+async fn metadata_engine_switch_preserves_tag() {
+    use roci_config::{MetadataEngine, StorageConfig};
+    use roci_storage::quota::QuotaTracker;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let body = br#"{"schemaVersion":2}"#;
+    let d = roci_storage::sha256_of(body);
+
+    // Push under log engine.
+    {
+        let config = StorageConfig::default();
+        assert_eq!(config.metadata.engine, MetadataEngine::Log);
+        let s = roci_storage::FsStorage::with_config(
+            dir.path(),
+            &config,
+            Arc::new(QuotaTracker::default()),
+        )
+        .unwrap();
+        s.put_manifest(
+            "r",
+            Some("v1"),
+            &d,
+            "application/vnd.oci.image.manifest.v1+json",
+            body,
+            roci_storage::ManifestLinks::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Reopen with lmdb — don't start maintenance / index writer.
+    {
+        let mut config = StorageConfig::default();
+        config.metadata.engine = MetadataEngine::Lmdb;
+        let s = roci_storage::FsStorage::with_config(
+            dir.path(),
+            &config,
+            Arc::new(QuotaTracker::default()),
+        )
+        .unwrap();
+        // The tag should resolve from the migrated metadata.
+        let m = s.get_manifest("r", "v1").await.unwrap();
+        assert_eq!(m.digest, d);
+        assert_eq!(m.bytes, body);
+    }
+}
