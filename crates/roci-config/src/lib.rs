@@ -256,6 +256,16 @@ pub struct S3Config {
     /// Parts transferred in parallel per multipart upload/copy.
     #[serde(default = "default_multipart_concurrency")]
     pub multipart_concurrency: usize,
+    /// If `true`, create the S3 bucket at backend startup when it does not
+    /// exist. Idempotent: `200` and `409 BucketAlreadyOwnedByYou` are both
+    /// treated as success; transport errors are retried with backoff.
+    #[serde(default)]
+    pub create_bucket: bool,
+    /// Path to a PEM file containing one or more CA certificates to trust
+    /// when connecting to the S3 endpoint over HTTPS (e.g. a private CA
+    /// serving a cert-manager-issued certificate).
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
 }
 
 fn default_s3_region() -> String {
@@ -1135,6 +1145,16 @@ impl S3Config {
                 ));
             }
         }
+        // Reject a ca_file that doesn't exist or can't be read at config time
+        // so a bad path fails fast at startup instead of on first S3 request.
+        if let Some(ca) = &self.ca_file {
+            if !ca.is_file() {
+                return Err(invalid(
+                    format!("{field}.ca_file"),
+                    format!("file does not exist: {}", ca.display()),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -1636,5 +1656,132 @@ mod tests {
             Config::load(&ok),
             Err(ConfigError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn s3_create_bucket_defaults_false() {
+        let toml = r#"
+            [storage]
+            root = "/tmp/roci"
+            [storage.s3]
+            bucket = "test"
+            region = "us-east-1"
+            endpoint = "http://localhost:9000"
+            allow_http = true
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let s3 = config.storage.s3.as_ref().unwrap();
+        assert!(!s3.create_bucket, "create_bucket should default to false");
+    }
+
+    #[test]
+    fn s3_create_bucket_true_round_trip() {
+        let toml = r#"
+            [storage]
+            root = "/tmp/roci"
+            [storage.s3]
+            bucket = "test"
+            region = "us-east-1"
+            endpoint = "http://localhost:9000"
+            allow_http = true
+            create_bucket = true
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let s3 = config.storage.s3.as_ref().unwrap();
+        assert!(s3.create_bucket, "create_bucket should be true");
+
+        // Round-trip through TOML serialization.
+        let re_toml = toml::to_string(&config).unwrap();
+        let re_config: Config = toml::from_str(&re_toml).unwrap();
+        assert!(re_config.storage.s3.as_ref().unwrap().create_bucket);
+    }
+
+    #[test]
+    fn s3_ca_file_missing_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.pem");
+        let toml = format!(
+            r#"
+            [storage]
+            root = "/tmp/roci"
+            [storage.s3]
+            bucket = "test"
+            region = "us-east-1"
+            endpoint = "http://localhost:9000"
+            allow_http = true
+            redirect_min_size = 0
+            ca_file = "{}"
+            "#,
+            missing.display()
+        );
+        let config: Config = toml::from_str(&toml).unwrap();
+        let err = config.validate();
+        assert!(
+            err.is_err(),
+            "ca_file pointing to missing file should be rejected"
+        );
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("ca_file"),
+            "error should mention ca_file: {msg}"
+        );
+    }
+
+    #[test]
+    fn s3_ca_file_valid_path_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, "not a real PEM but the file exists").unwrap();
+        let toml = format!(
+            r#"
+            [storage]
+            root = "{}"
+            [storage.s3]
+            bucket = "test"
+            region = "us-east-1"
+            endpoint = "http://localhost:9000"
+            allow_http = true
+            redirect_min_size = 0
+            ca_file = "{}"
+            "#,
+            dir.path().display(),
+            ca.display()
+        );
+        let config: Config = toml::from_str(&toml).unwrap();
+        // Validation checks file existence, not PEM content (client.rs handles PEM parse).
+        config.validate().unwrap();
+        assert_eq!(
+            config.storage.s3.as_ref().unwrap().ca_file.as_deref(),
+            Some(ca.as_path())
+        );
+    }
+
+    #[test]
+    fn s3_ca_file_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("bundle.pem");
+        std::fs::write(&ca, "PEM data").unwrap();
+        let toml = format!(
+            r#"
+            [storage]
+            root = "{}"
+            [storage.s3]
+            bucket = "test"
+            region = "us-east-1"
+            endpoint = "http://localhost:9000"
+            allow_http = true
+            redirect_min_size = 0
+            ca_file = "{}"
+            "#,
+            dir.path().display(),
+            ca.display()
+        );
+        let config: Config = toml::from_str(&toml).unwrap();
+        let re_toml = toml::to_string(&config).unwrap();
+        let re_config: Config = toml::from_str(&re_toml).unwrap();
+        assert_eq!(
+            re_config.storage.s3.as_ref().unwrap().ca_file.as_deref(),
+            Some(ca.as_path())
+        );
     }
 }

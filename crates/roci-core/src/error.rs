@@ -5,9 +5,9 @@
 //! single error type handlers return; it renders the spec JSON envelope
 //! `{ "errors": [{ "code", "message" }] }` with the correct HTTP status.
 //!
-//! `Internal` is the *only* non-spec code: it renders a `500` with the
-//! registry-specific `UNKNOWN` code (the spec permits registry-defined codes),
-//! preserving the pre-existing internal-error behavior.
+//! `Internal` and `Unavailable` are the *only* non-spec cases: they render
+//! `500` / `503` with the registry-specific `UNKNOWN` code (the spec permits
+//! registry-defined codes) and a fixed message, never backend error text.
 
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -98,6 +98,9 @@ pub enum ApiError {
         challenge: Option<HeaderValue>,
     },
     TooEarly,
+    /// Storage backend temporarily unreachable (e.g. S3 bucket not yet
+    /// replicated). Renders `503 Service Unavailable` with `UNKNOWN`.
+    Unavailable(String),
 }
 
 impl ApiError {
@@ -150,14 +153,15 @@ impl ApiError {
             ApiError::InsufficientStorage(_) => StatusCode::INSUFFICIENT_STORAGE,
             ApiError::Unauthenticated { .. } => StatusCode::UNAUTHORIZED,
             ApiError::TooEarly => StatusCode::from_u16(425).expect("425 is a valid status"),
+            ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
-    /// The wire code string (`UNKNOWN` for the internal case).
+    /// The wire code string (`UNKNOWN` for the internal and unavailable cases).
     pub fn code(&self) -> &str {
         match self {
             ApiError::Spec { code, .. } => code.wire(),
-            ApiError::Internal(_) => "UNKNOWN",
+            ApiError::Internal(_) | ApiError::Unavailable(_) => "UNKNOWN",
             ApiError::PayloadTooLarge(_) => ErrorCode::SizeInvalid.wire(),
             ApiError::InsufficientStorage(_) | ApiError::TooEarly => ErrorCode::Denied.wire(),
             ApiError::Unauthenticated { .. } => ErrorCode::Unauthorized.wire(),
@@ -167,7 +171,7 @@ impl ApiError {
     fn message(&self) -> &str {
         match self {
             ApiError::Spec { message, .. } => message,
-            ApiError::Internal(m) => m,
+            ApiError::Internal(m) | ApiError::Unavailable(m) => m,
             ApiError::PayloadTooLarge(m) => m,
             ApiError::InsufficientStorage(m) => m,
             ApiError::Unauthenticated { message, .. } => message,
@@ -247,6 +251,10 @@ impl From<StorageError> for ApiError {
                 ApiError::manifest_blob_unknown(format!("referenced blob {d} is not present"))
             }
             StorageError::Io(_) => ApiError::Internal("internal error".to_string()),
+            StorageError::Unavailable(detail) => {
+                tracing::warn!(error = %detail, "storage backend unavailable");
+                ApiError::Unavailable("storage temporarily unavailable".to_string())
+            }
         }
     }
 }

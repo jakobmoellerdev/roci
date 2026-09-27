@@ -17,9 +17,21 @@ use std::time::Duration;
 
 // ── helpers ────────────────────────────────────────────────────────────
 
-fn obj_err(e: object_store::Error) -> StorageError {
+pub(crate) fn obj_err(e: object_store::Error) -> StorageError {
     match e {
         object_store::Error::NotFound { .. } => StorageError::NotFound,
+        other => StorageError::Io(io::Error::other(other.to_string())),
+    }
+}
+
+/// Like [`obj_err`] but for **write paths**: a `NotFound` from a PUT/copy
+/// (i.e. "NoSuchBucket") must never surface as `NAME_UNKNOWN` (404) — it is a
+/// transient backend problem, not a missing repository.
+pub(crate) fn obj_err_write(e: object_store::Error) -> StorageError {
+    match e {
+        object_store::Error::NotFound { .. } => StorageError::Unavailable(
+            "storage backend returned NotFound on a write (bucket may not exist yet)".to_string(),
+        ),
         other => StorageError::Io(io::Error::other(other.to_string())),
     }
 }
@@ -56,6 +68,9 @@ const SWEEP_BATCH_SIZE: usize = 256;
 
 /// S3 single CopyObject limit: 5 GiB.
 pub(crate) const S3_COPY_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
+
+/// How long `create_bucket` keeps retrying while the backend starts.
+pub(crate) const CREATE_BUCKET_DEADLINE: Duration = Duration::from_secs(60);
 
 // ── Storage trait impl ─────────────────────────────────────────────────
 
@@ -335,7 +350,7 @@ impl Storage for S3Storage {
             {
                 drop(pin);
                 self.quota.release(repo, charged);
-                return Err(obj_err(e));
+                return Err(obj_err_write(e));
             }
         }
 
@@ -639,6 +654,15 @@ impl Storage for S3Storage {
 
 impl StorageBackend for S3Storage {
     async fn recover(&self) {
+        if self.create_bucket {
+            match self.ensure_bucket().await {
+                Ok(()) => self
+                    .bucket_ensured
+                    .store(true, std::sync::atomic::Ordering::Release),
+                // `ready()` keeps retrying, so /readyz heals once S3 accepts it.
+                Err(e) => tracing::error!(error = %e, "create_bucket failed"),
+            }
+        }
         self.recover_from_remote_indexes().await;
     }
 
@@ -698,6 +722,61 @@ impl StorageBackend for S3Storage {
             dedupe = self.config.dedupe,
             "S3 storage maintenance started"
         );
+    }
+
+    async fn ready(&self) -> Result<(), StorageError> {
+        // Fast path: a successful probe within the last 10 s is still valid.
+        const PROBE_TTL: Duration = Duration::from_secs(10);
+        {
+            let cache = self
+                .readiness_cache
+                .lock()
+                .expect("readiness_cache poisoned");
+            if let Some(ts) = *cache {
+                if ts.elapsed() < PROBE_TTL {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Startup CreateBucket gave up (backend slow to form): one more attempt
+        // per readiness check until it succeeds.
+        if self.create_bucket
+            && !self
+                .bucket_ensured
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.ensure_bucket_within(Duration::ZERO).await?;
+            self.bucket_ensured
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        // Probe: PUT then DELETE a sentinel object.
+        let key = if self.client.prefix.is_empty() {
+            ".roci-readyz-probe".to_string()
+        } else {
+            format!("{}/.roci-readyz-probe", self.client.prefix)
+        };
+        let path = ObjPath::from(key);
+
+        self.client
+            .store
+            .put(&path, PutPayload::from_static(b"ok"))
+            .await
+            .map_err(|e| StorageError::Unavailable(format!("readiness probe PUT failed: {e}")))?;
+
+        // Best-effort cleanup; failure doesn't affect readiness.
+        let _ = self.client.store.delete(&path).await;
+
+        // Cache success.
+        {
+            let mut cache = self
+                .readiness_cache
+                .lock()
+                .expect("readiness_cache poisoned");
+            *cache = Some(std::time::Instant::now());
+        }
+        Ok(())
     }
 }
 
@@ -793,7 +872,7 @@ impl S3Storage {
             .store
             .put(&lp, PutPayload::from_static(OCI_LAYOUT_MARKER.as_bytes()))
             .await
-            .map_err(obj_err)?;
+            .map_err(obj_err_write)?;
         // Write empty index.json if it doesn't exist.
         let ik = index_key(&self.client.prefix, repo)?;
         let ip = ObjPath::from(ik);
@@ -804,7 +883,7 @@ impl S3Storage {
                 .store
                 .put(&ip, PutPayload::from(Bytes::from(index)))
                 .await
-                .map_err(obj_err)?;
+                .map_err(obj_err_write)?;
         }
         self.layout_cache
             .lock()
@@ -834,7 +913,7 @@ impl S3Storage {
                 .store
                 .copy_opts(&from_path, &to_path, Default::default())
                 .await
-                .map_err(obj_err)?;
+                .map_err(obj_err_write)?;
         } else {
             // Parallel copy: ranged GETs → multipart upload, bounded memory.
             self.parallel_copy(&from_path, &to_path, size).await?;
@@ -858,15 +937,15 @@ impl S3Storage {
             .store
             .put_multipart_opts(to, Default::default())
             .await
-            .map_err(obj_err)?;
+            .map_err(obj_err_write)?;
         let mut writer = WriteMultipart::new_with_chunk_size(upload, part_size as usize);
 
         let mut offset: u64 = 0;
         while offset < size {
             // Back-pressure: wait until fewer than `concurrency` parts in flight.
             if let Err(e) = writer.wait_for_capacity(concurrency).await {
-                writer.abort().await.map_err(obj_err)?;
-                return Err(obj_err(e));
+                writer.abort().await.map_err(obj_err_write)?;
+                return Err(obj_err_write(e));
             }
             let len = (size - offset).min(part_size);
             let chunk = self
@@ -882,7 +961,7 @@ impl S3Storage {
         }
 
         if let Err(e) = writer.finish().await {
-            return Err(obj_err(e));
+            return Err(obj_err_write(e));
         }
         Ok(())
     }
@@ -955,7 +1034,7 @@ impl S3Storage {
                 .store
                 .put(&obj_path, PutPayload::from(Bytes::from(data)))
                 .await
-                .map_err(obj_err)?;
+                .map_err(obj_err_write)?;
         } else {
             // Streaming multipart upload.
             let upload = self
@@ -963,7 +1042,7 @@ impl S3Storage {
                 .store
                 .put_multipart_opts(&obj_path, Default::default())
                 .await
-                .map_err(obj_err)?;
+                .map_err(obj_err_write)?;
             let mut writer = WriteMultipart::new_with_chunk_size(upload, part_size);
 
             let mut file = roci_storage::beneath::open_beneath(&self.root, &rel).await?;
@@ -971,8 +1050,8 @@ impl S3Storage {
             loop {
                 // Back-pressure: bounded concurrency.
                 if let Err(e) = writer.wait_for_capacity(concurrency).await {
-                    writer.abort().await.map_err(obj_err)?;
-                    return Err(obj_err(e));
+                    writer.abort().await.map_err(obj_err_write)?;
+                    return Err(obj_err_write(e));
                 }
                 let n = tokio::io::AsyncReadExt::read(&mut file, &mut buf).await?;
                 if n == 0 {
@@ -982,7 +1061,7 @@ impl S3Storage {
             }
 
             if let Err(e) = writer.finish().await {
-                return Err(obj_err(e));
+                return Err(obj_err_write(e));
             }
         }
         Ok(())
@@ -1076,6 +1155,72 @@ impl S3Storage {
             .lock()
             .expect("poisoned")
             .insert(repo.to_string(), index);
+    }
+}
+
+// ── create bucket ──────────────────────────────────────────────────────
+
+impl S3Storage {
+    /// Ensure the configured S3 bucket exists: a signed path-style
+    /// `PUT /<bucket>` (CreateBucket) through the store's HTTP client, so the
+    /// `ca_file` roots and `allow_http` apply. `200` (created, or already
+    /// owned on backends that answer so) and `409` (`BucketAlreadyOwnedByYou`)
+    /// are success. There is no existence pre-check: a HEAD on a missing
+    /// bucket is an indistinguishable 404. Other statuses and transport errors
+    /// retry with backoff for up to [`CREATE_BUCKET_DEADLINE`] (the backend may
+    /// still be starting); on expiry the error is returned and `/readyz` stays
+    /// `503` until the bucket is writable.
+    pub(crate) async fn ensure_bucket(&self) -> Result<(), StorageError> {
+        self.ensure_bucket_within(CREATE_BUCKET_DEADLINE).await
+    }
+
+    pub(crate) async fn ensure_bucket_within(
+        &self,
+        deadline: Duration,
+    ) -> Result<(), StorageError> {
+        let (Some(signer), Some(http)) = (&self.client.signer, &self.client.bucket_http) else {
+            return Err(StorageError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "create_bucket requires S3 credentials",
+            )));
+        };
+        let give_up = tokio::time::Instant::now() + deadline;
+        let mut delay = Duration::from_millis(250);
+        loop {
+            // Re-sign each attempt: a retry window can outlive one signature.
+            let url = signer
+                .signed_url(
+                    http::Method::PUT,
+                    &ObjPath::from(""),
+                    Duration::from_secs(60),
+                )
+                .await
+                .map_err(|e| {
+                    StorageError::Io(io::Error::other(format!("signing CreateBucket: {e}")))
+                })?;
+            let request = http::Request::put(url.as_str())
+                .body(object_store::client::HttpRequestBody::empty())
+                .map_err(|e| StorageError::Io(io::Error::other(e)))?;
+            let failure = match http.execute(request).await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    if status == 200 || status == 409 {
+                        tracing::info!(status, "create_bucket: bucket ready");
+                        return Ok(());
+                    }
+                    format!("HTTP {status}")
+                }
+                Err(e) => e.to_string(),
+            };
+            if tokio::time::Instant::now() + delay > give_up {
+                return Err(StorageError::Unavailable(format!(
+                    "create_bucket failed: {failure}"
+                )));
+            }
+            tracing::warn!(error = %failure, "create_bucket: retrying");
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(5));
+        }
     }
 }
 
@@ -1655,7 +1800,7 @@ impl S3Storage {
             .store
             .put(&path, PutPayload::from(Bytes::from(bytes)))
             .await
-            .map_err(obj_err)?;
+            .map_err(obj_err_write)?;
         Ok(())
     }
 

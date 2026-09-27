@@ -17,7 +17,7 @@ roci's security posture is reverse-engineered from [zot](https://zotregistry.dev
 
 ## Kubernetes controls
 
-The Helm chart runs every workload PSS-restricted with default-deny NetworkPolicies, no ServiceAccount token or RBAC, a secure-by-default auth guard, digest-pinned dependency images, and roci's secrets as 0440 file mounts. See [Kubernetes controls (Helm chart)](https://github.com/jakobmoellerdev/roci/blob/main/SECURITY.md#kubernetes-controls-helm-chart) in the canonical doc.
+The Helm chart runs every workload PSS-restricted with default-deny NetworkPolicies, no ServiceAccount token or RBAC, a secure-by-default auth guard, digest-pinned dependency images, and roci's secrets as 0440 file mounts. Unauthenticated health endpoints (`/readyz`, `/livez`) expose only a readiness flag and a short reason string — no internal state or version info. Private-CA trust for S3 endpoints outside the chart is supported via the `ca_file` config key; RustFS client-cert mTLS is blocked (no client-cert API in `object_store`; no server-TLS-only mode in the RustFS subchart). See [Kubernetes controls (Helm chart)](https://github.com/jakobmoellerdev/roci/blob/main/SECURITY.md#kubernetes-controls-helm-chart) in the canonical doc.
 
 ## Authentication & authorization
 

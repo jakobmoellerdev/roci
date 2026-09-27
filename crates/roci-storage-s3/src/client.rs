@@ -2,6 +2,7 @@
 //! `InMemory` for tests.
 
 use object_store::aws::AmazonS3Builder;
+use object_store::client::HttpConnector;
 #[cfg(test)]
 use object_store::memory::InMemory;
 use object_store::signer::Signer;
@@ -84,6 +85,9 @@ pub(crate) struct S3Client {
     pub copy_limit: u64,
     /// SSRF host guard for signed-URL redirects.
     pub redirect_guard: RedirectGuard,
+    /// Raw HTTP client sharing the store's `ClientOptions` (TLS roots,
+    /// `allow_http`), for bucket-level calls object_store has no API for.
+    pub bucket_http: Option<object_store::client::HttpClient>,
 }
 
 /// The HTTPS client is built on rustls without a bundled provider: make
@@ -107,9 +111,9 @@ impl S3Client {
                 .with_virtual_hosted_style_request(false);
         }
 
-        if s3.allow_http {
-            builder = builder.with_allow_http(true);
-        }
+        // One ClientOptions for the store and the bucket-level HTTP client, so
+        // `allow_http` and the `ca_file` roots apply to both.
+        let mut opts = object_store::ClientOptions::default().with_allow_http(s3.allow_http);
 
         // Static credentials: key id + secret from file.
         if let Some(key_id) = &s3.access_key_id {
@@ -131,6 +135,43 @@ impl S3Client {
                 .with_access_key_id(key_id)
                 .with_secret_access_key(secret.trim());
         }
+
+        // Custom CA bundle for private-CA HTTPS endpoints.
+        if let Some(ca_path) = &s3.ca_file {
+            let pem = std::fs::read(ca_path).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("reading ca_file {}: {e}", ca_path.display()),
+                )
+            })?;
+            let certs = object_store::Certificate::from_pem_bundle(&pem).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("parsing PEM ca_file {}: {e}", ca_path.display()),
+                )
+            })?;
+            if certs.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "ca_file {} contains no valid PEM certificates",
+                        ca_path.display()
+                    ),
+                ));
+            }
+            for cert in certs {
+                opts = opts.with_root_certificate(cert);
+            }
+        }
+        builder = builder.with_client_options(opts.clone());
+        let bucket_http = object_store::client::ReqwestConnector::default()
+            .connect(&opts)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("building S3 HTTP client: {e}"),
+                )
+            })?;
 
         let store = builder.build().map_err(|e| {
             io::Error::new(
@@ -154,6 +195,7 @@ impl S3Client {
             multipart_concurrency: s3.multipart_concurrency,
             copy_limit: super::storage_impl::S3_COPY_LIMIT,
             redirect_guard,
+            bucket_http: Some(bucket_http),
         })
     }
 
@@ -179,12 +221,19 @@ impl S3Client {
             multipart_concurrency,
             copy_limit: super::storage_impl::S3_COPY_LIMIT,
             redirect_guard: RedirectGuard::new(vec!["s3.test.example".into()], false),
+            bucket_http: None,
         }
     }
 
     #[cfg(test)]
     pub fn with_redirect_guard(mut self, g: RedirectGuard) -> Self {
         self.redirect_guard = g;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_bucket_http(mut self, http: object_store::client::HttpClient) -> Self {
+        self.bucket_http = Some(http);
         self
     }
 }

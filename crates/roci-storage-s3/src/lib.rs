@@ -66,6 +66,13 @@ pub struct S3Storage {
     /// Striped per-`(repo, digest)` async locks serialising admit+publish so
     /// concurrent uploads of the same blob cannot double-charge quota.
     admit_locks: UploadLocks,
+    /// Cached readiness probe result: `(ok?, last_checked)`. A successful
+    /// probe is valid for 10 s; a failure is re-probed on the next call.
+    readiness_cache: Arc<StdMutex<Option<std::time::Instant>>>,
+    /// Create the S3 bucket if it does not exist at startup.
+    create_bucket: bool,
+    /// A CreateBucket attempt has succeeded (only meaningful with `create_bucket`).
+    bucket_ensured: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl S3Storage {
@@ -77,7 +84,9 @@ impl S3Storage {
         storage: &StorageConfig,
         quota: Arc<QuotaTracker>,
     ) -> io::Result<Self> {
-        Self::open_with_client(root, S3Client::from_config(s3)?, storage, quota)
+        let mut me = Self::open_with_client(root, S3Client::from_config(s3)?, storage, quota)?;
+        me.create_bucket = s3.create_bucket;
+        Ok(me)
     }
 
     /// Internal constructor shared by `open` and tests (InMemory).
@@ -109,6 +118,9 @@ impl S3Storage {
             manifest_sizes: Arc::new(StdMutex::new(HashMap::new())),
             cached_remote_index: Arc::new(StdMutex::new(HashMap::new())),
             admit_locks: Arc::new(StdMutex::new(HashMap::new())),
+            readiness_cache: Arc::new(StdMutex::new(None)),
+            create_bucket: false,
+            bucket_ensured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 

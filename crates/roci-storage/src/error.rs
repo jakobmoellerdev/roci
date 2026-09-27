@@ -33,6 +33,10 @@ pub enum StorageError {
     /// The concurrent upload-session cap is reached.
     #[error("too many concurrent upload sessions (limit {limit})")]
     TooManySessions { limit: usize },
+    /// The storage backend is temporarily unavailable (e.g. bucket not yet
+    /// accessible on all nodes). Write-path callers surface this as a 503.
+    #[error("storage unavailable: {0}")]
+    Unavailable(String),
 }
 
 /// Which storage quota a rejected write would exceed.

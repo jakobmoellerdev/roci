@@ -1,12 +1,15 @@
 {{- if .Values.rustfs.enabled }}
 {{- /*
-RustFS has no startup bucket creation, so this hook creates s3.bucket with a
-SigV4-signed PUT. Idempotent (409 BucketAlreadyOwnedByYou on upgrade) and
-retrying while RustFS is still forming its erasure set. A new bucket reaches
-the other RustFS pods asynchronously (a pod can answer NoSuchBucket to
-PutObject seconds after creation), so the hook then writes and deletes a
-probe object on every pod until each accepts it. Credentials reach curl
-through a config on stdin, never argv.
+roci creates s3.bucket itself (create_bucket = true in its config): /readyz
+stays 503 until the bucket is writable, and helm runs this post-install hook
+only after --wait sees roci Ready, so roci cannot depend on the hook.
+
+A new bucket reaches the other RustFS pods asynchronously (a pod can answer
+NoSuchBucket to PutObject seconds after creation), and roci sees only the
+Service. This hook therefore (idempotently: 200/409) PUTs the bucket, then
+writes and deletes a probe object on every pod via the headless Service until
+each accepts it, so the install completes only once all pods know the bucket.
+Credentials reach curl through a config on stdin, never argv.
 */}}
 {{- $fullname := include "roci.fullname" . }}
 apiVersion: batch/v1
