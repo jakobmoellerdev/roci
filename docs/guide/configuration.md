@@ -52,7 +52,7 @@ enabled = false
 
 [storage]
 root = "./roci-data"
-cache_max_bytes = 268435456   # small-blob LRU cache budget; 0 disables it
+cache_max_bytes = 268435456   # small-blob LRU cache budget (keys + content + bookkeeping); filled by reads and manifest pushes; 0 disables it
 small_blob_threshold = 102400 # max blob size eligible for the cache (bytes); 0 < t ≤ 8 MiB, t ≤ cache_max_bytes
 dedupe = true                 # link (reflink → hard link) a blob another repo already stores
 commit = false                # fsync blob data before acknowledging (zot's `commit`); manifests/WAL/index are always synced

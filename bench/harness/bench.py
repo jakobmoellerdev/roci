@@ -418,7 +418,7 @@ class Bench:
                 pass
 
     def ph_scale(self, name, url, out, m):
-        """Metadata-scale scenario: push many small manifests sharing one blob+config, then measure reads."""
+        """Metadata-scale scenario: push many small images (3 small blobs each), then measure reads."""
         sc = self.scale
         if not sc:
             raise PhaseUnsupported("no [profiles.<p>.scale] section in config.toml")

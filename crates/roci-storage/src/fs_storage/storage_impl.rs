@@ -262,13 +262,12 @@ impl Storage for FsStorage {
                 commit: self.config.commit,
                 quota: std::sync::Arc::clone(&self.quota),
                 dedupe: std::sync::Arc::clone(&self.dedupe),
-                warm_limit: self.cache.threshold().min(WARM_CAP),
                 verify,
             };
             run_blocking("finish_land", move || Ok(land_blob(ctx))).await?
         };
-        let (warm, landed_crc) = match landed {
-            Landed::Done { warm, crc } => (warm, crc),
+        let landed_crc = match landed {
+            Landed::Done { crc } => crc,
             Landed::Mismatch(actual) => {
                 drop(pin);
                 drop(_admit_guard);
@@ -308,9 +307,6 @@ impl Storage for FsStorage {
         drop(pin);
         drop(_admit_guard);
         self.blob_admit_locks.release(repo, &digest_str);
-        if let Some(bytes) = warm {
-            self.cache.put(repo, &digest_str, &bytes);
-        }
         roci_telemetry::record_upload_finalize("ok");
         Ok(())
     }
@@ -374,7 +370,6 @@ impl Storage for FsStorage {
         drop(pin);
         drop(_admit_guard);
         self.blob_admit_locks.release(repo, &digest_str);
-        self.cache.put(repo, &digest_str, data);
         Ok(())
     }
 
@@ -776,9 +771,6 @@ impl FsStorage {
     }
 }
 
-/// Ceiling for small-blob cache warm reads.
-const WARM_CAP: usize = 8 * 1024 * 1024;
-
 enum Staging {
     Missing,
     NotRegular,
@@ -847,17 +839,13 @@ struct LandCtx {
     commit: bool,
     quota: std::sync::Arc<crate::quota::QuotaTracker>,
     dedupe: std::sync::Arc<crate::DedupeIndex>,
-    warm_limit: usize,
     /// Deferred body tail + hash-on-write state for landing hop verification.
     verify: Option<(Deferred, Digest)>,
 }
 
 enum Landed {
-    /// Landed; cache warm bytes and optional CRC32C.
-    Done {
-        warm: Option<Vec<u8>>,
-        crc: Option<u32>,
-    },
+    /// Landed, with the CRC32C computed while verifying (if any).
+    Done { crc: Option<u32> },
     /// The deferred-tail digest did not match (nothing admitted or moved).
     Mismatch(Digest),
     /// Admission refused (quota): nothing was charged.
@@ -867,7 +855,6 @@ enum Landed {
 }
 
 fn land_blob(mut c: LandCtx) -> Landed {
-    use std::io::Read;
     let crc = match c.verify.take() {
         None => None,
         Some((body, expected)) => match body.write_tail() {
@@ -919,20 +906,8 @@ fn land_blob(mut c: LandCtx) -> Landed {
             error: map_not_found(e),
         };
     }
-    // Cache warm for small blobs.
-    let warm = (c.warm_limit > 0 && c.size as usize <= c.warm_limit)
-        .then(|| {
-            let f = resolve_beneath(&c.root, &c.alg_rel.join(&c.hex), rustix::fs::OFlags::RDONLY)
-                .ok()?;
-            let mut bytes = Vec::with_capacity(c.size as usize);
-            f.take(c.warm_limit as u64 + 1)
-                .read_to_end(&mut bytes)
-                .ok()?;
-            (bytes.len() <= c.warm_limit).then_some(bytes)
-        })
-        .flatten();
     let _ = charged;
-    Landed::Done { warm, crc }
+    Landed::Done { crc }
 }
 
 fn dedupe_link_sync(c: &LandCtx) -> bool {

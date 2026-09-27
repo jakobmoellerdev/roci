@@ -33,7 +33,7 @@ A hot-path step **passes** when every response has the expected status (404 for 
 
 ### Metadata-scale scenario
 
-The `scale` phase pushes many small manifests (reusing one shared config blob + one tiny 4 KiB layer, varying only the tag) to stress metadata indexing at volume. The `quick` profile pushes ~100 k tags (10 repos × 10 000 tags); `full` pushes 1 M tags (100 repos × 10 000 tags). After the push:
+The `scale` phase pushes many small images through `loadgen seed` to stress metadata indexing at volume: each image has its own 4 KiB layer, config and manifest (three small blobs per tag). The `quick` profile pushes ~100 k tags (10 repos × 10 000 tags, ~300 k blobs); `full` pushes 1 M tags (100 repos × 10 000 tags). After the push:
 
 | measurement | metric key |
 |---|---|
@@ -55,11 +55,11 @@ The scale parameters are configured per profile in `bench/config.toml` under `[p
 |---|---|---|---|---|
 | scale push (images/s) | 2845 | 1305 | 2109 | 74 |
 | tag resolve p50 / p99 (ms) | 0.24 / 11.8 | 0.25 / 778 | 0.21 / 1.1 | 2793 / 7030 |
-| anon RSS after reads (MiB) | 664 | 662 | 480 | 129 |
+| anon RSS after reads (MiB), before → after the heap fixes | 664 → 326 | 662 → 254 | 480 → 174 | 129 |
 | restart with the corpus (ms) | 8093 | 3649 | 973 | 112 |
 | metadata on disk (MB) | 89 | 222 | 215 | — |
 
-LMDB has the flattest tail latency and the fastest restart; the log engine is the fastest pusher; heap at this scale is dominated by something other than the metadata engine. Analysis and follow-ups: [RESEARCH §9.9](https://github.com/jakobmoellerdev/roci/blob/main/RESEARCH.md).
+LMDB has the flattest tail latency and the fastest restart; the log engine is the fastest pusher. The heap row shows the fixes from RESEARCH §9.9 (read-driven small-blob cache with honest budget accounting, clone-free log compaction, per-repo log state); the other rows are from the first run. Analysis and follow-ups: [RESEARCH §9.9](https://github.com/jakobmoellerdev/roci/blob/main/RESEARCH.md).
 
 ## Fairness & parity
 

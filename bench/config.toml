@@ -27,7 +27,7 @@ warmup_secs = 2
 fleet = 4
 
 [profiles.quick.scale]
-# Metadata-scale: many small manifests sharing one config+layer, vary tag.
+# Metadata-scale: many small images (own 4 KiB layer + config + manifest each).
 # Target ~100k tags in "quick-scale"; scale_repos × scale_tags_per_repo.
 scale_repos = 10
 scale_tags_per_repo = 10000
