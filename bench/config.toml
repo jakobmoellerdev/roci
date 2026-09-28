@@ -1,10 +1,11 @@
 seed = 42
 
 # All registries: every roci engine variant + external registries.
-all_registries = ["roci-log", "roci-snapshot", "roci-lmdb", "zot", "distribution"]
+# Default set; `distribution` stays selectable via BENCH_REGISTRIES / the `registries` input.
+all_registries = ["roci-log", "roci-lmdb", "zot"]
 
 # roci variants share the same image — only the config file differs.
-roci_variants = ["roci-log", "roci-snapshot", "roci-lmdb"]
+roci_variants = ["roci-log", "roci-lmdb"]
 
 [images.zot]   # zot full image, no extensions configured (shipped default image; zot-minimal is not benchmarked)
 amd64 = "ghcr.io/project-zot/zot-linux-amd64:v2.1.21@sha256:8258443838e95989c13c891f78a02bc1c391b5a00591ffef24cb8c17cde28038"

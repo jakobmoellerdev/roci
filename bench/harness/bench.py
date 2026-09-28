@@ -29,7 +29,7 @@ P99_BUDGET_MS = 20.0
 ZB_SIZE_MIB = {"1MB": 1, "10MB": 10, "100MB": 100}
 
 # roci variant names share the roci image; only the config file differs.
-ROCI_VARIANTS = {"roci-log", "roci-snapshot", "roci-lmdb"}
+ROCI_VARIANTS = {"roci-log", "roci-lmdb"}
 
 
 def is_roci(name: str) -> bool:
@@ -106,7 +106,7 @@ class Bench:
         self.profile_name = os.environ.get("BENCH_PROFILE", "quick")
         self.p = self.cfg["profiles"][self.profile_name]
         self.seed = int(self.cfg["seed"])
-        default_regs = ",".join(self.cfg.get("all_registries", ["roci-log", "roci-snapshot", "roci-lmdb", "zot", "distribution"]))
+        default_regs = ",".join(self.cfg.get("all_registries", ["roci-log", "roci-lmdb", "zot"]))
         self.registries = [r for r in os.environ.get("BENCH_REGISTRIES", default_regs).split(",") if r]
         self.roci_variants: set[str] = set(self.cfg.get("roci_variants", [])) | ROCI_VARIANTS
         self.reps = int(self.p["reps"])

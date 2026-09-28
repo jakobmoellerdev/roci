@@ -7,7 +7,7 @@ import statistics
 
 
 # Shared with bench.py — roci variant names.
-_ROCI_NAMES = {"roci", "roci-log", "roci-snapshot", "roci-lmdb"}
+_ROCI_NAMES = {"roci", "roci-log", "roci-lmdb"}
 # key -> (label, unit, better)
 METRICS: dict[str, tuple[str, str, str]] = {
     "startup.empty_ms": ("Startup, empty store", "ms", "lower"),

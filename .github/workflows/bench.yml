@@ -21,7 +21,7 @@ on:
         options: [quick, full]
         default: quick
       registries:
-        description: comma-separated registries (roci-log, roci-snapshot, roci-lmdb, zot, distribution); empty = all
+        description: comma-separated registries (roci-log, roci-lmdb, zot, distribution); empty = roci-log,roci-lmdb,zot
         type: string
         default: ""
       roci_image:

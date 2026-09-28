@@ -55,7 +55,7 @@ docker run -d --name roci --read-only \
   ghcr.io/jakobmoellerdev/roci:latest --config /etc/roci/roci.toml
 ```
 
-In Kubernetes, mount the file from a ConfigMap and TLS keys — plus `storage.metadata.hmac_key_file` and an S3 `secret_access_key_file`, if used — from a Secret. Garbage collection, scrub quarantine (`.roci-quarantine/`) and metadata snapshots all stay inside the storage volume, so the read-only root filesystem is unaffected. See [Configuration](/guide/configuration) for every key.
+In Kubernetes, mount the file from a ConfigMap and TLS keys — plus `storage.metadata.hmac_key_file` and an S3 `secret_access_key_file`, if used — from a Secret. Garbage collection, scrub quarantine (`.roci-quarantine/`) and metadata all stay inside the storage volume, so the read-only root filesystem is unaffected. See [Configuration](/guide/configuration) for every key.
 
 ## Image metadata
 

@@ -1,7 +1,0 @@
-[log]
-level = "warn"
-
-[storage.metadata]
-snapshot = true
-# compact_threshold_bytes stays at its 64 MiB default: the scale phase grows the
-# WAL well past it, so snapshots are cut at production cadence, not constantly.

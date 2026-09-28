@@ -42,7 +42,7 @@ tls:
 
 metadataHmac:
   # Secret holding a >= 32-byte key that authenticates every metadata log
-  # record and snapshot (compromised-storage-volume threat model).
+  # record (compromised-storage-volume threat model).
   existingSecret: ""
   # Key inside the Secret.
   key: hmac-key
@@ -114,10 +114,8 @@ config:
       # Concurrent upload sessions (0 = unlimited).
       maxUploadSessions: 1024
     metadata:
-      # log | redb
+      # log | lmdb
       engine: log
-      # Serve the log engine from an mmap snapshot.
-      snapshot: false
       # Compact the log once it grows past this size.
       compactThresholdBytes: 67108864
   telemetry:

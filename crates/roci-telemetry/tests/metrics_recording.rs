@@ -41,7 +41,6 @@ async fn metrics_full_lifecycle() {
     roci_telemetry::record_meta_wal_append();
     roci_telemetry::record_meta_wal_batch_size(3);
     roci_telemetry::record_meta_compaction("ok");
-    roci_telemetry::record_meta_snapshot("ok");
     roci_telemetry::record_upload_active(1);
     roci_telemetry::record_upload_bytes(65536);
     roci_telemetry::record_upload_finalize("ok");
@@ -78,7 +77,6 @@ async fn metrics_full_lifecycle() {
         "registry_quota_rejections_total{scope=\"total\"} 1",
         "registry_meta_wal_appends_total{} 2",
         "registry_meta_compaction_total{result=\"ok\"} 1",
-        "registry_meta_snapshot_total{result=\"ok\"} 1",
         "registry_upload_bytes_total{} 65536",
         "registry_upload_finalize_total{result=\"ok\"} 1",
     ] {

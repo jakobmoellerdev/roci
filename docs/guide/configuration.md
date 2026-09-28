@@ -76,9 +76,8 @@ max_upload_sessions = 1024    # concurrent upload sessions → 429 TOOMANYREQUES
 
 [storage.metadata]
 engine = "log"                # log: append-only WAL + in-RAM maps; lmdb: embedded B-tree KV (`lmdb` build; for LMDB use volume encryption)
-snapshot = false              # log engine: serve from an rkyv mmap snapshot + WAL tail
-compact_threshold_bytes = 67108864  # compact the WAL / cut a snapshot past this size
-# hmac_key_file = "/etc/roci/meta.key"  # ≥ 32-byte key authenticating WAL records + snapshot; with engine = "lmdb" the key is accepted (lossless engine switches) but LMDB does not use it — use volume encryption for LMDB at rest
+compact_threshold_bytes = 67108864  # compact the WAL past this size
+# hmac_key_file = "/etc/roci/meta.key"  # ≥ 32-byte key authenticating WAL records; with engine = "lmdb" the key is accepted (lossless engine switches) but LMDB does not use it — use volume encryption for LMDB at rest
 # map_size_bytes = 68719476736  # lmdb engine: LMDB mmap address-space reservation (default 64 GiB); must be > 0
 
 # Route a repository prefix to its own storage path or backend (zot `subPaths`).
@@ -199,7 +198,7 @@ authenticated = ["pull", "push"]
   - Request: `http_server_request_duration_seconds` (histogram), `registry_request_errors_total` (counter by `error_code`).
   - Storage: `registry_gc_collected_total` / `_bytes_total` (by `kind`), `registry_scrub_checked_total` / `_bytes_total` (by `result`), `registry_dedupe_links_total` (by `op`, `mechanism`), `registry_quota_rejections_total` (by `scope`).
   - Auth: `registry_auth_decisions_total` (by `method`, `result`).
-  - MetadataStore: `registry_meta_wal_appends_total`, `registry_meta_wal_batch_size` (histogram), `registry_meta_compaction_total` / `registry_meta_snapshot_total` (by `result`).
+  - MetadataStore: `registry_meta_wal_appends_total`, `registry_meta_wal_batch_size` (histogram), `registry_meta_compaction_total` (by `result`).
   - Upload sessions: `registry_upload_active` (gauge), `registry_upload_bytes_total`, `registry_upload_finalize_total` (by `result`).
 - **Spans** (child of the per-request `http.request` root span): `blob.stream` (bytes, range), `cas.link` (mechanism), `blob.open`, `meta.resolve`, `meta.append`, `upload.session`, `digest.verify`, `authn.authorize`. Storage-internal `spawn_blocking` work propagates the request span context.
 
