@@ -24,6 +24,10 @@ on:
         description: comma-separated registries (roci-log, roci-lmdb, zot, distribution); empty = roci-log,roci-lmdb,zot
         type: string
         default: ""
+      scale_tags_per_repo:
+        description: tags per repo in the metadata-scale phase (10 repos); the local quick profile uses 10000, which takes >1 h per external registry on this runner
+        type: string
+        default: "1000"
       roci_image:
         description: roci image to benchmark (default ghcr.io/<repo>:<commit sha>; must be published — main commits are)
         type: string
@@ -62,6 +66,7 @@ jobs:
           BENCH_ROCI_PREBUILT: ${{ inputs.roci_image || format('ghcr.io/{0}:{1}', github.repository, github.sha) }}
           BENCH_RUNNER_PREBUILT: "1"
           BENCH_REGISTRIES: ${{ inputs.registries }}
+          BENCH_SCALE_TAGS_PER_REPO: ${{ inputs.scale_tags_per_repo }}
         run: bash bench/run.sh "$MODE" "$PROFILE"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
