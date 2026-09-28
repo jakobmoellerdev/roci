@@ -4,12 +4,11 @@
 
 ## Registry variants
 
-roci is benchmarked under three metadata-engine configurations, each running as a separate named container:
+roci is benchmarked under two metadata-engine configurations, each running as a separate named container:
 
 | name | engine | notes |
 |------|--------|-------|
 | `roci-log` | log (default in-memory maps + append-only WAL) | baseline; equivalent to the previous bare `roci` entry |
-| `roci-snapshot` | log + `snapshot = true` (default 64 MiB compact threshold) | demand-paged mmap snapshot + WAL tail; compaction cuts snapshots during the scale phase |
 | `roci-lmdb` | LMDB (heed) | out-of-RAM B+ tree; needs the `full` (lmdb) build feature |
 
 External registries (`zot`, `distribution`) run their default configurations as before.
@@ -51,22 +50,22 @@ The scale parameters are configured per profile in `bench/config.toml` under `[p
 
 > **NON-AUTHORITATIVE: Docker Desktop VM (Apple M-series, 6 CPUs), `quick`, 1 rep.** zot saturated at ~435 rps under the 3,200 rps tag-resolve load, so its latency there is queueing.
 
-| 100k tags | roci-log | roci-snapshot | roci-lmdb | zot |
-|---|---|---|---|---|
-| scale push (images/s) | 2845 | 1305 | 2109 | 74 |
-| tag resolve p50 / p99 (ms) | 0.24 / 11.8 | 0.25 / 778 | 0.21 / 1.1 | 2793 / 7030 |
-| anon RSS after reads (MiB), before → after the heap fixes | 664 → 326 | 662 → 254 | 480 → 174 | 129 |
-| restart with the corpus (ms) | 8093 | 3649 | 973 | 112 |
-| metadata on disk (MB) | 89 | 222 | 215 | — |
+| 100k tags | roci-log | roci-lmdb | zot |
+|---|---|---|---|
+| scale push (images/s) | 2845 | 2109 | 74 |
+| tag resolve p50 / p99 (ms) | 0.24 / 11.8 | 0.21 / 1.1 | 2793 / 7030 |
+| anon RSS after reads (MiB), before → after the heap fixes | 664 → 326 | 480 → 174 | 129 |
+| restart with the corpus (ms) | 8093 | 973 | 112 |
+| metadata on disk (MB) | 89 | 215 | — |
 
-LMDB has the flattest tail latency and the fastest restart; the log engine is the fastest pusher. The heap row shows the fixes from RESEARCH §9.9 (read-driven small-blob cache with honest budget accounting, clone-free log compaction, per-repo log state); the other rows are from the first run. Analysis and follow-ups: [RESEARCH §9.9](https://github.com/jakobmoellerdev/roci/blob/main/RESEARCH.md).
+LMDB has the flattest tail latency and the fastest restart; the log engine is the fastest pusher. The heap row shows the fixes from RESEARCH §9.9 (read-driven small-blob cache with honest budget accounting, clone-free log compaction, per-repo log state); the other rows are from the first run. The `roci-snapshot` variant was removed based on these measurements (see RESEARCH §9.9). Analysis and follow-ups: [RESEARCH §9.9](https://github.com/jakobmoellerdev/roci/blob/main/RESEARCH.md).
 
 ## Fairness & parity
 
 - **Pinned inputs:** image digests per arch in `bench/config.toml`, pinned tool versions in `bench/Containerfile.runner` (zb checksum-verified).
 - **Defaults everywhere**, except: logging lowered to `warn` (per-request info logging is a config choice, not engine cost) and distribution's upload purging disabled (no background timer during a run). All run plain HTTP, no auth, local filesystem backend. roci runs its release `Containerfile` with `--features full` and no config file except the variant TOML — including its default `storage.commit = false`, which matches zot's `commit` default (blob data not fsynced before acknowledging).
 - **Isolation:** registry and runner get disjoint `--cpuset-cpus` (half the Docker CPUs each, ≤ 4); the registry gets a 4 GiB memory limit.
-- **Memory:** `anon` (anonymous RSS) and `file` (page cache) are reported separately from cgroup v2 `memory.stat`. Page cache is demand-paged for mmap-backed engines (snapshot, LMDB) so comparing only anon RSS would undercount their working set.
+- **Memory:** `anon` (anonymous RSS) and `file` (page cache) are reported separately from cgroup v2 `memory.stat`. Page cache is demand-paged for mmap-backed engines (LMDB) so comparing only anon RSS would undercount their working set.
 - **Order:** each rep shuffles the registry order (seeded), and every registry starts from an empty volume.
 - **zb is zot's own tool.** zb cannot drive distribution: it keeps only the path of an upload `Location` and drops distribution's mandatory `_state` query, so every push fails; those cells show `n/a`.
 
@@ -77,12 +76,12 @@ Cells are `median [min–max]` over reps; `vs roci-log` = other median / roci-lo
 ## Reproduce
 
 ```sh
-just bench quick                            # all variants, ~10 min smoke
+just bench quick                            # roci-log, roci-lmdb, zot (add distribution via the registries argument)
 just bench full                             # 5 reps; authoritative only on a dedicated Linux host
 just bench quick "roci-log,roci-lmdb,zot"   # subset of registries
 ```
 
-To benchmark a published image instead of building one, set `BENCH_ROCI_PREBUILT=<ref>` (e.g. `ghcr.io/jakobmoellerdev/roci:<commit-sha>` — every `main` commit is published); `BENCH_RUNNER_PREBUILT=1` skips building the runner image when `roci-bench/runner:local` is already loaded. The manual `bench` workflow does both: it pulls the GHCR image of the dispatched commit (or the `roci_image` input) and builds the runner image with a GitHub Actions layer cache. Its `registries` input selects the registries like the local argument (e.g. `roci-log,roci-lmdb,zot`; empty runs all). The published image is built with `full`, so `roci-lmdb` works out of the box.
+To benchmark a published image instead of building one, set `BENCH_ROCI_PREBUILT=<ref>` (e.g. `ghcr.io/jakobmoellerdev/roci:<commit-sha>` — every `main` commit is published); `BENCH_RUNNER_PREBUILT=1` skips building the runner image when `roci-bench/runner:local` is already loaded. The manual `bench` workflow does both: it pulls the GHCR image of the dispatched commit (or the `roci_image` input) and builds the runner image with a GitHub Actions layer cache. Its `registries` input selects the registries like the local argument (e.g. `roci-log,roci-lmdb,zot,distribution`; empty runs the default `roci-log,roci-lmdb,zot`). The published image is built with `full`, so `roci-lmdb` works out of the box.
 
 Prerequisites: rootful Docker, ≥ 4 CPUs visible to Docker, ≥ 20 GB free disk for `full`. Results land in `bench/results/<run-id>/` (`report.md`, `summary.json`, `env.json`, and `raw/<rep>/<registry>/` with every tool's output, stderr of failed phases, the cgroup time series and container logs). Only a dedicated Linux host is authoritative; **Docker Desktop results are non-authoritative** — Docker Desktop runs a Linux VM with shared resources, variable memory pressure, and a different I/O stack, so absolute numbers and even relative rankings can shift between runs. Such runs are labelled `NON-AUTHORITATIVE: Docker Desktop VM` in the report. The manual `bench` GitHub workflow runs either mode on a shared arm64 runner — compare ratios within one run only.
 

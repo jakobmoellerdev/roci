@@ -13,7 +13,7 @@ mod metrics;
 #[cfg(feature = "otel")]
 pub use metrics::{
     record_auth_decision, record_blocking_hop, record_dedupe_link, record_error,
-    record_gc_collected, record_meta_compaction, record_meta_snapshot, record_meta_wal_append,
+    record_gc_collected, record_meta_compaction, record_meta_wal_append,
     record_meta_wal_batch_size, record_quota_rejection, record_request, record_scrub,
     record_upload_active, record_upload_bytes, record_upload_finalize,
 };
@@ -42,7 +42,6 @@ noop! {
     record_meta_wal_append();
     record_meta_wal_batch_size(u64);
     record_meta_compaction(&str);
-    record_meta_snapshot(&str);
     record_upload_active(i64);
     record_upload_bytes(u64);
     record_upload_finalize(&str);

@@ -7,7 +7,7 @@ shim over the fully-covered library). Any uncovered lines are listed at gate
 time for triage; the few that remain are unreachable-in-CI defensive
 syscall-error arms in the beneath-root storage path.
 
-Current line coverage: **97.08%** (19417/20002 lines).
+Current line coverage: **96.98%** (18081/18644 lines).
 
 Regenerate with `just coverage` (or on every commit via the pre-commit hook).
 Inspect region-level gaps with `just coverage-report`.
@@ -18,7 +18,7 @@ Filename                                        Regions    Missed Regions     Co
 roci-cli/src/auth_tests.rs                          656                 7    98.93%          27                 1    96.30%         312                 1    99.68%           0                 0         -
 roci-cli/src/lib.rs                                2000                66    96.70%         119                12    89.92%        1165                24    97.94%           0                 0         -
 roci-cli/src/main.rs                                 52                 8    84.62%           8                 1    87.50%          33                 4    87.88%           0                 0         -
-roci-config/src/lib.rs                             1138                 6    99.47%          71                 1    98.59%        1072                 1    99.91%           0                 0         -
+roci-config/src/lib.rs                             1161                 6    99.48%          73                 1    98.63%        1085                 1    99.91%           0                 0         -
 roci-core/src/auth/bearer.rs                        617                 7    98.87%          26                 0   100.00%         318                 1    99.69%           0                 0         -
 roci-core/src/auth/cache.rs                          81                 0   100.00%           4                 0   100.00%          60                 0   100.00%           0                 0         -
 roci-core/src/auth/htpasswd.rs                      110                 1    99.09%          12                 0   100.00%          59                 0   100.00%           0                 0         -
@@ -41,8 +41,8 @@ roci-core/src/uploads.rs                            134                 0   100.
 roci-storage-s3/src/client.rs                       194                25    87.11%          15                 3    80.00%         149                22    85.23%           0                 0         -
 roci-storage-s3/src/keys.rs                         117                 2    98.29%          12                 0   100.00%          64                 0   100.00%           0                 0         -
 roci-storage-s3/src/lib.rs                           88                 6    93.18%           4                 0   100.00%          57                 0   100.00%           0                 0         -
-roci-storage-s3/src/storage_impl.rs                2295               400    82.57%         141                26    81.56%        1253               191    84.76%           0                 0         -
-roci-storage-s3/src/tests.rs                       4649                38    99.18%         266                 1    99.62%        2624                10    99.62%           0                 0         -
+roci-storage-s3/src/storage_impl.rs                2326               402    82.72%         145                26    82.07%        1282               192    85.02%           0                 0         -
+roci-storage-s3/src/tests.rs                       4693                38    99.19%         268                 1    99.63%        2637                10    99.62%           0                 0         -
 roci-storage-s3/src/uploads.rs                      341                42    87.68%          26                 2    92.31%         191                15    92.15%           0                 0         -
 roci-storage/src/beneath.rs                         439                49    88.84%          32                 0   100.00%         274                15    94.53%           0                 0         -
 roci-storage/src/bufpool.rs                          96                 6    93.75%           9                 1    88.89%          55                 7    87.27%           0                 0         -
@@ -65,9 +65,8 @@ roci-storage/src/layout.rs                         1000                26    97.
 roci-storage/src/lifecycle.rs                        64                 5    92.19%           2                 0   100.00%          48                 3    93.75%           0                 0         -
 roci-storage/src/lock_map.rs                         54                 0   100.00%           7                 0   100.00%          32                 0   100.00%           0                 0         -
 roci-storage/src/metadata/lmdb.rs                  2271               138    93.92%          83                 3    96.39%        1131                41    96.37%           0                 0         -
-roci-storage/src/metadata/log.rs                   5303               129    97.57%         181                 3    98.34%        2448                38    98.45%           0                 0         -
-roci-storage/src/metadata/mod.rs                   3201                88    97.25%         110                 6    94.55%        1758                37    97.90%           0                 0         -
-roci-storage/src/metadata/snapshot.rs               534                10    98.13%          17                 0   100.00%         258                 1    99.61%           0                 0         -
+roci-storage/src/metadata/log.rs                   2640                77    97.08%         111                 1    99.10%        1286                15    98.83%           0                 0         -
+roci-storage/src/metadata/mod.rs                   3161                85    97.31%         110                 6    94.55%        1735                35    97.98%           0                 0         -
 roci-storage/src/metadata/wal_hmac.rs               198                 1    99.49%          12                 0   100.00%          99                 0   100.00%           0                 0         -
 roci-storage/src/publish.rs                         350               112    68.00%          14                 1    92.86%         223                56    74.89%           0                 0         -
 roci-storage/src/quota.rs                           362                 4    98.90%          26                 0   100.00%         192                 0   100.00%           0                 0         -
@@ -75,7 +74,7 @@ roci-storage/src/routing.rs                         400                14    96.
 roci-storage/src/storage.rs                         170                 9    94.71%          18                 1    94.44%         115                 7    93.91%           0                 0         -
 roci-storage/src/upload_body.rs                     305                 8    97.38%          24                 0   100.00%         196                 2    98.98%           0                 0         -
 roci-telemetry/src/lib.rs                           244                18    92.62%          14                 1    92.86%         149                 1    99.33%           0                 0         -
-roci-telemetry/src/metrics.rs                       517                 2    99.61%          40                 0   100.00%         360                 0   100.00%           0                 0         -
+roci-telemetry/src/metrics.rs                       507                 2    99.61%          39                 0   100.00%         350                 0   100.00%           0                 0         -
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-TOTAL                                             37630              1697    95.49%        2092                85    95.94%       21227               709    96.66%           0                 0         -
+TOTAL                                             34481              1634    95.26%        2012                83    95.87%       19829               684    96.55%           0                 0         -
 ```

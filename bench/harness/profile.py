@@ -167,7 +167,7 @@ def _gap_phase(key: str) -> str:
     return {"storm": "storm", "hot": "hot", "crane": "crane", "zb": "zb", "cpu": "zb", "scale": "scale"}.get(p, "—")
 
 
-_ROCI_NAMES = {"roci", "roci-log", "roci-snapshot", "roci-lmdb"}
+_ROCI_NAMES = {"roci", "roci-log", "roci-lmdb"}
 
 
 def gaps(compare_summary: dict, meta) -> list[dict]:

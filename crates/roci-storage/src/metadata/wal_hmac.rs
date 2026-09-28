@@ -1,4 +1,4 @@
-//! WAL + snapshot HMAC authentication (SECURITY §Storage boundary).
+//! WAL HMAC authentication (SECURITY §Storage boundary).
 //! CRC detects torn tails; HMAC authenticates against compromised storage.
 //! Key ≥ 32 bytes; framing/key mismatch → log moved aside, rebuilt from layout.
 

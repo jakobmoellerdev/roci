@@ -7,7 +7,7 @@
 
 # roci
 
-![coverage](https://img.shields.io/badge/coverage-97.08%25-brightgreen)
+![coverage](https://img.shields.io/badge/coverage-96.98%25-brightgreen)
 
 **roci** is a Rust implementation of the [OCI Distribution Specification](spec/distribution-spec/spec.md) — an OCI container registry.
 
@@ -241,7 +241,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [x] Serve multiple storage paths (and backends, incl. S3-compatible object storage) from a single server
 - [x] Per-repo / per-total storage quotas and a concurrent upload-session cap
 - [x] In-memory small-blob content cache (byte-capped LRU, configurable `small_blob_threshold`)
-- [x] Embedded metadata index — append-log + in-RAM maps default (compaction, rkyv mmap snapshot, optional HMAC), LMDB (heed) B-tree KV upgrade
+- [x] Embedded metadata index — append-log + in-RAM maps default (compaction, optional HMAC), LMDB (heed) B-tree KV upgrade
 - [x] Lossless engine switching (log ↔ lmdb) — marker-based detection, verified migration at startup
 
 ### Replication
@@ -261,7 +261,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [x] OpenTelemetry observability (OTLP traces, metrics, and logs)
 - [ ] Node exporter for minimal builds
 - [ ] Swagger-based API documentation
-- [x] Fast cold start (rkyv mmap snapshot, opt-in `fast_restart` stamp) and low-fragmentation allocator
+- [x] Fast cold start (opt-in `fast_restart` stamp) and low-fragmentation allocator
 - [x] Hardened Helm chart (PSS restricted, NetworkPolicies, optional HA S3 storage on RustFS), e2e-tested on k0s
 
 ## License

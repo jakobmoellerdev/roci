@@ -301,11 +301,8 @@
                   "type": "string",
                   "enum": [
                     "log",
-                    "redb"
+                    "lmdb"
                   ]
-                },
-                "snapshot": {
-                  "type": "boolean"
                 },
                 "compactThresholdBytes": {
                   "type": "integer",

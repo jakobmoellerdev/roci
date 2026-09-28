@@ -299,15 +299,16 @@ impl Default for QuotaConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct MetadataConfig {
     pub engine: MetadataEngine,
-    /// Serve from mmap snapshot + log tail (fast cold start).
+    /// Removed — kept to reject `true` with a clear message.
+    #[doc(hidden)]
     pub snapshot: bool,
-    /// Compact the log (or cut a new snapshot) once it grows past this size.
+    /// Compact the log once it grows past this size.
     pub compact_threshold_bytes: u64,
     /// File holding a per-deployment HMAC key authenticating every log record
-    /// and snapshot (compromised-storage-volume threat model). With `engine =
-    /// "lmdb"` the key is accepted (so engine switches are lossless) but LMDB
-    /// does not use it — at-rest confidentiality is delegated to volume
-    /// encryption (LUKS/dm-crypt, cloud volume encryption).
+    /// (compromised-storage-volume threat model). With `engine = "lmdb"` the
+    /// key is accepted (so engine switches are lossless) but LMDB does not
+    /// use it — at-rest confidentiality is delegated to volume encryption
+    /// (LUKS/dm-crypt, cloud volume encryption).
     pub hmac_key_file: Option<PathBuf>,
     /// Max LMDB mmap region; log engine ignores this.
     pub map_size_bytes: u64,
@@ -955,10 +956,11 @@ impl StorageConfig {
             "storage.metadata.compact_threshold_bytes",
             m.compact_threshold_bytes,
         )])?;
-        if m.engine != MetadataEngine::Log && m.snapshot {
+        if m.snapshot {
             return Err(invalid(
                 "storage.metadata.snapshot",
-                "requires engine = \"log\"",
+                "the snapshot option has been removed; \
+                 use engine = \"lmdb\" for out-of-RAM metadata and fast restart",
             ));
         }
         require_nonzero(&[("storage.metadata.map_size_bytes", m.map_size_bytes)])?;
@@ -1125,7 +1127,7 @@ mod tests {
             gc = { enabled = true, delay_secs = 60, interval_secs = 30 }
             scrub = { enabled = true, interval_secs = 600, max_bytes_per_sec = 1024, mode = "app" }
             quota = { max_repo_bytes = 10, max_total_bytes = 100, max_upload_sessions = 0 }
-            metadata = { snapshot = true, compact_threshold_bytes = 4096, hmac_key_file = "/k" }
+            metadata = { compact_threshold_bytes = 4096, hmac_key_file = "/k" }
             [storage.subpaths."team-a/x"]
             root = "/srv/team-a"
             [storage.subpaths.mirror]
@@ -1191,7 +1193,6 @@ mod tests {
         assert_eq!(s.gc.delay_secs, 60);
         assert_eq!(s.scrub.mode, ScrubMode::App);
         assert_eq!(s.quota.max_upload_sessions, 0);
-        assert!(s.metadata.snapshot);
         assert_eq!(s.metadata.engine, MetadataEngine::Log);
         let mirror = s.subpaths["mirror"].s3.as_ref().unwrap();
         assert_eq!(mirror.region, "us-east-1");
@@ -1315,7 +1316,7 @@ mod tests {
                 "storage.metadata.engine",
             ),
             (
-                "[storage.metadata]\nengine = \"lmdb\"\nsnapshot = true",
+                "[storage.metadata]\nsnapshot = true",
                 "storage.metadata.snapshot",
             ),
             (
@@ -1585,6 +1586,27 @@ mod tests {
         let re_toml = toml::to_string(&config).unwrap();
         let re_config: Config = toml::from_str(&re_toml).unwrap();
         assert!(re_config.storage.s3.as_ref().unwrap().create_bucket);
+    }
+
+    #[test]
+    fn snapshot_false_accepted() {
+        let c = parse("[storage.metadata]\nsnapshot = false").unwrap();
+        c.storage.validate().unwrap();
+        assert!(!c.storage.metadata.snapshot);
+    }
+
+    #[test]
+    fn snapshot_true_rejected() {
+        let c: Config = toml::from_str("[storage.metadata]\nsnapshot = true").unwrap();
+        let err = c.storage.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("storage.metadata.snapshot"),
+            "error must be field-qualified: {err}"
+        );
+        assert!(
+            err.to_string().contains("removed"),
+            "error must mention removal: {err}"
+        );
     }
 
     #[test]

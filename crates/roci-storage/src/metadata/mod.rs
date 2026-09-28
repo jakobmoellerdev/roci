@@ -2,7 +2,6 @@
 //! §"Metadata index engine", invariant 6).
 
 mod log;
-mod snapshot;
 pub(crate) mod wal_hmac;
 
 #[cfg(feature = "lmdb")]
@@ -452,14 +451,6 @@ fn move_stale_destination_aside(root: &Path, dest_engine: MetadataEngine) -> io:
             "moving stale destination aside"
         );
         std::fs::rename(&dest_artifact, &aside)?;
-        // For log engine, also move the snapshot if present.
-        if dest_engine == MetadataEngine::Log {
-            let snap = root.join("roci-meta.snapshot");
-            if snap.exists() {
-                let snap_aside = root.join(format!("roci-meta.snapshot.migrated-{ts}"));
-                std::fs::rename(&snap, &snap_aside)?;
-            }
-        }
     }
     Ok(())
 }
@@ -650,13 +641,6 @@ fn move_old_source(root: &Path, source_engine: MetadataEngine, ts: u64) -> io::R
             let log = root.join("roci-meta.log");
             if log.exists() {
                 std::fs::rename(&log, root.join(format!("roci-meta.log.migrated-{ts}")))?;
-            }
-            let snap = root.join("roci-meta.snapshot");
-            if snap.exists() {
-                std::fs::rename(
-                    &snap,
-                    root.join(format!("roci-meta.snapshot.migrated-{ts}")),
-                )?;
             }
         }
         MetadataEngine::Lmdb => {
@@ -2331,19 +2315,14 @@ mod engine_tests {
 
     #[cfg(feature = "lmdb")]
     #[test]
-    fn move_stale_destination_aside_log_with_snapshot() {
+    fn move_stale_destination_aside_log() {
         let dir = tempfile::tempdir().unwrap();
 
         std::fs::write(dir.path().join("roci-meta.log"), b"old log").unwrap();
-        std::fs::write(dir.path().join("roci-meta.snapshot"), b"old snap").unwrap();
 
         move_stale_destination_aside(dir.path(), MetadataEngine::Log).unwrap();
 
         assert!(!dir.path().join("roci-meta.log").exists(), "log moved");
-        assert!(
-            !dir.path().join("roci-meta.snapshot").exists(),
-            "snapshot moved"
-        );
 
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -2405,20 +2384,14 @@ mod engine_tests {
 
     #[cfg(feature = "lmdb")]
     #[test]
-    fn move_old_source_log_moves_log_and_snapshot() {
+    fn move_old_source_log_moves_log() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("roci-meta.log"), b"log").unwrap();
-        std::fs::write(dir.path().join("roci-meta.snapshot"), b"snap").unwrap();
 
         move_old_source(dir.path(), MetadataEngine::Log, 12345).unwrap();
 
         assert!(!dir.path().join("roci-meta.log").exists());
-        assert!(!dir.path().join("roci-meta.snapshot").exists());
         assert!(dir.path().join("roci-meta.log.migrated-12345").exists());
-        assert!(dir
-            .path()
-            .join("roci-meta.snapshot.migrated-12345")
-            .exists());
     }
 
     #[cfg(feature = "lmdb")]

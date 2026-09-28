@@ -61,7 +61,6 @@ struct StorageInstruments {
     meta_wal_appends: Counter<u64>,
     meta_wal_batch_size: Histogram<u64>,
     meta_compaction: Counter<u64>,
-    meta_snapshot: Counter<u64>,
     upload_active: UpDownCounter<i64>,
     upload_bytes: Counter<u64>,
     upload_finalize: Counter<u64>,
@@ -131,10 +130,6 @@ pub(crate) fn install(provider: opentelemetry_sdk::metrics::SdkMeterProvider) {
         meta_compaction: counter(
             "registry.meta.compaction",
             "Metadata log compactions by result",
-        ),
-        meta_snapshot: counter(
-            "registry.meta.snapshot",
-            "Metadata snapshots written by result",
         ),
         upload_active: meter
             .i64_up_down_counter("registry.upload.active")
@@ -251,14 +246,6 @@ pub fn record_meta_wal_batch_size(batch: u64) {
 pub fn record_meta_compaction(result: &str) {
     if let Some(s) = STORAGE.get() {
         s.meta_compaction
-            .add(1, &[KeyValue::new("result", result.to_string())]);
-    }
-}
-
-/// Count one metadata snapshot by `result` (`ok`/`error`).
-pub fn record_meta_snapshot(result: &str) {
-    if let Some(s) = STORAGE.get() {
-        s.meta_snapshot
             .add(1, &[KeyValue::new("result", result.to_string())]);
     }
 }
