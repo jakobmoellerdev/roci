@@ -6,11 +6,11 @@ use super::snapshot::{self, SnapshotState};
 use super::wal_hmac::{self, decode_header, FramingMode, HmacKey};
 use super::{after, take_page, BlobChecksum, MetaOp, MetadataStore, Page, Referrer};
 use roci_config::MetadataConfig;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// In-RAM metadata maps mirrored to an append-only CRC32C-framed log.
 pub struct LogMetadataStore {
@@ -41,8 +41,6 @@ struct SyncCoord {
     synced: u64,
     handle: Option<std::fs::File>,
 }
-
-type RepoKey = (String, String);
 
 #[derive(Default, Clone)]
 struct SubjectReferrers {
@@ -103,26 +101,61 @@ impl SubjectReferrers {
     }
 }
 
+/// Per-repository metadata.  One shared `Box<str>` repo name per repo instead
+/// of one `String` copy per every map entry.
+#[derive(Default, Clone)]
+struct RepoState {
+    tags: BTreeMap<String, (String, Arc<str>)>,
+    media_types: HashMap<String, Arc<str>>,
+    referrers: HashMap<String, SubjectReferrers>,
+    backrefs: HashMap<String, Vec<String>>,
+    checksums: HashMap<String, BlobChecksum>,
+    deleted_digests: BTreeSet<String>,
+    deleted_checksums: BTreeSet<String>,
+}
+
+impl RepoState {
+    fn is_empty(&self) -> bool {
+        self.tags.is_empty()
+            && self.media_types.is_empty()
+            && self.referrers.is_empty()
+            && self.backrefs.is_empty()
+            && self.checksums.is_empty()
+            && self.deleted_digests.is_empty()
+            && self.deleted_checksums.is_empty()
+    }
+}
+
 /// Delta overlay when a snapshot base is present.
 #[derive(Default)]
 struct State {
-    tags: HashMap<String, BTreeMap<String, (String, String)>>,
-    media_types: HashMap<RepoKey, String>,
-    referrers: HashMap<RepoKey, SubjectReferrers>,
-    backrefs: HashMap<RepoKey, Vec<String>>,
-    checksums: HashMap<RepoKey, BlobChecksum>,
+    repos: HashMap<Box<str>, RepoState>,
+    /// Small interner for media-type strings (bounded by distinct values).
+    media_type_interner: HashSet<Arc<str>>,
     log: Option<std::fs::File>,
-    deleted_digests: HashMap<String, BTreeSet<String>>,
-    deleted_checksums: BTreeSet<RepoKey>,
 }
 
 impl State {
+    fn intern_media_type(&mut self, s: &str) -> Arc<str> {
+        if let Some(existing) = self.media_type_interner.get(s) {
+            return Arc::clone(existing);
+        }
+        let arc: Arc<str> = Arc::from(s);
+        self.media_type_interner.insert(Arc::clone(&arc));
+        arc
+    }
+
+    fn repo_mut(&mut self, repo: &str) -> &mut RepoState {
+        if !self.repos.contains_key(repo) {
+            self.repos.insert(Box::from(repo), RepoState::default());
+        }
+        self.repos.get_mut(repo).unwrap()
+    }
+
     fn add_backrefs(&mut self, repo: &str, manifest: &str, blobs: &[String]) {
+        let rs = self.repo_mut(repo);
         for blob in blobs {
-            let set = self
-                .backrefs
-                .entry((repo.to_string(), blob.clone()))
-                .or_default();
+            let set = rs.backrefs.entry(blob.clone()).or_default();
             if !set.iter().any(|m| m == manifest) {
                 set.push(manifest.to_string());
             }
@@ -130,78 +163,81 @@ impl State {
     }
 
     fn add_referrer(&mut self, repo: &str, subject: &str, referrer: &str, descriptor: &[u8]) {
-        self.referrers
-            .entry((repo.to_string(), subject.to_string()))
+        self.repo_mut(repo)
+            .referrers
+            .entry(subject.to_string())
             .or_default()
             .insert(referrer, descriptor);
     }
 
     fn is_digest_deleted(&self, repo: &str, digest: &str) -> bool {
-        self.deleted_digests
+        self.repos
             .get(repo)
-            .is_some_and(|s| s.contains(digest))
+            .is_some_and(|rs| rs.deleted_digests.contains(digest))
     }
 
     /// Materialize full state from delta + snapshot base.
     fn materialize(&self, base: Option<&snapshot::VerifiedSnapshot>) -> State {
         if base.is_none() {
             return State {
-                tags: self.tags.clone(),
-                media_types: self.media_types.clone(),
-                referrers: self.referrers.clone(),
-                backrefs: self.backrefs.clone(),
-                checksums: self.checksums.clone(),
+                repos: self.repos.clone(),
+                media_type_interner: self.media_type_interner.clone(),
                 log: None,
-                deleted_digests: self.deleted_digests.clone(),
-                deleted_checksums: self.deleted_checksums.clone(),
             };
         }
         let archived = base.unwrap().archived();
         let mut out = State::default();
 
+        // --- tags ---
         for entry in archived.tags.iter() {
-            let repo: String = entry.repo.as_str().into();
-            let deleted = self.deleted_digests.get(&repo);
+            let repo_str = entry.repo.as_str();
+            let deleted = self.repos.get(repo_str).map(|rs| &rs.deleted_digests);
             for tag_entry in entry.tags.iter() {
-                let tag: String = tag_entry.tag.as_str().into();
                 let digest: String = tag_entry.digest.as_str().into();
-                let media: String = tag_entry.media_type.as_str().into();
                 if deleted.is_some_and(|s| s.contains(&digest)) {
                     continue;
                 }
-                out.tags
-                    .entry(repo.clone())
-                    .or_default()
-                    .insert(tag, (digest, media));
+                let media = out.intern_media_type(tag_entry.media_type.as_str());
+                let tag: String = tag_entry.tag.as_str().into();
+                out.repo_mut(repo_str).tags.insert(tag, (digest, media));
             }
         }
-        for (repo, delta_tags) in &self.tags {
-            let out_tags = out.tags.entry(repo.clone()).or_default();
-            for (tag, val) in delta_tags {
-                out_tags.insert(tag.clone(), val.clone());
+        for (repo, rs) in &self.repos {
+            if !rs.tags.is_empty() {
+                let out_rs = out.repo_mut(repo);
+                for (tag, val) in &rs.tags {
+                    out_rs.tags.insert(tag.clone(), val.clone());
+                }
             }
         }
 
+        // --- media_types ---
         for entry in archived.media_types.iter() {
-            let repo: String = entry.repo.as_str().into();
-            let digest: String = entry.digest.as_str().into();
-            let media: String = entry.media_type.as_str().into();
-            let key = (repo, digest);
-            if self.is_digest_deleted(&key.0, &key.1) {
+            let repo_str = entry.repo.as_str();
+            let digest_str = entry.digest.as_str();
+            if self.is_digest_deleted(repo_str, digest_str) {
                 continue;
             }
-            out.media_types.insert(key, media);
+            let media = out.intern_media_type(entry.media_type.as_str());
+            out.repo_mut(repo_str)
+                .media_types
+                .insert(digest_str.to_string(), media);
         }
-        for (k, v) in &self.media_types {
-            out.media_types.insert(k.clone(), v.clone());
+        for (repo, rs) in &self.repos {
+            if !rs.media_types.is_empty() {
+                let out_rs = out.repo_mut(repo);
+                for (d, m) in &rs.media_types {
+                    out_rs.media_types.insert(d.clone(), Arc::clone(m));
+                }
+            }
         }
 
+        // --- referrers ---
         for entry in archived.referrers.iter() {
-            let repo: String = entry.repo.as_str().into();
+            let repo_str = entry.repo.as_str();
             let subject: String = entry.subject.as_str().into();
-            let key = (repo.clone(), subject);
-            let deleted = self.deleted_digests.get(&repo);
-            let out_refs = out.referrers.entry(key).or_default();
+            let deleted = self.repos.get(repo_str).map(|rs| &rs.deleted_digests);
+            let out_refs = out.repo_mut(repo_str).referrers.entry(subject).or_default();
             for ref_entry in entry.referrers.iter() {
                 let referrer: String = ref_entry.referrer_digest.as_str().into();
                 if deleted.is_some_and(|s| s.contains(&referrer)) {
@@ -211,63 +247,86 @@ impl State {
                 out_refs.insert(&referrer, &descriptor);
             }
         }
-        for (k, v) in &self.referrers {
-            let out_refs = out.referrers.entry(k.clone()).or_default();
-            for (d, (_, bytes)) in &v.by_digest {
-                out_refs.insert(d, bytes);
+        for (repo, rs) in &self.repos {
+            for (subject, v) in &rs.referrers {
+                let out_refs = out
+                    .repo_mut(repo)
+                    .referrers
+                    .entry(subject.clone())
+                    .or_default();
+                for (d, (_, bytes)) in &v.by_digest {
+                    out_refs.insert(d, bytes);
+                }
             }
         }
-        out.referrers.retain(|_, v| !v.by_digest.is_empty());
+        // prune empty referrer subjects
+        for rs in out.repos.values_mut() {
+            rs.referrers.retain(|_, v| !v.by_digest.is_empty());
+        }
 
+        // --- backrefs ---
         for entry in archived.backrefs.iter() {
-            let repo: String = entry.repo.as_str().into();
+            let repo_str = entry.repo.as_str();
             let blob: String = entry.blob.as_str().into();
-            let key = (repo.clone(), blob);
-            let deleted = self.deleted_digests.get(&repo);
+            let deleted = self.repos.get(repo_str).map(|rs| &rs.deleted_digests);
             let mut manifests: Vec<String> = entry
                 .manifests
                 .iter()
                 .map(|s| s.as_str().to_string())
                 .filter(|m| !deleted.is_some_and(|s| s.contains(m)))
                 .collect();
-            if let Some(delta) = self.backrefs.get(&key) {
-                for m in delta {
-                    if !manifests.contains(m) {
-                        manifests.push(m.clone());
+            if let Some(delta_rs) = self.repos.get(repo_str) {
+                if let Some(delta) = delta_rs.backrefs.get(&blob) {
+                    for m in delta {
+                        if !manifests.contains(m) {
+                            manifests.push(m.clone());
+                        }
                     }
                 }
             }
             if !manifests.is_empty() {
-                out.backrefs.insert(key, manifests);
+                out.repo_mut(repo_str).backrefs.insert(blob, manifests);
             }
         }
-        for (k, v) in &self.backrefs {
-            if !out.backrefs.contains_key(k) {
-                out.backrefs.insert(k.clone(), v.clone());
+        for (repo, rs) in &self.repos {
+            let out_rs = out.repo_mut(repo);
+            for (blob, v) in &rs.backrefs {
+                if !out_rs.backrefs.contains_key(blob) {
+                    out_rs.backrefs.insert(blob.clone(), v.clone());
+                }
             }
         }
 
+        // --- checksums ---
         for entry in archived.checksums.iter() {
-            let repo: String = entry.repo.as_str().into();
-            let digest: String = entry.digest.as_str().into();
-            let key = (repo, digest);
-            if self.deleted_checksums.contains(&key) {
+            let repo_str = entry.repo.as_str();
+            let digest_str = entry.digest.as_str();
+            let self_rs = self.repos.get(repo_str);
+            if self_rs.is_some_and(|rs| rs.deleted_checksums.contains(digest_str)) {
                 continue;
             }
-            if self.is_digest_deleted(&key.0, &key.1) {
+            if self.is_digest_deleted(repo_str, digest_str) {
                 continue;
             }
-            out.checksums.insert(
-                key,
+            out.repo_mut(repo_str).checksums.insert(
+                digest_str.to_string(),
                 BlobChecksum {
                     crc32c: entry.crc32c.into(),
                     size: entry.size.into(),
                 },
             );
         }
-        for (k, v) in &self.checksums {
-            out.checksums.insert(k.clone(), *v);
+        for (repo, rs) in &self.repos {
+            if !rs.checksums.is_empty() {
+                let out_rs = out.repo_mut(repo);
+                for (d, v) in &rs.checksums {
+                    out_rs.checksums.insert(d.clone(), *v);
+                }
+            }
         }
+
+        // drop empty repos
+        out.repos.retain(|_, rs| !rs.is_empty());
 
         out
     }
@@ -398,15 +457,12 @@ impl LogMetadataStore {
                 references,
                 referrer,
             } => {
-                state
-                    .media_types
-                    .insert((repo.clone(), digest.clone()), media_type.clone());
+                let mt = state.intern_media_type(media_type);
+                let rs = state.repo_mut(repo);
+                rs.media_types.insert(digest.clone(), Arc::clone(&mt));
                 if let Some(tag) = tag {
-                    state
-                        .tags
-                        .entry(repo.clone())
-                        .or_default()
-                        .insert(tag.clone(), (digest.clone(), media_type.clone()));
+                    rs.tags
+                        .insert(tag.clone(), (digest.clone(), Arc::clone(&mt)));
                 }
                 state.add_backrefs(repo, digest, references);
                 if let Some((subject, descriptor)) = referrer {
@@ -414,34 +470,23 @@ impl LogMetadataStore {
                 }
             }
             MetaOp::DeleteManifest { repo, digest } => {
-                state.checksums.remove(&(repo.clone(), digest.clone()));
-                state
-                    .deleted_checksums
-                    .insert((repo.clone(), digest.clone()));
-                state.media_types.remove(&(repo.clone(), digest.clone()));
-                state
-                    .deleted_digests
-                    .entry(repo.clone())
-                    .or_default()
-                    .insert(digest.clone());
-                if let Some(tags) = state.tags.get_mut(repo) {
-                    tags.retain(|_, (d, _)| d != digest);
-                    if tags.is_empty() {
-                        state.tags.remove(repo);
-                    }
-                }
-                state.referrers.retain(|(r, _), refs| {
-                    if r == repo {
-                        refs.remove(digest);
-                    }
+                let rs = state.repo_mut(repo);
+                rs.checksums.remove(digest.as_str());
+                rs.deleted_checksums.insert(digest.clone());
+                rs.media_types.remove(digest.as_str());
+                rs.deleted_digests.insert(digest.clone());
+                rs.tags.retain(|_, (d, _)| d != digest);
+                rs.referrers.retain(|_, refs| {
+                    refs.remove(digest);
                     !refs.by_digest.is_empty()
                 });
-                state.backrefs.retain(|(r, _), manifests| {
-                    if r == repo {
-                        manifests.retain(|m| m != digest);
-                    }
+                rs.backrefs.retain(|_, manifests| {
+                    manifests.retain(|m| m != digest);
                     !manifests.is_empty()
                 });
+                // Note: we do NOT drop the repo here even if it looks empty,
+                // because deleted_digests / deleted_checksums are needed as
+                // tombstones against the snapshot base.
             }
             MetaOp::PutBackrefs {
                 repo,
@@ -460,10 +505,10 @@ impl LogMetadataStore {
                 crc32c,
                 size,
             } => {
-                let key = (repo.clone(), digest.clone());
-                state.deleted_checksums.remove(&key);
-                state.checksums.insert(
-                    key,
+                let rs = state.repo_mut(repo);
+                rs.deleted_checksums.remove(digest.as_str());
+                rs.checksums.insert(
+                    digest.clone(),
                     BlobChecksum {
                         crc32c: *crc32c,
                         size: *size,
@@ -471,9 +516,9 @@ impl LogMetadataStore {
                 );
             }
             MetaOp::DeleteBlob { repo, digest } => {
-                let key = (repo.clone(), digest.clone());
-                state.checksums.remove(&key);
-                state.deleted_checksums.insert(key);
+                let rs = state.repo_mut(repo);
+                rs.checksums.remove(digest.as_str());
+                rs.deleted_checksums.insert(digest.clone());
             }
         }
     }
@@ -482,9 +527,9 @@ impl LogMetadataStore {
 impl MetadataStore for LogMetadataStore {
     fn resolve_tag(&self, repo: &str, tag: &str) -> Option<(String, String)> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        if let Some(tags) = state.tags.get(repo) {
-            if let Some(v) = tags.get(tag) {
-                return Some(v.clone());
+        if let Some(rs) = state.repos.get(repo) {
+            if let Some((digest, media)) = rs.tags.get(tag) {
+                return Some((digest.clone(), media.to_string()));
             }
         }
         let base = self.snap_base.lock().expect("snap lock poisoned");
@@ -507,11 +552,10 @@ impl MetadataStore for LogMetadataStore {
 
     fn manifest_media_type(&self, repo: &str, digest: &str) -> Option<String> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        if let Some(v) = state
-            .media_types
-            .get(&(repo.to_string(), digest.to_string()))
-        {
-            return Some(v.clone());
+        if let Some(rs) = state.repos.get(repo) {
+            if let Some(v) = rs.media_types.get(digest) {
+                return Some(v.to_string());
+            }
         }
         if state.is_digest_deleted(repo, digest) {
             return None;
@@ -532,9 +576,13 @@ impl MetadataStore for LogMetadataStore {
     fn tags_page(&self, repo: &str, last: Option<&str>, limit: usize) -> Option<Page<String>> {
         let state = self.inner.lock().expect("metadata lock poisoned");
         let base = self.snap_base.lock().expect("snap lock poisoned");
+        let rs = state.repos.get(repo);
 
         if base.is_none() {
-            let tags = state.tags.get(repo)?;
+            let tags = &rs?.tags;
+            if tags.is_empty() {
+                return None;
+            }
             return Some(take_page(
                 tags.range::<str, _>(after(last)).map(|(t, _)| t.clone()),
                 limit,
@@ -542,7 +590,7 @@ impl MetadataStore for LogMetadataStore {
         }
 
         let a = base.as_ref().unwrap().archived();
-        let delta_tags = state.tags.get(repo);
+        let delta_tags = rs.map(|r| &r.tags);
         let base_repo = a
             .tags
             .binary_search_by(|e| e.repo.as_str().cmp(repo))
@@ -589,10 +637,10 @@ impl MetadataStore for LogMetadataStore {
     ) -> Option<Page<Referrer>> {
         let state = self.inner.lock().expect("metadata lock poisoned");
         let base = self.snap_base.lock().expect("snap lock poisoned");
-        let key = (repo.to_string(), subject.to_string());
+        let rs = state.repos.get(repo);
 
         if base.is_none() {
-            let refs = state.referrers.get(&key)?;
+            let refs = rs?.referrers.get(subject)?;
             return Some(refs.page(artifact_type, last, limit));
         }
 
@@ -602,7 +650,7 @@ impl MetadataStore for LogMetadataStore {
             .binary_search_by(|e| (e.repo.as_str(), e.subject.as_str()).cmp(&(repo, subject)))
             .ok()
             .map(|i| &a.referrers[i].referrers);
-        let delta_refs = state.referrers.get(&key);
+        let delta_refs = rs.and_then(|r| r.referrers.get(subject));
 
         if base_refs.is_none() && delta_refs.is_none() {
             return None;
@@ -634,10 +682,11 @@ impl MetadataStore for LogMetadataStore {
 
     fn has_referrer(&self, repo: &str, subject: &str, referrer: &str) -> bool {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        let key = (repo.to_string(), subject.to_string());
-        if let Some(refs) = state.referrers.get(&key) {
-            if refs.by_digest.contains_key(referrer) {
-                return true;
+        if let Some(rs) = state.repos.get(repo) {
+            if let Some(refs) = rs.referrers.get(subject) {
+                if refs.by_digest.contains_key(referrer) {
+                    return true;
+                }
             }
         }
         if state.is_digest_deleted(repo, referrer) {
@@ -661,7 +710,7 @@ impl MetadataStore for LogMetadataStore {
 
     fn backrefs(&self, repo: &str, blob: &str) -> Vec<String> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        let key = (repo.to_string(), blob.to_string());
+        let rs = state.repos.get(repo);
         let base = self.snap_base.lock().expect("snap lock poisoned");
 
         let mut result: Vec<String> = Vec::new();
@@ -681,7 +730,7 @@ impl MetadataStore for LogMetadataStore {
             }
         }
 
-        if let Some(delta) = state.backrefs.get(&key) {
+        if let Some(delta) = rs.and_then(|r| r.backrefs.get(blob)) {
             for m in delta {
                 if !result.contains(m) {
                     result.push(m.clone());
@@ -694,12 +743,13 @@ impl MetadataStore for LogMetadataStore {
 
     fn checksum(&self, repo: &str, digest: &str) -> Option<BlobChecksum> {
         let state = self.inner.lock().expect("metadata lock poisoned");
-        let key = (repo.to_string(), digest.to_string());
-        if let Some(v) = state.checksums.get(&key) {
-            return Some(*v);
-        }
-        if state.deleted_checksums.contains(&key) || state.is_digest_deleted(repo, digest) {
-            return None;
+        if let Some(rs) = state.repos.get(repo) {
+            if let Some(v) = rs.checksums.get(digest) {
+                return Some(*v);
+            }
+            if rs.deleted_checksums.contains(digest) || rs.deleted_digests.contains(digest) {
+                return None;
+            }
         }
         let base = self.snap_base.lock().expect("snap lock poisoned");
         if let Some(snap) = base.as_ref() {
@@ -730,28 +780,28 @@ impl MetadataStore for LogMetadataStore {
         let state = self.inner.lock().expect("metadata lock poisoned");
         let base = self.snap_base.lock().expect("snap lock poisoned");
         let mut repos: BTreeSet<String> = state
-            .media_types
-            .keys()
-            .chain(state.referrers.keys())
-            .map(|(r, _)| r.clone())
+            .repos
+            .iter()
+            .filter(|(_, rs)| !rs.media_types.is_empty() || !rs.referrers.is_empty())
+            .map(|(r, _)| r.to_string())
             .collect();
         if let Some(snap) = base.as_ref() {
             let a = snap.archived();
             for entry in a.media_types.iter() {
-                let repo: String = entry.repo.as_str().into();
-                let digest: String = entry.digest.as_str().into();
-                if !state.is_digest_deleted(&repo, &digest) {
-                    repos.insert(repo);
+                let repo_str = entry.repo.as_str();
+                let digest_str = entry.digest.as_str();
+                if !state.is_digest_deleted(repo_str, digest_str) {
+                    repos.insert(repo_str.to_string());
                 }
             }
             for entry in a.referrers.iter() {
-                let repo: String = entry.repo.as_str().into();
+                let repo_str = entry.repo.as_str();
                 let has_live = entry
                     .referrers
                     .iter()
-                    .any(|r| !state.is_digest_deleted(&repo, r.referrer_digest.as_str()));
+                    .any(|r| !state.is_digest_deleted(repo_str, r.referrer_digest.as_str()));
                 if has_live {
-                    repos.insert(repo);
+                    repos.insert(repo_str.to_string());
                 }
             }
         }
@@ -762,11 +812,10 @@ impl MetadataStore for LogMetadataStore {
         let state = self.inner.lock().expect("metadata lock poisoned");
         let base = self.snap_base.lock().expect("snap lock poisoned");
         let mut result: Vec<String> = state
-            .media_types
-            .keys()
-            .filter(|(r, _)| r == repo)
-            .map(|(_, d)| d.clone())
-            .collect();
+            .repos
+            .get(repo)
+            .map(|rs| rs.media_types.keys().cloned().collect())
+            .unwrap_or_default();
         if let Some(snap) = base.as_ref() {
             let a = snap.archived();
             for entry in a.media_types.iter() {
@@ -800,9 +849,9 @@ impl MetadataStore for LogMetadataStore {
                 }
             }
         }
-        if let Some(dt) = state.tags.get(repo) {
-            for (t, v) in dt {
-                merged.insert(t.clone(), v.clone());
+        if let Some(rs) = state.repos.get(repo) {
+            for (t, (d, m)) in &rs.tags {
+                merged.insert(t.clone(), (d.clone(), m.to_string()));
             }
         }
         merged.into_iter().map(|(t, (d, m))| (t, d, m)).collect()
@@ -832,13 +881,12 @@ impl MetadataStore for LogMetadataStore {
             }
         }
 
-        for ((r, subject), refs) in &state.referrers {
-            if r != repo {
-                continue;
-            }
-            let sr = by_subject.entry(subject.clone()).or_default();
-            for (d, (_, bytes)) in &refs.by_digest {
-                sr.insert(d, bytes);
+        if let Some(rs) = state.repos.get(repo) {
+            for (subject, refs) in &rs.referrers {
+                let sr = by_subject.entry(subject.clone()).or_default();
+                for (d, (_, bytes)) in &refs.by_digest {
+                    sr.insert(d, bytes);
+                }
             }
         }
 
@@ -946,12 +994,22 @@ impl LogMetadataStore {
         }
         let mut state = self.inner.lock().expect("metadata lock poisoned");
         let mut base = self.snap_base.lock().expect("snap lock poisoned");
-        let full = state.materialize(base.as_ref());
+        // The lock is held for the whole rewrite, so without a snapshot base
+        // the image is written straight from the live maps; cloning them here
+        // doubled the metadata heap at every compaction (RESEARCH §9.9).
+        let merged;
+        let full: &State = match base.as_ref() {
+            None => &state,
+            Some(b) => {
+                merged = state.materialize(Some(b));
+                &merged
+            }
+        };
         if self.snapshot_enabled {
             let mut gen = self.generation.lock().expect("gen lock poisoned");
             let next = *gen + 1;
-            let (tmp, covered) = self.write_log_image(&full, Some(next))?;
-            let snap_state = state_to_snapshot(&full, next, covered);
+            let (tmp, covered) = self.write_log_image(full, Some(next))?;
+            let snap_state = state_to_snapshot(full, next, covered);
             let body = rkyv::to_bytes::<rkyv::rancor::Error>(&snap_state)
                 .map_err(|e| io::Error::other(format!("rkyv: {e}")))?;
             let hdr = snapshot::encode_header(&body, self.hmac_key.as_ref());
@@ -960,17 +1018,12 @@ impl LogMetadataStore {
             self.image_len.store(covered, Ordering::Release);
             *base = snapshot::VerifiedSnapshot::open(&self.snapshot_path, self.hmac_key.as_ref())?;
             *gen = next;
-            state.tags.clear();
-            state.media_types.clear();
-            state.referrers.clear();
-            state.backrefs.clear();
-            state.checksums.clear();
-            state.deleted_digests.clear();
-            state.deleted_checksums.clear();
+            state.repos.clear();
+            state.media_type_interner.clear();
             roci_telemetry::record_meta_compaction("ok");
             roci_telemetry::record_meta_snapshot("ok");
         } else {
-            let (tmp, len) = self.write_log_image(&full, None)?;
+            let (tmp, len) = self.write_log_image(full, None)?;
             self.install_log(&mut state, &tmp)?;
             self.image_len.store(len, Ordering::Release);
             roci_telemetry::record_meta_compaction("ok");
@@ -990,13 +1043,13 @@ impl LogMetadataStore {
             f.write_all(&encode_raw(marker.as_bytes(), key))?;
         }
         let mut tagged: BTreeSet<(&str, &str)> = BTreeSet::new();
-        for (repo, tags) in &full.tags {
-            for (tag, (digest, media_type)) in tags {
+        for (repo, rs) in &full.repos {
+            for (tag, (digest, media_type)) in &rs.tags {
                 f.write_all(&encode(
                     &MetaOp::PutManifest {
-                        repo: repo.clone(),
+                        repo: repo.to_string(),
                         digest: digest.clone(),
-                        media_type: media_type.clone(),
+                        media_type: media_type.to_string(),
                         tag: Some(tag.clone()),
                         references: Vec::new(),
                         referrer: None,
@@ -1006,56 +1059,64 @@ impl LogMetadataStore {
                 tagged.insert((repo, digest));
             }
         }
-        for ((repo, digest), media_type) in &full.media_types {
-            if !tagged.contains(&(repo.as_str(), digest.as_str())) {
+        for (repo, rs) in &full.repos {
+            for (digest, media_type) in &rs.media_types {
+                if !tagged.contains(&(repo.as_ref(), digest.as_str())) {
+                    f.write_all(&encode(
+                        &MetaOp::PutManifest {
+                            repo: repo.to_string(),
+                            digest: digest.clone(),
+                            media_type: media_type.to_string(),
+                            tag: None,
+                            references: Vec::new(),
+                            referrer: None,
+                        },
+                        key,
+                    ))?;
+                }
+            }
+        }
+        for (repo, rs) in &full.repos {
+            for (blob, manifests) in &rs.backrefs {
+                for m in manifests {
+                    f.write_all(&encode(
+                        &MetaOp::PutBackrefs {
+                            repo: repo.to_string(),
+                            manifest: m.clone(),
+                            blobs: vec![blob.clone()],
+                        },
+                        key,
+                    ))?;
+                }
+            }
+        }
+        for (repo, rs) in &full.repos {
+            for (subject, refs) in &rs.referrers {
+                for (referrer, (_, descriptor)) in &refs.by_digest {
+                    f.write_all(&encode(
+                        &MetaOp::PutReferrer {
+                            repo: repo.to_string(),
+                            subject: subject.clone(),
+                            referrer: referrer.clone(),
+                            descriptor: descriptor.clone(),
+                        },
+                        key,
+                    ))?;
+                }
+            }
+        }
+        for (repo, rs) in &full.repos {
+            for (digest, ck) in &rs.checksums {
                 f.write_all(&encode(
-                    &MetaOp::PutManifest {
-                        repo: repo.clone(),
+                    &MetaOp::PutChecksum {
+                        repo: repo.to_string(),
                         digest: digest.clone(),
-                        media_type: media_type.clone(),
-                        tag: None,
-                        references: Vec::new(),
-                        referrer: None,
+                        crc32c: ck.crc32c,
+                        size: ck.size,
                     },
                     key,
                 ))?;
             }
-        }
-        for ((repo, blob), manifests) in &full.backrefs {
-            for m in manifests {
-                f.write_all(&encode(
-                    &MetaOp::PutBackrefs {
-                        repo: repo.clone(),
-                        manifest: m.clone(),
-                        blobs: vec![blob.clone()],
-                    },
-                    key,
-                ))?;
-            }
-        }
-        for ((repo, subject), refs) in &full.referrers {
-            for (referrer, (_, descriptor)) in &refs.by_digest {
-                f.write_all(&encode(
-                    &MetaOp::PutReferrer {
-                        repo: repo.clone(),
-                        subject: subject.clone(),
-                        referrer: referrer.clone(),
-                        descriptor: descriptor.clone(),
-                    },
-                    key,
-                ))?;
-            }
-        }
-        for ((repo, digest), ck) in &full.checksums {
-            f.write_all(&encode(
-                &MetaOp::PutChecksum {
-                    repo: repo.clone(),
-                    digest: digest.clone(),
-                    crc32c: ck.crc32c,
-                    size: ck.size,
-                },
-                key,
-            ))?;
         }
         let f = f.into_inner().map_err(io::IntoInnerError::into_error)?;
         f.sync_all()?;
@@ -1084,16 +1145,18 @@ fn state_to_snapshot(state: &State, generation: u64, log_offset: u64) -> Snapsho
     use snapshot::*;
 
     let mut tags: Vec<RepoTags> = state
-        .tags
+        .repos
         .iter()
-        .map(|(repo, btree)| RepoTags {
-            repo: repo.clone(),
-            tags: btree
+        .filter(|(_, rs)| !rs.tags.is_empty())
+        .map(|(repo, rs)| RepoTags {
+            repo: repo.to_string(),
+            tags: rs
+                .tags
                 .iter()
                 .map(|(tag, (digest, media))| TagEntry {
                     tag: tag.clone(),
                     digest: digest.clone(),
-                    media_type: media.clone(),
+                    media_type: media.to_string(),
                 })
                 .collect(),
         })
@@ -1101,58 +1164,66 @@ fn state_to_snapshot(state: &State, generation: u64, log_offset: u64) -> Snapsho
     tags.sort_by(|a, b| a.repo.cmp(&b.repo));
 
     let mut media_types: Vec<MediaTypeEntry> = state
-        .media_types
+        .repos
         .iter()
-        .map(|((r, d), m)| MediaTypeEntry {
-            repo: r.clone(),
-            digest: d.clone(),
-            media_type: m.clone(),
+        .flat_map(|(repo, rs)| {
+            rs.media_types.iter().map(move |(d, m)| MediaTypeEntry {
+                repo: repo.to_string(),
+                digest: d.clone(),
+                media_type: m.to_string(),
+            })
         })
         .collect();
     media_types.sort_by(|a, b| (&a.repo, &a.digest).cmp(&(&b.repo, &b.digest)));
 
-    let mut referrers: Vec<SubjectReferrers> = state
-        .referrers
+    let mut referrers: Vec<snapshot::SubjectReferrers> = state
+        .repos
         .iter()
-        .map(|((repo, subject), sr)| {
-            let mut entries: Vec<ReferrerEntry> = sr
-                .by_digest
-                .iter()
-                .map(|(d, (at, bytes))| ReferrerEntry {
-                    referrer_digest: d.clone(),
-                    artifact_type: at.clone().unwrap_or_default(),
-                    descriptor: bytes.clone(),
-                })
-                .collect();
-            entries.sort_by(|a, b| a.referrer_digest.cmp(&b.referrer_digest));
-            snapshot::SubjectReferrers {
-                repo: repo.clone(),
-                subject: subject.clone(),
-                referrers: entries,
-            }
+        .flat_map(|(repo, rs)| {
+            rs.referrers.iter().map(move |(subject, sr)| {
+                let mut entries: Vec<ReferrerEntry> = sr
+                    .by_digest
+                    .iter()
+                    .map(|(d, (at, bytes))| ReferrerEntry {
+                        referrer_digest: d.clone(),
+                        artifact_type: at.clone().unwrap_or_default(),
+                        descriptor: bytes.clone(),
+                    })
+                    .collect();
+                entries.sort_by(|a, b| a.referrer_digest.cmp(&b.referrer_digest));
+                snapshot::SubjectReferrers {
+                    repo: repo.to_string(),
+                    subject: subject.clone(),
+                    referrers: entries,
+                }
+            })
         })
         .collect();
     referrers.sort_by(|a, b| (&a.repo, &a.subject).cmp(&(&b.repo, &b.subject)));
 
     let mut backrefs: Vec<BackrefEntry> = state
-        .backrefs
+        .repos
         .iter()
-        .map(|((r, b), ms)| BackrefEntry {
-            repo: r.clone(),
-            blob: b.clone(),
-            manifests: ms.clone(),
+        .flat_map(|(repo, rs)| {
+            rs.backrefs.iter().map(move |(b, ms)| BackrefEntry {
+                repo: repo.to_string(),
+                blob: b.clone(),
+                manifests: ms.clone(),
+            })
         })
         .collect();
     backrefs.sort_by(|a, b| (&a.repo, &a.blob).cmp(&(&b.repo, &b.blob)));
 
     let mut checksums: Vec<ChecksumEntry> = state
-        .checksums
+        .repos
         .iter()
-        .map(|((r, d), ck)| ChecksumEntry {
-            repo: r.clone(),
-            digest: d.clone(),
-            crc32c: ck.crc32c,
-            size: ck.size,
+        .flat_map(|(repo, rs)| {
+            rs.checksums.iter().map(move |(d, ck)| ChecksumEntry {
+                repo: repo.to_string(),
+                digest: d.clone(),
+                crc32c: ck.crc32c,
+                size: ck.size,
+            })
         })
         .collect();
     checksums.sort_by(|a, b| (&a.repo, &a.digest).cmp(&(&b.repo, &b.digest)));
@@ -1175,12 +1246,12 @@ fn state_to_snapshot(state: &State, generation: u64, log_offset: u64) -> Snapsho
 fn export_state(full: &State, sink: &mut dyn FnMut(MetaOp) -> io::Result<()>) -> io::Result<()> {
     use std::collections::BTreeSet;
     let mut tagged: BTreeSet<(&str, &str)> = BTreeSet::new();
-    for (repo, tags) in &full.tags {
-        for (tag, (digest, media_type)) in tags {
+    for (repo, rs) in &full.repos {
+        for (tag, (digest, media_type)) in &rs.tags {
             sink(MetaOp::PutManifest {
-                repo: repo.clone(),
+                repo: repo.to_string(),
                 digest: digest.clone(),
-                media_type: media_type.clone(),
+                media_type: media_type.to_string(),
                 tag: Some(tag.clone()),
                 references: Vec::new(),
                 referrer: None,
@@ -1188,44 +1259,52 @@ fn export_state(full: &State, sink: &mut dyn FnMut(MetaOp) -> io::Result<()>) ->
             tagged.insert((repo, digest));
         }
     }
-    for ((repo, digest), media_type) in &full.media_types {
-        if !tagged.contains(&(repo.as_str(), digest.as_str())) {
-            sink(MetaOp::PutManifest {
-                repo: repo.clone(),
+    for (repo, rs) in &full.repos {
+        for (digest, media_type) in &rs.media_types {
+            if !tagged.contains(&(repo.as_ref(), digest.as_str())) {
+                sink(MetaOp::PutManifest {
+                    repo: repo.to_string(),
+                    digest: digest.clone(),
+                    media_type: media_type.to_string(),
+                    tag: None,
+                    references: Vec::new(),
+                    referrer: None,
+                })?;
+            }
+        }
+    }
+    for (repo, rs) in &full.repos {
+        for (blob, manifests) in &rs.backrefs {
+            for m in manifests {
+                sink(MetaOp::PutBackrefs {
+                    repo: repo.to_string(),
+                    manifest: m.clone(),
+                    blobs: vec![blob.clone()],
+                })?;
+            }
+        }
+    }
+    for (repo, rs) in &full.repos {
+        for (subject, refs) in &rs.referrers {
+            for (referrer, (_, descriptor)) in &refs.by_digest {
+                sink(MetaOp::PutReferrer {
+                    repo: repo.to_string(),
+                    subject: subject.clone(),
+                    referrer: referrer.clone(),
+                    descriptor: descriptor.clone(),
+                })?;
+            }
+        }
+    }
+    for (repo, rs) in &full.repos {
+        for (digest, ck) in &rs.checksums {
+            sink(MetaOp::PutChecksum {
+                repo: repo.to_string(),
                 digest: digest.clone(),
-                media_type: media_type.clone(),
-                tag: None,
-                references: Vec::new(),
-                referrer: None,
+                crc32c: ck.crc32c,
+                size: ck.size,
             })?;
         }
-    }
-    for ((repo, blob), manifests) in &full.backrefs {
-        for m in manifests {
-            sink(MetaOp::PutBackrefs {
-                repo: repo.clone(),
-                manifest: m.clone(),
-                blobs: vec![blob.clone()],
-            })?;
-        }
-    }
-    for ((repo, subject), refs) in &full.referrers {
-        for (referrer, (_, descriptor)) in &refs.by_digest {
-            sink(MetaOp::PutReferrer {
-                repo: repo.clone(),
-                subject: subject.clone(),
-                referrer: referrer.clone(),
-                descriptor: descriptor.clone(),
-            })?;
-        }
-    }
-    for ((repo, digest), ck) in &full.checksums {
-        sink(MetaOp::PutChecksum {
-            repo: repo.clone(),
-            digest: digest.clone(),
-            crc32c: ck.crc32c,
-            size: ck.size,
-        })?;
     }
     Ok(())
 }
@@ -2153,7 +2232,15 @@ mod tests {
         );
         drop(s);
         let s = LogMetadataStore::open_with(dir.path(), &cfg(1)).unwrap();
-        assert!(s.inner.lock().unwrap().tags.is_empty(), "heap delta empty");
+        assert!(
+            s.inner
+                .lock()
+                .unwrap()
+                .repos
+                .values()
+                .all(|rs| rs.tags.is_empty()),
+            "heap delta empty"
+        );
         assert_eq!(
             s.resolve_tag("r", "v1").map(|(d, _)| d).as_deref(),
             Some("sha256:aa"),
@@ -2179,7 +2266,12 @@ mod tests {
         drop(s);
         let s = LogMetadataStore::open_with(dir.path(), &cfg).unwrap();
         assert_eq!(
-            s.inner.lock().unwrap().tags["r"].len(),
+            s.inner
+                .lock()
+                .unwrap()
+                .repos
+                .get("r")
+                .map_or(0, |rs| rs.tags.len()),
             1,
             "only tail in heap"
         );

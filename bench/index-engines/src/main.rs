@@ -1,4 +1,4 @@
-//! roci index-engine bake-off: heed3 (LMDB, plain + encrypted) vs redb
+//! roci index-engine bake-off: heed (LMDB, plain) vs redb
 //!
 //! Mirrors roci's real metadata schema and access patterns
 //! (ARCHITECTURE §Metadata index engine, `crates/roci-storage/src/metadata/redb.rs`):
@@ -327,13 +327,13 @@ mod redb_engine {
 // ---------------------------------------------------------------------------
 
 mod heed_engine {
-    use heed3::types::*;
-    use heed3::{Database, EnvOpenOptions, WithoutTls};
+    use heed::types::*;
+    use heed::{Database, EnvOpenOptions, WithoutTls};
     use std::fs;
     use std::path::Path;
 
     pub struct HeedEngine {
-        pub env: heed3::Env<WithoutTls>,
+        pub env: heed::Env<WithoutTls>,
         pub tags: Database<Str, Str>,
         pub media_types: Database<Str, Str>,
         pub referrers: Database<Str, Bytes>,
@@ -368,7 +368,7 @@ mod heed_engine {
                     .max_dbs(10)
                     .map_size(map_size)
                     .open(dir)
-                    .expect("heed3 open")
+                    .expect("heed open")
             };
 
             let mut wtxn = env.write_txn().unwrap();
@@ -612,7 +612,7 @@ fn run_benchmark(config: &BenchConfig) {
     fs::create_dir_all(&tmpdir).unwrap();
 
     println!("╔══════════════════════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║  roci index-engine bake-off: heed3 (LMDB, mdb.master3) vs redb                                ║");
+    println!("║  roci index-engine bake-off: heed (LMDB, mdb.master) vs redb                                  ║");
     println!("╠══════════════════════════════════════════════════════════════════════════════════════════════════╣");
     println!("║  Host: {:<85}║", format!("{} {}", env::consts::OS, env::consts::ARCH));
     println!("║  Profile: --release with LTO (fat)                                                             ║");

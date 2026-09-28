@@ -113,6 +113,13 @@ class Sampler:
     def peak_anon_mib(self) -> float | None:
         return max((s[1] for s in self.samples), default=0) / 2**20 if self.samples else None
 
+    def current_file_mib(self) -> float | None:
+        s = self.sample()
+        return s[2] / 2**20 if s else None
+
+    def peak_file_mib(self) -> float | None:
+        return max((s[2] for s in self.samples), default=0) / 2**20 if self.samples else None
+
     def dump_csv(self, path: str, t0: float = 0.0):
         with open(path, "w") as f:
             f.write("t_s,anon_bytes,file_bytes,usage_usec,tasks\n")

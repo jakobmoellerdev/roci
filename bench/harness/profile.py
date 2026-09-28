@@ -164,23 +164,30 @@ def metrics_delta(before: str, after: str, prefix: str = "http_server_request_du
 
 def _gap_phase(key: str) -> str:
     p = key.split(".")[0]
-    return {"storm": "storm", "hot": "hot", "crane": "crane", "zb": "zb", "cpu": "zb"}.get(p, "—")
+    return {"storm": "storm", "hot": "hot", "crane": "crane", "zb": "zb", "cpu": "zb", "scale": "scale"}.get(p, "—")
+
+
+_ROCI_NAMES = {"roci", "roci-log", "roci-snapshot", "roci-lmdb"}
 
 
 def gaps(compare_summary: dict, meta) -> list[dict]:
-    """Rows where the best competitor beats roci by > GAP_PCT in the metric's `better` direction.
+    """Rows where the best competitor beats the first roci variant by > GAP_PCT in the metric's `better` direction.
 
     `meta(key)` returns (label, unit, better) or None.
     """
     rows = []
     for key, per in compare_summary.get("metrics", {}).items():
         m = meta(key)
+        # Find the first roci variant present in this metric.
+        roci_name = next((r for r in per if r in _ROCI_NAMES), None)
         # mib_per_s is rps × size: same ratio as the rps row, so it would only duplicate it.
-        if not m or "roci" not in per or len(per) < 2 or key.endswith(".mib_per_s"):
+        if not m or roci_name is None or len(per) < 2 or key.endswith(".mib_per_s"):
             continue
         better = m[2]
-        roci = per["roci"]["median"]
-        others = {r: s["median"] for r, s in per.items() if r != "roci"}
+        roci = per[roci_name]["median"]
+        others = {r: s["median"] for r, s in per.items() if r not in _ROCI_NAMES}
+        if not others:
+            continue
         name, best = (max if better == "higher" else min)(others.items(), key=lambda kv: kv[1])
         if better == "higher":
             beats = best > roci * (1 + GAP_PCT / 100)

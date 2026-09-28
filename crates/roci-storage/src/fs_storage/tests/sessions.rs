@@ -83,11 +83,12 @@ async fn upload_ops_reject_invalid_id_and_do_not_leak_locks() {
     assert!(!s.upload_locks.contains("r", "deadbeef"));
 }
 
-// Small blobs cached on finalize; large blobs are not.
+// Uploads never warm the cache (push-only traffic must not fill it); the first
+// read of a small blob does, a large blob never.
 #[tokio::test]
-async fn finalize_warms_cache_for_small_blobs_only() {
+async fn blob_upload_does_not_warm_cache_first_read_does() {
     let (_dir, s) = store();
-    for (data, cached) in [
+    for (data, cached_after_read) in [
         (b"warmable".to_vec(), true),
         (
             vec![9u8; crate::cache::DEFAULT_SMALL_BLOB_THRESHOLD + 1],
@@ -99,8 +100,12 @@ async fn finalize_warms_cache_for_small_blobs_only() {
         s.finish_upload("r", &id, &d, u64::MAX, crate::upload_body(&data), u64::MAX)
             .await
             .unwrap();
-        assert_eq!(s.cache.get("r", &d.as_string()).is_some(), cached);
+        assert!(s.cache.get("r", &d.as_string()).is_none());
         assert_eq!(s.read_blob("r", &d).await.unwrap(), data);
+        assert_eq!(
+            s.cache.get("r", &d.as_string()).is_some(),
+            cached_after_read
+        );
     }
 }
 
@@ -124,12 +129,22 @@ async fn custom_small_blob_threshold_controls_caching() {
     s.put_blob("r", &big_d, big_data).await.unwrap();
     assert!(
         s.cache.get("r", &big_d.as_string()).is_none(),
+        "put never warms"
+    );
+    s.read_blob("r", &big_d).await.unwrap();
+    assert!(
+        s.cache.get("r", &big_d.as_string()).is_none(),
         "17-byte blob should not be cached with threshold=16"
     );
 
     let small_data = b"0123456789abcdef"; // 16 bytes
     let small_d = sha256_of(small_data);
     s.put_blob("r", &small_d, small_data).await.unwrap();
+    assert!(
+        s.cache.get("r", &small_d.as_string()).is_none(),
+        "put never warms"
+    );
+    s.read_blob("r", &small_d).await.unwrap();
     assert_eq!(
         s.cache.get("r", &small_d.as_string()).map(|b| b.to_vec()),
         Some(small_data.to_vec()),

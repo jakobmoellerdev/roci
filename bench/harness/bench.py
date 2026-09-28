@@ -1,6 +1,5 @@
 """Benchmark orchestrator (runs inside the runner container; see bench/run.sh)."""
 
-from __future__ import annotations
 
 import datetime as dt
 import hashlib
@@ -22,12 +21,20 @@ from . import cgroup, fixtures, parse, profile, report
 RESULTS = "/results"
 WORK = "/work"
 BENCH = "/bench"
-PHASES = ["startup_empty", "storm", "hot", "startup_populated", "crane", "zb", "disk"]
+PHASES = ["startup_empty", "storm", "hot", "startup_populated", "crane", "zb", "scale", "disk"]
 PROFILED = ("storm", "hot", "crane", "zb")
 MT_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 ENDPOINTS = ("manifest_get", "blob_head", "blob_head_missing", "tags_list")
 P99_BUDGET_MS = 20.0
 ZB_SIZE_MIB = {"1MB": 1, "10MB": 10, "100MB": 100}
+
+# roci variant names share the roci image; only the config file differs.
+ROCI_VARIANTS = {"roci-log", "roci-snapshot", "roci-lmdb"}
+
+
+def is_roci(name: str) -> bool:
+    """True for any roci engine variant (roci-log, roci-snapshot, …) or bare 'roci'."""
+    return name in ROCI_VARIANTS or name == "roci"
 
 
 class PhaseFailed(Exception):
@@ -99,10 +106,13 @@ class Bench:
         self.profile_name = os.environ.get("BENCH_PROFILE", "quick")
         self.p = self.cfg["profiles"][self.profile_name]
         self.seed = int(self.cfg["seed"])
-        self.registries = [r for r in os.environ.get("BENCH_REGISTRIES", "roci,zot,distribution").split(",") if r]
+        default_regs = ",".join(self.cfg.get("all_registries", ["roci-log", "roci-snapshot", "roci-lmdb", "zot", "distribution"]))
+        self.registries = [r for r in os.environ.get("BENCH_REGISTRIES", default_regs).split(",") if r]
+        self.roci_variants: set[str] = set(self.cfg.get("roci_variants", [])) | ROCI_VARIANTS
         self.reps = int(self.p["reps"])
+        self.scale = self.p.get("scale", {})
         if self.mode == "perf":
-            self.registries, self.reps = ["roci"], 1
+            self.registries, self.reps = ["roci-log"], 1
         self.mem = os.environ.get("BENCH_SERVER_MEMORY", "4g")
         self.server_cpus = os.environ["BENCH_SERVER_CPUS"]
         self.runner_image = os.environ["BENCH_RUNNER_IMAGE"]
@@ -123,7 +133,7 @@ class Bench:
         return m[a]
 
     def image_for(self, name: str) -> str:
-        if name == "roci":
+        if is_roci(name):
             return os.environ["BENCH_ROCI_PERF_IMAGE" if self.mode == "perf" else "BENCH_ROCI_IMAGE"]
         return self.cfg["images"][name][self.arch_]
 
@@ -153,9 +163,13 @@ class Bench:
         finally:
             docker("volume", "rm", "-f", "bench-probe", check=False)
         env["images"] = {}
+        seen_images: dict[str, dict] = {}
         for r in self.registries:
-            j = json.loads(docker("image", "inspect", self.image_for(r)))[0]
-            env["images"][r] = {"ref": self.image_for(r), "Id": j["Id"], "RepoDigests": j.get("RepoDigests")}
+            ref = self.image_for(r)
+            if ref not in seen_images:
+                j = json.loads(docker("image", "inspect", ref))[0]
+                seen_images[ref] = {"ref": ref, "Id": j["Id"], "RepoDigests": j.get("RepoDigests")}
+            env["images"][r] = seen_images[ref]
         env["tools"] = {
             "vegeta": run(["vegeta", "-version"], 30, check=False).stdout.strip(),
             "crane": run(["crane", "version"], 30, check=False).stdout.strip(),
@@ -172,18 +186,27 @@ class Bench:
 
     # ------------------------------------------------------------ container
     def create(self, name: str):
-        datadir = "/var/lib/roci" if name == "roci" else "/var/lib/registry"
+        roci = is_roci(name)
+        datadir = "/var/lib/roci" if roci else "/var/lib/registry"
         args = ["create", "--name", f"bench-{name}", "--network", "roci-bench", "--cpuset-cpus", self.server_cpus,
                 "--memory", self.mem, "--memory-swap", self.mem, "-v", f"bench-{name}-data:{datadir}"]
-        if name == "roci":
+        if roci:
             args += ["-e", "RUST_LOG=warn", self.image_for(name)]
-            if self.mode == "perf":
-                args += ["--config", "/bench-roci.toml", "--listen", "0.0.0.0:5000", "--storage-root", "/var/lib/roci"]
+            # Always pass --config pointing to the variant's config file.
+            cfg_path = f"/bench-{name}.toml"
+            args += ["--config", cfg_path, "--listen", "0.0.0.0:5000", "--storage-root", "/var/lib/roci"]
         else:
             args.append(self.image_for(name))
         docker(*args)
-        if name == "roci" and self.mode == "perf":
-            docker("cp", f"{BENCH}/registries/roci-perf.toml", "bench-roci:/bench-roci.toml")
+        # Copy the right config file into the container.
+        if roci:
+            if self.mode == "perf":
+                # Perf mode uses roci-perf.toml as the base; in practice only roci-log runs in perf.
+                docker("cp", f"{BENCH}/registries/roci-perf.toml", f"bench-{name}:{cfg_path}")
+            else:
+                # Map variant name to config file. Bare "roci" → roci-log.toml.
+                cfg_file = f"{name}.toml" if name in ROCI_VARIANTS else "roci-log.toml"
+                docker("cp", f"{BENCH}/registries/{cfg_file}", f"bench-{name}:{cfg_path}")
         elif name == "zot":
             docker("cp", f"{BENCH}/registries/zot.json", "bench-zot:/etc/zot/config.json")
         elif name == "distribution":
@@ -382,7 +405,128 @@ class Bench:
         o = docker("run", "--rm", "-v", f"bench-{name}-data:/v:ro", "--entrypoint", "du", self.runner_image,
                    "-sB1", "/v")
         m["disk.bytes"] = int(o.split()[0])
+        # Metadata disk size: du of roci-meta.* files (roci variants only).
+        if is_roci(name):
+            meta_out = docker("run", "--rm", "-v", f"bench-{name}-data:/v:ro", "--entrypoint", "sh",
+                              self.runner_image, "-c",
+                              "find /v -name 'roci-meta.*' -o -name 'data.mdb' -o -name 'lock.mdb' | "
+                              "xargs du -sB1 2>/dev/null | awk '{s+=$1} END{print s+0}'",
+                              check=False)
+            try:
+                m["disk.meta_bytes"] = int(meta_out.strip())
+            except ValueError:
+                pass
 
+    def ph_scale(self, name, url, out, m):
+        """Metadata-scale scenario: push many small images (3 small blobs each), then measure reads."""
+        sc = self.scale
+        if not sc:
+            raise PhaseUnsupported("no [profiles.<p>.scale] section in config.toml")
+        repos = int(sc["scale_repos"])
+        tags_per = int(sc["scale_tags_per_repo"])
+        total_tags = repos * tags_per
+        conc = int(sc.get("scale_concurrency", 32))
+
+        # Push phase: reuse loadgen's seed command with the scale parameters.
+        corpus, stats = f"{out}/scale_corpus.json", f"{out}/scale_stats.json"
+        p = run(["loadgen", "seed", "-registry", url, "-repos", str(repos),
+                 "-tags", str(tags_per), "-seed", str(self.seed + 1000),
+                 "-concurrency", str(conc), "-corpus", corpus, "-stats", stats],
+                timeout=7200, check=False)
+        st = json.load(open(stats)) if os.path.exists(stats) else {}
+        if p.returncode != 0:
+            raise PhaseFailed(f"scale loadgen exit {p.returncode}\n{p.stderr}\n"
+                              f"error_samples: {json.dumps(st.get('error_samples'), indent=1)}")
+        m["scale.push_images_per_s"] = st["images_per_s"]
+        m["scale.push_p99_ms"] = st["latency_ms"]["p99"]
+        m["scale.total_tags"] = total_tags
+
+        time.sleep(3)  # let the server settle
+
+        # Memory after scale push.
+        if self.sampler:
+            m["scale.anon_mib_after_push"] = self.sampler.current_anon_mib()
+            m["scale.file_mib_after_push"] = self.sampler.current_file_mib()
+
+        # Tag-resolve latency: vegeta HEAD on random tags at concurrency.
+        scale_corpus = json.load(open(corpus))
+        imgs = scale_corpus["images"]
+        scale_repos_list = scale_corpus["repos"]
+        acc = f"Accept: {MT_MANIFEST}\n"
+        targets = [f"GET {url}/v2/{i['repo']}/manifests/{i['tag']}\n{acc}" for i in imgs]
+        random.Random(self.seed).shuffle(targets)
+        tgt_path = f"{WORK}/scale-manifest-get.txt"
+        with open(tgt_path, "w") as f:
+            f.write("\n".join(targets) + "\n")
+
+        read_conc = int(sc.get("scale_read_concurrency", 32))
+        read_secs = int(sc.get("scale_read_secs", 10))
+        v = self.vegeta(tgt_path, read_conc * 100, read_secs, f"{WORK}/scale-resolve.bin")
+        m["scale.resolve_p50_ms"] = v["p50_ms"]
+        m["scale.resolve_p99_ms"] = v["p99_ms"]
+        m["scale.resolve_rps"] = v["rate"]
+
+        # tags/list paging: measure time to list all tags for the first repo.
+        t0 = time.monotonic()
+        tlist_url = f"{url}/v2/{scale_repos_list[0]}/tags/list"
+        tag_count = 0
+        page_url: str | None = tlist_url
+        while page_url:
+            req = urllib.request.Request(page_url)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                body = json.loads(r.read())
+                tag_count += len(body.get("tags") or [])
+                link = r.headers.get("Link", "")
+            # Parse RFC 8288 Link header for next page.
+            next_match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+            if next_match:
+                rel = next_match.group(1)
+                page_url = rel if rel.startswith("http") else f"{url}{rel}"
+            else:
+                page_url = None
+        m["scale.tags_list_ms"] = (time.monotonic() - t0) * 1000
+        m["scale.tags_list_count"] = tag_count
+
+        # Referrers listing: time to list referrers for a manifest (will likely be empty
+        # with synthetic content, but measures the code path).
+        t0 = time.monotonic()
+        digest = imgs[0]["manifest_digest"]
+        ref_url = f"{url}/v2/{imgs[0]['repo']}/referrers/{digest}"
+        try:
+            with urllib.request.urlopen(ref_url, timeout=30) as r:
+                ref_body = json.loads(r.read())
+                m["scale.referrers_count"] = len(ref_body.get("manifests") or [])
+        except urllib.error.HTTPError:
+            m["scale.referrers_count"] = 0
+        m["scale.referrers_ms"] = (time.monotonic() - t0) * 1000
+
+        # Memory after reads.
+        if self.sampler:
+            m["scale.anon_mib_after_read"] = self.sampler.current_anon_mib()
+            m["scale.file_mib_after_read"] = self.sampler.current_file_mib()
+
+        # Startup time with full corpus (restart).
+        docker("restart", f"bench-{name}", timeout=120)
+        m["scale.startup_populated_ms"] = self.wait_ready(name, url)
+        if self.sampler:
+            self.sampler.retarget(self.cgroup_dir(name))
+
+        # Metadata disk size after scale.
+        if is_roci(name):
+            docker("stop", f"bench-{name}", timeout=120)
+            meta_out = docker("run", "--rm", "-v", f"bench-{name}-data:/v:ro", "--entrypoint", "sh",
+                              self.runner_image, "-c",
+                              "find /v -name 'roci-meta.*' -o -name 'data.mdb' -o -name 'lock.mdb' | "
+                              "xargs du -sB1 2>/dev/null | awk '{s+=$1} END{print s+0}'",
+                              check=False)
+            try:
+                m["scale.meta_bytes"] = int(meta_out.strip())
+            except ValueError:
+                pass
+            docker("start", f"bench-{name}")
+            self.wait_ready(name, url)
+            if self.sampler:
+                self.sampler.retarget(self.cgroup_dir(name))
     # -------------------------------------------------------------- profiling
     def perf_start(self, phase: str, name: str, url: str):
         pid = docker("inspect", "-f", "{{.State.Pid}}", f"bench-{name}")
@@ -491,7 +635,7 @@ class Bench:
                         procs = self.perf_start(ph, name, url)
                     except (OSError, urllib.error.URLError, PhaseFailed) as e:
                         self.profile_data[ph] = {"unavailable": f"profiler start: {e}"}
-                if self.sampler and ph in ("storm", "hot", "crane", "zb"):
+                if self.sampler and ph in ("storm", "hot", "crane", "zb", "scale"):
                     with self.sampler.phase(ph):
                         fn(name, url, out, m, *a)
                 else:
@@ -526,11 +670,13 @@ class Bench:
                 raise HarnessBroken(str(e)) from e
             time.sleep(5)
             m["memory.idle_anon_mib"] = self.sampler.current_anon_mib()
+            m["memory.idle_file_mib"] = self.sampler.current_file_mib()
 
         def storm(name, url, out, m):
             self.ph_storm(name, url, out, m)
             time.sleep(5)
             m["memory.corpus_anon_mib"] = self.sampler.current_anon_mib()
+            m["memory.corpus_file_mib"] = self.sampler.current_file_mib()
 
         self.zb_gib = 0.0
         self.pull_to_devnull = getattr(self, "pull_to_devnull", None)
@@ -546,15 +692,17 @@ class Bench:
                 if ready:
                     phase("crane", self.ph_crane)
                     phase("zb", self.ph_zb)
+                    phase("scale", self.ph_scale)
                     phase("disk", self.ph_disk)
                 else:
-                    failed.extend(p for p in ("crane", "zb", "disk") if p not in failed)
+                    failed.extend(p for p in ("crane", "zb", "scale", "disk") if p not in failed)
             else:
                 failed.extend(p for p in PHASES[1:] if p not in failed)
         finally:
             if self.sampler:
                 self.sampler.stop()
                 m["memory.peak_anon_mib"] = self.sampler.peak_anon_mib()
+                m["memory.peak_file_mib"] = self.sampler.peak_file_mib()
                 t0 = self.sampler.samples[0][0] if self.sampler.samples else 0.0
                 self.sampler.dump_csv(f"{out}/cgroup.csv", t0)
             with open(f"{out}/container.log", "w") as f:
@@ -574,10 +722,14 @@ class Bench:
         log(f"bench: mode={self.mode} profile={self.profile_name} reps={self.reps} registries={self.registries}")
         log("bench: building fixture")
         self.fixture_digest = fixtures.build_app_layout(self.fixture_dir, self.seed)
+        pulled: set[str] = set()
         for r in self.registries:
-            if r != "roci":
-                log(f"bench: pulling {self.image_for(r)}")
-                docker("pull", self.image_for(r), timeout=900)
+            if not is_roci(r):
+                ref = self.image_for(r)
+                if ref not in pulled:
+                    log(f"bench: pulling {ref}")
+                    docker("pull", ref, timeout=900)
+                    pulled.add(ref)
         self.write_env()
         saved = {}
         if self.mode == "perf":
@@ -616,7 +768,7 @@ class Bench:
             f.write(report.render_markdown(summary, self.env, note))
         if self.mode == "perf":
             with open(f"{RESULTS}/profile_report.md", "w") as f:
-                f.write(self.profile_report(per_rep[0]["roci"]))
+                f.write(self.profile_report(per_rep[0][self.registries[0]]))
         return 1 if any(summary["failed"].values()) else 0
 
     def profile_report(self, res: dict) -> str:
