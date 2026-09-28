@@ -458,7 +458,7 @@ impl Storage for S3Storage {
             return Ok(page);
         }
         Ok(layout_tags_page(
-            &self.read_remote_index(repo).await?,
+            &self.read_index_view(repo).await?,
             last,
             limit,
         ))
@@ -480,7 +480,7 @@ impl Storage for S3Storage {
         {
             return Ok(page);
         }
-        let index = self.read_remote_index(repo).await?;
+        let index = self.read_index_view(repo).await?;
         let linked = layout_subject_referrers(&index, &target);
         if linked.is_empty() {
             return Ok(Page::default());
@@ -954,7 +954,7 @@ impl S3Storage {
         repo: &str,
         tag: &str,
     ) -> Result<(Digest, String), StorageError> {
-        let index = self.read_remote_index(repo).await?;
+        let index = self.read_index_view(repo).await?;
         let manifests = index
             .get("manifests")
             .and_then(|m| m.as_array())
@@ -1455,33 +1455,7 @@ impl S3Storage {
             Err(StorageError::NotFound) => None,
             Err(e) => return Err(e),
         };
-
-        let mut size_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-        if let Some(ref idx) = existing {
-            if let Some(manifests) = idx.get("manifests").and_then(|m| m.as_array()) {
-                for entry in manifests {
-                    if let (Some(d), Some(s)) = (
-                        entry.get("digest").and_then(|v| v.as_str()),
-                        entry.get("size").and_then(|v| v.as_u64()),
-                    ) {
-                        size_map.insert(d.to_string(), s);
-                    }
-                }
-            }
-        }
-
-        {
-            let ms = self.manifest_sizes.lock().expect("manifest_sizes poisoned");
-            for ((r, d), s) in ms.iter() {
-                if r == repo {
-                    size_map.insert(d.clone(), *s);
-                }
-            }
-        }
-
-        let index = roci_storage::index_from_meta(&*self.meta, repo, existing, |d| {
-            size_map.get(d).copied()
-        })?;
+        let index = self.index_over(repo, existing)?;
 
         let bytes =
             serde_json::to_vec(&index).map_err(|e| StorageError::Io(io::Error::other(e)))?;
@@ -1493,6 +1467,67 @@ impl S3Storage {
             .await
             .map_err(obj_err_write)?;
         Ok(())
+    }
+
+    /// The index clients see: a dirty repo's view is derived from the store
+    /// over the remote file, so reads never observe the write-behind lag
+    /// (ARCHITECTURE invariant 12), exactly as the filesystem backend does.
+    pub(crate) async fn read_index_view(
+        &self,
+        repo: &str,
+    ) -> Result<serde_json::Value, StorageError> {
+        let dirty = self
+            .index_dirty
+            .lock()
+            .expect("index_dirty poisoned")
+            .contains_key(repo);
+        if !dirty {
+            return self.read_remote_index(repo).await;
+        }
+        let existing = match self.read_remote_index(repo).await {
+            Ok(idx) => Some(idx),
+            Err(StorageError::NotFound) => None,
+            Err(e) => return Err(e),
+        };
+        self.index_over(repo, existing)
+    }
+
+    /// `index.json` for `repo`: the store merged over `existing`, with sizes
+    /// from the existing entries and the manifests this process stored.
+    fn index_over(
+        &self,
+        repo: &str,
+        existing: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, StorageError> {
+        let mut size_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        if let Some(manifests) = existing
+            .as_ref()
+            .and_then(|idx| idx.get("manifests"))
+            .and_then(|m| m.as_array())
+        {
+            for entry in manifests {
+                if let (Some(d), Some(s)) = (
+                    entry.get("digest").and_then(|v| v.as_str()),
+                    entry.get("size").and_then(|v| v.as_u64()),
+                ) {
+                    size_map.insert(d.to_string(), s);
+                }
+            }
+        }
+        {
+            let ms = self.manifest_sizes.lock().expect("manifest_sizes poisoned");
+            for ((r, d), s) in ms.iter() {
+                if r == repo {
+                    size_map.insert(d.clone(), *s);
+                }
+            }
+        }
+        Ok(roci_storage::index_from_meta(
+            &*self.meta,
+            repo,
+            existing,
+            |d| size_map.get(d).copied(),
+        )?)
     }
 }
 

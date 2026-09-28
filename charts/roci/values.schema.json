@@ -301,7 +301,7 @@
                   "type": "string",
                   "enum": [
                     "log",
-                    "redb"
+                    "lmdb"
                   ]
                 },
                 "compactThresholdBytes": {

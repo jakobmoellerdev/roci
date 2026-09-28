@@ -683,6 +683,22 @@ async fn write_remote_index_and_read_back() {
     assert!(has_tag);
 }
 
+/// `index.json` is written behind; until the writer catches up a dirty repo's
+/// reads derive from the store, so a deleted manifest's tag never reappears
+/// (OCI conformance "tags list should reflect manifest deletion").
+#[tokio::test]
+async fn deleted_tag_not_listed_while_index_write_is_pending() {
+    let (_dir, s) = test_store();
+    let data = b"stale-cfg";
+    let cd = sha256_digest(data);
+    s.put_blob("repo", &cd, data).await.unwrap();
+    let (md, _) = put_tagged(&s, "repo", "v1", &cd, &[]).await;
+    s.write_remote_index("repo").await.unwrap(); // remote index.json names v1
+    s.delete_manifest("repo", &md).await.unwrap(); // store updated, file not yet
+    let page = s.list_tags("repo", None, 100).await.unwrap();
+    assert!(page.items.is_empty(), "stale tag listed: {:?}", page.items);
+}
+
 #[tokio::test]
 async fn finish_upload_multipart_above_part_size() {
     let (_dir, s) = small_part_store(None);

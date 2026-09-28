@@ -7,7 +7,7 @@ shim over the fully-covered library). Any uncovered lines are listed at gate
 time for triage; the few that remain are unreachable-in-CI defensive
 syscall-error arms in the beneath-root storage path.
 
-Current line coverage: **96.98%** (18043/18604 lines).
+Current line coverage: **96.98%** (18081/18644 lines).
 
 Regenerate with `just coverage` (or on every commit via the pre-commit hook).
 Inspect region-level gaps with `just coverage-report`.
@@ -41,8 +41,8 @@ roci-core/src/uploads.rs                            134                 0   100.
 roci-storage-s3/src/client.rs                       194                25    87.11%          15                 3    80.00%         149                22    85.23%           0                 0         -
 roci-storage-s3/src/keys.rs                         117                 2    98.29%          12                 0   100.00%          64                 0   100.00%           0                 0         -
 roci-storage-s3/src/lib.rs                           88                 6    93.18%           4                 0   100.00%          57                 0   100.00%           0                 0         -
-roci-storage-s3/src/storage_impl.rs                2295               400    82.57%         141                26    81.56%        1253               191    84.76%           0                 0         -
-roci-storage-s3/src/tests.rs                       4649                38    99.18%         266                 1    99.62%        2624                10    99.62%           0                 0         -
+roci-storage-s3/src/storage_impl.rs                2326               402    82.72%         145                26    82.07%        1282               192    85.02%           0                 0         -
+roci-storage-s3/src/tests.rs                       4693                38    99.19%         268                 1    99.63%        2637                10    99.62%           0                 0         -
 roci-storage-s3/src/uploads.rs                      341                42    87.68%          26                 2    92.31%         191                15    92.15%           0                 0         -
 roci-storage/src/beneath.rs                         439                49    88.84%          32                 0   100.00%         274                15    94.53%           0                 0         -
 roci-storage/src/bufpool.rs                          96                 6    93.75%           9                 1    88.89%          55                 7    87.27%           0                 0         -
@@ -76,5 +76,5 @@ roci-storage/src/upload_body.rs                     305                 8    97.
 roci-telemetry/src/lib.rs                           244                18    92.62%          14                 1    92.86%         149                 1    99.33%           0                 0         -
 roci-telemetry/src/metrics.rs                       507                 2    99.61%          39                 0   100.00%         350                 0   100.00%           0                 0         -
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-TOTAL                                             34406              1632    95.26%        2006                83    95.86%       19787               683    96.55%           0                 0         -
+TOTAL                                             34481              1634    95.26%        2012                83    95.87%       19829               684    96.55%           0                 0         -
 ```
