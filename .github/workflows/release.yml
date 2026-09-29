@@ -119,3 +119,79 @@ jobs:
           # Upload tarballs + checksums.
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             artifacts/*.tar.gz artifacts/*.tar.gz.sha256
+
+  # Publish the Helm chart as an OCI artifact, version-locked to the release:
+  # tag vX.Y.Z → oci://ghcr.io/<owner>/charts/roci:X.Y.Z with appVersion X.Y.Z
+  # (the image container.yml publishes for the same tag), plus a build-provenance
+  # attestation pushed next to it. workflow_dispatch without a tag only packages.
+  chart:
+    name: helm chart (OCI)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      # Pinned helm; keep in sync with helm.yml (bump version + sha256 together).
+      HELM_VERSION: 4.3.0
+      HELM_SHA256: 86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb # helm-v4.3.0-linux-amd64.tar.gz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned helm
+        run: |
+          curl -sSfL "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz" -o helm.tgz
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum -c -
+          tar xzf helm.tgz linux-amd64/helm
+          sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
+
+      - name: Package chart
+        id: pkg
+        shell: bash
+        env:
+          GIT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          version=""
+          if [[ "$GIT_REF" == refs/tags/v* ]]; then version="${GIT_REF#refs/tags/v}"; fi
+          pkg="$(bash scripts/helm-package.sh "$RUNNER_TEMP/chart" "$version")"
+          test -f "$pkg"
+          echo "package=$pkg" >> "$GITHUB_OUTPUT"
+
+      # The docker login is for the attestation push; helm keeps its own credentials.
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push chart to GHCR
+        id: push
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PKG: ${{ steps.pkg.outputs.package }}
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${OWNER,,}/charts"
+          printf '%s' "$REGISTRY_PASSWORD" | helm registry login ghcr.io -u "$REGISTRY_USER" --password-stdin
+          out="$(helm push "$PKG" "oci://${repo}" 2>&1)"
+          printf '%s\n' "$out"
+          digest="$(sed -n 's/^Digest: //p' <<<"$out")"
+          [[ "$digest" == sha256:* ]]
+          echo "name=${repo}/roci" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          helm registry logout ghcr.io
+      - name: Attest chart provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.push.outputs.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

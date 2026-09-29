@@ -168,15 +168,19 @@ built by [`release.yml`](.github/workflows/release.yml) on `v*` tags.
 
 ### Kubernetes (Helm)
 
-A hardened Helm chart is provided at `charts/roci/`. Install with:
+A hardened Helm chart is provided at `charts/roci/`. Every `v*` release publishes
+it to GHCR as an OCI artifact, version-locked to the release (chart `X.Y.Z`
+deploys image `roci:X.Y.Z`), with a build-provenance attestation. Install with:
 
 ```sh
 kubectl create namespace roci
 kubectl label namespace roci pod-security.kubernetes.io/enforce=restricted
-helm repo add rustfs https://charts.rustfs.com
-helm dependency build charts/roci
-helm install roci charts/roci -n roci --set auth.allowAnonymous=true
+helm install roci oci://ghcr.io/jakobmoellerdev/charts/roci --version <X.Y.Z> \
+  -n roci --set auth.allowAnonymous=true
+gh attestation verify oci://ghcr.io/jakobmoellerdev/charts/roci:<X.Y.Z> --owner jakobmoellerdev
 ```
+
+To install from a checkout instead: `helm repo add rustfs https://charts.rustfs.com && helm dependency build charts/roci`, then `helm install roci charts/roci …`.
 
 The chart enforces Pod Security Standards restricted, per-workload NetworkPolicies, a secure-by-default auth guard, and supports optional HA S3 storage on RustFS. See the [Kubernetes guide](https://jakobmoellerdev.github.io/roci/guide/kubernetes) for the full configuration reference.
 
@@ -262,7 +266,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [ ] Node exporter for minimal builds
 - [ ] Swagger-based API documentation
 - [x] Fast cold start (opt-in `fast_restart` stamp) and low-fragmentation allocator
-- [x] Hardened Helm chart (PSS restricted, NetworkPolicies, optional HA S3 storage on RustFS), e2e-tested on k0s
+- [x] Hardened Helm chart (PSS restricted, NetworkPolicies, optional HA S3 storage on RustFS), e2e-tested on k0s, released as an attested OCI artifact on GHCR (`oci://ghcr.io/jakobmoellerdev/charts/roci`)
 
 ## License
 

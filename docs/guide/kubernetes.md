@@ -15,7 +15,20 @@ kubectl label namespace roci \
   pod-security.kubernetes.io/warn=restricted
 ```
 
-Build the chart dependencies and install:
+Install the chart published with a roci release. Every `v*` release pushes it to GHCR as an OCI artifact, version-locked to the release: chart `X.Y.Z` has `appVersion` `X.Y.Z` and deploys `ghcr.io/jakobmoellerdev/roci:X.Y.Z`. The RustFS subchart is bundled.
+
+```sh
+helm install roci oci://ghcr.io/jakobmoellerdev/charts/roci --version <X.Y.Z> -n roci \
+  --set auth.allowAnonymous=true
+```
+
+Each published chart carries a build-provenance attestation; verify it before installing:
+
+```sh
+gh attestation verify oci://ghcr.io/jakobmoellerdev/charts/roci:<X.Y.Z> --owner jakobmoellerdev
+```
+
+To install from a checkout (e.g. unreleased `main`), build the chart dependencies first:
 
 ```sh
 helm repo add rustfs https://charts.rustfs.com
@@ -23,6 +36,8 @@ helm dependency build charts/roci
 helm install roci charts/roci -n roci \
   --set auth.allowAnonymous=true
 ```
+
+The remaining examples use the local `charts/roci` path; substitute `oci://ghcr.io/jakobmoellerdev/charts/roci --version <X.Y.Z>` for a released chart.
 
 The `--set auth.allowAnonymous=true` flag is required for a minimal install. Without it (and without configuring `auth.htpasswd.existingSecret` or `auth.accessControl`), rendering fails with an error reminding you to configure authentication.
 

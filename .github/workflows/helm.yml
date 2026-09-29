@@ -13,7 +13,7 @@ concurrency:
   group: helm-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Pinned tool versions; bump version + sha256 together.
+# Pinned tool versions; bump version + sha256 together (HELM_* also in release.yml).
 env:
   HELM_VERSION: 4.3.0
   HELM_SHA256: 86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb # helm-v4.3.0-linux-amd64.tar.gz
