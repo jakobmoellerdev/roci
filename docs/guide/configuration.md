@@ -212,7 +212,7 @@ roci compiles in two flavors (see [Architecture](/design/architecture)):
 
 Configuring `s3`, `engine = "lmdb"`, or `auth.ldap` in a build without the corresponding feature aborts startup with a field-qualified error. Configuring `engine = "redb"` fails with an error directing users to `"lmdb"` — redb has been removed and metadata is rebuilt from the layout on first LMDB open.
 
-**Switching metadata engines** (e.g. `log` → `lmdb`, or `lmdb` → `log`): change `storage.metadata.engine` in your config and restart. roci detects the mismatch, exports all metadata from the old engine, writes a verified copy into the new engine format, and atomically swaps it in. The switch is lossless — no data from the old engine is lost, and the registry never serves from a partial copy. Old engine files are preserved as `*.migrated-<timestamp>` alongside the storage root and can be deleted once the switch is verified. The `roci-meta.engine` marker file (written atomically with fsync) records which engine is active; a crash before the marker is written leaves the old engine active and the migration reruns on next start. If both the engine and the HMAC key are changed at once, a warning recommends doing them in separate restarts. Note: `engine = "redb"` is still rejected — redb has been removed and the LMDB engine is the recommended upgrade.
+**Switching metadata engines** (`log` ↔ `lmdb`) is a config change plus a restart and is lossless; see [Metadata engines](./metadata-engines) for how the two compare, when to switch and what happens during the migration.
 
 Every extension is reachable from the CLI **only** behind a cargo feature, never as an unconditional dependency. Behavior is then selected at runtime through configuration.
 

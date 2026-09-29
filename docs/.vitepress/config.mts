@@ -63,6 +63,7 @@ export default defineConfig({
             { text: 'Introduction', link: '/guide/introduction' },
             { text: 'Getting started', link: '/guide/getting-started' },
             { text: 'Configuration', link: '/guide/configuration' },
+            { text: 'Metadata engines', link: '/guide/metadata-engines' },
             { text: 'Container image', link: '/guide/container' },
             { text: 'Kubernetes (Helm)', link: '/guide/kubernetes' },
             { text: 'Benchmarks', link: '/guide/benchmarks' },
