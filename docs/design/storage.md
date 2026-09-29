@@ -39,4 +39,4 @@ The spec-visible `index.json` is maintained by **coalescing write-behind**: a mu
 
 An optional background scrub verifies each blob against the CRC32C recorded when it was written, visiting the store in a staggered order under a bandwidth cap, and re-hashes with the full digest only on a mismatch. A blob that no longer matches its digest is quarantined so it reads as absent and can be pushed again. On btrfs and ZFS the filesystem's own scrub is used instead.
 
-See also: [Architecture](/design/architecture) · [Research](/design/research) · [Configuration](/guide/configuration).
+See also: [Architecture](/design/architecture) · [Research](/design/research) · [Configuration](/guide/configuration) · [Metadata engines](/guide/metadata-engines).
