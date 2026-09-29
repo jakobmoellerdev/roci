@@ -85,6 +85,7 @@ docker create --name roci-bench-runner --privileged --cgroupns=host --pid=host \
   -e BENCH_CLIENT_CPUS="$BENCH_CLIENT_CPUS" \
   -e BENCH_SERVER_MEMORY="${BENCH_SERVER_MEMORY:-4g}" \
   -e BENCH_REGISTRIES="${BENCH_REGISTRIES:-roci-log,roci-lmdb,zot}" \
+  -e BENCH_SCALE_TAGS_PER_REPO="${BENCH_SCALE_TAGS_PER_REPO:-}" \
   -e BENCH_KEEP_PERF_DATA="${BENCH_KEEP_PERF_DATA:-0}" \
   -e GITHUB_ACTIONS="${GITHUB_ACTIONS:-}" \
   roci-bench/runner:local >/dev/null

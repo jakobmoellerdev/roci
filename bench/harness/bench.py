@@ -110,7 +110,11 @@ class Bench:
         self.registries = [r for r in os.environ.get("BENCH_REGISTRIES", default_regs).split(",") if r]
         self.roci_variants: set[str] = set(self.cfg.get("roci_variants", [])) | ROCI_VARIANTS
         self.reps = int(self.p["reps"])
-        self.scale = self.p.get("scale", {})
+        self.scale = dict(self.p.get("scale", {}))
+        # CI override: the 4-vCPU GitHub runner cannot push the local 100k-image
+        # corpus through every registry in its time budget.
+        if self.scale and os.environ.get("BENCH_SCALE_TAGS_PER_REPO"):
+            self.scale["scale_tags_per_repo"] = int(os.environ["BENCH_SCALE_TAGS_PER_REPO"])
         if self.mode == "perf":
             self.registries, self.reps = ["roci-log"], 1
         self.mem = os.environ.get("BENCH_SERVER_MEMORY", "4g")
@@ -645,11 +649,22 @@ class Bench:
                 unsupported[ph] = str(e)
                 log(f"[rep {rep}] {name}: {ph} n/a: {e}")
                 return True
-            except PhaseFailed as e:
+            except (PhaseFailed, OSError) as e:
+                # OSError covers a registry that died mid-phase (connection
+                # refused/reset, URLError): fail this phase with the container's
+                # fate (e.g. OOM-killed at the memory cap) and keep the run going.
+                msg = str(e)
+                if not isinstance(e, PhaseFailed):
+                    state = docker(
+                        "inspect", "-f",
+                        "status={{.State.Status}} oom_killed={{.State.OOMKilled}} exit={{.State.ExitCode}}",
+                        f"bench-{name}", check=False,
+                    )
+                    msg = f"{type(e).__name__}: {e} (bench-{name}: {state or 'not found'})"
                 failed.append(ph)
                 with open(f"{out}/{ph}.err", "w") as f:
-                    f.write(str(e))
-                log(f"[rep {rep}] {name}: {ph} FAILED: {str(e).splitlines()[0]}")
+                    f.write(msg)
+                log(f"[rep {rep}] {name}: {ph} FAILED: {msg.splitlines()[0]}")
                 return False
             finally:
                 if procs:
