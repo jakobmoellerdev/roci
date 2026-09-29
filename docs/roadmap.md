@@ -80,7 +80,7 @@ Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
 - [ ] Node exporter for minimal builds
 - [ ] Swagger-based API documentation
 - [x] Fast cold start (opt-in `fast_restart` stamp) and low-fragmentation allocator
-- [x] Hardened Helm chart (PSS restricted, NetworkPolicies, optional HA S3 storage on RustFS), e2e-tested on k0s
+- [x] Hardened Helm chart (PSS restricted, NetworkPolicies, optional HA S3 storage on RustFS), e2e-tested on k0s, released as an attested OCI artifact on GHCR (`oci://ghcr.io/jakobmoellerdev/charts/roci`)
 - [x] Health endpoints (`/readyz`, `/livez`) for Kubernetes probes — unauthenticated, rate-limit-free
 - [x] S3 bucket auto-creation (`create_bucket`, always on in the chart's RustFS mode) and private-CA trust (`ca_file`)
 - [ ] RustFS client-cert mTLS (blocked: `object_store` lacks client-cert API; RustFS subchart has no server-TLS-only mode)
