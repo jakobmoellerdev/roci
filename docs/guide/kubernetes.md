@@ -132,6 +132,6 @@ The upstream RustFS chart's test pod lacks the security context required by PSS 
 
 ## Limitations
 
-- **Single replica.** roci runs as exactly one replica (ARCHITECTURE invariant 7: each repository has one writing instance). The S3 backend keeps metadata and upload staging on a local PVC, so a second replica would diverge. Clustering is planned for Phase 8.
+- **Single replica.** roci runs as exactly one replica: each repository has one writing instance. The S3 backend keeps metadata and upload staging on a local PVC, so a second replica would diverge. Clustering is planned for Phase 8.
 - **Bundled RustFS only.** The chart does not template external S3 endpoints.
 - **RustFS mTLS unsupported.** The RustFS 1.0.0 subchart's `mtls.enabled` bundles server TLS and client-certificate authentication into a single `RUSTFS_SERVER_MTLS_ENABLE` flag — there is no server-TLS-only mode. `object_store` (roci's S3 client) has no client-certificate identity API, so roci cannot present a client cert. In-cluster S3 traffic remains plaintext, confined by NetworkPolicy. The chart rejects `rustfs.mtls.enabled` with this explanation. For a private-CA S3 endpoint outside the chart, set `ca_file`.

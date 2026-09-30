@@ -190,83 +190,112 @@ Beyond the required gate, CI runs three security/static-analysis workflows: `act
 
 ## Feature roadmap
 
-Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
+**31 shipped · 5 in progress · 17 planned · 1 blocked** — ● shipped · ◐ in progress · ○ planned · ⊘ blocked. The docs site renders the same data as an interactive page ([`docs/roadmap.md`](docs/roadmap.md)).
+
+| Area | Progress | |
+|---|---|---|
+| Core distribution | `█████░░░░░` | 7 / 14 |
+| Security & access control | `████████░░` | 9 / 11 |
+| Storage | `██████████` | 8 / 8 |
+| Operability | `███████░░░` | 7 / 10 |
+| Content & ecosystem | `░░░░░░░░░░` | 0 / 5 |
+| Query & search | `░░░░░░░░░░` | 0 / 2 |
+| Scaling | `░░░░░░░░░░` | 0 / 3 |
+| Replication | `░░░░░░░░░░` | 0 / 1 |
 
 ### Core distribution
 
-- [x] Conforms to OCI Distribution Spec APIs (v1.1.1)
-- [x] Uses OCI image layout for image storage
-- [x] Can serve any OCI image layout as a registry
-- [~] Single binary for all features
-- [x] Runs without root privileges
-- [~] Clear separation between core dist-spec and roci-specific extensions
-- [x] Behavior controlled entirely via configuration
-- [x] Binaries released for multiple operating systems and architectures
-- [x] Image deletion by tag
-- [ ] Compatible with ecosystem tools (skopeo, cri-o)
-- [x] Suitable for on-premises deployments (e.g. colocated with Kubernetes)
-- [~] HTTP/2 multiplexing + keep-alive; TLS 1.3 with optional kTLS zero-copy
-- [~] SHA-512 default digests (SHA-256 accepted); constant-time verification
-- [ ] Immutable-by-digest response caching (`ETag`/`If-None-Match` → `304`), correct tag-vs-digest cache-control
-- [ ] Foreign media types & `tar+zstd` layers stored/served as opaque blobs (Nydus, eStargz, SBOM, signatures)
-
-### Content & ecosystem
-
-- [ ] Container image signatures — cosign
-- [ ] Container image signatures — notation
-- [ ] Helm chart support
-- [ ] Lazy-pull origin (eStargz / SOCI / Nydus) via Range + referrer-carried metadata
-- [ ] BLAKE3 Bao verified streaming — per-`Range`-chunk integrity, stored as a referrer
-
-### Query & search
-
-- [ ] Advanced image queries via search extension
-- [ ] Vulnerability scanning of images (Trivy) with SBOMs (SPDX/CycloneDX) as referrers
+| | Capability | |
+|---|---|---|
+| ● | OCI Distribution Spec v1.1.1 | Passes the upstream conformance suite |
+| ● | OCI image layout storage | Any layout on disk can be served as a registry |
+| ● | Rootless | Runs without root privileges |
+| ● | Config-driven | Behavior controlled entirely via configuration |
+| ● | Multi-platform releases | Binaries for multiple operating systems and architectures |
+| ● | Delete by tag | |
+| ● | On-premises ready | e.g. colocated with Kubernetes |
+| ◐ | Single binary | One binary for all features |
+| ◐ | Core / extension split | Dist-spec core cleanly separated from roci extensions |
+| ◐ | HTTP/2 and TLS 1.3 | Multiplexing and keep-alive; optional kTLS zero-copy |
+| ◐ | SHA-512 digests | SHA-512 by default, SHA-256 accepted; constant-time verification |
+| ○ | Ecosystem compatibility | skopeo, cri-o |
+| ○ | Digest response caching | `ETag` / `If-None-Match` → `304`; correct tag-vs-digest cache-control |
+| ○ | Foreign media types | Nydus, eStargz, SBOMs, signatures and `tar+zstd` layers served as opaque blobs |
 
 ### Security & access control
 
-- [x] TLS support (TLS 1.3, 0-RTT hardening via `425 Too Early`)
-- [x] TLS mutual authentication (client cert, optional CA/leaf-fingerprint pinning)
-- [x] HTTP Basic authentication — local htpasswd (bcrypt)
-- [x] HTTP Basic authentication — LDAP (opt-in cargo feature `ldap`, not in `full`)
-- [x] HTTP Bearer token authentication (external token server; ES256/RS256 verification, per-request scope binding)
-- [x] Identity-Based Access Control (glob patterns, specificity matching, admin/group support)
-- [x] Live modification of authorization configuration while running
-- [~] Boundary hardening — path-traversal-safe validation, wire digest allowlist, bounded inputs (size/`n`/depth)
-- [x] Repository isolation — no cross-repo presence/content oracle; cross-repo mount double-authorized
-- [x] SSRF containment — no client-URL fetch; host-allowlisted, repo-gated redirects; config-load rejection of internal endpoints
-- [ ] Prior-art CVE-class regression suite in CI
+| | Capability | |
+|---|---|---|
+| ● | TLS 1.3 | 0-RTT hardening via `425 Too Early` |
+| ● | Mutual TLS | Client certificates with optional CA or leaf-fingerprint pinning |
+| ● | Basic auth — htpasswd | bcrypt only |
+| ● | Basic auth — LDAP | Opt-in cargo feature `ldap`, not in `full` |
+| ● | Bearer tokens | External token server; ES256/RS256, per-request scope binding |
+| ● | Identity-based access control | Glob patterns, specificity matching, admins and groups |
+| ● | Live authorization reload | Change access rules without a restart |
+| ● | Repository isolation | No cross-repo presence oracle; cross-repo mounts authorized twice |
+| ● | SSRF containment | No client-supplied URL fetches; allowlisted, repo-gated redirects |
+| ◐ | Boundary hardening | Path-traversal-safe validation, digest allowlist, bounded inputs |
+| ○ | CVE-class regression suite | Prior-art registry CVEs replayed in CI |
 
 ### Storage
 
-- [x] Online, O(garbage) garbage collection (grace-period, backref index, startup backref rebuild; never offline)
-- [x] Copy-on-write (reflink `FICLONE`) deduplication across repos — mounts and uploads — hard-link then streaming-copy fallback
-- [x] Data scrubbing (CRC32C staggered + adaptive, FS-scrub offload, digest re-hash escalation, quarantine)
-- [x] Serve multiple storage paths (and backends, incl. S3-compatible object storage) from a single server
-- [x] Per-repo / per-total storage quotas and a concurrent upload-session cap
-- [x] In-memory small-blob content cache (byte-capped LRU, configurable `small_blob_threshold`)
-- [x] Embedded metadata index — append-log + in-RAM maps default (compaction, optional HMAC), LMDB (heed) B-tree KV upgrade
-- [x] Lossless engine switching (log ↔ lmdb) — marker-based detection, verified migration at startup
-
-### Replication
-
-- [ ] Pull and synchronize from other dist-spec conformant registries
-
-### Scaling
-
-- [ ] Vertical scale — efficient scale-up on a single node (streaming, zero-copy, bounded memory)
-- [ ] Horizontal scale-out — clustered instances, repo sharding via consistent hashing (HRW + bounded-load), peer proxy
-- [ ] RSS scales with reference count, not stored bytes (mmap-offloadable metadata; runs on a Raspberry Pi)
+| | Capability | |
+|---|---|---|
+| ● | Online garbage collection | O(garbage) with a grace period and backref index; never offline |
+| ● | Copy-on-write dedup | Reflink (`FICLONE`) across repos, with hard-link and copy fallbacks |
+| ● | Data scrubbing | CRC32C checks, digest re-hash on mismatch, quarantine |
+| ● | Multiple storage paths | Mix local paths and S3-compatible object storage in one server |
+| ● | Quotas | Per-repo and total quotas, plus a cap on concurrent uploads |
+| ● | Small-blob cache | Byte-capped in-memory LRU for manifests and configs |
+| ● | Metadata engines | In-memory log (default, optional HMAC) or LMDB on disk |
+| ● | Lossless engine switching | log ↔ lmdb with a verified migration at startup |
 
 ### Operability
 
-- [x] Rate limiting — per-HTTP-method and per-client (authenticated identity or peer IP, LRU-bounded)
-- [x] Prometheus metrics
-- [x] OpenTelemetry observability (OTLP traces, metrics, and logs)
-- [ ] Node exporter for minimal builds
-- [ ] Swagger-based API documentation
-- [x] Fast cold start (opt-in `fast_restart` stamp) and low-fragmentation allocator
-- [x] Hardened Helm chart (PSS restricted, NetworkPolicies, optional HA S3 storage on RustFS), e2e-tested on k0s, released as an attested OCI artifact on GHCR (`oci://ghcr.io/jakobmoellerdev/charts/roci`)
+| | Capability | |
+|---|---|---|
+| ● | Rate limiting | Per HTTP method and per client |
+| ● | Prometheus metrics | |
+| ● | OpenTelemetry | OTLP traces, metrics and logs |
+| ● | Fast cold start | Opt-in `fast_restart` stamp and a low-fragmentation allocator |
+| ● | Hardened Helm chart | PSS restricted, NetworkPolicies, optional HA S3 on RustFS; attested OCI artifact at `oci://ghcr.io/jakobmoellerdev/charts/roci` |
+| ● | Health endpoints | `/readyz` and `/livez`, unauthenticated and rate-limit-free |
+| ● | S3 bucket auto-creation | `create_bucket`, plus private-CA trust via `ca_file` |
+| ○ | Node exporter for minimal builds | |
+| ○ | OpenAPI documentation | |
+| ⊘ | RustFS client-cert mTLS | `object_store` has no client-cert API; the RustFS chart has no server-TLS-only mode |
+
+### Content & ecosystem
+
+| | Capability | |
+|---|---|---|
+| ○ | cosign signatures | |
+| ○ | notation signatures | |
+| ○ | Helm charts as artifacts | |
+| ○ | Lazy-pull origin | eStargz, SOCI and Nydus via Range requests and referrer metadata |
+| ○ | BLAKE3 verified streaming | Per-`Range`-chunk integrity, stored as a referrer |
+
+### Query & search
+
+| | Capability | |
+|---|---|---|
+| ○ | Search extension | Advanced image queries |
+| ○ | Vulnerability scanning | Trivy, with SPDX/CycloneDX SBOMs as referrers |
+
+### Scaling
+
+| | Capability | |
+|---|---|---|
+| ○ | Vertical scale | Streaming, zero-copy, bounded memory on one node |
+| ○ | Horizontal scale-out | Repo sharding via consistent hashing with a peer proxy |
+| ○ | Memory follows references | RSS scales with reference count, not stored bytes |
+
+### Replication
+
+| | Capability | |
+|---|---|---|
+| ○ | Registry sync | Pull and synchronize from any dist-spec conformant registry |
 
 ## License
 

@@ -352,6 +352,21 @@ A first-party benchmark (M4 Pro, 48 GB, APFS/NVMe, `--release`+LTO; each structu
 
 LMDB now sits within ~1.5× of zot, and ~60 MiB of its post-read heap is the manifests the read phase cached, which is the cache doing its job. The snapshot engine still peaks during compaction (it materializes the base plus delta and serializes the whole archive in memory) — tracked with its tail latency in PLAN. The log engine's remaining gap to LMDB is its in-RAM index, the designed cost of that engine (ARCHITECTURE §RAM consumption).
 
+**Follow-up: `full` run on Linux (2026-09-29, commit `e07f8627e69d`, RESEARCH: RociBenchCI).** Shared GitHub arm64 runner, 2 registry CPUs, 5 reps, 100k images, tag-resolve at 6,400 rps; ratios only.
+
+| 100k images (median) | roci-log | roci-lmdb | zot |
+|---|---|---|---|
+| scale push (images/s) / p99 (ms) | 1167 / 96 | 561 / 228 | 105 / 867 |
+| tag resolve p50 / p99 (ms) | 0.17 / 0.53 | 0.17 / 0.51 | 1263 / 3158 (saturated ~1,040 rps) |
+| anon RSS after reads (MiB) | 316 | 147 | 169 |
+| restart with the corpus (ms) | 2635 | 2190 | 365 |
+| metadata on disk (MB) | 129 | 234 | — |
+
+- **Heap fixes hold on Linux**: log 316 MiB, LMDB 147 MiB — below zot. The ~170 MiB log−LMDB gap (~1.7 KB per three-blob image) matches the in-RAM maps estimate (ARCHITECTURE §RAM consumption); the rest is runtime plus cached manifests common to both. Plan ~3 KB total heap per image for the log engine.
+- **Tail latency parity**: the log engine's 11.8 ms p99 on Docker Desktop did not reproduce; both engines hit ~0.5 ms p99.
+- **Restart gap narrowed**: LMDB 2.2 s vs log 2.6 s (Docker Desktop: 1.0 vs 8.1 s). Not attributed yet; restart alone is no longer a strong reason to pick LMDB at 100k images.
+- **Push**: log ~2× LMDB.
+
 ## Sources
 
 | # | Title | Authors / Org | Venue / Year | Relevance to roci |
@@ -438,6 +453,7 @@ LMDB now sits within ~1.5× of zot, and ~60 MiB of its post-read heap is the man
 | RociIndexBench | roci index-engine bake-off: heed (LMDB) vs redb (first-party) | roci | 2026-09-25, Apple Silicon macOS (M-series)/APFS-NVMe, --release + LTO | heed/LMDB 1.3–4× faster reads (4–7× at 8 threads), 17–26% smaller disk; redb 3–6× faster writes. **[changed — heed migration] ADOPT heed/LMDB:** multi-thread read wins decisive; heed supports musl. Backs §8.6/§9.8. |
 | heed3-cookbook | heed3 cookbook (encrypted env docs) | Meilisearch | docs.rs 2026 | Documents the heed3 `EncryptedEnv` API and its internal cycling decryption buffer. Cited for the concurrency defect finding (§9.8). |
 | RociEngineScaleBench | roci metadata engines (log, log+snapshot, heed/LMDB) vs zot 2.1.21 at 100k images (first-party) | roci | 2026-09-27, Docker Desktop (Apple M-series, 6 CPUs), quick/1 rep — non-authoritative | LMDB: tag-resolve p99 1.1 ms vs 11.8 (log) / 778 (snapshot); restart 1.0 s vs 8.1 / 3.6 s. Heap 480–714 MiB for every engine vs zot 90–129 MiB, attributed to push-filled small-blob cache (~360 MiB), a full state clone per log compaction and per-key repo copies; after fixes log 326 / LMDB 174 MiB post-read. Backs §9.9. |
+| RociBenchCI | roci-log / roci-lmdb vs zot 2.1.21, `full` profile (first-party) | roci | 2026-09-29, GitHub `ubuntu-24.04-arm` (2 registry CPUs, 4 GiB), 5 reps, bench workflow run 36576479158 — ratios only | Log 1167 vs LMDB 561 vs zot 105 images/s; tag-resolve p99 ~0.5 ms both engines; heap after reads 316 / 147 / 169 MiB; restart 2.6 / 2.2 / 0.4 s. |
 | COSI | Container Object Storage Interface (COSI) | Kubernetes SIG Storage | sigs.k8s.io/container-object-storage-interface-spec (v1alpha2 pre-release), v0.2.2 release (v1alpha1); GitHub issues #407 (BucketAccess race), #392 (driver lifecycle) | Deferred for roci: v1alpha2 is pre-release, the latest sigs release (v0.2.2) still targets v1alpha1, and open bugs block production bucket provisioning. Revisit when v1beta1 ships. |
 
 *Compiled 2026-09-19. §1–7 from the first scout wave + CHBL/Venti primary reads; §8 from LayoutHashCAS/IndexEngineFilters/DedupGCScrub/IOServingObjStore + BLAKE3/binary-fuse reads; §9 from IoUringE2E/SmallObjectPacking/ZeroCopyIndexMem/WholeRegistryEngine + Haystack/AIStore reads. All §8–9 scouts delivered briefs in yield text (local:// write avoided per prior lesson); one §9 scout wedged on a yield-schema mismatch and was harvested via recovered result.*

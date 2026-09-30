@@ -35,7 +35,7 @@ docs/
 │   └── social-card.svg
 ├── guide/                # user + contributor guide
 ├── design/               # design overviews that link the canonical root docs
-├── roadmap.md            # mirrors the README feature roadmap
+├── roadmap.md            # roadmap data (frontmatter) mirroring the README; rendered by theme/Roadmap.vue
 └── index.md              # home page
 ```
 
