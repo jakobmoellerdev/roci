@@ -64,4 +64,4 @@ Records flamegraphs (`perf record`), syscall summaries and roci's per-route late
 
 ## Index-engine bake-off (LMDB vs redb)
 
-`just bench-index` (in `bench/index-engines/`, outside the product workspace) compares heed/LMDB and redb on roci's metadata access pattern. On macOS (non-authoritative), LMDB was 1.3–4× faster on reads single-threaded, up to 7× at 8 threads, and 17–26% smaller on disk; redb was 3–6× faster on writes. roci ships LMDB because reads dominate. Details: [RESEARCH §9.8](https://github.com/jakobmoellerdev/roci/blob/main/RESEARCH.md).
+`just bench-index` (in `bench/index-engines/`, outside the product workspace) compares heed/LMDB and redb on roci's metadata access pattern. On macOS (non-authoritative), LMDB was 1.3–4× faster on reads single-threaded, up to 7× at 8 threads, and 17–26% smaller on disk; redb was 3–6× faster on writes. roci ships LMDB because reads dominate.

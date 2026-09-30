@@ -1,86 +1,107 @@
+---
+aside: false
+outline: false
+# Roadmap data. Mirrors the "Feature roadmap" in the repo-root README.md:
+# change a capability's status in both files in one change.
+# status: done | wip | planned | blocked
+areas:
+  - id: core
+    title: Core distribution
+    tagline: The OCI Distribution Spec, served from a plain OCI image layout.
+    items:
+      - { status: done, title: OCI Distribution Spec v1.1.1, detail: "Passes the upstream conformance suite." }
+      - { status: done, title: OCI image layout storage, detail: "Any layout on disk can be served as a registry." }
+      - { status: done, title: Rootless, detail: "Runs without root privileges." }
+      - { status: done, title: Config-driven, detail: "Behavior controlled entirely via configuration." }
+      - { status: done, title: Multi-platform releases, detail: "Binaries for multiple operating systems and architectures." }
+      - { status: done, title: Delete by tag }
+      - { status: done, title: On-premises ready, detail: "e.g. colocated with Kubernetes." }
+      - { status: wip, title: Single binary, detail: "One binary for all features." }
+      - { status: wip, title: Core / extension split, detail: "Dist-spec core cleanly separated from roci extensions." }
+      - { status: wip, title: HTTP/2 and TLS 1.3, detail: "Multiplexing and keep-alive; optional kTLS zero-copy." }
+      - { status: wip, title: SHA-512 digests, detail: "SHA-512 by default, SHA-256 accepted; constant-time verification." }
+      - { status: planned, title: Ecosystem compatibility, detail: "skopeo, cri-o." }
+      - { status: planned, title: Digest response caching, detail: "`ETag` / `If-None-Match` → `304`; correct tag-vs-digest cache-control." }
+      - { status: planned, title: Foreign media types, detail: "Nydus, eStargz, SBOMs, signatures and `tar+zstd` layers served as opaque blobs." }
+
+  - id: security
+    title: Security & access control
+    tagline: Authenticated, authorized, and hard to misuse.
+    items:
+      - { status: done, title: TLS 1.3, detail: "0-RTT hardening via `425 Too Early`." }
+      - { status: done, title: Mutual TLS, detail: "Client certificates with optional CA or leaf-fingerprint pinning." }
+      - { status: done, title: Basic auth — htpasswd, detail: "bcrypt only." }
+      - { status: done, title: Basic auth — LDAP, detail: "Opt-in cargo feature `ldap`, not in `full`." }
+      - { status: done, title: Bearer tokens, detail: "External token server; ES256/RS256, per-request scope binding." }
+      - { status: done, title: Identity-based access control, detail: "Glob patterns, specificity matching, admins and groups." }
+      - { status: done, title: Live authorization reload, detail: "Change access rules without a restart." }
+      - { status: done, title: Repository isolation, detail: "No cross-repo presence oracle; cross-repo mounts authorized twice." }
+      - { status: done, title: SSRF containment, detail: "No client-supplied URL fetches; allowlisted, repo-gated redirects." }
+      - { status: wip, title: Boundary hardening, detail: "Path-traversal-safe validation, digest allowlist, bounded inputs." }
+      - { status: planned, title: CVE-class regression suite, detail: "Prior-art registry CVEs replayed in CI." }
+
+  - id: storage
+    title: Storage
+    tagline: Content-addressed, deduplicated, self-healing.
+    items:
+      - { status: done, title: Online garbage collection, detail: "O(garbage) with a grace period and backref index; never offline." }
+      - { status: done, title: Copy-on-write dedup, detail: "Reflink (`FICLONE`) across repos, with hard-link and copy fallbacks." }
+      - { status: done, title: Data scrubbing, detail: "CRC32C checks, digest re-hash on mismatch, quarantine." }
+      - { status: done, title: Multiple storage paths, detail: "Mix local paths and S3-compatible object storage in one server." }
+      - { status: done, title: Quotas, detail: "Per-repo and total quotas, plus a cap on concurrent uploads." }
+      - { status: done, title: Small-blob cache, detail: "Byte-capped in-memory LRU for manifests and configs." }
+      - { status: done, title: Metadata engines, detail: "In-memory log (default, optional HMAC) or LMDB on disk." }
+      - { status: done, title: Lossless engine switching, detail: "log ↔ lmdb with a verified migration at startup." }
+
+  - id: operability
+    title: Operability
+    tagline: Observable, deployable, boring to run.
+    items:
+      - { status: done, title: Rate limiting, detail: "Per HTTP method and per client." }
+      - { status: done, title: Prometheus metrics }
+      - { status: done, title: OpenTelemetry, detail: "OTLP traces, metrics and logs." }
+      - { status: done, title: Fast cold start, detail: "Opt-in `fast_restart` stamp and a low-fragmentation allocator." }
+      - { status: done, title: Hardened Helm chart, detail: "PSS restricted, NetworkPolicies, optional HA S3 on RustFS; attested OCI artifact at `oci://ghcr.io/jakobmoellerdev/charts/roci`." }
+      - { status: done, title: Health endpoints, detail: "`/readyz` and `/livez`, unauthenticated and rate-limit-free." }
+      - { status: done, title: S3 bucket auto-creation, detail: "`create_bucket`, plus private-CA trust via `ca_file`." }
+      - { status: planned, title: Node exporter for minimal builds }
+      - { status: planned, title: OpenAPI documentation }
+      - { status: blocked, title: RustFS client-cert mTLS, detail: "`object_store` has no client-cert API; the RustFS chart has no server-TLS-only mode." }
+
+  - id: content
+    title: Content & ecosystem
+    tagline: Signatures, charts and lazy pulls.
+    items:
+      - { status: planned, title: cosign signatures }
+      - { status: planned, title: notation signatures }
+      - { status: planned, title: Helm charts as artifacts }
+      - { status: planned, title: Lazy-pull origin, detail: "eStargz, SOCI and Nydus via Range requests and referrer metadata." }
+      - { status: planned, title: BLAKE3 verified streaming, detail: "Per-`Range`-chunk integrity, stored as a referrer." }
+
+  - id: search
+    title: Query & search
+    tagline: Find images and what is inside them.
+    items:
+      - { status: planned, title: Search extension, detail: "Advanced image queries." }
+      - { status: planned, title: Vulnerability scanning, detail: "Trivy, with SPDX/CycloneDX SBOMs as referrers." }
+
+  - id: scaling
+    title: Scaling
+    tagline: From a Raspberry Pi to a cluster.
+    items:
+      - { status: planned, title: Vertical scale, detail: "Streaming, zero-copy, bounded memory on one node." }
+      - { status: planned, title: Horizontal scale-out, detail: "Repo sharding via consistent hashing with a peer proxy." }
+      - { status: planned, title: Memory follows references, detail: "RSS scales with reference count, not stored bytes." }
+
+  - id: replication
+    title: Replication
+    tagline: Mirror other registries.
+    items:
+      - { status: planned, title: Registry sync, detail: "Pull and synchronize from any dist-spec conformant registry." }
+---
+
 # Roadmap
 
-::: tip Kept in sync with the README
-This page mirrors the feature roadmap in the repo-root [`README.md`](https://github.com/jakobmoellerdev/roci/blob/main/README.md). When a capability's status changes, update both in the same change (see `AGENTS.md`).
-:::
+What roci does today, what is being built, and what comes next.
 
-Legend: `[ ]` planned · `[~]` in progress · `[x]` done.
-
-## Core distribution
-
-- [x] Conforms to OCI Distribution Spec APIs (v1.1.1)
-- [x] Uses OCI image layout for image storage
-- [x] Can serve any OCI image layout as a registry
-- [~] Single binary for all features
-- [x] Runs without root privileges
-- [~] Clear separation between core dist-spec and roci-specific extensions
-- [x] Behavior controlled entirely via configuration
-- [x] Binaries released for multiple operating systems and architectures
-- [x] Image deletion by tag
-- [ ] Compatible with ecosystem tools (skopeo, cri-o)
-- [x] Suitable for on-premises deployments (e.g. colocated with Kubernetes)
-- [~] HTTP/2 multiplexing + keep-alive; TLS 1.3 with optional kTLS zero-copy
-- [~] SHA-512 default digests (SHA-256 accepted); constant-time verification
-- [ ] Immutable-by-digest response caching (`ETag`/`If-None-Match` → `304`), correct tag-vs-digest cache-control
-- [ ] Foreign media types & `tar+zstd` layers stored/served as opaque blobs (Nydus, eStargz, SBOM, signatures)
-
-## Content & ecosystem
-
-- [ ] Container image signatures — cosign
-- [ ] Container image signatures — notation
-- [ ] Helm chart support
-- [ ] Lazy-pull origin (eStargz / SOCI / Nydus) via Range + referrer-carried metadata
-- [ ] BLAKE3 Bao verified streaming — per-`Range`-chunk integrity, stored as a referrer
-
-## Query & search
-
-- [ ] Advanced image queries via search extension
-- [ ] Vulnerability scanning of images (Trivy) with SBOMs (SPDX/CycloneDX) as referrers
-
-## Security & access control
-
-- [x] TLS support (TLS 1.3, 0-RTT hardening via `425 Too Early`)
-- [x] TLS mutual authentication (client cert, optional CA/leaf-fingerprint pinning)
-- [x] HTTP Basic authentication — local htpasswd (bcrypt)
-- [x] HTTP Basic authentication — LDAP (opt-in cargo feature `ldap`, not in `full`)
-- [x] HTTP Bearer token authentication (external token server; ES256/RS256 verification, per-request scope binding)
-- [x] Identity-Based Access Control (glob patterns, specificity matching, admin/group support)
-- [x] Live modification of authorization configuration while running
-- [~] Boundary hardening — path-traversal-safe validation, wire digest allowlist, bounded inputs (size/`n`/depth)
-- [x] Repository isolation — no cross-repo presence/content oracle; cross-repo mount double-authorized
-- [x] SSRF containment — no client-URL fetch; host-allowlisted, repo-gated redirects; config-load rejection of internal endpoints
-- [ ] Prior-art CVE-class regression suite in CI
-
-## Storage
-
-- [x] Online, O(garbage) garbage collection (grace-period, backref index, startup backref rebuild; never offline)
-- [x] Copy-on-write (reflink `FICLONE`) deduplication across repos — mounts and uploads — hard-link then streaming-copy fallback
-- [x] Data scrubbing (CRC32C staggered + adaptive, FS-scrub offload, digest re-hash escalation, quarantine)
-- [x] Serve multiple storage paths (and backends, incl. S3-compatible object storage) from a single server
-- [x] Per-repo / per-total storage quotas and a concurrent upload-session cap
-- [x] In-memory small-blob content cache (byte-capped LRU, configurable `small_blob_threshold`)
-- [x] Embedded metadata index — append-log + in-RAM maps default (compaction, optional HMAC), LMDB (heed) B-tree KV upgrade
-- [x] Lossless engine switching (log ↔ lmdb) — marker-based detection, verified migration at startup
-
-## Replication
-
-- [ ] Pull and synchronize from other dist-spec conformant registries
-
-## Scaling
-
-- [ ] Vertical scale — efficient scale-up on a single node (streaming, zero-copy, bounded memory)
-- [ ] Horizontal scale-out — clustered instances, repo sharding via consistent hashing (HRW + bounded-load), peer proxy
-- [ ] RSS scales with reference count, not stored bytes (mmap-offloadable metadata; runs on a Raspberry Pi)
-
-## Operability
-
-- [x] Rate limiting — per-HTTP-method and per-client (authenticated identity or peer IP, LRU-bounded)
-- [x] Prometheus metrics
-- [x] OpenTelemetry observability (OTLP traces, metrics, and logs)
-- [ ] Node exporter for minimal builds
-- [ ] Swagger-based API documentation
-- [x] Fast cold start (opt-in `fast_restart` stamp) and low-fragmentation allocator
-- [x] Hardened Helm chart (PSS restricted, NetworkPolicies, optional HA S3 storage on RustFS), e2e-tested on k0s, released as an attested OCI artifact on GHCR (`oci://ghcr.io/jakobmoellerdev/charts/roci`)
-- [x] Health endpoints (`/readyz`, `/livez`) for Kubernetes probes — unauthenticated, rate-limit-free
-- [x] S3 bucket auto-creation (`create_bucket`, always on in the chart's RustFS mode) and private-CA trust (`ca_file`)
-- [ ] RustFS client-cert mTLS (blocked: `object_store` lacks client-cert API; RustFS subchart has no server-TLS-only mode)
+<Roadmap />

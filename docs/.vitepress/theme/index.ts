@@ -6,7 +6,11 @@
 import DefaultTheme from 'vitepress/theme'
 import type { Theme } from 'vitepress'
 import './brand.css'
+import Roadmap from './Roadmap.vue'
 
 export default {
   extends: DefaultTheme,
+  enhanceApp({ app }) {
+    app.component('Roadmap', Roadmap)
+  },
 } satisfies Theme
